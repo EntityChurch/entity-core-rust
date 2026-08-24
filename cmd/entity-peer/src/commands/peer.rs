@@ -111,6 +111,8 @@ pub async fn start(
     hash_type: &str,
     validate: bool,
     publish_root: bool,
+    signaling_node: bool,
+    peer_issued_registries: &[String],
     publish_descriptors: bool,
     keepalive_overrides: KeepaliveOverrides,
 ) -> anyhow::Result<()> {
@@ -252,6 +254,62 @@ pub async fn start(
         anyhow::bail!("sqlite storage requires the 'sqlite' feature (not compiled in)");
     }
 
+    // EXTENSION-SIGNALING §4/§5: mount the rendezvous node on this peer.
+    // Installed through the same public `PeerBuilder::handler` seam
+    // `entity-signaling-node` uses — that seam mints the interface entity, the
+    // handler entity, the dispatch-index binding and the §6.9 grant, so
+    // serving the node from a general-purpose peer needs no core change (the
+    // isolation property PROPOSAL-CONNECTION-NODE §3 makes the deliverable).
+    //
+    // **Admission is the peer's, not this flag's.** This registers the handler
+    // and nothing else: an unknown caller reaches the verbs only if the peer's
+    // existing posture already covers `system/signaling` — `--debug-grants`
+    // (the dev/harness open-access posture, which peer-manager passes), or an
+    // operator-installed `system/capability/policy/{peer}` entry. Same pairing
+    // Go's `-signaling-node` documents against its `--open-access` default.
+    //
+    // It is tempting to have this flag seed
+    // `system/capability/policy/default` with
+    // `entity_signaling::signaling_seed_grants()` — the standalone node's
+    // `--open` posture, exactly three verbs, no wildcard. Do not: that entry
+    // is read with two OPPOSITE meanings. `assemble_inbound_grants` unions it
+    // onto the connection's grants (a floor), while the §6.2 capability
+    // handler's `request` treats the matched entry as the attenuation CEILING.
+    // A signaling-only `default` entry therefore caps every unrelated cap
+    // request on the peer — measured: `capability` went 13/13 to 7 P / 6 F,
+    // all six behind `request_returns_grant` 403. Narrow-and-additive on one
+    // path is narrow-and-subtractive on the other.
+    if signaling_node {
+        let core = std::sync::Arc::new(entity_signaling::SignalingCore::new(addr));
+        builder = builder.handler(std::sync::Arc::new(
+            entity_signaling::SignalingHandler::new(core, peer_id.as_str()),
+        ));
+        println!("  signaling: system/signaling node (advertise → {})", addr);
+        if !debug_grants {
+            tracing::warn!(
+                "--signaling-node without --debug-grants: an unknown peer gets the \
+                 §4.4 floor and every signaling verb is 403 before it reaches a \
+                 bucket. Install a system/capability/policy entry covering \
+                 system/signaling for the peers this node serves, or run \
+                 `entity-signaling-node --open` for the public-introducer posture."
+            );
+        }
+    }
+
+    // Phase P: author + sign a published-root over the served subtree and
+    // re-sign it on every trie-root change (PROPOSAL-PEER-MANIFEST §4 P1).
+    // --serve-namespace scopes the published subtree to one content namespace;
+    // --serve-closure-root publishes over the whole peer subtree, which is the
+    // EXTENSION-TREE §3.4.1a universal prefix "/". The two flags are mutually
+    // exclusive. Trie keys are relative to the tracked prefix, so under "/"
+    // they are the peer-prefix-stripped paths the consumer's `resolve()` uses.
+    if publish_root {
+        builder = builder.with_published_root(match serve_namespace {
+            Some(ns) => format!("{}/", ns.trim_matches('/')),
+            None => "/".to_string(),
+        });
+    }
+
     let peer = builder.build()?;
 
     // --history flag: store a history config entity so the engine records transitions
@@ -296,6 +354,68 @@ pub async fn start(
                 .map(|d| format!(" (max_depth: {})", d))
                 .unwrap_or_default()
         );
+    }
+
+    // --peer-issued-registry: pin remote registries as `peer-issued` chain
+    // backends (PROPOSAL-PEER-ISSUED-REGISTRY-BACKEND §4).
+    //
+    // The entry MUST carry `hints.endpoint`. A bare `(kind, id)` entry looks
+    // complete and arms nothing but an impl that gets the endpoint from
+    // somewhere else — which is exactly the defect Go's own harness shipped
+    // against a correctly-pinned Python peer: six vectors reporting "fixture
+    // saw 0 requests", indistinguishable from an unpinned peer. Our reader
+    // takes the endpoint from the hint and nowhere else, so a missing hint is
+    // a silent no-op here too.
+    //
+    // This REPLACES any existing resolver-config rather than merging. Same
+    // lesson from the same report: the registry category installs its own
+    // config earlier in a run and removes it on the way out, so "preserve what
+    // is there" preserves nothing. The install has to be self-sufficient.
+    if !peer_issued_registries.is_empty() {
+        let pid = peer.peer_id().to_string();
+        let mut chain = Vec::new();
+        for (i, spec) in peer_issued_registries.iter().enumerate() {
+            let (registry_id, endpoint) = spec.split_once('@').ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--peer-issued-registry expects <peer_id>@<url>, got {:?}",
+                    spec
+                )
+            })?;
+            if registry_id.is_empty() || endpoint.is_empty() {
+                anyhow::bail!(
+                    "--peer-issued-registry expects <peer_id>@<url>, got {:?}",
+                    spec
+                );
+            }
+            chain.push(entity_registry::ResolverChainEntry {
+                backend_kind: entity_registry::BACKEND_KIND_PEER_ISSUED.to_string(),
+                backend_id: registry_id.to_string(),
+                priority: i as u32,
+                accepted_trust_anchors: Vec::new(),
+                hints: Some(entity_core::ecf::Value::Map(vec![(
+                    entity_core::ecf::text("endpoint"),
+                    entity_core::ecf::text(endpoint),
+                )])),
+            });
+            println!("  registry: peer-issued pin {} → {}", registry_id, endpoint);
+        }
+        // The local-name backend stays in the chain at the lowest priority —
+        // pinning a remote registry must not silently disable a peer's own
+        // petnames.
+        chain.push(entity_registry::ResolverChainEntry {
+            backend_kind: entity_registry::BACKEND_KIND_LOCAL_NAME.to_string(),
+            backend_id: "local".to_string(),
+            priority: chain.len() as u32,
+            accepted_trust_anchors: Vec::new(),
+            hints: None,
+        });
+        let config = entity_registry::ResolverConfigData {
+            resolver_chain: chain,
+            ..Default::default()
+        };
+        let config_hash = peer.content_store().put(config.to_entity()?)?;
+        peer.location_index()
+            .set(&entity_registry::resolver_config_path(&pid), config_hash);
     }
 
     // --files: register a root mapping for the local/files handler. Matches
@@ -353,25 +473,27 @@ pub async fn start(
         listeners.push(Box::new(ws_listener));
     }
 
-    // Phase P: author + sign a published-root over the served subtree so
-    // MANIFEST_GET serves a signed tree root (PROPOSAL-PEER-MANIFEST §4). The
-    // trie is keyed by peer-prefix-stripped paths (the root_tracker convention;
-    // cross-impl key reconciliation is a validate-peer item — see
-    // docs/SPEC-AMBIGUITIES.md). Static one-time publish; an empty subtree
-    // still publishes the canonical empty CHAMP root (a real served node) so
-    // MANIFEST_GET / the trie-closure GET resolve regardless of content.
+    // The publisher was armed at build time and has already minted its first
+    // head off the tracker's initial trie build (an empty subtree still yields
+    // the canonical empty CHAMP root — a real served node — so MANIFEST_GET and
+    // the trie-closure GET resolve regardless of content). Everything written
+    // since, including the transport profile above, has already been folded in.
     if publish_root {
-        // --serve-namespace scopes the published subtree; --serve-closure-root
-        // publishes over the whole peer subtree (the closure floor a consumer
-        // walks). serve_namespace and serve_closure_root are mutually exclusive.
-        match publish_served_root(&peer, serve_namespace) {
-            Ok((head, seq)) => println!(
-                "  published-root: seq={} head={} (serving {})",
+        match peer
+            .published_root_head()
+            .and_then(|h| peer.content_store().get(&h).map(|e| (h, e)))
+            .and_then(|(h, e)| {
+                entity_core::types::PublishedRootData::from_entity(&e)
+                    .ok()
+                    .map(|d| (h, d.seq))
+            }) {
+            Some((head, seq)) => println!(
+                "  published-root: seq={} head={} (serving {}, republishing on tree-root change)",
                 seq,
                 head.to_hex(),
                 serve_namespace.unwrap_or("<whole peer subtree>")
             ),
-            Err(e) => tracing::error!("publish-root failed: {}", e),
+            None => tracing::error!("publish-root: no head bound after build"),
         }
     }
 
@@ -649,46 +771,6 @@ fn publish_self_tcp_profile(
     peer.location_index().set(&path, hash);
     println!("  transport: {} → tcp://{}", path, tcp_addr);
     Ok(())
-}
-
-fn publish_served_root(
-    peer: &entity_core::peer::Peer,
-    serve_namespace: Option<&str>,
-) -> anyhow::Result<(entity_core::hash::Hash, u64)> {
-    use std::collections::BTreeMap;
-
-    let shared = peer.shared();
-    let pid = peer.peer_id().as_str().to_string();
-    let peer_prefix = format!("/{}/", pid);
-    // --serve-closure-root (no namespace) publishes over the whole peer
-    // subtree; --serve-namespace scopes to one content namespace.
-    let qualified_prefix = match serve_namespace {
-        Some(ns) => format!("{}{}/", peer_prefix, ns.trim_matches('/')),
-        None => peer_prefix.clone(),
-    };
-
-    let mut bindings = BTreeMap::new();
-    for entry in shared.location_index.list(&qualified_prefix) {
-        let key = entry
-            .path
-            .strip_prefix(&peer_prefix)
-            .unwrap_or(&entry.path)
-            .to_string();
-        bindings.insert(key, entry.hash);
-    }
-
-    let root = entity_core::tree::trie::build_trie(shared.content_store.as_ref(), &bindings)
-        .map_err(|e| anyhow::anyhow!("build_trie: {}", e))?;
-    let head = peer
-        .publish_root(root)
-        .map_err(|e| anyhow::anyhow!("publish_root: {}", e))?;
-    let seq = shared
-        .content_store
-        .get(&head)
-        .and_then(|e| entity_core::types::PublishedRootData::from_entity(&e).ok())
-        .map(|d| d.seq)
-        .unwrap_or(0);
-    Ok((head, seq))
 }
 
 /// Issue a curated peer-issued registry binding (PROPOSAL-PEER-ISSUED §3.2).

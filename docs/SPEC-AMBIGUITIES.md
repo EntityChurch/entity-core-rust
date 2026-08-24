@@ -155,15 +155,25 @@ side.
 > (`core/tree/src/trie.rs`); `--publish-root` selects it and publishes even an
 > empty subtree (the canonical empty CHAMP root is a real served node). This
 > closes validate-peer published_root **v4** (MANIFEST_GET served) and **v7**
-> (CONTENT_GET(root_hash) → trie node). ~~**Still open:** (2) cross-impl trie
-> **key convention** byte-match~~ — **RESOLVED 2026-07-31 at the live run**, as
-> predicted: Go's `published_root` swept **7·0·0·0** against Rust `c043c7f`, and
-> v5+v7 passing proves the key convention byte-matches despite the different
-> derivations (Rust keys peer-prefix-stripped; Go uses
-> RootTracker/`PrefixForLocalPeer`). **Still open:** (3) auto-republish-on-change —
-> Rust is still static one-time publish, gated on pinning the multi-prefix →
-> single-root selection (point 1 below). See
-> `docs/validation/reports/2026-07-31-seven-categories-cleared-and-rust-joins-the-meet.md`.
+> (CONTENT_GET(root_hash) → trie node).
+>
+> **(3) auto-republish-on-change — RESOLVED 2026-08-08.** `--publish-root` now
+> installs a `system/tree/tracking-config` for the served prefix and re-signs on
+> every trie-root change (`PublishRootHook`, `core/peer/src/published_root.rs`),
+> which is what Go's `2026-08-07-f` report measured us failing (one manifest
+> state across 5m45s, `seq` 0 and staying 0). Point 1's multi-prefix→single-root
+> question is answered by construction rather than pinned: the publisher follows
+> exactly one tracked prefix, the one the operator's serving flag selects.
+>
+> **(2) cross-impl trie key convention — REOPENED 2026-08-08. The 2026-07-31
+> closure was wrong.** It read "Go's `published_root` swept 7·0·0·0" as proof
+> the key convention byte-matches. It is not: `v5_outbound_dial` fetches the
+> manifest and verifies the **signature**, and `v7_trie_closure_content_get`
+> CONTENT_GETs `root_hash` and asserts the entity **type** is a trie node
+> (`cmd/internal/validate/published_root.go`, Go `05d1fca`). **Neither resolves
+> a key**, so neither can distinguish the conventions. No vector in any category
+> walks a path from a published root today. See `## PHASE P — the published
+> trie's key convention is unproven cross-impl` below for the live divergence.
 
 **Spec:** STRATEGY-REGISTRY-DISCOVERY-IMPL §0.5 P1/P2 +
 `PROPOSAL-PEER-MANIFEST-STATIC-HANDSHAKE.md` §1.1/§4.
@@ -193,6 +203,119 @@ startup publish over `--serve-namespace`, bare-path-keyed. The
 `peer.publish_root(root_hash)` programmatic primitive is unambiguous (caller
 picks the root). Cross-impl byte alignment on these three points reconciles at
 the validate-peer reconvene (P5/P7).
+
+---
+
+## PHASE P — the published trie's key convention is unproven cross-impl
+
+> **OPEN — filed 2026-08-08, routing to arch + cohort.** Reopens point (2) of
+> the entry above, whose 2026-07-31 closure rested on two vectors that do not
+> test what was claimed.
+>
+> **Updated 2026-08-08 (later) — Go withdrew the closure and built the missing
+> vector.** `published_root.v8_trie_key_convention` (Go `5eab686`) mirrors the
+> served trie over the wire, rebuilds it locally, and asserts the rebuilt root
+> equals the served one. It measures the cohort three ways and **confirms this
+> entry from the other side**, with one result better than expected and one
+> worse. See "What v8 measured" below; the two asks stand unchanged.
+
+**Spec:** `PROPOSAL-PEER-MANIFEST-STATIC-HANDSHAKE.md` §1.1 (walk from the
+signed root by `relative_key`) + `EXTENSION-TREE.md` §3.4.1a.
+
+**Passage / gap.** §1.1 has the consumer resolve a path by walking the HAMT from
+the signed `root_hash`. It does not say what a key **is** — relative to what.
+The trie is keyed by `relative_key`; the publisher and the consumer must agree
+on the frame, and nothing normative fixes it.
+
+**Where the two impls actually stand (both at `2026-08-08`):**
+
+| | tracked prefix under the operator's publish flag | resulting key for a binding at `/{peer}/system/content/public/x` |
+|---|---|---|
+| rust | `"/"` — the §3.4.1a universal tree root | `system/content/public/x` |
+| go | `"system/"` — `publishedroot.PrefixForLocalPeer` | `content/public/x` |
+
+The **rule** is now identical on both sides — keys are relative to the tracked
+prefix (rust converged on it here; it previously stripped only the peer prefix
+regardless of the tracked prefix). What differs is **which prefix the flag
+picks**, and that difference is enough: a Go consumer resolving `content/public/x`
+against a rust peer misses, and a rust consumer resolving `system/content/public/x`
+against a Go peer misses. Neither is *wrong* under the spec as written; they
+just cannot dial each other's manifests.
+
+There is a second, smaller consequence of the same choice: rust's universal
+prefix puts `local/files/...` inside the published closure and Go's `system/`
+does not, so the two peers serve different sets under `--serve-closure-root`.
+
+**Why no test caught it.** `published_root` v5 verifies a signature; v7 fetches
+`root_hash` and asserts the entity type. Neither resolves a key. An exhaustive
+read of Go's `cmd/internal/validate/` at `05d1fca` finds no vector that walks a
+path from a published root in any category.
+
+**What v8 measured (Go `5eab686`, three fresh peers).** The gap is real and the
+table above was two-thirds of it:
+
+| | key frame | observed keys | bindings |
+|---|---|---|---|
+| go | `system/`-relative | `attestation`, `capability` | 401 |
+| rust | peer-relative | `system/attestation`, `local/files` | 415 |
+| python | absolute | `/{peer_id}/system/signature/…` | 490 |
+
+Two findings, and **the good one is as load-bearing as the bad one**:
+
+- **The trie ALGORITHM agrees across all three impls.** All three PASS the
+  rebuild equality — §3.3 routing, the pinned `bitWidth=5` / `bucketSize=3`, the
+  §3.1 canonical form and the bucket sort all reproduce byte-identical roots.
+  This had never been measured cross-impl before. It holds. We pass it at
+  `703bb7b` (`published_root 8·0·0·0`).
+- **The keys do not agree, and it is three-way, not two-way.** rust and Go
+  differ by exactly the `system/` segment; python trims nothing. Go explicitly
+  did *not* file python's absolute keys as a defect — under the universal tree
+  "the peer_id" is not a single value, so it is a defensible third reading. That
+  is arch's call, and it strengthens ask (1): three impls read the same silence
+  three different ways.
+
+**The root cause is sharper than "which prefix the flag picks."**
+`system/peer/published-root` carries `peer_id`, `root_hash`, `seq`,
+`published_at`, `predecessor` — and **no prefix field at all**. §3.3's "the
+prefix is an operational parameter, not stored in the snapshot entity" holds for
+snapshot / extract / merge, where the prefix rides the request; a **published**
+root has no such channel, so the consumer receives the keys and never the
+operand they are relative to. Our `"/"` → `/{peer}//` finding (see
+`HANDOFF-2026-08-08-…-two-defects.md` §2) is the same gap from the publisher's
+side. This is why ask (1) is the load-bearing one: no key convention is
+self-describing until the entity carries the frame.
+
+**One limit v8 states in its own header, and it matters for reading a PASS.**
+The rebuild takes its keys *from the trie*, so it is self-consistent by
+construction with respect to key **form** — an impl keying by absolute path
+rebuilds to its own root perfectly and passes. The equality proves the
+algorithm; the printed key classification is what surfaces a wrong form.
+Neither substitutes for the other, and "v8 passes" is therefore **not** a claim
+that our keys are cohort-correct.
+
+**Interim choice:** rust keeps `"/"`, because it is the prefix that preserves
+what rust already published (the whole peer subtree, peer-prefix-stripped keys)
+and because §3.4.1a names it explicitly as the universal-tree value. Not a
+claim that it is the right cohort answer.
+
+**For architecture / cohort:** two asks, in order.
+1. **Pin the frame** — now a three-way choice, not two:
+   (a) "keys are relative to the tracked prefix, and the published-root MUST
+   carry which prefix that was" — what rust and Go both do now, self-describing
+   only with one new field;
+   (b) "keys are always peer-prefix-stripped regardless of tracked prefix" —
+   needs Go to change, needs no field;
+   (c) "keys are absolute universal-tree paths" — python's reading, which needs
+   no field either and is the only one of the three that survives a peer serving
+   more than one peer-id's subtree.
+   Whichever lands, (a)'s field is worth having on its own: without it a
+   consumer cannot tell (a) from (b) from (c) by inspection.
+2. **Arm a vector that resolves a key**, whichever way (1) lands. Go's v8 proves
+   the *algorithm* but by construction cannot fail on key **form** (see the
+   limit above), so this ask is **not** closed by v8 — it needs a check that
+   resolves a *known* path against a *published* root, which is a different
+   assertion. Until one exists, form stays unprovable from a green suite —
+   exactly how the 2026-07-31 closure happened.
 
 ---
 

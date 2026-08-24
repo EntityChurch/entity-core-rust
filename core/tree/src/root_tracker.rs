@@ -6,8 +6,13 @@
 //! mutation under the config's prefix into a stored trie, writing the current
 //! root hash to `system/tree/root/{prefix}`.
 //!
-//! Self-guard: mutations under `system/tree/root/*` are ignored to prevent
+//! Self-guard: mutations at or under `system/tree/root` are ignored to prevent
 //! recursive updates when the tracker itself writes root hashes.
+//!
+//! Feedback-loop guard: writes tagged with a handler pattern whose output
+//! *describes* trie state rather than contributing content (the published-root
+//! publisher, the history transition recorder) are ignored too — see
+//! [`is_feedback_loop_handler`].
 //!
 //! Config hot-reload: writes to `system/tree/tracking-config/*` trigger an
 //! initial build (or clear) for the affected prefix.
@@ -23,9 +28,58 @@ use crate::trie;
 /// A decoded `system/tree/tracking-config` entry.
 #[derive(Debug, Clone)]
 struct TrackingConfig {
-    /// Bare prefix (relative to the peer), MUST end with `/`.
+    /// Bare prefix (relative to the peer), MUST end with `/`. The value `"/"`
+    /// designates the universal tree root (EXTENSION-TREE §3.4.1a).
     prefix: String,
     enabled: bool,
+}
+
+/// `handler_pattern` tag the published-root publisher stamps on its own tree
+/// writes so this tracker can skip them ([`is_feedback_loop_handler`]).
+///
+/// The publisher binds its manifest at `system/peer/published-root` and its
+/// signature at `system/signature/{hex}` — both inside a `system/`-or-universal
+/// tracked prefix. Untagged, the publisher's own write advances the trie root,
+/// which fires the publisher again; Go measured that runaway at ~55 publishes/s
+/// with no external traffic.
+pub const PUBLISHED_ROOT_HANDLER_PATTERN: &str = "system/peer/published-root";
+
+/// Does `pattern` name a sync-hook consumer whose writes inside a tracked
+/// prefix would loop the trie-root → consumer → trie-root cycle?
+///
+/// The set is intentionally narrow: only consumers whose output *describes*
+/// trie state (published-root manifests + signatures, history transitions)
+/// belong here, never consumers that contribute user content. Two concrete
+/// cycles it breaks, both of which only reach far enough to bite once a
+/// tracked prefix is wide enough to contain `system/` (the universal prefix
+/// `"/"` always is):
+///
+/// - publisher writes published-root → trie root advances → publisher fires
+///   again (needs no history at all);
+/// - tracker writes the tracked root → history records that write under
+///   `system/history/` → trie root advances → history records that … (runs
+///   with no publisher in the picture).
+///
+/// Matches `entity-core-go`'s `isFeedbackLoopHandler` (`core/tree/root_tracker.go`).
+pub fn is_feedback_loop_handler(pattern: &str) -> bool {
+    matches!(pattern, PUBLISHED_ROOT_HANDLER_PATTERN | "system/history")
+}
+
+/// EXTENSION-TREE §3.4.1 canonical prefix form: strip leading **and** trailing
+/// `/`. The universal-tree prefix `"/"` collapses to the empty string, which is
+/// what selects the un-suffixed `system/tree/root` storage path.
+fn canonical_prefix(bare_prefix: &str) -> &str {
+    bare_prefix.trim_matches('/')
+}
+
+/// Build a `system/tree/tracking-config` entity for `prefix` (which MUST end
+/// with `/`; `"/"` is the universal tree root per §3.4.1a).
+pub fn tracking_config_entity(prefix: &str, enabled: bool) -> Option<Entity> {
+    let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+        (entity_ecf::text("enabled"), entity_ecf::bool_val(enabled)),
+        (entity_ecf::text("prefix"), entity_ecf::text(prefix)),
+    ]));
+    Entity::new("system/tree/tracking-config", data).ok()
 }
 
 pub struct RootTrackerEngine {
@@ -35,6 +89,10 @@ pub struct RootTrackerEngine {
     /// Pre-computed prefix `/{peer_id}/system/tree/root/` for the self-guard
     /// check and for writing root entries.
     root_path_prefix: String,
+    /// Pre-computed `/{peer_id}/system/tree/root` — the §3.4.1 storage path for
+    /// the universal prefix, and the exact-match half of the self-guard (it has
+    /// no trailing `/`, so `root_path_prefix` alone would not catch it).
+    root_path_exact: String,
     /// Pre-computed prefix `/{peer_id}/system/tree/tracking-config/` for
     /// the config-change branch.
     config_path_prefix: String,
@@ -50,13 +108,15 @@ impl RootTrackerEngine {
         location_index: Arc<dyn LocationIndex>,
         local_peer_id: String,
     ) -> Self {
-        let root_path_prefix = format!("/{}/system/tree/root/", &local_peer_id);
+        let root_path_exact = format!("/{}/system/tree/root", &local_peer_id);
+        let root_path_prefix = format!("{}/", &root_path_exact);
         let config_path_prefix = format!("/{}/system/tree/tracking-config/", &local_peer_id);
         Self {
             content_store,
             location_index,
             local_peer_id,
             root_path_prefix,
+            root_path_exact,
             config_path_prefix,
             cached_configs: RwLock::new(Vec::new()),
         }
@@ -95,15 +155,53 @@ impl RootTrackerEngine {
         *self.cached_configs.write().unwrap() = configs;
     }
 
-    /// Compute the qualified absolute path for the root entry of `bare_prefix`.
-    fn qualified_root_path(&self, bare_prefix: &str) -> String {
-        let stripped = bare_prefix.trim_end_matches('/');
-        format!("{}{}", self.root_path_prefix, stripped)
+    /// Compute the qualified absolute path for the root entry of `bare_prefix`,
+    /// per the EXTENSION-TREE §3.4.1 path substitution: canonical form `P` is
+    /// the prefix with leading and trailing `/` stripped; an empty `P` (the
+    /// universal prefix `"/"`) stores at `system/tree/root`, otherwise at
+    /// `system/tree/root/{P}`.
+    pub fn qualified_root_path(&self, bare_prefix: &str) -> String {
+        let p = canonical_prefix(bare_prefix);
+        if p.is_empty() {
+            self.root_path_exact.clone()
+        } else {
+            format!("{}{}", self.root_path_prefix, p)
+        }
     }
 
     /// Qualified prefix for events under `bare_prefix` (e.g. `/{peer}/project/`).
-    fn qualified_bare_prefix(&self, bare_prefix: &str) -> String {
-        format!("/{}/{}", self.local_peer_id, bare_prefix)
+    /// The universal prefix `"/"` qualifies to `/{peer}/` — every path in the
+    /// peer's tree.
+    ///
+    /// **This is EXTENSION-TREE §3.3's `absolute_prefix`** — the operand trie
+    /// keys are relative to, and therefore exactly what a published root must
+    /// declare in its §3.3a `prefix` field. It is public for that one caller:
+    /// a publisher that derived the declaration any other way could drift from
+    /// the trim actually applied, and the whole point of the field is that the
+    /// declaration and the keys agree.
+    ///
+    /// Always ends with `/`, which §3.3a requires.
+    ///
+    /// **Our config's `"/"` is the §3.3 *peer-qualified* shape, not the
+    /// universal one.** §3.3 (arch `391c92b`) ruled that a configured `"/"`
+    /// means a **no-op** trim spanning every peer-id, leaving keys fully
+    /// qualified — because under the universal tree "the peer_id" is not a
+    /// single value, and trimming the local one produces a mixed key space.
+    /// This tracker instead maps `"/"` to `/{peer}/`: peer-scoped, keys
+    /// peer-stripped. That is a legitimate shape — it is the table's
+    /// `"/{peer_id}/"` row — and it is what we declare on the wire, so the
+    /// published root is correct. What is left is a **spelling mismatch in our
+    /// own config**: an operator writing `prefix: "/"` here gets the
+    /// peer-qualified reading, not the universal one. Changing it would move
+    /// the tracked-root storage path (§3.4.1 substitutes `""` → `system/tree/root`)
+    /// and re-key every published trie, so it is deliberately not done here.
+    pub fn qualified_bare_prefix(&self, bare_prefix: &str) -> String {
+        let p = canonical_prefix(bare_prefix);
+        if p.is_empty() {
+            format!("/{}/", self.local_peer_id)
+        } else {
+            format!("/{}/{}/", self.local_peer_id, p)
+        }
     }
 
     /// Read the currently tracked root hash for a prefix, if any.
@@ -111,9 +209,19 @@ impl RootTrackerEngine {
     /// The binding at `system/tree/root/{prefix}` points directly at the
     /// root trie node's content hash — no wrapper entity
     /// (EXTENSION-TREE §3.4.1 + TREE-ROOT-PATH-AMBIGUITY.md direct-binding).
+    pub fn tracked_root(&self, bare_prefix: &str) -> Option<Hash> {
+        self.load_tracked_root(bare_prefix)
+    }
+
     fn load_tracked_root(&self, bare_prefix: &str) -> Option<Hash> {
         self.location_index
             .get(&self.qualified_root_path(bare_prefix))
+    }
+
+    /// Is `path` one of this tracker's own output bindings? Both the
+    /// un-suffixed universal path and the `{prefix}`-suffixed ones.
+    fn is_self_path(&self, path: &str) -> bool {
+        path == self.root_path_exact || path.starts_with(&self.root_path_prefix)
     }
 
     /// Bind the trie root hash directly at `system/tree/root/{prefix}`.
@@ -155,7 +263,7 @@ impl RootTrackerEngine {
         let mut bindings = std::collections::BTreeMap::new();
         for e in entries {
             // Skip the tracker's own output paths to avoid circular inclusion.
-            if e.path.starts_with(&self.root_path_prefix) {
+            if self.is_self_path(&e.path) {
                 continue;
             }
             // Strip the qualified prefix to get the relative path the trie indexes by.
@@ -261,8 +369,22 @@ impl SyncTreeHook for RootTrackerEngine {
         event: &TreeChangeEvent,
         ctx: &mut ExecutionContext,
     ) -> Result<(), entity_store::CascadeHalt> {
-        if event.path.starts_with(&self.root_path_prefix) {
+        if self.is_self_path(&event.path) {
             return Ok(());
+        }
+
+        // Break the feedback cycles a wide tracked prefix opens up: a consumer
+        // that writes *about* the tree from inside the tracked prefix would
+        // otherwise advance the root and re-trigger itself. See
+        // `is_feedback_loop_handler`.
+        if let Some(pattern) = event
+            .context
+            .as_ref()
+            .and_then(|c| c.handler_pattern.as_deref())
+        {
+            if is_feedback_loop_handler(pattern) {
+                return Ok(());
+            }
         }
 
         if event.path.starts_with(&self.config_path_prefix) {
@@ -509,6 +631,140 @@ mod tests {
             &mut ctx,
         );
         assert!(engine.load_tracked_root("project/").is_none());
+    }
+
+    /// EXTENSION-TREE §3.4.1 path substitution, including the universal-prefix
+    /// row of the spec's table (`"/"` → canonical `""` → `system/tree/root`,
+    /// with no trailing separator). Getting that row wrong is not cosmetic: the
+    /// old form wrote to `system/tree/root/`, which no consumer reads.
+    #[test]
+    fn root_storage_path_follows_3_4_1_substitution() {
+        let (_, _, engine) = setup();
+        let base = format!("/{}/system/tree/root", peer_id());
+        assert_eq!(engine.qualified_root_path("/"), base);
+        assert_eq!(
+            engine.qualified_root_path("project/"),
+            format!("{}/project", base)
+        );
+        assert_eq!(
+            engine.qualified_root_path("project/src/"),
+            format!("{}/project/src", base)
+        );
+    }
+
+    /// The universal prefix tracks every path in the peer's tree. Before the
+    /// §3.4.1 canonicalization fix this silently tracked nothing: the qualified
+    /// prefix came out as `/{peer}//`, which no event path starts with, so
+    /// every `apply_event` returned early and the root never moved.
+    #[test]
+    fn universal_prefix_tracks_the_whole_peer_subtree() {
+        let (cs, li, engine) = setup();
+        let cfg = make_tracking_config_entity("/", true);
+        let cfg_rel = "system/tree/tracking-config/universal";
+        let cfg_hash = put_at(
+            cs.as_ref(),
+            li.as_ref(),
+            &format!("/{}/{}", peer_id(), cfg_rel),
+            cfg,
+        );
+        engine.bootstrap();
+
+        let mut ctx = ExecutionContext::default();
+        let mut expected = BTreeMap::new();
+        // The config binding itself is under the universal prefix, so the
+        // tracked trie legitimately carries it.
+        expected.insert(cfg_rel.to_string(), cfg_hash);
+        for (i, rel) in ["system/content/public/a", "local/files/docs/b"]
+            .iter()
+            .enumerate()
+        {
+            let hash = cs.put(make_entity("t", &format!("e{}", i))).unwrap();
+            let abs = format!("/{}/{}", peer_id(), rel);
+            li.set(&abs, hash);
+            let _ = engine.on_tree_change(&synthetic_event(&abs, Some(hash), None), &mut ctx);
+            expected.insert(rel.to_string(), hash);
+        }
+
+        let tracked = engine
+            .tracked_root("/")
+            .expect("universal prefix must maintain a root");
+        // Keys are peer-prefix-stripped under the universal prefix — the
+        // convention `PublishedRootClient::resolve` walks with.
+        assert_eq!(tracked, trie::build_trie(cs.as_ref(), &expected).unwrap());
+    }
+
+    /// Under the universal prefix the tracker's own output binding is
+    /// `/{peer}/system/tree/root` — no trailing `/`, so the prefix half of the
+    /// self-guard does not cover it. Left unguarded, writing the root re-enters
+    /// the tracker and folds the root hash into the trie that produced it.
+    #[test]
+    fn self_guard_covers_the_unsuffixed_universal_root_path() {
+        let (cs, li, engine) = setup();
+        let cfg = make_tracking_config_entity("/", true);
+        put_at(
+            cs.as_ref(),
+            li.as_ref(),
+            &format!("/{}/system/tree/tracking-config/universal", peer_id()),
+            cfg,
+        );
+        engine.bootstrap();
+        let before = engine.tracked_root("/").unwrap();
+
+        let bogus = Hash::compute("t", b"bogus");
+        let mut ctx = ExecutionContext::default();
+        let root_path = format!("/{}/system/tree/root", peer_id());
+        let _ = engine.on_tree_change(&synthetic_event(&root_path, Some(bogus), None), &mut ctx);
+
+        assert_eq!(
+            engine.tracked_root("/").unwrap(),
+            before,
+            "a write at the universal root path must not advance the root"
+        );
+    }
+
+    /// Writes tagged by a feedback-loop consumer never move the trie root.
+    /// This is what stops the published-root publisher (whose manifest and
+    /// signature both land under `system/`) from re-triggering itself, and the
+    /// tracker→history→tracker cycle that runs with no publisher at all.
+    #[test]
+    fn feedback_loop_handler_writes_do_not_move_the_root() {
+        let (cs, li, engine) = setup();
+        let cfg = make_tracking_config_entity("/", true);
+        put_at(
+            cs.as_ref(),
+            li.as_ref(),
+            &format!("/{}/system/tree/tracking-config/universal", peer_id()),
+            cfg,
+        );
+        engine.bootstrap();
+        let before = engine.tracked_root("/").unwrap();
+
+        for pattern in [PUBLISHED_ROOT_HANDLER_PATTERN, "system/history"] {
+            let hash = cs.put(make_entity("t", pattern)).unwrap();
+            let abs = format!("/{}/system/peer/published-root", peer_id());
+            li.set(&abs, hash);
+            let mut event = synthetic_event(&abs, Some(hash), None);
+            event.context = Some(ExecutionContext {
+                handler_pattern: Some(pattern.to_string()),
+                ..Default::default()
+            });
+            let mut ctx = ExecutionContext::default();
+            let _ = engine.on_tree_change(&event, &mut ctx);
+            assert_eq!(
+                engine.tracked_root("/").unwrap(),
+                before,
+                "{pattern} write must not advance the tracked root"
+            );
+        }
+
+        // Control: the same write untagged DOES advance it, so the assertions
+        // above are about the tag and not about the path.
+        let hash = cs.put(make_entity("t", "untagged")).unwrap();
+        let abs = format!("/{}/system/peer/published-root", peer_id());
+        li.set(&abs, hash);
+        let mut ctx = ExecutionContext::default();
+        let _ = engine.on_tree_change(&synthetic_event(&abs, Some(hash), None), &mut ctx);
+        assert_ne!(engine.tracked_root("/").unwrap(), before);
     }
 
     #[test]

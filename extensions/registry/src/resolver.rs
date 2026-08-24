@@ -42,6 +42,11 @@ pub struct RegistryHandler {
     peer_id: String,
     qualified_pattern: String,
     log: Arc<ResolutionLog>,
+    /// The live remote-read transport for `peer-issued` chain entries, if the
+    /// host wired one. `None` is the v1 posture and stays fully supported: the
+    /// backend then resolves against the local store only — the §2.2
+    /// precede/offline path.
+    reader: Option<Arc<dyn crate::peer_issued::RegistryTreeReader>>,
 }
 
 impl RegistryHandler {
@@ -58,6 +63,48 @@ impl RegistryHandler {
             peer_id: local_peer_id,
             qualified_pattern,
             log,
+            reader: None,
+        }
+    }
+
+    /// Wire the live remote-read transport for `peer-issued` backends.
+    ///
+    /// Without it the backend is the offline half only: it resolves whatever a
+    /// deployment pre-fetched into the local store and never dials the pinned
+    /// registry.
+    pub fn with_reader(mut self, reader: Arc<dyn crate::peer_issued::RegistryTreeReader>) -> Self {
+        self.reader = Some(reader);
+        self
+    }
+
+    /// Fetch what a `peer-issued` resolve of this name will read, for every
+    /// pinned registry in the chain that carries an endpoint hint.
+    ///
+    /// Runs before the sync resolve and is a no-op when no reader is wired, when
+    /// no chain entry is `peer-issued`, or when the name is already cached
+    /// (§2.2 — the precede path MUST NOT touch the wire).
+    async fn warm_peer_issued(&self, ctx: &HandlerContext) {
+        let Some(reader) = self.reader.as_ref() else {
+            return;
+        };
+        let Ok(map) = decode_map(&ctx.params.data) else {
+            return;
+        };
+        let Some(name) = get_field(&map, "name").and_then(|v| v.as_text()) else {
+            return;
+        };
+        for entry in self.load_config().resolver_chain.iter() {
+            if entry.backend_kind != BACKEND_KIND_PEER_ISSUED {
+                continue;
+            }
+            crate::peer_issued::warm_cache(
+                reader.as_ref(),
+                &self.content_store,
+                &self.location_index,
+                entry,
+                name,
+            )
+            .await;
         }
     }
 
@@ -246,7 +293,17 @@ impl RegistryHandler {
 impl Handler for RegistryHandler {
     async fn handle(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         match ctx.operation.as_str() {
-            "resolve" => Ok(self.handle_resolve(ctx)),
+            "resolve" => {
+                // The live remote-read seam runs HERE, not inside the backend:
+                // `meta_resolve` and every backend under it are sync, and the
+                // fetch is not. Warming the store first lets the whole resolve
+                // algorithm stay unchanged and transport-blind — which is the
+                // architecture `peer_issued`'s module doc has described since
+                // v1 ("a core/peer/SDK concern that POPULATES this store").
+                // No reader configured ⇒ the precede/offline path, unchanged.
+                self.warm_peer_issued(ctx).await;
+                Ok(self.handle_resolve(ctx))
+            }
             "invalidate-cache" => Ok(self.handle_invalidate_cache(ctx)),
             other => Ok(error(
                 STATUS_BAD_REQUEST,

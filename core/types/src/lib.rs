@@ -1006,6 +1006,24 @@ pub struct PublishedRootData {
     pub peer_id: String,
     /// The current tree root the publisher commits to (bare `system/hash`).
     pub root_hash: Hash,
+    /// **The prefix these trie keys are relative to** (EXTENSION-TREE §3.3a,
+    /// REQUIRED as of arch `391c92b`). MUST end with `/`; `"/"` designates the
+    /// universal tree.
+    ///
+    /// This is the operand a consumer needs to turn a `relative_key` back into
+    /// an absolute path (`absolute_prefix + relative_key`, §3.3). It has to
+    /// live on the *root* rather than the manifest because the root is the
+    /// signed artifact: a consumer that has verified the signature must be able
+    /// to interpret what it signed without verifying a second chain that could
+    /// disagree with it.
+    ///
+    /// One of §3.3's three admissible shapes. We publish the **peer-qualified**
+    /// form `/{peer_id}/`, because that is what our keys are actually relative
+    /// to — `system/attestation`, not `attestation` (Go's `system/`-relative)
+    /// and not `/{peer_id}/system/attestation` (python's universal, where the
+    /// trim is a no-op). All three are conformant; the field is what tells them
+    /// apart, and its absence is what let them diverge unnoticed for months.
+    pub prefix: String,
     /// Monotonic freshness counter (reject `seq < cached` on receive).
     pub seq: u64,
     /// Publication timestamp, milliseconds since Unix epoch.
@@ -1031,6 +1049,7 @@ impl PublishedRootData {
 
         let mut peer_id = None;
         let mut root_hash = None;
+        let mut prefix = None;
         let mut seq = None;
         let mut published_at = None;
         let mut predecessor = None;
@@ -1046,6 +1065,7 @@ impl PublishedRootData {
                         );
                     }
                 }
+                Some("prefix") => prefix = v.as_text().map(|s| s.to_string()),
                 Some("seq") => seq = v.as_integer().and_then(|i| u64::try_from(i).ok()),
                 Some("published_at") => {
                     published_at = v.as_integer().and_then(|i| u64::try_from(i).ok())
@@ -1066,6 +1086,12 @@ impl PublishedRootData {
             peer_id: peer_id.ok_or_else(|| TypesError::DecodeError("missing peer_id".into()))?,
             root_hash: root_hash
                 .ok_or_else(|| TypesError::DecodeError("missing root_hash".into()))?,
+            // REQUIRED per §3.3a — a published root without it cannot be
+            // interpreted, so this is a decode failure and not a defaulted
+            // field. Defaulting would have to pick one of the three shapes and
+            // silently promote it to "what you get for saying nothing", which
+            // is the same asymmetry in a harder-to-see form.
+            prefix: prefix.ok_or_else(|| TypesError::DecodeError("missing prefix".into()))?,
             seq: seq.ok_or_else(|| TypesError::DecodeError("missing seq".into()))?,
             published_at: published_at
                 .ok_or_else(|| TypesError::DecodeError("missing published_at".into()))?,
@@ -1081,6 +1107,7 @@ impl PublishedRootData {
                 entity_ecf::text("published_at"),
                 entity_ecf::Value::Integer(self.published_at.into()),
             ),
+            (entity_ecf::text("prefix"), entity_ecf::text(&self.prefix)),
             (
                 entity_ecf::text("root_hash"),
                 entity_ecf::Value::Bytes(self.root_hash.to_bytes().to_vec()),
@@ -1417,6 +1444,7 @@ mod tests {
         let pr = PublishedRootData {
             peer_id: "z6MkExampleBase58PeerId".into(),
             root_hash,
+            prefix: "/z6MkExampleBase58PeerId/".into(),
             seq: 7,
             published_at: 1_700_000_000_000,
             predecessor: Some(pred),
@@ -1435,6 +1463,7 @@ mod tests {
         let pr = PublishedRootData {
             peer_id: "z6MkGenesis".into(),
             root_hash,
+            prefix: "system/".into(),
             seq: 0,
             published_at: 1_700_000_000_000,
             predecessor: None,
@@ -1452,6 +1481,7 @@ mod tests {
         let pr = PublishedRootData {
             peer_id: "z6Mk".into(),
             root_hash: Hash::compute("g", &data),
+            prefix: "/".into(),
             seq: 1,
             published_at: 42,
             predecessor: None,

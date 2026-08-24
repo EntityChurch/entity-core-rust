@@ -567,6 +567,124 @@ async fn poll_closure_scope_serves_signed_root_closure() {
     handle.abort();
 }
 
+/// The §6.5.3.1 listing routes under closure scope — `{prefix}.list`,
+/// `{peer_id}.list`, and the universal `peers.list`.
+///
+/// None of those paths carries a binding of its own, so a tree-face that only
+/// answers for exact leaf bindings 404s all three. It did: the eleven
+/// `serving_mode` listing checks sat behind `seed_republished` and were
+/// `SKIP`ped for as long as we never republished, so closure-scope listings had
+/// never once been exercised — a coverage hole the republish work opened up
+/// rather than created. `poll_closure_scope_serves_signed_root_closure` above
+/// does not catch it: every path it fetches is a bound leaf.
+#[tokio::test]
+async fn poll_closure_scope_serves_listings_over_the_closure() {
+    use entity_peer::http_live::ClosureScope;
+    use std::collections::BTreeMap;
+
+    let server = PeerBuilder::new()
+        .keypair(Keypair::from_seed([92u8; 32]))
+        .build()
+        .expect("peer builds");
+    let peer_id = server.peer_id().to_string();
+    let shared = server.shared();
+    server.start_engines(&shared);
+
+    let entity = Entity::new("test/blob", b"listing payload".to_vec()).expect("entity");
+    let leaf_hash = entity.content_hash;
+    shared.content_store.put(entity).expect("put leaf");
+    let key = format!(
+        "system/content/public/{}",
+        hex_encode(&leaf_hash.to_bytes())
+    );
+    shared
+        .location_index
+        .set(&format!("/{}/{}", peer_id, key), leaf_hash);
+
+    // A foreign peer's namespace in this peer's local view (V7 §1.4) — out of
+    // the closure, but its peer-id must still surface in `peers.list`.
+    let other_peer = "1HtVqLgPqkScVxjVN8VFGFiH7T2P3aSDwJxQ8DGEoooo1z";
+    let foreign = Entity::new("test/blob", b"foreign payload".to_vec()).expect("entity");
+    let foreign_hash = foreign.content_hash;
+    shared.content_store.put(foreign).expect("put foreign");
+    shared.location_index.set(
+        &format!("/{}/system/content/public/x", other_peer),
+        foreign_hash,
+    );
+
+    let mut bindings = BTreeMap::new();
+    bindings.insert(key, leaf_hash);
+    let root = entity_tree::trie::build_trie(shared.content_store.as_ref(), &bindings)
+        .expect("build trie");
+    server.publish_root(root).expect("publish root");
+
+    let listener = HttpLiveListener::bind_poll("127.0.0.1:0", "")
+        .await
+        .expect("poll listener binds")
+        .with_scope(Arc::new(ClosureScope::new()));
+    let url = format!("http://{}", listener.bound_addr());
+    let shared_clone = shared.clone();
+    let handle = tokio::spawn(async move {
+        let _ = listener.serve(shared_clone).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    let client = reqwest::Client::new();
+    let status_of = |u: String| {
+        let c = client.clone();
+        async move { c.get(u).send().await.expect("GET").status().as_u16() }
+    };
+
+    // An intermediate prefix carrying an in-scope descendant.
+    assert_eq!(
+        status_of(format!("{}/{}/system/content/public.list", url, peer_id)).await,
+        200,
+        "prefix listing over an in-scope leaf"
+    );
+    // The peer-root listing.
+    assert_eq!(
+        status_of(format!("{}/{}.list", url, peer_id)).await,
+        200,
+        "peer-root listing"
+    );
+    // The universal-tree-root listing, and it MUST name both peer-ids —
+    // §6.5.6 makes `peers.list` an enumeration of the local view's top-level
+    // segments, not a closure-filtered set (Go's `serveAllPeersListing` and our
+    // own `NamespaceScope` both read it that way).
+    let peers = client
+        .get(format!("{}/peers.list", url))
+        .send()
+        .await
+        .expect("GET peers.list");
+    assert_eq!(peers.status().as_u16(), 200, "universal-tree-root listing");
+    let body = peers.bytes().await.expect("body").to_vec();
+    let listing = entity_wire::decode_entity(&body).expect("listing entity");
+    // Entry keys are the peer-id segments, CBOR text — searching the ECF bytes
+    // for the ASCII id is enough to assert membership without re-walking the
+    // listing schema here.
+    let names = |needle: &str| {
+        listing
+            .data
+            .windows(needle.len())
+            .any(|w| w == needle.as_bytes())
+    };
+    assert!(names(&peer_id), "peers.list must name the local peer");
+    assert!(
+        names(other_peer),
+        "peers.list must name every top-level peer-id the local view holds \
+         bindings for, not only the ones inside the closure"
+    );
+
+    // A prefix with no in-scope descendant is still not served (T4).
+    assert_eq!(
+        status_of(format!("{}/{}/system/nowhere.list", url, peer_id)).await,
+        404,
+        "a prefix with nothing in the closure under it stays 404"
+    );
+
+    handle.abort();
+}
+
 #[tokio::test]
 async fn poll_content_get_out_of_namespace_returns_404() {
     // The peer has the bytes in its store but they're NOT bound into
@@ -2022,6 +2140,119 @@ async fn amendment5_cap_token_scope_is_drift_free_vs_check_permission() {
         !c_out,
         "hash bound only in out-of-cap namespace MUST be out of scope"
     );
+}
+
+/// §6.5.6 universal-tree-root listing: a bare `/{peer_id}` is reachable under
+/// EVERY scope predicate, so `peers.list` enumerates every peer-id the local
+/// view binds under and a consumer can descend into a foreign subtree.
+///
+/// This is one convention that lives in three implementations of it, which is
+/// how it drifted: `NamespaceScope` grew the arm at the Reading-B audit fix,
+/// `ClosureScope` did not (which is what `peers_list_surfaces_other_peer`
+/// caught cross-impl), and `CapTokenScope` had an ancestor arm that only ever
+/// reaches the LOCAL peer-id — its includes canonicalize against `local_pid`,
+/// so no foreign segment can match one. Nothing exercised the cap predicate
+/// under a listing, so the third divergence was silent. Assert all three
+/// together, against the same foreign id, so the next one cannot be.
+#[tokio::test]
+async fn every_scope_predicate_surfaces_a_bare_foreign_peer_id() {
+    use entity_capability::{CapabilityToken, GrantEntry, Granter, IdScope, PathScope};
+    use entity_peer::http_live::{CapTokenScope, ClosureScope, NamespaceScope};
+
+    let server = PeerBuilder::new()
+        .keypair(Keypair::from_seed([122u8; 32]))
+        .build()
+        .expect("peer builds");
+    let peer_id = server.peer_id().to_string();
+    let shared = server.shared();
+    server.start_engines(&shared);
+
+    // A closure scope answers from a live published-root head, so give it one
+    // to track. Without a head its cache stays empty and it (correctly) serves
+    // nothing at all — which would fail this assertion for an unrelated reason.
+    let seeded = Entity::new("test/blob", b"closure-seed".to_vec()).expect("entity");
+    let seeded_hash = seeded.content_hash;
+    shared.content_store.put(seeded).expect("put");
+    let key = format!(
+        "system/content/public/{}",
+        hex_encode(&seeded_hash.to_bytes())
+    );
+    shared
+        .location_index
+        .set(&format!("/{}/{}", peer_id, key), seeded_hash);
+    let mut bindings = std::collections::BTreeMap::new();
+    bindings.insert(key, seeded_hash);
+    let root = entity_tree::trie::build_trie(shared.content_store.as_ref(), &bindings)
+        .expect("build trie");
+    server.publish_root(root).expect("publish root");
+
+    let grant = GrantEntry {
+        handlers: PathScope::new(vec!["system/tree".to_string()]),
+        operations: IdScope::new(vec!["get".to_string()]),
+        resources: PathScope::new(vec![format!("/{}/system/content/public/*", peer_id)]),
+        peers: None,
+        constraints: None,
+        allowances: None,
+    };
+    let cap = CapabilityToken {
+        grants: vec![grant],
+        granter: Granter::Single(Hash::compute("test/granter", b"x")),
+        grantee: Hash::compute("test/grantee", b"y"),
+        parent: None,
+        created_at: 0,
+        expires_at: None,
+        not_before: None,
+        delegation_caveats: None,
+    };
+
+    // A peer-id the local peer holds nothing under and has no cap for.
+    let foreign_pid = Keypair::from_seed([123u8; 32]).peer_id().to_string();
+    let foreign_root = format!("/{}", foreign_pid);
+
+    let predicates: Vec<(&str, Box<dyn entity_peer::http_live::ScopePredicate>)> = vec![
+        (
+            "namespace",
+            Box::new(NamespaceScope::new("system/content/public")),
+        ),
+        ("cap-token", Box::new(CapTokenScope::new(cap))),
+        ("closure", Box::new(ClosureScope::new())),
+    ];
+
+    for (name, scope) in &predicates {
+        let reachable = scope
+            .in_scope_path(&foreign_root, &shared)
+            .await
+            .expect("in_scope_path");
+        assert!(
+            reachable,
+            "{name} scope MUST surface a bare foreign `/{{peer_id}}` — \
+             `peers.list` filters each child through this predicate, so a \
+             `false` here erases the peer from the universal-tree listing"
+        );
+    }
+
+    // The arm is top-level only: it MUST NOT hand out a foreign peer's
+    // contents. Every predicate still answers `false` one segment deeper,
+    // which is what keeps the listing an enumeration and not a leak.
+    let foreign_leaf = format!("/{}/system/content/public/anything", foreign_pid);
+    for (name, scope) in &predicates {
+        let reachable = scope
+            .in_scope_path(&foreign_leaf, &shared)
+            .await
+            .expect("in_scope_path");
+        if *name == "namespace" {
+            // NamespaceScope is namespace-anchored across ALL peer-ids by
+            // definition (`/*/{namespace}`), so a foreign path under the
+            // served namespace is in scope for it and 404s at the binding
+            // lookup instead. That is its documented Reading-B shape.
+            continue;
+        }
+        assert!(
+            !reachable,
+            "{name} scope MUST NOT extend the top-level arm to a foreign \
+             peer's content path"
+        );
+    }
 }
 
 // ============================================================

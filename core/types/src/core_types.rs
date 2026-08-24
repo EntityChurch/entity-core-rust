@@ -684,17 +684,23 @@ fn system_network_candidate() -> TypeDefinition {
 }
 
 /// `system/peer/published-root` — the signed static anchor for a peer's
-/// current tree root (PROPOSAL-PEER-MANIFEST-STATIC-HANDSHAKE §4,
-/// NORMATIVE-LOCKED). `peer_id` is the Base58 id `system/peer-id`
-/// per V7 §1.5 (§4 erratum, arch ratification `24a4a97` / Ruling-1 — the
-/// originally-locked `<hash>` was corrected to Base58 to match the `http-poll`
-/// profile). `root_hash` / `predecessor` are bare `system/hash`. The
-/// authenticating signature is carried at the §5.2 invariant-pointer path
-/// `system/signature/{hex(content_hash)}`, never a `refs:` block.
+/// current tree root. **Normative home is now EXTENSION-TREE §3.3a** (arch
+/// `391c92b`), which supersedes the `PROPOSAL-PEER-MANIFEST-STATIC-HANDSHAKE`
+/// §4 locked definition all three impls originally built to; that proposal
+/// lives in the pre-split legacy archive and is historical record only.
+///
+/// `peer_id` is the Base58 id `system/peer-id` per V7 §1.5 (§4 erratum, arch
+/// ratification `24a4a97` / Ruling-1 — the originally-locked `<hash>` was
+/// corrected to Base58 to match the `http-poll` profile). `root_hash` /
+/// `predecessor` are bare `system/hash`. `prefix` is REQUIRED and is what makes
+/// the trie keys interpretable (§3.3a). The authenticating signature is carried
+/// at the §5.2 invariant-pointer path `system/signature/{hex(content_hash)}`,
+/// never a `refs:` block.
 fn system_peer_published_root() -> TypeDefinition {
     TypeDefBuilder::new("system/peer/published-root")
         .field("peer_id", t("system/peer-id"))
         .field("root_hash", t("system/hash"))
+        .field("prefix", t("system/tree/path"))
         .field("seq", t("primitive/uint"))
         .field("published_at", t("primitive/uint"))
         .field("predecessor", opt("system/hash"))

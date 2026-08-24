@@ -36,6 +36,10 @@ pub mod liveness;
 #[cfg(feature = "network")]
 pub mod network_link;
 pub mod peer_status;
+/// Consumer half of the `http_live` poll routes — same gate as the publisher
+/// it dials, because it is defined in terms of those routes' URL layout.
+#[cfg(all(feature = "http-live", not(target_arch = "wasm32")))]
+pub mod poll_read;
 pub mod published_root;
 /// The §7 punch wired behind the §10.3 seam. Opt-in (`signaling`) and native
 /// only — the choreography is substrate-agnostic, but this wiring is TCP.
@@ -753,12 +757,35 @@ impl Peer {
         root_hash: entity_hash::Hash,
     ) -> Result<entity_hash::Hash, published_root::PublishedRootError> {
         let shared = self.shared();
+        let prefix = format!("/{}/", shared.peer_id.as_str());
+        self.publish_root_with_prefix(root_hash, prefix)
+    }
+
+    /// [`publish_root`] declaring an explicit §3.3a `prefix` — the absolute
+    /// prefix the trie keys committed to by `root_hash` are relative to.
+    ///
+    /// `publish_root` defaults to the peer-qualified `/{peer_id}/` because that
+    /// is what a trie built over this peer's own subtree is keyed by. A caller
+    /// that built its trie over some other operand (a `system/`-relative
+    /// snapshot, or the universal tree where the trim is a no-op and keys stay
+    /// fully qualified) MUST say so here: the field is the consumer's only way
+    /// to reconstruct an absolute path, so a wrong declaration is worse than a
+    /// missing one — it reconstructs confidently to a path that does not exist.
+    ///
+    /// [`publish_root`]: Self::publish_root
+    pub fn publish_root_with_prefix(
+        &self,
+        root_hash: entity_hash::Hash,
+        prefix: impl Into<String>,
+    ) -> Result<entity_hash::Hash, published_root::PublishedRootError> {
+        let shared = self.shared();
         let engine = published_root::PublishRootEngine::new(
             shared.content_store.clone(),
             shared.location_index.clone(),
             shared.keypair.clone_identity(),
             shared.peer_id.as_str().to_string(),
             shared.identity_hash,
+            prefix,
         );
         engine.publish(root_hash)
     }
@@ -975,6 +1002,12 @@ pub struct PeerBuilder {
     /// patterns and the validator SKIPs honestly per §7a.4. Effective only when
     /// the `conformance` cargo feature is compiled in.
     conformance_handlers: bool,
+    /// PROPOSAL-PEER-MANIFEST §4 P1 opt-in: the tracked prefix a
+    /// `published_root::PublishRootHook` follows, republishing a signed
+    /// `system/peer/published-root` on every trie-root change. `None` ⇒ no
+    /// publisher (the peer serves no signed root unless one is minted by hand
+    /// via `Peer::publish_root`).
+    published_root_prefix: Option<String>,
     #[cfg(feature = "query")]
     query_indexes: Option<Arc<dyn entity_query::QueryIndexStore>>,
     /// Retained by `.idb()` so the built `Peer` can surface `checkpoint()` to
@@ -998,6 +1031,7 @@ impl PeerBuilder {
             owner_identity: None,
             seed_policy: Vec::new(),
             conformance_handlers: false,
+            published_root_prefix: None,
             #[cfg(feature = "query")]
             query_indexes: None,
             #[cfg(all(target_arch = "wasm32", feature = "wasm-idb-persist"))]
@@ -1117,6 +1151,25 @@ impl PeerBuilder {
         self
     }
 
+    /// Publish a signed `system/peer/published-root` over `tracked_prefix` and
+    /// **keep republishing it on every trie-root change**
+    /// (PROPOSAL-PEER-MANIFEST-STATIC-HANDSHAKE §4 P1).
+    ///
+    /// `tracked_prefix` is a peer-relative EXTENSION-TREE §3.4.1a prefix ending
+    /// in `/`; `"/"` designates the universal tree root (every path in the
+    /// peer's own subtree), which is what `--publish-root --serve-closure-root`
+    /// selects. Build installs a `system/tree/tracking-config` for it, so the
+    /// `RootTrackerEngine` maintains the trie root incrementally and the
+    /// publisher only ever re-signs a hash the tracker already computed.
+    ///
+    /// Trie keys are relative to `tracked_prefix` — under `"/"` that is the
+    /// peer-prefix-stripped form (`system/content/public/{hex}`), which is what
+    /// a consumer passes to `PublishedRootClient::resolve`.
+    pub fn with_published_root(mut self, tracked_prefix: impl Into<String>) -> Self {
+        self.published_root_prefix = Some(tracked_prefix.into());
+        self
+    }
+
     /// Register an observe-only dispatch-event hook (GUIDE-INSPECTABILITY v1.2
     /// §2.1 #3 / §2.2 "Path tap"). Fires twice per dispatch — once at request
     /// entry, once at request exit — at the dispatcher↔handler-body boundary
@@ -1192,6 +1245,33 @@ impl PeerBuilder {
     /// CLI / config / file wrappers desugar to this method; a
     /// `with_seed_policy_from_file` loader is deferred until the keystone
     /// protocol-generator ratifies the cross-peer file format.
+    ///
+    /// # A policy entry is read with two OPPOSITE meanings
+    ///
+    /// This method reads purely additive — you name a grantee, you hand them a
+    /// scope — and on the connection path it is: `assemble_inbound_grants`
+    /// **unions** the matched entry onto the connection's grants, so a narrow
+    /// entry *adds* authority (a floor).
+    ///
+    /// On the §6.2 `capability:request` path the same entry is the attenuation
+    /// **ceiling**: the handler rejects any request that is not an attenuation
+    /// of it, so a narrow entry *removes* authority. The two readings live in
+    /// different crates (`core/peer::connection` and
+    /// `extensions/capability`), and nothing in the type system connects them.
+    ///
+    /// **This bites hardest on the literal `default` key**, which is the
+    /// fallback for every caller without an entry of their own — so a narrow
+    /// `default` becomes the request ceiling for the entire peer. Seeding one
+    /// with three signaling verbs took the `capability` category from 13/13 to
+    /// 7 P / 6 F on 2026-08-08: every §6.2 request 403'd, including ones that
+    /// had nothing to do with signaling. A standalone single-handler node never
+    /// trips it, because there is no other capability to request.
+    ///
+    /// So: prefer a **per-grantee** key (hex identity-hash or Base58 PeerID)
+    /// whenever the grant is meant to be additive. Reach for `default` only
+    /// when you intend a peer-wide ceiling as well as a peer-wide floor. When a
+    /// request is rejected by a matched entry the capability handler logs at
+    /// `warn` with which form matched.
     ///
     /// [`with_owner_identity`]: Self::with_owner_identity
     pub fn with_seed_policy(mut self, entries: Vec<(String, Vec<GrantEntry>)>) -> Self {
@@ -2004,13 +2084,22 @@ impl PeerBuilder {
                 pid.clone(),
                 1024,
             ));
-            let registry_handler = Arc::new(entity_registry::RegistryHandler::new(
+            let registry_handler = entity_registry::RegistryHandler::new(
                 content_store.clone(),
                 notifying_li.clone(),
                 pid.clone(),
                 resolution_log,
-            ));
-            handler_registry.register(registry_handler);
+            );
+            // The §2.2 live remote-read transport for `peer-issued` chain
+            // entries. Wired unconditionally where it can be built: it costs
+            // nothing until a chain entry is BOTH `peer-issued` and carries an
+            // endpoint hint, and a peer that pins a registry it cannot dial is
+            // the confusing half-configured state — the pin looks installed and
+            // silently resolves nothing.
+            #[cfg(all(feature = "http-live", not(target_arch = "wasm32")))]
+            let registry_handler = registry_handler
+                .with_reader(Arc::new(crate::poll_read::HttpPollRegistryReader::new()));
+            handler_registry.register(Arc::new(registry_handler));
             bootstrap_handler(
                 &content_store,
                 &notifying_li,
@@ -2479,6 +2568,32 @@ impl PeerBuilder {
         root_tracker.bootstrap();
         emit_dispatcher.register_hook(root_tracker.clone());
 
+        // PROPOSAL-PEER-MANIFEST §4 P1: re-sign the published-root on every
+        // trie-root change. Registered right after the tracker whose output it
+        // watches (the tracker's root write nested-dispatches through every
+        // hook, so ordering is for legibility, not correctness).
+        let published_root_hook = self.published_root_prefix.as_ref().map(|prefix| {
+            let hook = Arc::new(published_root::PublishRootHook::new(
+                published_root::PublishRootEngine::new(
+                    content_store.clone(),
+                    notifying_li.clone(),
+                    keypair.clone_identity(),
+                    pid.clone(),
+                    identity_hash,
+                    // §3.3a: declare the absolute prefix the tracker actually
+                    // trims by, taken from the tracker itself. Under our
+                    // universal `"/"` that is `/{peer_id}/` — the §3.3
+                    // peer-qualified shape, which is what our keys really are
+                    // (`system/attestation`, not the fully-qualified form the
+                    // universal shape would require).
+                    root_tracker.qualified_bare_prefix(prefix),
+                ),
+                root_tracker.qualified_root_path(prefix),
+            ));
+            emit_dispatcher.register_hook(hook.clone());
+            hook
+        });
+
         // Revision config ↔ tracking-config coordination (precondition hook).
         // Fires on writes to `system/revision/config/prefixes/*` and keeps the
         // matching `system/tree/tracking-config/*` entity in sync.
@@ -2511,6 +2626,49 @@ impl PeerBuilder {
         for (name, f) in self.binding_hooks {
             emit_dispatcher.register_hook(Arc::new(BindingObserver { name, f }));
         }
+
+        let arm_published_root = |hook: &published_root::PublishRootHook, prefix: &str| {
+            match entity_tree::root_tracker::tracking_config_entity(prefix, true) {
+                Some(cfg) => {
+                    match content_store.put(cfg) {
+                        Ok(cfg_hash) => {
+                            // A `{name}` of `publishedroot` labels who installed
+                            // it (§3.4.1a: the name is opaque), so an operator
+                            // config for the same prefix coexists rather than
+                            // being displaced.
+                            notifying_li.set(
+                                &format!("/{}/system/tree/tracking-config/publishedroot", pid),
+                                cfg_hash,
+                            );
+                        }
+                        Err(e) => tracing::error!(
+                            error = %e,
+                            "published-root: storing tracking-config failed; no signed root will be served"
+                        ),
+                    }
+                }
+                None => tracing::error!(
+                    prefix = %prefix,
+                    "published-root: invalid tracking prefix; no signed root will be served"
+                ),
+            }
+            // The config write above publishes via the cascade whenever it moved
+            // the tracked root. It does not when the tracker already held that
+            // exact root — a restart off persistent storage, or an operator
+            // config for the same prefix that `bootstrap()` already built. Cover
+            // that case explicitly; `publish` is a no-op on an unchanged root.
+            if let Some(root) = root_tracker.tracked_root(prefix) {
+                if let Err(e) = hook.publish_initial(root) {
+                    tracing::error!(error = %e, "published-root: initial publish failed");
+                }
+            }
+            tracing::info!(
+                prefix = %prefix,
+                tracked_root_path = %hook.tracked_root_path(),
+                head = ?hook.current_head_hash(),
+                "published-root publisher armed"
+            );
+        };
 
         tracing::info!(
             peer_id = %peer_id,
@@ -2608,6 +2766,21 @@ impl PeerBuilder {
                     notifying_li.set(&path, hash);
                 }
             }
+        }
+
+        // Arm the published-root publisher LAST. The hook is already
+        // registered (position 6, above); what happens here is installing the
+        // `system/tree/tracking-config` whose cascade builds the first trie
+        // root and mints seq 0. Deferring it to the end of build() keeps
+        // startup at a single publish — every bootstrap write above (identity,
+        // handler grants, the RE-2 `ready` status, the durability
+        // advertisement) is already in the tree and folds into that one root
+        // instead of each minting its own head.
+        if let (Some(hook), Some(prefix)) = (
+            published_root_hook.as_ref(),
+            self.published_root_prefix.as_ref(),
+        ) {
+            arm_published_root(hook, prefix);
         }
 
         Ok(Peer {
@@ -3402,6 +3575,146 @@ mod tests {
         assert_eq!(data.root_hash, root);
         assert_eq!(data.seq, 0);
         assert!(data.predecessor.is_none());
+    }
+
+    /// Decode the peer's current published-root head into `(head, seq, root_hash,
+    /// predecessor)`.
+    #[cfg(test)]
+    fn head_state(
+        peer: &Peer,
+    ) -> (
+        entity_hash::Hash,
+        u64,
+        entity_hash::Hash,
+        Option<entity_hash::Hash>,
+    ) {
+        let head = peer.published_root_head().expect("a head must be bound");
+        let entity = peer.shared().content_store.get(&head).unwrap();
+        let d = entity_types::PublishedRootData::from_entity(&entity).unwrap();
+        (head, d.seq, d.root_hash, d.predecessor)
+    }
+
+    /// PROPOSAL-PEER-MANIFEST §4 P1 + EXTENSION-NETWORK §6.5.6 Amendment 10
+    /// (arch `c78b3dc` closure-timing ruling): the served closure tracks the
+    /// **current** `published-root.root_hash`, so a peer that mints a root once
+    /// at startup and never again serves a closure frozen at boot — every
+    /// entity written afterwards is permanently outside the served set.
+    ///
+    /// This is the check `serving_mode.seed_republished` makes over the wire
+    /// (Go's report `2026-08-07-f`, which measured us at one distinct manifest
+    /// across 5m45s, `seq` 0 and staying 0). Asserting on the *decoded head*
+    /// rather than on the publisher call is deliberate: the pre-fix code also
+    /// bound a head — what it never did was advance one.
+    #[tokio::test]
+    async fn published_root_republishes_on_every_tree_root_change() {
+        let peer = PeerBuilder::new()
+            .keypair(test_keypair())
+            .with_published_root("/")
+            .build()
+            .unwrap();
+
+        let (head0, seq0, root0, pred0) = head_state(&peer);
+        assert!(pred0.is_none(), "the first head chains to nothing");
+
+        // A tree:put through the ordinary emit path — exactly what the
+        // validator's `seed_in_scope` does before it polls /manifest.
+        let seeded = entity_entity::Entity::new(
+            "test/leaf",
+            entity_ecf::to_ecf(&entity_ecf::text("seed-1")),
+        )
+        .unwrap();
+        let seeded_hash = seeded.content_hash;
+        peer.tree()
+            .put(&qp("system/content/public/seed-1"), seeded)
+            .unwrap();
+
+        let (head1, seq1, root1, pred1) = head_state(&peer);
+        assert_ne!(head1, head0, "the head must advance on a tree-root change");
+        assert_eq!(seq1, seq0 + 1, "seq is monotonic per republish");
+        assert_eq!(pred1, Some(head0), "the new head chains to the prior one");
+        assert_ne!(root1, root0, "the signed root commits to the new tree");
+
+        // The seeded entity is inside the CURRENT root's closure — the property
+        // the 27 dependent serving_mode checks were unexercised for.
+        let closure =
+            entity_tree::trie::collect_node_closure(peer.shared().content_store.as_ref(), root1);
+        assert!(
+            closure.contains(&seeded_hash),
+            "the seeded entity must be reachable from the republished root"
+        );
+
+        // A second put chains again — this is a stream, not a one-shot.
+        let second = entity_entity::Entity::new(
+            "test/leaf",
+            entity_ecf::to_ecf(&entity_ecf::text("seed-2")),
+        )
+        .unwrap();
+        peer.tree()
+            .put(&qp("system/content/public/seed-2"), second)
+            .unwrap();
+        let (_, seq2, _, pred2) = head_state(&peer);
+        assert_eq!(seq2, seq1 + 1);
+        assert_eq!(pred2, Some(head1));
+    }
+
+    /// The publisher's own two writes (manifest + invariant-pointer signature)
+    /// land inside the universal tracked prefix, so they are tagged
+    /// `PUBLISHED_ROOT_HANDLER_PATTERN` and the tracker skips them.
+    ///
+    /// Two distinct things go wrong without that tag, and only the second is
+    /// visible from a seq count — which is why this asserts both:
+    ///
+    /// - **the seq count** — one `tree:put` must mint exactly one head. Go
+    ///   measured the untagged runaway at ~55 publishes/s with no external
+    ///   traffic, invalidating the closure cache faster than a consumer can
+    ///   finish a CONTENT_GET.
+    /// - **`root_hash == the tracked root`** — the load-bearing one, and the
+    ///   one the re-entry guard alone does *not* buy. Untagged, the publisher's
+    ///   writes advance the trie root after the head has been signed and the
+    ///   re-entry guard swallows the follow-up publish, so the peer serves a
+    ///   signed root that is permanently one step behind its own tree. That is
+    ///   the frozen-closure defect again, just with a smaller freeze.
+    #[tokio::test]
+    async fn published_root_commits_to_the_tracked_root_exactly() {
+        let peer = PeerBuilder::new()
+            .keypair(test_keypair())
+            .with_published_root("/")
+            .build()
+            .unwrap();
+        let tracked_root_path = format!("/{}/system/tree/root", peer.peer_id());
+        let tracked = || peer.shared().location_index.get(&tracked_root_path);
+
+        let (_, seq_before, root_before, _) = head_state(&peer);
+        assert_eq!(Some(root_before), tracked(), "at rest, after build");
+
+        let entity =
+            entity_entity::Entity::new("test/leaf", entity_ecf::to_ecf(&entity_ecf::text("once")))
+                .unwrap();
+        peer.tree()
+            .put(&qp("system/content/public/once"), entity)
+            .unwrap();
+
+        let (_, seq_after, root_after, _) = head_state(&peer);
+        assert_eq!(
+            seq_after,
+            seq_before + 1,
+            "one tree:put must yield exactly one republish, not a cascade of them"
+        );
+        assert_eq!(
+            Some(root_after),
+            tracked(),
+            "the signed root must be the tracked root, not the tracked root minus \
+             the publisher's own writes"
+        );
+    }
+
+    /// Without the opt-in the peer publishes nothing — a peer that advertises
+    /// no signed root serves the path-bound shape, where §6.5.6's closure-timing
+    /// rule does not apply. No republisher may be armed by default.
+    #[test]
+    fn published_root_publisher_is_opt_in() {
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
+        assert!(peer.published_root_head().is_none());
     }
 
     #[test]
@@ -4908,6 +5221,73 @@ mod tests {
         eprintln!(
             "perf_treeput_1100: {} puts in {:?} ({:.1} µs/put)",
             N, elapsed, per_put_us
+        );
+    }
+
+    /// The same canary with the published-root publisher armed over the
+    /// universal prefix — the configuration `--publish-root
+    /// --serve-closure-root` runs, and the one where an O(tree)-per-put
+    /// republish would hide.
+    ///
+    /// This is the shape the design deliberately avoids: re-deriving the root
+    /// with `location_index.list()` + `build_trie` on every change is O(tree)
+    /// per put and grows without bound. The publisher instead re-signs the
+    /// hash `RootTrackerEngine` already maintains incrementally, so the added
+    /// cost per put is one signature and two entities — a constant.
+    ///
+    /// Read it against `perf_treeput_1100` from the same run: the ratio is the
+    /// number, not the absolute µs. Roughly flat is right; a ratio that climbs
+    /// with N is the regression.
+    ///
+    /// `cargo test -p entity-peer --release --lib perf_treeput_1100_publishing -- --ignored --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn perf_treeput_1100_publishing() {
+        let peer = PeerBuilder::new()
+            .keypair(test_keypair())
+            .with_published_root("/")
+            .build()
+            .unwrap();
+        let shared = peer.shared();
+        peer.start_engines(&shared);
+
+        const N: u32 = 1100;
+        let start = std::time::Instant::now();
+        for i in 0..N {
+            let path = qp(&format!("perf/path-{}", i));
+            let params_data = entity_ecf::to_ecf(&entity_ecf::cbor_map! {
+                "entity" => entity_ecf::cbor_map!{
+                    "data" => entity_ecf::text("x"),
+                    "type" => entity_ecf::text("test/type")
+                }
+            });
+            let params = entity_entity::Entity::new("system/tree/put/params", params_data).unwrap();
+            let opts = entity_handler::ExecuteOptions {
+                resource: Some(entity_capability::ResourceTarget {
+                    targets: vec![path.clone()],
+                    exclude: vec![],
+                }),
+                ..Default::default()
+            };
+            let result = peer
+                .execute_with_options("system/tree", "put", params, opts)
+                .await
+                .unwrap();
+            assert_eq!(result.status, 200);
+        }
+        let elapsed = start.elapsed();
+        let per_put_us = elapsed.as_micros() as f64 / f64::from(N);
+        let (_, seq, _, _) = head_state(&peer);
+        eprintln!(
+            "perf_treeput_1100_publishing: {} puts in {:?} ({:.1} µs/put), published-root seq={}",
+            N, elapsed, per_put_us, seq
+        );
+        // Every put moved the root, so every put must have minted a head. A
+        // seq that lags N is a swallowed republish, not a faster path.
+        assert_eq!(
+            seq,
+            u64::from(N),
+            "one republish per root-changing put (seq 0 was minted at build)"
         );
     }
 

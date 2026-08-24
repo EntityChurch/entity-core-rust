@@ -41,6 +41,30 @@ const STATUS_INTERNAL: u32 = 500;
 /// handler crate they already depend on.
 pub use entity_capability::POLICY_FALLBACK_SEGMENT;
 
+/// Which of the three §6.2 policy-lookup forms produced a match. Diagnostics
+/// only — the grants are identical whichever path found them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyMatchForm {
+    /// `system/capability/policy/{hex(identity_hash)}` — the canonical form.
+    Hex,
+    /// `system/capability/policy/{base58_peer_id}` — the pre-contact
+    /// affordance, canonicalized to hex on match.
+    Base58,
+    /// `system/capability/policy/default` — the peer-wide fallback, matched
+    /// only because this caller had no entry of their own.
+    Fallback,
+}
+
+impl PolicyMatchForm {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hex => "hex",
+            Self::Base58 => "base58",
+            Self::Fallback => POLICY_FALLBACK_SEGMENT,
+        }
+    }
+}
+
 /// `system/capability` handler implementing request / delegate / revoke.
 pub struct CapabilityHandler {
     content_store: Arc<dyn ContentStore>,
@@ -149,7 +173,7 @@ impl CapabilityHandler {
                 ),
             ));
         }
-        if let Some(policy_grants) = self.lookup_policy_grants(&author) {
+        if let Some((policy_grants, form)) = self.lookup_policy_grants(&author) {
             let policy_token = CapabilityToken {
                 grants: policy_grants,
                 granter: Granter::single(self.identity_hash),
@@ -161,6 +185,22 @@ impl CapabilityHandler {
                 delegation_caveats: None,
             };
             if !is_attenuated(&child, &policy_token, &self.local_peer_id) {
+                // Say WHICH entry did this. A `default` entry is the fallback
+                // for every caller without a more specific one, so a narrow
+                // one silently becomes the ceiling for the whole peer — and it
+                // reads as purely additive at the seeding API, because on the
+                // *connection* path (`assemble_inbound_grants`) the same entry
+                // is UNIONED on as a floor. One key, two opposite meanings, in
+                // two different crates. That collision cost a 13/13 → 7 P/6 F
+                // regression on 2026-08-08; the operator's only clue was a
+                // bare 403, so name the form here.
+                tracing::warn!(
+                    policy_form = form.as_str(),
+                    "capability: §6.2 request attenuated to nothing by the \
+                     matched policy entry — this entry is a CEILING here and a \
+                     FLOOR on the connection path; a `default` entry narrower \
+                     than what callers legitimately request rejects all of them"
+                );
                 return Ok(HandlerResult::error(
                     STATUS_FORBIDDEN,
                     error_entity(
@@ -179,8 +219,13 @@ impl CapabilityHandler {
 
     /// V7 §6.2 v7.64 dual-form policy resolution. Walks the lookup
     /// order: (1) hex form, (2) Base58 form, (3) `default`. Returns
-    /// the first matching entry's `grants` array, or `None` if no
-    /// entry exists at any of the three paths.
+    /// the first matching entry's `grants` array **and which form
+    /// matched**, or `None` if no entry exists at any of the three
+    /// paths. The form is carried purely for diagnostics — a
+    /// [`PolicyMatchForm::Fallback`] match means this caller had no
+    /// entry of their own and inherited the peer-wide `default`, which
+    /// is the case where a narrow entry rejects requests its author
+    /// never meant to reject.
     ///
     /// Hex is canonical; Base58 is the pre-configuration affordance
     /// (operator pasted the handle before knowing the public_key).
@@ -196,14 +241,14 @@ impl CapabilityHandler {
     /// the v7.65 §6 lazy-canonicalization machinery: operator may write
     /// a pre-configured Base58-form entry before having the public_key;
     /// on first match (post-handshake) it canonicalizes in place.
-    fn lookup_policy_grants(&self, author: &Hash) -> Option<Vec<GrantEntry>> {
+    fn lookup_policy_grants(&self, author: &Hash) -> Option<(Vec<GrantEntry>, PolicyMatchForm)> {
         let author_hex = hex_of(author);
         let by_hex = format!(
             "/{}/system/capability/policy/{}",
             self.local_peer_id, author_hex
         );
         if let Some(grants) = self.read_policy_grants(&by_hex) {
-            return Some(grants);
+            return Some((grants, PolicyMatchForm::Hex));
         }
 
         // Try the Base58 form (pre-configured "pending-canonicalization"
@@ -221,7 +266,7 @@ impl CapabilityHandler {
                 // policy entry under the canonical hex form and clear the
                 // Base58 entry. Idempotent + self-healing.
                 self.canonicalize_policy_entry(&by_b58, &by_hex);
-                return Some(grants);
+                return Some((grants, PolicyMatchForm::Base58));
             }
         }
 
@@ -230,6 +275,7 @@ impl CapabilityHandler {
             self.local_peer_id, POLICY_FALLBACK_SEGMENT
         );
         self.read_policy_grants(&by_default)
+            .map(|g| (g, PolicyMatchForm::Fallback))
     }
 
     /// Derive the canonical wire PeerID (Base58) for the peer at

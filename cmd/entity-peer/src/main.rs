@@ -166,13 +166,56 @@ enum PeerAction {
         /// 404s system/validate/* so the validator SKIPs honestly per §7a.4.
         #[arg(long)]
         validate: bool,
-        /// Phase P: on startup, author + sign a `system/peer/published-root`
-        /// over the `--serve-namespace` subtree so `MANIFEST_GET` serves a
-        /// signed tree root (PROPOSAL-PEER-MANIFEST §4). Requires
-        /// `--serve-namespace`. Static one-time publish (coral-reef publisher);
-        /// re-publish-on-change is a documented follow-up.
+        /// Phase P: author + sign a `system/peer/published-root` over the
+        /// served subtree so `MANIFEST_GET` serves a signed tree root, and
+        /// **re-sign it on every trie-root change** (PROPOSAL-PEER-MANIFEST
+        /// §4 P1). Requires `--serve-namespace` or `--serve-closure-root`;
+        /// the latter publishes over the whole peer subtree. Under §6.5.6
+        /// Amendment 10 the served closure tracks the current
+        /// `published-root.root_hash`, so the republish is what keeps an
+        /// entity written after startup inside the served set.
         #[arg(long)]
         publish_root: bool,
+        /// EXTENSION-SIGNALING §4/§5: additionally serve the
+        /// `system/signaling` rendezvous node — the punch carrier's
+        /// `offer`/`collect`/`advertise` verbs — from this peer. Matches Go
+        /// peer's `-signaling-node`.
+        ///
+        /// **Pair it with an admission posture.** The flag registers the
+        /// handler; it does not grant anyone access to it. Without
+        /// `--debug-grants` or an operator-installed
+        /// `system/capability/policy` entry covering `system/signaling`, an
+        /// unknown peer gets the §4.4 floor and every verb is 403. (Go's
+        /// `-signaling-node` documents the same pairing against its
+        /// `--open-access` default.)
+        ///
+        /// `entity-signaling-node` remains the way to run a node and nothing
+        /// else; this flag is the same handler installed through the same
+        /// public `PeerBuilder::handler` seam, on a peer that also does other
+        /// work. `advertise` publishes the peer's `--listen` address, which is
+        /// wrong behind NAT or a load balancer — use the standalone node
+        /// binary's `--endpoint` for any real deployment.
+        #[arg(long)]
+        signaling_node: bool,
+        /// PROPOSAL-PEER-ISSUED-REGISTRY-BACKEND: pin a remote registry as a
+        /// `peer-issued` resolver-chain backend, as `<peer_id>@<url>`.
+        ///
+        /// Installs a §4 `ResolverChainEntry` with `backend_kind:
+        /// "peer-issued"`, `backend_id` the registry's Base58 peer-id, and the
+        /// endpoint in `hints.endpoint` — which is where the cohort puts it
+        /// (Python's `RegistryReader` reads it from there). `system/registry:
+        /// resolve` then fetches the registry's bindings over its http-poll
+        /// surface on a cache miss and verifies each one against the PINNED
+        /// key: a binding signed by anyone else is rejected and the chain
+        /// advances, never downgraded to a pin.
+        ///
+        /// The peer-id is the trust root and is not negotiable from the wire —
+        /// it is why this is a pin and not a lookup. Matches Go peer's
+        /// `--peer-issued-registry` and Python's flag of the same name.
+        ///
+        /// Repeatable: pin several registries and they are tried in flag order.
+        #[arg(long, value_name = "PEER_ID@URL")]
+        peer_issued_registry: Vec<String>,
         /// Enable EXTENSION-CONTENT v3.5 §5.3 descriptor publication on
         /// `--files` roots (DOMAIN-LOCAL-FILES §2.5). With this set, a
         /// `read` of a file with a known media-type publishes a
@@ -319,6 +362,8 @@ async fn main() -> anyhow::Result<()> {
                     hash_type,
                     validate,
                     publish_root,
+                    signaling_node,
+                    peer_issued_registry,
                     publish_descriptors,
                     keepalive_interval_ms,
                     keepalive_timeout_ms,
@@ -342,6 +387,8 @@ async fn main() -> anyhow::Result<()> {
                         &hash_type,
                         validate,
                         publish_root,
+                        signaling_node,
+                        &peer_issued_registry,
                         publish_descriptors,
                         commands::peer::KeepaliveOverrides {
                             interval_ms: keepalive_interval_ms,

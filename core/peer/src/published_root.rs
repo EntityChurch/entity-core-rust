@@ -8,6 +8,9 @@
 //! a `published-root` entity (monotonic `seq`, `predecessor` chain), carries the
 //! signature at the invariant-pointer path, and binds the current head at
 //! `/{peer}/system/peer/published-root` so `MANIFEST_GET` serves the latest.
+//! [`PublishRootHook`] is the "on tree-root change" half: a `SyncTreeHook`
+//! watching the `RootTrackerEngine`'s `system/tree/root/{P}` binding, so the
+//! republish is O(1) per tree change rather than an O(tree) rebuild per put.
 //!
 //! **Consumer** ([`PublishedRootClient`]) — fetches a peer's signed root,
 //! verifies the signature against a **pinned** publisher key (the §2 trust
@@ -24,7 +27,11 @@ use std::sync::Mutex;
 use entity_crypto::{verify_for_key_type, IdentityKeypair, KeyType};
 use entity_entity::Entity;
 use entity_hash::{default_hash_format, invariant_signature_path, Hash};
-use entity_store::{ContentStore, LocationIndex, StoreError};
+use entity_store::{
+    CascadeHalt, ContentStore, ExecutionContext, LocationIndex, StoreError, SyncTreeHook,
+    TreeChangeEvent,
+};
+use entity_tree::root_tracker::PUBLISHED_ROOT_HANDLER_PATTERN;
 use entity_tree::trie::trie_get;
 use entity_types::{PublishedRootData, SignatureData, TYPE_PUBLISHED_ROOT};
 
@@ -82,6 +89,12 @@ pub struct PublishRootEngine {
     keypair: IdentityKeypair,
     peer_id: String,
     identity_hash: Hash,
+    /// EXTENSION-TREE §3.3's `absolute_prefix` — the operand this publisher's
+    /// trie keys are relative to, declared on every published root (§3.3a).
+    /// Derived from the tracker via `qualified_bare_prefix` rather than from
+    /// the operator's bare flag, so the declaration cannot drift from the trim
+    /// that actually produced the keys.
+    prefix: String,
 }
 
 impl PublishRootEngine {
@@ -91,6 +104,7 @@ impl PublishRootEngine {
         keypair: IdentityKeypair,
         peer_id: String,
         identity_hash: Hash,
+        prefix: impl Into<String>,
     ) -> Self {
         Self {
             content_store,
@@ -98,11 +112,35 @@ impl PublishRootEngine {
             keypair,
             peer_id,
             identity_hash,
+            prefix: prefix.into(),
         }
+    }
+
+    /// The §3.3a prefix this publisher declares.
+    pub fn prefix(&self) -> &str {
+        &self.prefix
     }
 
     fn head_path(&self) -> String {
         published_root_head_path(&self.peer_id)
+    }
+
+    /// The cascade context every publisher write carries. The
+    /// `handler_pattern` tag is what lets `RootTrackerEngine` skip these
+    /// writes: both of them land inside a `system/`-or-universal tracked
+    /// prefix, so untagged they would advance the trie root and re-fire the
+    /// publisher (see [`entity_tree::root_tracker::is_feedback_loop_handler`]).
+    ///
+    /// A fresh context rather than the ambient cascade's: a republish is the
+    /// publisher's own act, not a continuation of whatever write moved the
+    /// root. Mirrors Go's `publisherCtx` (`ext/publishedroot/publisher.go`).
+    fn write_context(&self) -> ExecutionContext {
+        ExecutionContext {
+            author: Some(self.identity_hash),
+            handler_pattern: Some(PUBLISHED_ROOT_HANDLER_PATTERN.to_string()),
+            operation: Some("publish".to_string()),
+            ..Default::default()
+        }
     }
 
     /// The current head published-root hash (what `MANIFEST_GET` serves).
@@ -136,6 +174,7 @@ impl PublishRootEngine {
         let pr = PublishedRootData {
             peer_id: self.peer_id.clone(),
             root_hash,
+            prefix: self.prefix.clone(),
             seq,
             published_at: now_ms(),
             predecessor,
@@ -159,12 +198,141 @@ impl PublishRootEngine {
             .map_err(|e| PublishedRootError::Encode(e.to_string()))?;
         let sig_hash = sig_entity.content_hash;
         self.content_store.put(sig_entity)?;
-        self.location_index
-            .set(&invariant_signature_path(&self.peer_id, &hash), sig_hash);
+        let _ = self.location_index.set_with_context(
+            &invariant_signature_path(&self.peer_id, &hash),
+            sig_hash,
+            self.write_context(),
+        );
 
         // Bind the head pointer last (MANIFEST_GET reads it).
-        self.location_index.set(&self.head_path(), hash);
+        let _ = self
+            .location_index
+            .set_with_context(&self.head_path(), hash, self.write_context());
         Ok(hash)
+    }
+}
+
+// ===========================================================================
+// Publisher hook — "on tree-root change" (PROPOSAL-PEER-MANIFEST §4 P1)
+// ===========================================================================
+
+/// Republishes `system/peer/published-root` whenever the tracked trie root for
+/// one prefix advances.
+///
+/// The hook watches exactly one path — the `RootTrackerEngine`'s output binding
+/// for its prefix (`system/tree/root` for the universal prefix, else
+/// `system/tree/root/{P}`) — and re-signs the hash bound there. That is the
+/// whole cost: the tracker already maintains the root **incrementally**
+/// (`trie_put`/`trie_remove` along one path), so a republish is one signature
+/// and two entities per tree change, not a `location_index.list()` +
+/// `build_trie` over the served subtree per put (the O(tree)-per-put shape
+/// `perf_treeput_1100` exists to catch).
+///
+/// Recursion is broken at the tracker, not here: the publisher's own two writes
+/// are tagged [`PUBLISHED_ROOT_HANDLER_PATTERN`] and the tracker skips them, so
+/// they never move the root that would re-fire this hook. `publishing` is the
+/// belt-and-braces second guard (matching Go's re-entry sentinel) in case a
+/// future consumer relays a root write back around.
+pub struct PublishRootHook {
+    engine: PublishRootEngine,
+    /// Absolute path of the tracked-root binding this publisher follows.
+    tracked_root_path: String,
+    publishing: Mutex<bool>,
+}
+
+impl PublishRootHook {
+    pub fn new(engine: PublishRootEngine, tracked_root_path: impl Into<String>) -> Self {
+        Self {
+            engine,
+            tracked_root_path: tracked_root_path.into(),
+            publishing: Mutex::new(false),
+        }
+    }
+
+    /// The tracked-root path this hook watches.
+    pub fn tracked_root_path(&self) -> &str {
+        &self.tracked_root_path
+    }
+
+    /// Publish `root_hash` under the re-entry guard. Returns `None` when a
+    /// publish is already in flight on this hook (the in-flight one subsumes
+    /// this call) — never an error the caller must distinguish.
+    fn guarded_publish(&self, root_hash: Hash) -> Option<Result<Hash, PublishedRootError>> {
+        {
+            let mut in_flight = self.publishing.lock().unwrap();
+            if *in_flight {
+                return None;
+            }
+            *in_flight = true;
+        }
+        let result = self.engine.publish(root_hash);
+        *self.publishing.lock().unwrap() = false;
+        Some(result)
+    }
+
+    /// Publish the tracked root as it stands now. Used at startup, when the
+    /// tracker already holds a root (a restart off persistent storage, or a
+    /// bootstrap rebuild that ran before this hook was registered) and so no
+    /// change event is coming. A no-op when `root_hash` already matches the
+    /// current head.
+    pub fn publish_initial(&self, root_hash: Hash) -> Result<Hash, PublishedRootError> {
+        match self.guarded_publish(root_hash) {
+            Some(r) => r,
+            // A publish is in flight; it covers this root.
+            None => self
+                .engine
+                .current_head_hash()
+                .ok_or(PublishedRootError::SignatureMissing),
+        }
+    }
+
+    /// The current head hash, if anything has been published.
+    pub fn current_head_hash(&self) -> Option<Hash> {
+        self.engine.current_head_hash()
+    }
+}
+
+impl SyncTreeHook for PublishRootHook {
+    fn on_tree_change(
+        &self,
+        event: &TreeChangeEvent,
+        _ctx: &mut ExecutionContext,
+    ) -> Result<(), CascadeHalt> {
+        if event.path != self.tracked_root_path {
+            return Ok(());
+        }
+        // A delete at the tracked-root path means the prefix was disabled or
+        // removed (EXTENSION-TREE §3.4.1a hot-reload), not a new root. Leave
+        // the last published head standing rather than signing a zero root.
+        let root_hash = match event.new_hash {
+            Some(h) => h,
+            None => return Ok(()),
+        };
+        match self.guarded_publish(root_hash) {
+            Some(Ok(head)) => tracing::debug!(
+                root = %root_hash,
+                head = %head,
+                "[published-root] republished on tracked-root change"
+            ),
+            Some(Err(e)) => tracing::error!(
+                root = %root_hash,
+                error = %e,
+                "[published-root] republish failed"
+            ),
+            None => tracing::debug!(
+                root = %root_hash,
+                "[published-root] publish already in flight; skipping re-entry"
+            ),
+        }
+        Ok(())
+    }
+
+    fn name(&self) -> &str {
+        "peer/published-root-publisher"
+    }
+
+    fn handler_pattern(&self) -> &str {
+        PUBLISHED_ROOT_HANDLER_PATTERN
     }
 }
 
@@ -580,6 +748,7 @@ mod tests {
             keypair.clone_identity(),
             peer_id.clone(),
             dummy_identity_hash(),
+            format!("/{}/", peer_id),
         );
         let head = engine.publish(root_hash).unwrap();
         (store, li, keypair, peer_id, head)
@@ -621,6 +790,7 @@ mod tests {
             keypair.clone_identity(),
             peer_id.clone(),
             dummy_identity_hash(),
+            format!("/{}/", peer_id),
         );
         let root_a = Hash::compute("test", b"root-a");
         let root_b = Hash::compute("test", b"root-b");
@@ -723,6 +893,7 @@ mod tests {
             keypair.clone_identity(),
             peer_id.clone(),
             dummy_identity_hash(),
+            format!("/{}/", peer_id),
         );
         let h0 = engine.publish(Hash::compute("t", b"r0")).unwrap();
         let h1 = engine.publish(Hash::compute("t", b"r1")).unwrap();
@@ -818,6 +989,93 @@ mod tests {
         match verify_content(&body, &honest.content_hash) {
             Err(PublishedRootError::ContentHashMismatch) => {}
             other => panic!("expected ContentHashMismatch, got {:?}", other),
+        }
+    }
+
+    /// EXTENSION-TREE §3.3a + §6.2, in-tree: **the declared prefix must
+    /// reconstruct every published key to a path the peer actually holds.**
+    ///
+    /// This is Go's `v9_prefix_key_form` / `v10_prefix_reconstruction` asked
+    /// from our own side, and it is a *different question* from the rebuild
+    /// check. `v8` mirrors the trie, rebuilds it, and compares roots — which
+    /// proves the routing algorithm and can never fail on key **form**, because
+    /// the rebuild takes its keys from the trie. An implementation keying by
+    /// absolute path rebuilds to its own root perfectly. Go demonstrated
+    /// exactly that by making its peer declare `"/"` while still keying
+    /// `system/`-relative: v8 PASSed, v9 and v10 FAILed.
+    ///
+    /// So this walks the other way: take each published `relative_key`,
+    /// reconstruct `absolute_prefix + relative_key` through the prefix WE
+    /// declared, and require the LocationIndex to bind that path to the same
+    /// hash the trie holds. A declaration that does not describe the keys
+    /// produces a path the peer does not have — confidently, which is what
+    /// makes a wrong prefix worse than a missing one.
+    #[test]
+    fn the_declared_prefix_reconstructs_every_key_to_a_held_path() {
+        let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
+        let li: Arc<dyn LocationIndex> = Arc::new(MemoryLocationIndex::new());
+        let keypair = kp();
+        let peer_id = keypair.peer_id().as_str().to_string();
+
+        // Bindings across two subtrees, because the distinction between our
+        // peer-qualified prefix and Go's `system/` one is invisible if
+        // everything lives under `system/` — `local/files` is precisely the
+        // key their prefix excludes and ours covers.
+        let mut bindings = BTreeMap::new();
+        for key in ["system/attestation/a", "local/files/doc", "data/notes"] {
+            let e = leaf_entity(key);
+            let h = e.content_hash;
+            store.put(e).unwrap();
+            li.set(&format!("/{}/{}", peer_id, key), h);
+            bindings.insert(key.to_string(), h);
+        }
+        let root_hash = build_trie(store.as_ref(), &bindings).unwrap();
+
+        let declared = format!("/{}/", peer_id);
+        let engine = PublishRootEngine::new(
+            store.clone(),
+            li.clone(),
+            keypair.clone_identity(),
+            peer_id.clone(),
+            dummy_identity_hash(),
+            declared.clone(),
+        );
+        let head = engine.publish(root_hash).unwrap();
+
+        let published = PublishedRootData::from_entity(&store.get(&head).unwrap()).unwrap();
+        assert_eq!(
+            published.prefix, declared,
+            "the published root MUST carry the prefix its keys are relative to"
+        );
+        assert!(
+            published.prefix.ends_with('/'),
+            "§3.3a: a prefix MUST end with `/`"
+        );
+
+        // §3.3's resolution: `/`-leading is already absolute; `/` alone is the
+        // universal tree and resolves to the empty operand (a no-op trim).
+        let absolute_prefix = if published.prefix == "/" {
+            String::new()
+        } else if published.prefix.starts_with('/') {
+            published.prefix.clone()
+        } else {
+            format!("/{}/{}", peer_id, published.prefix)
+        };
+
+        let served = entity_tree::trie::collect_all_bindings(store.as_ref(), root_hash, "");
+        assert_eq!(served.len(), 3, "all three bindings should be published");
+        for (relative_key, value_hash) in &served {
+            let reconstructed = format!("{}{}", absolute_prefix, relative_key);
+            assert_eq!(
+                li.get(&reconstructed),
+                Some(*value_hash),
+                "reconstructing {:?} through the declared prefix {:?} gave {:?}, \
+                 which this peer does not bind to that hash — the declaration \
+                 does not describe the keys",
+                relative_key,
+                published.prefix,
+                reconstructed
+            );
         }
     }
 }

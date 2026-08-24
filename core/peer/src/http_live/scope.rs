@@ -407,7 +407,18 @@ impl ScopePredicate for CapTokenScope {
             }
         }
 
-        Ok(false)
+        // Universal-tree top-level arm — the same convention [`NamespaceScope`]
+        // and [`ClosureScope`] carry, and Go's `serveAllPeersListing` hardcodes:
+        // a bare `/{peer_id}` is reachable whatever the cap holds, so
+        // `peers.list` enumerates every peer-id the local view binds under. The
+        // ancestor arm above only reaches the *local* peer-id (includes
+        // canonicalize against `local_pid`), so without this a foreign peer-id
+        // vanished from `peers.list` under cap scope alone — exactly the
+        // divergence `peers_list_surfaces_other_peer` caught between the other
+        // two predicates. The cap still governs everything below: each child
+        // goes back through this predicate and `render_leaf` resolves the
+        // binding, so an out-of-cap leaf 404s identically to not-held (T4).
+        Ok(is_bare_top_level_segment(absolute_path))
     }
 
     fn describe(&self) -> String {
@@ -417,6 +428,15 @@ impl ScopePredicate for CapTokenScope {
             // Render grantee as a short hash hex prefix for logs.
             &super::hex_encode(&self.cap.grantee.to_bytes())[..16],
         )
+    }
+}
+
+/// Is `path` exactly one non-empty top-level segment — `/{peer_id}`, with no
+/// trailing slash and no further segments?
+fn is_bare_top_level_segment(path: &str) -> bool {
+    match path.strip_prefix('/') {
+        Some(rest) => !rest.is_empty() && !rest.contains('/'),
+        None => false,
     }
 }
 
@@ -466,15 +486,29 @@ fn grant_allows_tree_get(grant: &entity_capability::GrantEntry) -> bool {
 /// tracks the publisher automatically with no operator-maintained cap set.
 ///
 /// **Content-face** (`in_scope`): hash ∈ {head, signature, trie-closure}.
+///
 /// **Tree-face** (`in_scope_path`): a path is served iff the host's binding at
 /// that path resolves to a closure hash — which is exactly the signature
 /// invariant-pointer leaf (`system/signature/{hex(head)}`, the surface the
 /// outbound dialer resolves per V7 §5.2) and the published tree's path
-/// bindings. The consumer re-verifies every fetched body by hash regardless
-/// (§1.1), so a host binding an extra path to a closure hash gains nothing.
+/// bindings — **or** it is an ancestor of such a path. The ancestor arm is
+/// what the §6.5.3.1 listing routes stand on: `{prefix}.list`, `{peer_id}.list`
+/// and `peers.list` all address prefixes that carry no binding of their own, so
+/// a leaf-only predicate 404s every listing under closure scope. (It did:
+/// `serving_mode`'s eleven listing checks were `SKIP`ped behind
+/// `seed_republished` and only became reachable once the republish landed.)
+/// Same convention as [`NamespaceScope`] and Go's `ClosureScope.InScopePath`.
+/// Leaf-vs-ancestor stays strict at the request: `render_leaf` looks the
+/// binding up and an unbound ancestor 404s identically to not-held (T4).
+///
+/// The consumer re-verifies every fetched body by hash regardless (§1.1), so a
+/// host binding an extra path to a closure hash gains nothing.
 ///
 /// Membership is memoized and keyed by the head hash, so the trie is re-walked
-/// only when the publisher advances the head.
+/// only when the publisher advances the head. The ancestor set is built in the
+/// same pass — one index scan — because the listing route asks the tree-face
+/// once per candidate child, and re-deriving it per query would make a single
+/// listing O(children × tree).
 pub struct ClosureScope {
     cache: Mutex<Option<ClosureSnapshot>>,
 }
@@ -482,6 +516,9 @@ pub struct ClosureScope {
 struct ClosureSnapshot {
     head: Hash,
     members: HashSet<Hash>,
+    /// Every path whose binding is a closure member, plus every ancestor of
+    /// one, plus the universal root `/` when the set is non-empty.
+    paths: HashSet<String>,
 }
 
 impl ClosureScope {
@@ -529,7 +566,34 @@ impl ClosureScope {
         {
             members.insert(sig_hash);
         }
-        *cache = Some(ClosureSnapshot { head, members });
+
+        // Project the content-face onto the path space: every binding that
+        // resolves to a closure member, and every ancestor of one.
+        let mut paths: HashSet<String> = HashSet::new();
+        for entry in shared.location_index.list("/") {
+            if !members.contains(&entry.hash) {
+                continue;
+            }
+            let mut p = entry.path.as_str();
+            loop {
+                paths.insert(p.to_string());
+                match p.rfind('/') {
+                    // `Some(0)` is the last cut before the universal root, which
+                    // is added below; `None` cannot occur on an absolute path.
+                    Some(0) | None => break,
+                    Some(i) => p = &p[..i],
+                }
+            }
+        }
+        if !paths.is_empty() {
+            paths.insert("/".to_string());
+        }
+
+        *cache = Some(ClosureSnapshot {
+            head,
+            members,
+            paths,
+        });
     }
 }
 
@@ -556,13 +620,25 @@ impl ScopePredicate for ClosureScope {
         shared: &Arc<PeerShared>,
     ) -> Result<bool, ScopeError> {
         self.refresh(shared);
-        let bound = shared.location_index.get(absolute_path);
         let cache = self.cache.lock().unwrap();
-        let members = match cache.as_ref() {
-            Some(s) => &s.members,
+        let snapshot = match cache.as_ref() {
+            Some(s) => s,
             None => return Ok(false),
         };
-        Ok(bound.map(|h| members.contains(&h)).unwrap_or(false))
+        if snapshot.paths.contains(absolute_path) {
+            return Ok(true);
+        }
+        // Universal-tree ancestor case: a bare `/{peer_id}` top-level segment
+        // is reachable whatever the closure holds, so a descending walk can
+        // find in-scope content and `peers.list` enumerates every peer-id the
+        // local view holds bindings for (§6.5.6 universal-tree-root listing).
+        // `NamespaceScope::in_scope_path` already reads it this way; the two
+        // predicates diverging here is what made `peers_list_surfaces_other_peer`
+        // pass under namespace scope and fail under closure scope. Enumeration
+        // is still bounded by the index — `render_listing` only emits children
+        // that actually carry bindings — and every child below this level goes
+        // back through the closure filter.
+        Ok(is_bare_top_level_segment(absolute_path))
     }
 
     fn describe(&self) -> String {
@@ -584,5 +660,17 @@ mod tests {
             NamespaceScope::new("/system/content/public/").namespace(),
             "system/content/public"
         );
+    }
+
+    #[test]
+    fn bare_top_level_segment_recognition() {
+        assert!(is_bare_top_level_segment("/2KCFip6Zz4R5Ynn"));
+        // A trailing slash makes it a prefix form, not the bare segment; the
+        // universal root and any deeper path are handled by the closure set.
+        assert!(!is_bare_top_level_segment("/2KCFip6Zz4R5Ynn/"));
+        assert!(!is_bare_top_level_segment("/2KCFip6Zz4R5Ynn/system"));
+        assert!(!is_bare_top_level_segment("/"));
+        assert!(!is_bare_top_level_segment(""));
+        assert!(!is_bare_top_level_segment("no-leading-slash"));
     }
 }
