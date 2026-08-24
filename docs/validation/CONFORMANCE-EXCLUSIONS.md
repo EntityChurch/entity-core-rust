@@ -65,9 +65,8 @@ This is not a standing exemption.
 attributed to a claimed source peer walks that source's substitute chain and
 fetches through it.
 
-**Not drivable at the wire against this peer, and this is a build gap rather
-than an obstacle.** Two things hold it off the wire, and only the first is
-deliberate:
+**Not drivable at the wire against this peer.** One thing holds it off the wire,
+and it is deliberate and cohort-convergent:
 
 1. **`claimed_source_peer_id` is local dispatcher context by Ruling 4, not a
    wire field.** `system/content:get-request` carries no such field — the
@@ -75,21 +74,42 @@ deliberate:
    `system/content` handler passes `None` from its only call site
    (`extensions/content/src/handler.rs`, `let claimed_source: Option<Hash> =
    None`), and `consult` short-circuits on `ConsultMiss::NoClaimedSource`
-   before touching a chain. That much is the ruling working as designed.
-2. **Nothing installs the surface.** `ChainConsultHook` is never registered as a
-   `MissResolver`, and `entity-storage-substitute-http`'s handler is never
-   registered on a peer. Exhaustively: no crate outside
-   `extensions/storage-substitute-*` depends on either crate — they are
-   workspace members with no consumer. The only construction of
-   `ChainConsultHook` in the tree is its own test.
+   before touching a chain. That is the ruling working as designed, and go and
+   py both defer identically.
 
-**So the honest status line is: built, compiled, tested in isolation, and
-unreachable from any wire request.** `entity-core-go` reached the same finding
-across all three impls (`2bb028b` inventory, then the §7 behavioural checks) and
-the mechanism is the same everywhere — no production caller sets the claimed
-source. Recording it here because the previous framing ("built in all three,
-measured by nothing") understated it: the surface is not merely unmeasured, it
-has no trigger.
+`entity-core-go` reached the same finding across all three impls (`2bb028b`
+inventory, then the §7 behavioural checks) — no production caller sets the
+claimed source anywhere.
+
+> **Amended 2026-08-22 — the second ground is gone, and removing it found four
+> defects.** This entry used to carry a ground 2, *"nothing installs the
+> surface"*: `entity-storage-substitute-http`'s handler was registered on no
+> peer, and exhaustively no crate outside `extensions/storage-substitute-*`
+> depended on it. That was true, it was **not** a reason for an exclusion — it
+> was an unwired surface wearing one, and it is why go's release gate scored
+> this peer `substitute 0P/1S` (a skip counts as a failure) for as long as it
+> did. The handler is now registered in `entity peer start`
+> (`cmd/entity-peer/src/commands/peer.rs`), the §7 convention is wire-reachable,
+> and the category scores **8/8 · 0F**.
+>
+> Registering it is what made the surface measurable, and it was immediately
+> `5P/3F` — three real conformance defects that the skip had been hiding, plus
+> a fourth found while fixing them. §2.3's `entry` travelled as a `bstr` where
+> go and py send an entity **value**, so every cross-impl call died at the first
+> field; the §7 plaintext refusal answered 400 where it is a 403 authorization
+> decision; and §2.2's *"`content_url_prefix` is REQUIRED, no derivation
+> default — an impl that treats it as optional-with-derivation is
+> non-conformant"* was implemented as the superseded D-14 derivation, in both
+> the absent and the empty-string forms. **An exclusion whose ground is "we
+> never wired it" is a gap, not an exemption — this entry now rests only on
+> the Ruling-4 ground, which is a property of the protocol rather than of our
+> build.**
+>
+> **What is still not wired, stated plainly:** `ChainConsultHook` is not
+> registered as a `MissResolver` on any peer. That does not change the
+> exclusion's reach — ground 1 keeps the §3 chain undrivable over the wire
+> regardless — but it means the §3 vectors below remain satisfied in-process
+> only, and this note is the place that says so rather than leaving it implied.
 
 **Satisfied by (in-process).** `extensions/storage-substitute-sources/tests/chain_consult.rs`
 (7 vectors — bare-hash short-circuit TV-SS-BARE-1, the four cap-axis denials,

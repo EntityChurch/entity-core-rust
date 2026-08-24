@@ -2012,22 +2012,32 @@ fn system_compute_group_by_args() -> TypeDefinition {
 // form the `compute/apply` args map produces, which is what the corpus carries
 // and what every seat's evaluator reads.
 //
-// **C-11 Corner 2 rules this to a scalar `system/hash` (D3) — and it is NOT
-// landed here, deliberately.** The ruling lives in a DRAFT proposal targeting
-// v3.27; the standard is to implement the landed spec, not an in-flight
-// proposal, and arch's own packet says outright *"do not implement from this
-// packet's prose."*
+// **D3 (C-11 Corner 2) — LANDED 2026-08-22, as the third and last seat.**
+// `collections` is a **scalar** `system/hash` naming an expression that
+// evaluates to an array of arrays, matching every sibling collection arg
+// (`map`/`filter`/`fold`/`group-by`, `assoc-args.collection`) and what all three
+// evaluators actually read.
 //
-// We tried it anyway and measured the cost, which is the part worth keeping:
-// a type descriptor is a **published contract**, and `validate-peer`'s
-// `type_system_compute_concat_args_match` compares our published descriptor
-// against the *sibling's local type table*. So the first seat to land D3 goes
-// red against every seat that has not — we scored 446 · 439P · 6W · **1F** on
-// exactly that check. **D3 is not landable seat-by-seat; it needs a
-// synchronized cut with the v3.27 fold.** Routed to the tier lead.
+// **The rollout is the part worth keeping.** A type descriptor is a published
+// contract and `validate-peer`'s `type_system_compute_concat_args_match`
+// compares our published descriptor against the *sibling's local type table* —
+// so the first seat to narrow it goes red against every seat that has not. We
+// landed it early, measured 446 · 439P · 6W · **1F** on exactly that check, and
+// backed it out. Arch ruled the window rather than the shape
+// (`ROUTING-2026-08-21-h` §3): there is no lockstep instrument, teaching the
+// checker to accept both shapes is dual-kind acceptance the corpus forbids, so
+// the transient FAIL is **carried in the open and never baselined**, in the
+// order py → go → rust. **This seat landing is what closes it**; the FAIL should
+// be gone cohort-wide from here.
+//
+// The reason is **uniformity + arity**: the literal-array shape froze `concat`'s
+// arity at authoring time, so a `concat` over a computed number of collections
+// was inexpressible. Arch's originally-published derivation (that §7.1's `walk`
+// would miss dependencies under the array shape) is **retracted** — §4a, no
+// implementation had that defect; do not carry that argument.
 fn system_compute_concat_args() -> TypeDefinition {
     TypeDefBuilder::new("system/compute/concat-args")
-        .field("collections", arr(t("system/hash")))
+        .field("collections", t("system/hash"))
         .build()
 }
 
@@ -3994,6 +4004,58 @@ mod tests {
                 field_name
             );
         }
+    }
+
+    /// D3 (C-11 Corner 2) — `concat-args.collections` is a **scalar**
+    /// `system/hash`, not an array of them.
+    ///
+    /// Asserted on the **published** descriptor as well as the declaration,
+    /// because publication is the leg that is measured: `validate-peer`'s
+    /// `type_system_compute_concat_args_match` compares what we publish against
+    /// the sibling's local type table. That check is *generated* — its name is
+    /// `"type_" + sanitizeName(def.Name) + "_match"` — so grepping the validator
+    /// for `concat-args` returns nothing and reads as "unscored." It is scored;
+    /// grep the loop that declares the check, not the item.
+    ///
+    /// This is the declaration half of a pair. The evaluator half is
+    /// `concat_refuses_the_array_of_hashes_shape_d3_withdrew` in
+    /// `entity-compute`, which cannot live here (that crate does not depend on
+    /// `entity-types`, and the DAG is not worth bending for a test). Landing
+    /// only one of the two is how a peer ends up advertising a contract its own
+    /// evaluator does not enforce.
+    #[test]
+    fn concat_args_collections_is_a_scalar_hash_not_an_array_of_them() {
+        let types = all_core_types();
+        let td = types
+            .iter()
+            .find(|t| t.name == "system/compute/concat-args")
+            .expect("concat-args is registered");
+        let spec = td
+            .fields
+            .get("collections")
+            .expect("collections is declared");
+
+        assert_eq!(
+            spec.type_ref.as_deref(),
+            Some("system/hash"),
+            "D3: collections names one expression hash"
+        );
+        assert!(
+            spec.array_of.is_none(),
+            "D3 withdraws the array-of-hashes shape; the literal array froze \
+             concat's arity at authoring time"
+        );
+
+        // And it survives publication in that shape — an `array_of` wrapper here
+        // is the exact byte difference the cross-impl check scores.
+        let entity = td.to_entity().expect("descriptor encodes");
+        let encoded = String::from_utf8_lossy(&entity.data).to_string();
+        assert!(encoded.contains("system/hash"));
+        assert!(
+            !encoded.contains("array_of"),
+            "published concat-args still carries array_of: {}",
+            encoded
+        );
     }
 
     #[test]

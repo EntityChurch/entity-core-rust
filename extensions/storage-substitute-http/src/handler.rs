@@ -23,7 +23,7 @@ use ciborium::Value;
 use entity_entity::Entity;
 use entity_handler::{
     error_entity, Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_GATEWAY,
-    STATUS_BAD_REQUEST, STATUS_NOT_FOUND, STATUS_UNAVAILABLE,
+    STATUS_BAD_REQUEST, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_UNAVAILABLE,
 };
 use entity_hash::Hash;
 
@@ -70,12 +70,24 @@ impl HttpSubstituteHandler {
             _ => return bad_request("invalid_params", "expected CBOR map"),
         };
 
-        let entry_bytes = match field_bytes(map, "entry") {
-            Some(b) => b,
+        // §2.3 declares `entry: system/substitute/source` — an entity VALUE
+        // in the map, not a bstr wrapping one. Extract its RAW bytes rather
+        // than routing through `ciborium::Value`, so the source's `data` is
+        // never decoded-and-re-encoded on the way to `decode_entity`.
+        //
+        // This shape is load-bearing and was wrong here until the handler was
+        // first reachable: we emitted and accepted `Value::Bytes`, and our own
+        // orchestrator emitted the same, so the round-trip agreed with itself
+        // and every cross-impl call failed at the first field. go
+        // (`SubstituteTryRequestData{Entry entity.Entity}`) and py
+        // (`entry` as a dict) both carry the entity inline as a value.
+        let entry_bytes = match entity_wire::cbor_map_field_raw(ctx.params.data.as_slice(), "entry")
+        {
+            Some(b) => b.to_vec(),
             None => {
                 return bad_request(
                     "invalid_params",
-                    "entry (wire-encoded source entity bytes) required",
+                    "entry (the full system/substitute/source entity) required",
                 );
             }
         };
@@ -84,7 +96,7 @@ impl HttpSubstituteHandler {
             None => return bad_request("invalid_params", "hash required"),
         };
 
-        // Decode the source entity from the inline bytes (Ruling 2).
+        // Decode the source entity from the inline value (Ruling 2).
         let source_entity = match entity_wire::decode_entity(&entry_bytes) {
             Ok(e) => e,
             Err(e) => {
@@ -121,11 +133,18 @@ impl HttpSubstituteHandler {
 
         let url = match build_content_url(&endpoint, &target_hash) {
             Ok(u) => u,
+            // §7 / TV-CDN-TLS-1. **403, not 400.** Refusing a plaintext
+            // scheme is an authorization decision about the endpoint, not a
+            // complaint about a malformed request: a 400 invites the caller
+            // to "fix" the params, when the only fix is a different scheme.
+            // core-go answers `403 https_required` at the same point
+            // (`ext/storagesubstitutehttp/handler.go`); we answered 400 for
+            // as long as nothing could reach the handler to notice.
             Err(UrlBuildError::NonHttpsScheme(prefix)) => {
                 return HandlerResult::error(
-                    STATUS_BAD_REQUEST,
+                    STATUS_FORBIDDEN,
                     error_entity(
-                        "non_https_scheme",
+                        "https_required",
                         &format!("content URL prefix must be https://: {}", prefix),
                     ),
                 );

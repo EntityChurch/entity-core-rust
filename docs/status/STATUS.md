@@ -1,6 +1,6 @@
 # entity-core-rust — status
 
-_Updated: 2026-08-17 · public: v0.8.0 (master)_
+_Updated: 2026-08-22 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -34,6 +34,232 @@ and tree semantics are interop-validated against the Go and Python peers, not
 just self-tested.
 
 ## Where we left off
+
+_2026-08-22 (b) — **the release gate exits 0 for the first time, and the one line that got it there
+uncovered four shipping conformance defects.**_
+
+**`scripts/validate-complete.sh rust` — `REAL_EXIT=0`, all six passes exit 0.** That had never been
+true at this seat. The single thing holding it at 1 was `substitute 0P/**1S**`, and a skip counts as
+a failure.
+
+**The skip was ours and it was not an exclusion.** `entity-storage-substitute-http` was built,
+unit-tested, and depended on by **no crate outside `extensions/storage-substitute-*`** — so
+`system/substitute/http` was a surface present in the tree and absent from the substrate, and
+`CONFORMANCE-EXCLUSIONS.md` had it written down as ground 2 of a declared exclusion. Writing it down
+is how it survived: the gate read *declared* where the truth was *undone*. Registering the handler
+in `entity peer start` is one `builder.handler(...)` line — that seam already mints the interface
+entity, the handler entity, the dispatch-index binding and the §6.9 grant, so there was no core
+change to make. core-go has registered it in its peer binary all along.
+
+**Wiring it scored `5P/3F` immediately, and a fourth defect surfaced while fixing those three.** All
+four had been shipping behind a fully green in-tree suite, because nothing could reach the handler
+to disagree with it:
+
+| Defect | Was | Spec |
+|---|---|---|
+| §2.3 `entry` encoded as a **`bstr`**, not an entity value | every cross-impl call died at the first field | §2.3 types it `system/substitute/source` |
+| §7 plaintext refusal answered **400** | — | 403; it is an authorization decision about the scheme |
+| §2.2 `content_url_prefix` **derived** from `tree_url_prefix` | the superseded D-14 | *"an impl that treats it as optional-with-derivation is non-conformant"* |
+| …and still failed on the **empty string** after the absent case was fixed | 403, the wrong defect | go's struct has no `omitempty`, so unset arrives as `Some("")` |
+
+The `entry` one is the same-side round-trip pitfall realized as completely as it can be: **our
+encoder and our decoder were wrong together**, agreed with each other perfectly, and passed every
+test we had. go and py both carry the entity as a value.
+
+**Measured at each step on the wire, not argued** — unwired → *category skipped* · wired → **5P/3F**
+· + entry shape + 403 → **7P/1F** · + required-prefix (absent only) → **7P/1F**, still red, which is
+what caught the empty-string case · + empty → **8P/0F**. The in-tree tests were green at every one
+of those points, so the wire is the only thing in that chain that measured anything.
+
+Two tests were rewritten to assert the opposite of what they had — the D-14 derivation rows — so
+per the charter they are **not** the evidence here; the cross-impl check is, and it is named at the
+code. A new test pins the `entry` wire shape by its CBOR **major type** rather than by a round-trip,
+because a round-trip is exactly what was green under the wrong shape.
+
+Ratchet: a declared exclusion whose ground is *"nothing installs it"* is a gap wearing an exemption;
+and a code comment citing a proposal or review item (here `D-14, §6.4 — workbench-go review`) is a
+claim with an expiry date that the comment will never announce.
+
+Gate: `make test` **116 suites / 2220 / 0F** · clippy · fmt · wasm · features (27 configs).
+
+_2026-08-22 (a) — **D3 is closed three-way, B-1 is fixed, and the 362-vector cross-bless does not
+lock — because the harness never transmits the vector's depth budget.**_
+
+Three things landed and one thing was found that nobody had asked about.
+
+**B-1 (release blocker, arch `COHORT-OPEN-ITEMS` §0b) — private keys are 0600, at creation.**
+`bd44465`. Both `save_to_file` arms (Ed25519, Ed448) now route through one
+`write_private_key_file`: `O_CREAT` with mode `0600` set **at creation**, not chmod-ed after, plus
+a `set_permissions` on the open fd so re-minting over an existing `0644` key repairs it. The
+original finding named one arm and cited a comparator that does not exist (`entity-core-rs`); the
+real one is core-go's `core/crypto/keypair.go`, and it is cited at the constant. Four callers
+(godot, two CLI commands, signaling-node) reach disk through those two functions and no other site
+writes `to_pem()` output. **The obvious test would have lied, and that was measured rather than
+argued** — `assert mode == 0o600` on a fresh mint is a claim about the *umask*: under `umask 0077`
+it passes against the unfixed `fs::write` (3F at 0022, 1F at 0077). The row that holds at every
+umask is the re-mint over an existing 0644 file.
+
+**D3 (C-15 / C-11 Corner 2) — `concat-args.collections` is a scalar hash.** `69998ac`.
+`type_system` **446 · 440P · 6W · 0F** (was 439P · **1F**), confirmed by check name. The transition
+window — py, then go `0e1f604`, then this seat — is **closed rather than baselined**. Our delta was
+not go's: they scoped D3 *"declaration-only"*, true of their tree and false of ours, because
+`resolve_concat_collections` branched on the field's CBOR kind and answered `[1,2,3]` to a program
+core-go refuses outright. Descriptor **plus** that branch, reported as a scope difference rather
+than absorbed.
+
+**The headline was not in anyone's worklist.** The compute cross-bless at 362 (wire profile, corpus
+`333de571`) does **not** lock: 361 agree, one differs — `cv9a` — and the harness's own §4 classifier
+read *"one impl differs → core-go's bug."* **That attribution is backwards.** The control was one
+extra emission: drive **go's own peer** over the wire and cross-bless it against go's in-process
+emission. go disagrees with **itself**, and the three "agreeing" peers all match go-over-the-wire.
+Mechanism, proven by construction at both ends rather than inferred from the vote — `peeremit.go`
+encodes exactly one budget key (`{"budget": Operations}`), `VecBudget.Depth` is never transmitted,
+and **§5.2 has no request field for evaluation depth at any seat**. So every wire emission ran cv9a
+at `PEER_DEFAULT_MAX_DEPTH` (1024) instead of its declared 24, and the 60-level element never
+tripped. Three emissions from one harness that drops the same precondition are cohort-consistent by
+construction. **The row is void, not a divergence**, and `core-go/stage1` is the only emission that
+measured the stated condition.
+
+Routed to core-go as harness owner with three options (declare not-wire-drivable · have
+`emit --peer` refuse a vector whose `Depth` is under the peer default · route the spec question to
+arch) and **none of them implemented here** — the harness and the vector are theirs. The spec half
+is now logged in `SPEC-AMBIGUITIES.md` (COMPUTE §5.2 — no depth request field).
+
+**And it corrects our own back-catalogue.** `worked/recurse/tail-sum` pins `Depth: 16` and has
+locked in every wire bless we ever reported, but its recursion is *tail* and 5 levels deep, so it
+passes at 16 and at 1024 alike. **Every "N/N LOCKED" we have published over the wire route was
+silent about the depth axis.** Not wrong; narrower than it read, and the ratchet now says so.
+
+Report: `docs/validation/reports/2026-08-22-a-*`. Gate: `make test` **116 suites / 2220 / 0F** ·
+clippy · fmt · wasm · features (27 configs).
+
+_2026-08-21 (d) — **Corner 1 landed three ways, CV-7c was a real defect the corpus never asked
+about, and D3 had to be backed out because a descriptor cannot land seat-by-seat.**_
+
+Corpus **358/358 LOCKED** go↔rust at go's `9ad0110` freeze — the re-bless owed at 355 and again at
+358, closed in one pass. `d59f559`.
+
+**A LOCK is a claim with an expiry date.** We had reported `352/352` and routed it as the evidence
+for C-6; go then seeded CV-7a/b/c and CV-8a/b/c, and bisect at our own `145cd1c` measured **3
+two-way**, not 0. One (`cv7c`) was a real, uncaught defect — `concat` answered `type_mismatch`
+where an error *sub-collection* must short-circuit — and the same fix closed `sweep/0281`, **a
+vector nobody named in any routing**. Both turned out to be pre-existing; the bisect is what makes
+that sentence worth anything.
+
+**C-11 Corner 1** — `map`'s output element is a contained position — landed with a carve-out that
+is deliberately **narrower than go's** and routed as a named divergence. go carves out the three
+evaluation-limit codes; the criterion that actually holds is a resource **shared across the
+elements**, so `budget_exhausted` and `cascade_limit` propagate and `depth_exceeded` contains
+(`budget.depth` is restored on unwind). The predicate keys on the `code`, never on the variant —
+keying on `ComputeValue::Error(_)` vs the SA-1 entity form would reinstate the exact §2.4
+provenance-dependence the ruling exists to remove. Kept out of the frozen corpus at both seats.
+
+**C-12** — `compute/error` in the store path short-circuits — landed at the `resolve_string_arg`
+helper, which is the boundary: all six consumed string operands share it.
+
+**D3 was landed and backed out in the same session**, and that is the check working. `cargo test`,
+`clippy` and `make features` were all green; `validate-peer -category type_system` scored **1F**,
+because `type_system_compute_concat_args_match` compares our *published* descriptor against the
+sibling's local type table. A descriptor edit is a divergence the moment one seat makes it and
+until the last seat does. Two things earned: the grep that said "not scored" was wrong because the
+check name is **generated** (`"type_" + sanitizeName(def.Name) + "_match"`), so grep the loop that
+declares it, not the item; and the proposal carrying D3 was `Status: DRAFT`, which binds — implement
+the landed spec, not an in-flight packet.
+
+Report: `docs/validation/reports/2026-08-21-d-*`.
+
+_2026-08-21 — **COMPUTE v3.24→v3.26 at this seat, and the routed one-line item was three
+versions.**_
+
+`c6ecfe8` · `2ef7a21` · `c0d9b9e` · `145cd1c`. core-go routed v3.26 as *"add the carve-out at the
+array-element boundary in `materialize`"* — a one-function change, with their diff as the reference.
+**We had nothing to carve out of.** `range` / `group-by` / `concat` / `assoc` did not exist here:
+the item was v3.24 (four primitives + five spec-pinned args types) **plus** v3.25's four corner
+rulings **plus** v3.26. A routing's work item is a delta against the *sibling's* tree; ours is
+whatever our tree is missing, and the two are only the same when both seats were level. Reported as
+a scope difference rather than closed as written.
+
+Two things the packet found on its own. **The four v3.24 args-type descriptors were unpublished** —
+the third registration site, found on the wire, not in the tree (`c0d9b9e`). And the
+NETWORK §6.5.3 hex-strictness item was already correct in both builders, but **the test guarding one
+of them was a tautology** (`2ef7a21`): it compared the builder against the very helper the builder
+calls, so mutating `Hash::to_hex` to the digest-only form — the precise shape core-go shipped — left
+it green. Replaced with a property assertion exercised at two formats. Running
+SPECIFICATION-FORMAT §8.4.5's own grep over the whole tree then surfaced two more genuine
+fixed-width pins nobody had routed (`revision::is_prefix_config_path`'s `66`, `store::opfs`'s
+framing at `33`), both write-shape/read-shape asymmetries inside a single file.
+
+_2026-08-20 — **REGISTRY v1.19 lands, and the pin-delta predicate is over raw bytes.**_
+
+`6c889df` · `6b2c9e2`. R-15/R-16/R-17 closed and R-27's four clauses pinned; wire rows 7 and 8 both
+green and **mutation-proven** (neuter the pin check → `row 8a → 200, want 403`, 17/18·1F).
+
+**R-17 rode the board as "rust's one-liner"** — a `type_ref` reading `core/entity` where §4.3's own
+table names the precise token — and reverting it on the wire scored `type_system` **431/438 · 1F**.
+It had been a live scored failure the whole time. A cohort item touching a **published contract**
+is measured by a check somewhere; find the check before you accept the ledger's adjective.
+
+**The pin-delta predicate is a security verdict, so it compares raw field bytes.** §4.3's
+byte-identical MUST decides whether a write needs pin authority; a decode-then-re-encode compare
+that drops a §4.2 forward-compat key reads a changed pin list as *"no change"* and rewrites the
+registry's most privileged row under `registry-configure` alone. We read the word literally;
+**core-go's typed-struct decode did not, and that is where it bit** (go `f44ed4d`). Found in a
+sibling rather than in a second bite here, and the charter says so exactly.
+
+Reports: `docs/validation/reports/2026-08-20-b-*`, `-c-*`.
+
+_2026-08-19 — **both registry rulings land, R-4 was mis-scoped, and a tampered interior node was
+coming back as an unbound name.**_
+
+`898e55b` · `aaa591e` → `cf570b2` · `eeeff6b` · `302b7f4`.
+
+**Arch ruled both routed registry items and neither seat's reading survived either one** — the §4.1
+filter is now a pure function of the name (our row 1 lost on the argument we had filed *against*
+ourselves; go's no-match fallback lost too) and `name_constraints` is §4's one matcher. Converging
+on the sibling would have shipped a reading the spec later withdrew, **in both directions**. Ask for
+a ruling, not for a winner: both seats asked "which of us?" and the answer was a third reading.
+
+**R-4 was mis-scoped and we measured that rather than implementing the citation.** The ledger quoted
+§6a.6 (*"an O(1) index lookup, not a scan"*) at `resolver::is_revoked`, but §6a.6's argument is a
+**registry** called from §6a.4; the site named implements **§3.1**, which constrains no storage
+path, and conformance drives it as a scan. Implementing it made a green peer red (`registry` 1F),
+and the fix rewrote its own fixture in the same commit — destroying the evidence that it was a fix.
+Reverted at `cf570b2`. The fast-path half was worse than useless: mutation deleted it and **no test
+failed**, because `by-target/{hex}` sits inside the scanned prefix.
+
+**A tampered interior node is a forgery, not an absence** (`302b7f4`, reported from
+entity-browser-rust). `VerifyingFetchStore::get` did `verify_content(..).ok()?` into an
+`Option`-returning `ContentStore`, so a HAMT node whose bytes hash to nothing left by the same door
+as a node that was never published — and `resolve` answered `Ok(None)`, i.e. *"the publisher never
+bound that key"*, about an origin that had just served a forgery. It reached every consumer of a
+signed root. The leaf was always safe, which is why `consumer_rejects_tampered_content` passed
+throughout. Mismatch is now latched on the store and checked before `resolve` believes a `None`;
+the gate asserts the control as hard as the attack.
+
+Report: `docs/validation/reports/2026-08-19-*`.
+
+_2026-08-18 — **the six-item queue closes, and the §5.2 in-process sub-dispatch path ran no
+capability check at all.**_
+
+`80d9f67` · `7c21d04` · `a23bb27` · `90e60c0` · `b388026` · `59e6f55` · `ea27715` · `0e325ba` ·
+`9f02618` · `c06a6ab`. Zero scored failures on the wire at `59e6f55` against go's release gate.
+
+The item worth naming for release: **§5.2 D1** — the in-process sub-dispatch path ran **no**
+authorization check of any dimension. Proven by construction rather than by grep, which is the
+method: brace-balanced extraction of the whole function, then a count of every authorization symbol
+inside it (`check_permission`, `check_resource_scope`, `check_grant_covers`, `matches_scope`,
+`STATUS_FORBIDDEN`: all zero across 628 lines). That is a stronger and *different* finding than the
+one arch asked about. The fix needed a new type — `DispatchCeiling::{PeerRoot, Handler(Option<_>)}`
+— because `Option<CapabilityToken>`'s `None` had to mean **deny** for a grantless handler and
+**allow** for the peer's own SDK entry points, and either default is a shipped bug.
+
+Two more that generalized into the charter: a closed grammar needs a **writer that refuses**
+(§4.4.17 V6), except where nothing *can* be refused (REGISTRY §4, where every non-`*` byte is a
+literal) — two closed grammars, opposite write-time dispositions; and `since` meant an *exclusive
+watermark walking newer* on `fetch` and an *inclusive cursor walking older* on `log`, through **one
+shared decoder**, so the same argument returned disjoint sets with no error anywhere.
+
+Reports: `docs/validation/reports/2026-08-18-f-*`.
 
 _2026-08-17 (h) — **CAP-6 confirmed on the wire (17/17), and the sweep past it found the ingest
 half, where the same value was fail-open.**_

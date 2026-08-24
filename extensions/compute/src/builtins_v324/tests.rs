@@ -540,18 +540,20 @@ fn concat_short_circuits_an_error_sub_collection() {
     );
 }
 
-/// Both `collections` encodings are read, and this pins the array-of-hashes one
-/// **because it is the shape C-11 Corner 2 (D3) withdraws** — so when v3.27
-/// folds, this is the test that flips, and it flips alone.
+/// D3 landed: the array-of-hashes `collections` encoding is **withdrawn**, and
+/// this is the test the prior session staged to flip — *"when v3.27 folds, this
+/// is the test that flips, and it flips alone."* It did.
 ///
-/// It is held rather than landed for a measured reason, not a cautious one: a
-/// type descriptor is a published contract, so the first seat to narrow it goes
-/// red against every seat that has not. Landing D3 here scored
-/// `type_system_compute_concat_args_match` **1F** (446 · 439P · 6W · 1F) against
-/// core-go's unchanged local type table, then was backed out. The corpus is
-/// unaffected either way — CV-5 and CV-7c both carry the single-hash form.
+/// It asserts the withdrawal rather than deleting the case, because a deleted
+/// test asserts nothing: a peer that still evaluated the literal-array form
+/// would be green under the deletion and is red under this.
+///
+/// **This is the half of D3 that is not declaration-only at this seat.** go's
+/// `builtinConcat` resolves `collections` through `evalControlArg` and never
+/// evaluated the literal array, so *"declaration-only"* is true of go's tree and
+/// false of ours. Before D3 we answered `[1,2,3]` to a program core-go refuses.
 #[test]
-fn concat_reads_the_array_of_hashes_shape_the_landed_spec_declares() {
+fn concat_refuses_the_array_of_hashes_shape_d3_withdrew() {
     let cs = MemoryContentStore::new();
     let li = MemoryLocationIndex::new();
     let a = cs.put(lit_array(ints(&[1, 2]))).unwrap();
@@ -580,8 +582,18 @@ fn concat_reads_the_array_of_hashes_shape_the_landed_spec_declares() {
         &mut ctx,
     )
     .expect("concat is a builtin");
-    assert_eq!(array_of(&got), ints(&[1, 2, 3]));
+    assert!(
+        got.is_error(),
+        "a literal array of hashes is no longer a `system/hash`; concat must refuse it, got {:?}",
+        got
+    );
 }
+
+// The declaration half of the same pair is pinned in `core/types`
+// (`concat_args_collections_is_a_scalar_hash_not_an_array_of_them`) — the
+// evaluator crate does not depend on `entity-types` and the DAG is not worth
+// bending for a test. The two together are what stop the descriptor and the
+// evaluator from drifting back apart.
 
 /// The other encoding, and the one every seat's evaluator actually reads (and
 /// the one D3 will make the only one): a single hash resolving to an array of

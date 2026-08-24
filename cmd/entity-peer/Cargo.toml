@@ -16,6 +16,7 @@ path = "src/main.rs"
 entity-core.workspace = true
 entity-signaling.workspace = true
 entity-registry.workspace = true
+entity-storage-substitute-http.workspace = true
 clap.workspace = true
 serde.workspace = true
 toml.workspace = true

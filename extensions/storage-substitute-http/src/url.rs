@@ -107,14 +107,26 @@ impl EndpointConfig {
     /// Shared between [`Self::decode_entity`] and the legacy inline-map
     /// fallback in [`Self::decode_endpoint_field`].
     ///
-    /// **`content_url_prefix` default-resolution (D-14, §6.4 — workbench-go
-    /// review).** When `content_url_prefix` is absent, derive
-    /// `content_url_prefix = {tree_url_prefix}/content` (the single-peer
-    /// default — S1/S2/S3/S6). Multi-peer-shared-domain hosts that
-    /// dedup content (S4) or split tree/content hosts (S5) MUST emit
-    /// `content_url_prefix` explicitly. Both prefixes absent → still
-    /// `MissingField("content_url_prefix")` since there's nothing to
+    /// **`content_url_prefix` is REQUIRED and there is NO derivation
+    /// default** — §2.2, *pinned ruling*, whose last sentence is
+    /// "an impl that treats it as optional-with-derivation is
+    /// non-conformant." An absent `content_url_prefix` is
+    /// `MissingField`, whether or not a `tree_url_prefix` is present to
     /// derive from.
+    ///
+    /// **This replaces D-14** (§6.4, the workbench-go review), which asked
+    /// for `content_url_prefix = {tree_url_prefix}/content` when absent —
+    /// the single-peer default S1/S2/S3/S6. We implemented D-14 and the
+    /// ruling later superseded it; the ruling's argument is deployment
+    /// scenario **S4** (tree per-peer, content dedup'd to a shared bucket),
+    /// where deriving sends the fetch to an origin the publisher never
+    /// committed to. That either 404s or — worse — exists and serves some
+    /// other peer's bytes. A proposal carries rationale; the spec carries
+    /// the rule.
+    ///
+    /// The refusal is deliberately ahead of every check that *interprets*
+    /// the prefix, including the §7 https floor: a derived prefix that then
+    /// fails the scheme check reports the wrong defect and hides this one.
     fn decode_data_map(map: &[(Value, Value)]) -> Result<EndpointConfig, EndpointDecodeError> {
         let content_layout_str = field_text(map, "content_layout")
             .ok_or(EndpointDecodeError::MissingField("content_layout"))?;
@@ -124,15 +136,17 @@ impl EndpointConfig {
         let tree_url_prefix = field_text(map, "tree_url_prefix");
         let tree_leaf_suffix = field_text(map, "tree_leaf_suffix").unwrap_or_else(default_suffix);
 
-        let content_url_prefix = match field_text(map, "content_url_prefix") {
-            Some(s) => s,
-            None => match &tree_url_prefix {
-                Some(tree) => format!("{}/content", trim(tree)),
-                None => {
-                    return Err(EndpointDecodeError::MissingField("content_url_prefix"));
-                }
-            },
-        };
+        // Absent AND empty are the same fact — "the publisher stated no
+        // content commitment". go's `TransportEndpoint.ContentURLPrefix`
+        // carries no `omitempty`, so an endpoint that simply does not set it
+        // arrives here as `Some("")`, not `None`; refusing only `None` leaves
+        // the empty string to fall through to the scheme check and answer
+        // 403 https_required, which reports the wrong defect and hides this
+        // one. core-go guards the same way (`contentPrefix == ""` → 400,
+        // ahead of its https gate).
+        let content_url_prefix = field_text(map, "content_url_prefix")
+            .filter(|s| !s.is_empty())
+            .ok_or(EndpointDecodeError::MissingField("content_url_prefix"))?;
 
         Ok(EndpointConfig {
             tree_url_prefix,
@@ -460,40 +474,64 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_decode_derives_content_url_prefix_from_tree() {
-        // D-14 / §6.4 default-resolution: when `content_url_prefix` is
-        // absent, derive `{tree_url_prefix}/content`.
-        let cbor = Value::Map(vec![
-            (
-                Value::Text("tree_url_prefix".to_string()),
-                Value::Text("https://my-domain.example".to_string()),
-            ),
-            (
-                Value::Text("content_layout".to_string()),
-                Value::Text("flat".to_string()),
-            ),
-        ]);
-        let cfg = EndpointConfig::decode_endpoint_field(Some(&cbor)).unwrap();
-        assert_eq!(cfg.content_url_prefix, "https://my-domain.example/content");
-    }
-
-    #[test]
-    fn endpoint_decode_strips_trailing_slash_when_deriving() {
-        let cbor = Value::Map(vec![
-            (
-                Value::Text("tree_url_prefix".to_string()),
-                Value::Text("https://shared.example.com/peers/peerA/".to_string()),
-            ),
-            (
-                Value::Text("content_layout".to_string()),
-                Value::Text("flat".to_string()),
-            ),
-        ]);
-        let cfg = EndpointConfig::decode_endpoint_field(Some(&cbor)).unwrap();
-        assert_eq!(
-            cfg.content_url_prefix,
-            "https://shared.example.com/peers/peerA/content"
-        );
+    fn a_tree_prefix_alone_does_not_derive_a_content_prefix() {
+        // §2.2 pinned ruling: `content_url_prefix` is REQUIRED and there is
+        // NO derivation default — "an impl that treats it as
+        // optional-with-derivation is non-conformant." This test replaces
+        // two that asserted D-14's derivation (`{tree}/content`, with
+        // trailing-slash trimming); D-14 was superseded, and the derivation
+        // is the S4 defect the ruling exists to remove.
+        //
+        // **The rewritten expectation is not the evidence.** A test edited in
+        // the same commit as the behaviour witnesses nothing; the independent
+        // witness is core-go's `substitute` category check
+        // `content_url_prefix_required_no_derivation`, which scored this seat
+        // FAIL (403/"https_required", want 400) before the fix and PASS after.
+        //
+        // Both rows matter: the plain prefix is the one D-14 derived from,
+        // and the trailing-slash form is the one whose trimming used to be a
+        // separate test — under derivation each produced a URL, so a row that
+        // only asserted "some prefix came back" could not tell the readings
+        // apart.
+        // The third row is the one the wire actually sends and the one the
+        // first pass at this fix missed: go's `TransportEndpoint` has no
+        // `omitempty` on `content_url_prefix`, so "unset" reaches us as
+        // `Some("")`. Refusing only the absent key left the empty string
+        // falling through to the §7 scheme gate — 403 https_required, the
+        // wrong defect, and the cross-impl check stayed red through a fix
+        // that looked complete in-tree. Absent and empty are one fact.
+        for (label, prefix_entry) in [
+            ("absent", None),
+            ("empty", Some(String::new())),
+            ("empty-with-slash-tree", Some(String::new())),
+        ] {
+            let tree = if label == "empty-with-slash-tree" {
+                "https://shared.example.com/peers/peerA/"
+            } else {
+                "https://my-domain.example"
+            };
+            let mut fields = vec![
+                (
+                    Value::Text("tree_url_prefix".to_string()),
+                    Value::Text(tree.to_string()),
+                ),
+                (
+                    Value::Text("content_layout".to_string()),
+                    Value::Text("flat".to_string()),
+                ),
+            ];
+            if let Some(p) = prefix_entry {
+                fields.push((
+                    Value::Text("content_url_prefix".to_string()),
+                    Value::Text(p),
+                ));
+            }
+            let cbor = Value::Map(fields);
+            match EndpointConfig::decode_endpoint_field(Some(&cbor)) {
+                Err(EndpointDecodeError::MissingField("content_url_prefix")) => {}
+                other => panic!("{label}: must be MissingField(content_url_prefix), got {other:?}"),
+            }
+        }
     }
 
     #[test]

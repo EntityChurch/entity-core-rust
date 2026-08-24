@@ -81,7 +81,7 @@ pub use broker::MessagePortBroker;
 /// its required verification posture without depending on `entity-signaling`
 /// directly — the same courtesy `worker_webrtc` extends for the Worker arm.
 pub use entity_signaling::webrtc::VerificationPolicy;
-pub use main_thread_establish::{IceObserver, MainThreadWebRtcEstablisher};
+pub use main_thread_establish::{IceObserver, MainThreadWebRtcEstablisher, NegotiationReport};
 pub use web_transport::WebTransport;
 
 use entity_wasm_worker_protocol::{

@@ -6162,3 +6162,50 @@ is the bare hash in both seats regardless, and no corpus vector groups by an ent
 equality bytes and go's cannot currently produce a different grouping that anything can see.
 Recorded as owed rather than done: this becomes a real edit the moment a vector groups by an entity
 key, and it is written down here so that vector does not arrive as a surprise.
+
+---
+
+## COMPUTE §5.2 — `system/compute:eval` has no request field for evaluation **depth**, so a depth-discriminating vector has no wire representation at all
+
+**Passage.** §5.2 gives the request an `operations` budget and describes it as *"a voluntary
+self-restriction entering a min"* against the peer's own ceiling. There is **no equivalent for
+evaluation depth**: depth arrives only from a capability constraint or the peer default
+(`PEER_DEFAULT_MAX_DEPTH = 1024` here).
+
+**The ambiguity, and it is a gap rather than a wording problem.** The conformance corpus declares a
+per-vector budget with **two** dimensions (`VecBudget.Operations`, `VecBudget.Depth`), and the
+in-process route honours both. The wire route cannot: there is no field to put `Depth` in. So a
+vector whose outcome turns on the depth ceiling is satisfiable in-process and **unmeasurable over
+the wire at every seat**, with no error anywhere to say so.
+
+**How it surfaced, and why it is filed here rather than as a harness bug.** The 362-vector
+cross-bless (wire profile, corpus `333de571`) failed to lock on exactly one vector — `cv9a`
+(`map` contains `depth_exceeded`), which declares `Depth: 24` and whose middle element recurses 60
+levels. core-go's harness classifier read the 2-of-3 split as *"core-go's bug."* Driving **go's own
+peer** over the wire and cross-blessing it against go's in-process emission showed go disagreeing
+with **itself**, with the three "agreeing" peers all matching go-over-the-wire: every wire emission
+had evaluated the vector at 1024, not 24, so the 60-level element never tripped. Three emissions
+produced by one harness that drops the same precondition are cohort-consistent by construction, not
+independent convergence. The harness half (`peeremit.go` encodes only `{"budget": Operations}`) is
+core-go's to fix; **the reason it cannot simply encode the other half is this spec gap**, which is a
+conformance-class question, not a harness one.
+
+**Interim choice (ours).** None — no code moved, and none should. `init_budget`
+(`extensions/compute/src/eval/`) reads `params_data` for `budget` alone, which is exactly what §5.2
+specifies; `bounds` carries `cascade_depth` / `chain_depth`, neither of which is evaluation depth.
+Inventing a request field here would be protocol design at an implementation seat.
+
+**Ask.** Either (a) add a depth dimension to the §5.2 request budget alongside `operations`, with
+the same min-against-the-ceiling semantics, or (b) state that evaluation depth is deliberately
+peer-only and non-negotiable per request — in which case the conformance class should say that a
+depth-declaring vector is **in-process-only by construction**, so a harness can refuse it rather
+than answer it and score the one seat that measured the stated condition as the outlier.
+
+**Corollary worth keeping regardless of the ruling.** The only other depth-pinned vector,
+`worked/recurse/tail-sum`, pins `Depth: 16` but recurses *tail* and 5 levels, so it passes at 16 and
+at 1024 alike. Every wire cross-bless anyone has published — ours included — has therefore been
+silent about the depth axis rather than confirming it.
+
+Routed to core-go (harness owner) and arch in
+`docs/validation/reports/2026-08-22-a-d3-closed-b1-fixed-and-cv9a-cannot-be-driven-over-the-wire.md`
+§3.

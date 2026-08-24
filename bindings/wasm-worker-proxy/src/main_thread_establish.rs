@@ -120,7 +120,46 @@ struct MainThreadWebRtcIo {
 ///   called on the negotiation path — an implementation that panics or blocks is
 ///   a consumer bug.
 pub trait IceObserver: Send + Sync {
-    fn negotiation_finished(&self, peer_id: &str, local_candidates: &[String], established: bool);
+    fn negotiation_finished(&self, report: NegotiationReport<'_>);
+}
+
+/// One finished negotiation, as an observer sees it.
+///
+/// A struct rather than a parameter list because it **grows**: the first version
+/// carried the local candidates and nothing else, and a consumer classifying on
+/// those alone is structurally unable to tell *"the network could not carry
+/// it"* from *"the far side was never there"* — two failures that are identical
+/// from here and have nothing in common as advice. Measured in a real browser:
+/// a chat opened against an offline peer was told *"no reflector is set up"*,
+/// which is both false and unactionable, because the only fact the observer had
+/// was `[Host]`.
+#[derive(Debug, Clone, Copy)]
+pub struct NegotiationReport<'a> {
+    pub peer_id: &'a str,
+    /// **Our own** agent's raw SDP candidate lines.
+    pub local_candidates: &'a [String],
+    pub established: bool,
+    /// Did the SDP exchange complete — offerer accepted an answer, or answerer
+    /// posted one? `true` means somebody was there and ICE is what failed;
+    /// `false` means the exchange never closed, so **nothing about the network
+    /// between the two peers was ever exercised** and no topology claim about
+    /// it can be honest.
+    ///
+    /// `None` is *not measurable*, never `false`: a carrier error or a policy
+    /// refusal fails before the negotiation loop can know either way, and a
+    /// consumer reading absence as "they did not answer" would blame a peer for
+    /// our own refusal.
+    pub sdp_exchange_complete: Option<bool>,
+    /// Counterpart ICE candidates actually fed to the agent, when the failure
+    /// could say.
+    ///
+    /// **Deliberately not the counterpart's *message* count.** That number
+    /// (`WebRtcError::Timeout::counterpart_msgs`) is skip-own-filtered against
+    /// *this* negotiation's own posts, so a peer retrying at the same pair key
+    /// counts its **previous** negotiation's deposits — still in the bucket for
+    /// their TTL — as the counterpart's. Measured: 8 "counterpart" messages
+    /// against a peer that was not running at all.
+    pub remote_candidates_fed: Option<usize>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -270,10 +309,39 @@ impl MainThreadWebRtcEstablisher {
     /// Report one finished negotiation. Called on **every** exit path after the
     /// session exists — a consumer that only ever hears about failures cannot
     /// clear the advice it is showing when the peer finally connects.
-    fn report_ice(&self, peer_id: &str, seen: &Rc<RefCell<Vec<String>>>, established: bool) {
-        if let Some(obs) = &self.ice_observer {
-            obs.negotiation_finished(peer_id, &seen.borrow(), established);
-        }
+    ///
+    /// `failure` is the error the negotiation ended with, when it ended in one.
+    /// Only [`WebRtcError::Timeout`] can say whether the far side ever answered
+    /// — every other variant failed before the loop could know, and reports
+    /// `None` rather than a `false` that reads as a claim about the counterpart.
+    fn report_ice(
+        &self,
+        peer_id: &str,
+        seen: &Rc<RefCell<Vec<String>>>,
+        established: bool,
+        failure: Option<&WebRtcError>,
+    ) {
+        let Some(obs) = &self.ice_observer else {
+            return;
+        };
+        let (sdp_exchange_complete, remote_candidates_fed) = match failure {
+            Some(WebRtcError::Timeout {
+                answered,
+                candidates_fed,
+                ..
+            }) => (Some(*answered), Some(*candidates_fed)),
+            // An open data channel is an SDP exchange that completed, by
+            // construction.
+            None if established => (Some(true), None),
+            _ => (None, None),
+        };
+        obs.negotiation_finished(NegotiationReport {
+            peer_id,
+            local_candidates: &seen.borrow(),
+            established,
+            sdp_exchange_complete,
+            remote_candidates_fed,
+        });
     }
 
     /// Drop a negotiation's session and close its `RTCPeerConnection`. Called on
@@ -414,7 +482,7 @@ impl LiveEstablish for MainThreadWebRtcEstablisher {
                 // Report AFTER `discard_session` but BEFORE returning: the tee
                 // outlives the session, and this is the failure a consumer most
                 // needs to classify.
-                self.report_ice(peer_id, &seen, false);
+                self.report_ice(peer_id, &seen, false, Some(&e));
                 return Err(mapped);
             }
         };
@@ -429,7 +497,7 @@ impl LiveEstablish for MainThreadWebRtcEstablisher {
         // The success half of the contract. A consumer told only about failures
         // would keep showing "this network needs a relay" over a working
         // connection — the cry-wolf failure, arriving late instead of early.
-        self.report_ice(peer_id, &seen, true);
+        self.report_ice(peer_id, &seen, true, None);
 
         // §6.5 → §7.4.1, "one role assignment, not two": the peer that offered
         // is the initiator and sends HELLO; the peer that answered serves it.

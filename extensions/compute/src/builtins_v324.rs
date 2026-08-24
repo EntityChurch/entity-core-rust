@@ -447,78 +447,49 @@ pub(crate) fn dispatch_concat(
 
 /// Resolve `concat`'s `collections` arg into the sub-collections it names.
 ///
-/// **Two encodings reach this, and both are accepted.** The landed §3.5 declares
-/// `concat-args.collections` as `{array_of: {type_ref: "system/hash"}}` — an
-/// array of expression hashes — while `compute/apply`'s args map is
-/// `name → hash`, so a `collections` arg arriving through apply is a *single*
-/// hash naming an expression that evaluates to an array of arrays. The corpus
-/// vectors (CV-5, CV-7c) carry the second form. Both are read; the CBOR kind of
-/// the field distinguishes them without ambiguity (`Bytes` = one hash, `Array`
-/// = many). Logged in `docs/SPEC-AMBIGUITIES.md`.
+/// **One encoding, since D3.** `collections` is a *single* `system/hash` naming
+/// an expression that evaluates to an array of arrays — the form
+/// `compute/apply`'s `name → hash` args map produces, the form the corpus
+/// carries (CV-5, CV-7c), and the form every seat's evaluator reads.
 ///
-/// **C-11 Corner 2 (D3) rules the single-hash form normative and withdraws the
-/// array — and that is deliberately NOT implemented here yet.** The derivation
-/// is worth recording because it is not the obvious one and it is not
-/// "three seats agree": §7.1's reactive `walk` recurses only on **scalar**
-/// `system/hash` field values, so under the array shape every
-/// `compute/lookup/tree` inside every sub-collection goes unregistered and a
-/// reactive `concat` evaluates correctly once and is then never woken again.
+/// **This function previously accepted a second encoding and that is the half of
+/// D3 the routing did not scope.** The pre-D3 §3.5 declared `collections` as
+/// `{array_of: {type_ref: "system/hash"}}`, so we read a literal CBOR array of
+/// expression hashes as well, distinguishing on the field's CBOR kind. C-11
+/// Corner 2 withdraws that shape.
 ///
-/// It is held because the ruling is a DRAFT proposal targeting v3.27 and the
-/// declaration it changes is a **published contract**: landing it at one seat
-/// scores a cross-impl FAIL against every seat that has not
-/// (`type_system_compute_concat_args_match`, measured 1F here). It lands with
-/// the v3.27 fold, cohort-wide, not seat-by-seat.
+/// **Recomputed against this tree, D3 is not declaration-only here.** Arch and
+/// core-go both scope it as *"declaration-only, nothing on the wire moves"* —
+/// true **at go's seat**, where `builtinConcat` resolves `collections` through
+/// `evalControlArg` as one arg and the literal-array form was never evaluable.
+/// Here it was, so we accepted a program shape go rejects: a divergence in the
+/// lenient direction, which is the fail-open one, and one no corpus vector
+/// reaches because no vector authors the withdrawn shape. The delta at this seat
+/// is the descriptor **plus** this branch; reported as a scope difference rather
+/// than closed as written.
+///
+/// Refusal is now by construction rather than by a branch: a `Value::Array`
+/// field is not a `system/hash`, so `eval_ref` rejects it. That is the same
+/// disposition go reaches by decoding `Args` as `map[string]hash.Hash`.
+///
+/// The standing reason for D3 is **uniformity + arity** — the literal-array
+/// shape froze `concat`'s arity at authoring time. Arch's originally-published
+/// §7.1-walk derivation is **retracted** (`ROUTING-2026-08-21-h` §4a): no
+/// implementation had that defect, and `apply.args` / `let.bindings` are older
+/// containers of the same kind. Do not carry that argument.
 fn resolve_concat_collections(
     data: &Value,
     scope: &Scope,
     budget: &mut Budget,
     ctx: &mut EvalContext<'_>,
 ) -> Result<Vec<Vec<Value>>, ComputeValue> {
-    let field = match data.get("collections") {
-        Some(f) => f.clone(),
-        None => {
-            return Err(
-                ComputeError::MissingArgument("concat: missing 'collections'".into()).to_value(),
-            )
-        }
-    };
-
-    // Spec-declared form: an array of expression hashes, each an array.
-    if let Value::Array(entries) = &field {
-        let mut out = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let hash = match entry.as_bytes().and_then(|b| Hash::from_bytes(b).ok()) {
-                Some(h) => h,
-                None => {
-                    return Err(ComputeError::TypeMismatch(
-                        "concat: each collections entry must be a system/hash".into(),
-                    )
-                    .to_value())
-                }
-            };
-            let target = ctx.resolve_or_error(&hash, "concat collection")?;
-            let value = crate::eval::evaluate(&target, scope, budget, ctx);
-            // Each sub-collection is a CONSUMED operand (its length is read to
-            // copy), so an error there short-circuits.
-            if value.is_error() {
-                return Err(value);
-            }
-            match value {
-                ComputeValue::Primitive(Value::Array(items)) => out.push(items),
-                other => {
-                    return Err(ComputeError::TypeMismatch(format!(
-                        "concat: each collection must be an array, got {}",
-                        value_kind(&other)
-                    ))
-                    .to_value())
-                }
-            }
-        }
-        return Ok(out);
+    if data.get("collections").is_none() {
+        return Err(
+            ComputeError::MissingArgument("concat: missing 'collections'".into()).to_value(),
+        );
     }
 
-    // Apply form: one hash naming an expression that yields an array of arrays.
+    // One hash naming an expression that yields an array of arrays.
     let value = consumed_arg(
         data,
         "collections",

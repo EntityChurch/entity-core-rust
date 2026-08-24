@@ -432,23 +432,17 @@ impl SubstituteConsultHook for ChainConsultHook {
                 "substitute_consult: trying entry"
             );
 
-            // Params shape (Ruling 2 — `system/substitute/try-request`):
-            //   { entry: <bstr of encode_entity(source)>, hash: <bstr of requested_hash> }
-            // The `entry` field carries the FULL source entity inline as
-            // wire-encoded bytes. The convention handler decodes the
-            // bytes back into an Entity directly — no local-store
-            // re-lookup. Byte fidelity is preserved (the entity arrives
-            // as raw bytes, never decoded-and-re-encoded in transit per
-            // CLAUDE.md's interop pitfall).
+            // Params shape (§2.3 — `system/substitute/try-request`):
+            //   { hash: <bstr 33>, entry: <the source ENTITY, as a value> }
+            // The `entry` field carries the FULL source entity inline so the
+            // convention handler needs no local-store re-lookup (Ruling 2).
+            // It is an entity value, NOT a bstr wrapping one — go and py both
+            // read it that way, and until the http handler was registered on
+            // a peer nothing could catch that our encoder and our decoder
+            // were wrong together. Byte fidelity is preserved: the entity's
+            // `data` is spliced raw, never decoded-and-re-encoded.
             let entry_bytes = entity_wire::encode_entity(&candidate.entity);
-            let params_value = build_try_request(&entry_bytes, hash);
-            let params_bytes = match encode_value(&params_value) {
-                Ok(b) => b,
-                Err(e) => {
-                    last_error = Some(format!("encode_failed: {}", e));
-                    continue;
-                }
-            };
+            let params_bytes = build_try_request(&entry_bytes, hash);
             let params = match Entity::new(TYPE_SUBSTITUTE_TRY_REQUEST, params_bytes) {
                 Ok(e) => e,
                 Err(e) => {
@@ -552,22 +546,68 @@ fn is_transient(status: u32) -> bool {
         || status == entity_handler::STATUS_INTERNAL_ERROR
 }
 
-fn build_try_request(entry_entity_bytes: &[u8], target_hash: &Hash) -> ciborium::Value {
-    use ciborium::Value;
-    Value::Map(vec![
-        (
-            Value::Text("entry".to_string()),
-            Value::Bytes(entry_entity_bytes.to_vec()),
-        ),
-        (
-            Value::Text("hash".to_string()),
-            Value::Bytes(target_hash.to_bytes().to_vec()),
-        ),
-    ])
+/// Encode the §2.3 `system/substitute/try-request` data map.
+///
+/// `entry` is declared `system/substitute/source` — the entity travels as a
+/// **value** in the map, not as a bstr wrapping its wire bytes. Built by hand
+/// rather than through `ciborium::Value` for the same reason `encode_entity`
+/// is: the source's `data` is spliced in as raw CBOR and never
+/// decoded-and-re-encoded.
+///
+/// ECF key order is by encoded key length then lexicographic, so `hash`
+/// (5 bytes) precedes `entry` (6 bytes).
+fn build_try_request(entry_entity_bytes: &[u8], target_hash: &Hash) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(0xA2); // map(2)
+    entity_ecf::encode_cbor_text(&mut out, "hash");
+    entity_ecf::encode_cbor_bstr(&mut out, &target_hash.to_bytes());
+    entity_ecf::encode_cbor_text(&mut out, "entry");
+    out.extend_from_slice(entry_entity_bytes);
+    out
 }
 
-fn encode_value(v: &ciborium::Value) -> Result<Vec<u8>, ciborium::ser::Error<std::io::Error>> {
-    let mut out = Vec::new();
-    ciborium::into_writer(v, &mut out)?;
-    Ok(out)
+#[cfg(test)]
+mod try_request_shape_tests {
+    use super::*;
+    use entity_entity::Entity;
+
+    /// §2.3's `entry` is an entity **value**, and the discriminator is the
+    /// CBOR major type of the field — not that the field round-trips.
+    ///
+    /// **Why the round-trip is not the assertion.** Our encoder and our
+    /// decoder agreed on `Value::Bytes` for as long as this handler was
+    /// unregistered, so `decode(encode(x)) == x` was green under the wrong
+    /// shape the whole time — the tautology the charter names. What separates
+    /// the two readings is one byte: a CBOR map head (major type 5) versus a
+    /// bstr head (major type 2). This test reads that byte.
+    ///
+    /// Measured on the wire, not argued: with the bstr shape, core-go's
+    /// `substitute` category scored this seat 5P/**3F** (every check that
+    /// needed a decoded `entry` failed at the first field); with the map
+    /// shape, 8P/0F.
+    #[test]
+    fn entry_travels_as_an_entity_value_never_as_a_bstr() {
+        let source = Entity::new("system/substitute/source", vec![0xA0]).unwrap();
+        let target = Hash::from_bytes(&[0u8; 33]).unwrap();
+        let params = build_try_request(&entity_wire::encode_entity(&source), &target);
+
+        let entry = entity_wire::cbor_map_field_raw(&params, "entry")
+            .expect("try-request must carry an `entry` field");
+        let major = entry[0] >> 5;
+        assert_eq!(
+            major, 5,
+            "entry must be a CBOR map (the entity value); major type {major} — \
+             major 2 is the bstr shape that could not be decoded by go or py"
+        );
+
+        // And it must still be the same entity, spliced rather than re-encoded.
+        let decoded = entity_wire::decode_entity(entry).expect("entry decodes as an entity");
+        assert_eq!(decoded.entity_type, "system/substitute/source");
+        assert_eq!(decoded.content_hash, source.content_hash);
+
+        // `hash` stays a bstr — §2.3 types it `system/hash`, and the two
+        // fields taking different CBOR shapes is the point.
+        let h = entity_wire::cbor_map_field_raw(&params, "hash").expect("hash field");
+        assert_eq!(h[0] >> 5, 2, "hash must remain a bstr");
+    }
 }

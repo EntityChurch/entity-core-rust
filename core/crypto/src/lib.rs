@@ -35,6 +35,63 @@ use entity_entity::Entity;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+/// Mode for a persisted private key: owner read/write, nothing for group or
+/// other. Matches `entity-core-go`'s `core/crypto/keypair.go` (`0600`,
+/// documented there as such) — an independent implementation that got this
+/// right deliberately.
+#[cfg(unix)]
+const PRIVATE_KEY_MODE: u32 = 0o600;
+
+/// Write PEM private-key material to `path` with owner-only permissions.
+///
+/// **The single writer for every private key this crate persists.** Both
+/// [`Keypair::save_to_file`] and [`IdentityKeypair::save_to_file`]'s Ed448 arm
+/// route through here; a second `std::fs::write` of `to_pem()` output anywhere
+/// in the tree is the defect this function exists to make unrepresentable
+/// (B-1, arch `COHORT-OPEN-ITEMS` §0b — the Ed25519 arm was found first and the
+/// Ed448 arm had the identical defect, so fixing one site would have left every
+/// Ed448 key world-readable).
+///
+/// **Mode is set at creation, not chmod-ed afterwards.** A `fs::write` followed
+/// by `set_permissions` leaves a window in which the key exists on disk at
+/// `0644` — small, but the whole content of the file is the secret.
+///
+/// The explicit `set_permissions` on the open handle is the *second* half and
+/// covers a different case: `OpenOptions::mode` applies only when the file is
+/// created, so re-minting over an existing `0644` key would otherwise keep the
+/// old mode. It operates on the fd, not the path, so it cannot be raced onto a
+/// substituted file — and it runs **before** the write, so the bytes never land
+/// in a world-readable inode.
+///
+/// Non-unix targets (including `wasm32`, where a browser peer keeps key
+/// material in OPFS and never reaches this path) fall back to a plain write:
+/// there is no portable mode to set, and silently pretending otherwise would be
+/// worse than the platform's own default.
+fn write_private_key_file(path: &Path, pem: &str) -> Result<(), CryptoError> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(PRIVATE_KEY_MODE)
+            .open(path)
+            .map_err(|e| CryptoError::IoError(e.to_string()))?;
+        file.set_permissions(std::fs::Permissions::from_mode(PRIVATE_KEY_MODE))
+            .map_err(|e| CryptoError::IoError(e.to_string()))?;
+        file.write_all(pem.as_bytes())
+            .map_err(|e| CryptoError::IoError(e.to_string()))?;
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, pem).map_err(|e| CryptoError::IoError(e.to_string()))
+    }
+}
+
 /// Key type identifier for Ed25519 (production allocation per V7 §1.5).
 pub const KEY_TYPE_ED25519: u8 = 0x01;
 
@@ -411,9 +468,13 @@ impl Keypair {
     }
 
     /// Save the keypair to a file (PEM-wrapped private key + `.pub` file).
+    ///
+    /// The private key is written `0600` via [`write_private_key_file`]; the
+    /// `.pub` sidecar is deliberately left at the process umask, because it is
+    /// public by construction.
     pub fn save_to_file(&self, path: &Path) -> Result<(), CryptoError> {
         let pem = self.to_pem();
-        std::fs::write(path, pem).map_err(|e| CryptoError::IoError(e.to_string()))?;
+        write_private_key_file(path, &pem)?;
 
         // Write public key file
         let pub_path = path.with_extension("pub");
@@ -1148,12 +1209,15 @@ impl IdentityKeypair {
     }
 
     /// Save the identity to a PEM file plus a `.pub` sidecar.
+    ///
+    /// Both arms write the private key `0600` — the Ed25519 arm through
+    /// [`Keypair::save_to_file`], this one through the same
+    /// [`write_private_key_file`]. They are the two sites B-1 names.
     pub fn save_to_file(&self, path: &Path) -> Result<(), CryptoError> {
         match self {
             Self::Ed25519(kp) => kp.save_to_file(path),
             Self::Ed448(_) => {
-                std::fs::write(path, self.to_pem())
-                    .map_err(|e| CryptoError::IoError(e.to_string()))?;
+                write_private_key_file(path, &self.to_pem())?;
                 let pub_path = path.with_extension("pub");
                 let pub_line = format!(
                     "entity-{} {} {}\n",
@@ -1478,6 +1542,91 @@ mod tests {
         let kp = Keypair::from_seed(TEST_SEED);
         kp.save_to_file(&path).unwrap();
         assert!(Keypair::exists_at(&path));
+    }
+
+    // ---------------- B-1: a persisted private key is owner-only ----------------
+    // arch `COHORT-OPEN-ITEMS` §0b. Both `save_to_file` arms wrote the PEM with a
+    // bare `std::fs::write`, which is `O_CREAT` at 0o666 reduced by the umask —
+    // 0644 under the default 0022.
+    //
+    // **The obvious assertion is not the discriminator, and that is the point of
+    // the second row.** `assert mode == 0o600` on a freshly-minted key is a claim
+    // about the *umask*, not about this code: run the suite under `umask 0077` and
+    // the unfixed `fs::write` produces 0600 and passes. The row that cannot be
+    // defeated by the environment is the **re-mint over an existing 0644 file** —
+    // it is false under `fs::write` at every umask, because `write` preserves the
+    // mode of a file it did not create. Mutation-verified in both directions.
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn saved_private_key_is_not_readable_by_group_or_other() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let ed25519_path = dir.path().join("ed25519key");
+        Keypair::from_seed(TEST_SEED)
+            .save_to_file(&ed25519_path)
+            .unwrap();
+        assert_eq!(mode_of(&ed25519_path), 0o600, "Ed25519 arm");
+
+        // The Ed448 arm is the *second* site B-1 names — it has no sibling
+        // implementation to compare against, so fixing only Ed25519 would have
+        // left it exposed with nothing to catch it.
+        let ed448_path = dir.path().join("ed448key");
+        let seed = [0x42u8; ED448_SECRET_KEY_LEN];
+        let ed448 = IdentityKeypair::Ed448(Ed448Keypair::from_seed(&seed).unwrap());
+        ed448.save_to_file(&ed448_path).unwrap();
+        assert_eq!(mode_of(&ed448_path), 0o600, "Ed448 arm");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn re_minting_over_a_world_readable_key_clamps_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("testkey");
+
+        // A key minted by a peer built before this fix — or re-keyed in place.
+        std::fs::write(&path, "stale").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(mode_of(&path), 0o644, "precondition");
+
+        Keypair::from_seed(TEST_SEED).save_to_file(&path).unwrap();
+
+        // `OpenOptions::mode` alone would NOT have fixed this: it applies only
+        // when the file is created. The explicit `set_permissions` on the open
+        // handle is what closes it, and it runs before the write.
+        assert_eq!(mode_of(&path), 0o600);
+        assert!(std::fs::read_to_string(&path).unwrap().contains("BEGIN"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn the_public_sidecar_is_not_clamped() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("testkey");
+        let pub_path = path.with_extension("pub");
+
+        // Pre-created at 0644 so this row is umask-independent too: `fs::write`
+        // preserves an existing mode, so the assertion is purely about which
+        // writer the sidecar goes through. The `.pub` file is public by
+        // construction and routing it through the private writer would be a
+        // (harmless but wrong) over-correction that hides the real rule.
+        std::fs::write(&pub_path, "placeholder").unwrap();
+        std::fs::set_permissions(&pub_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        Keypair::from_seed(TEST_SEED).save_to_file(&path).unwrap();
+
+        assert_eq!(mode_of(&pub_path), 0o644);
+        assert_eq!(mode_of(&path), 0o600);
     }
 
     // ---------------- v7.64 PIM-* conformance vectors ----------------

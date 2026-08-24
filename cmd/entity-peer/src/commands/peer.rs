@@ -280,6 +280,46 @@ pub async fn start(
         anyhow::bail!("sqlite storage requires the 'sqlite' feature (not compiled in)");
     }
 
+    // EXTENSION-SUBSTITUTE §6/§7: mount the `system/substitute/http`
+    // convention handler.
+    //
+    // **Why unconditional, and why this line exists at all.** The crate was
+    // built, unit-tested and reachable from nothing: exhaustively, no
+    // `Cargo.toml` outside `extensions/storage-substitute-*` depended on
+    // `entity-storage-substitute-http`, so `system/substitute/http` was a
+    // surface present in the tree and absent from the substrate — the shape
+    // our charter names, and the sole reason go's release gate scored this
+    // peer `substitute 0P/1S` (a skip counts as a failure) while go and py
+    // both answered. §6's convention-dispatch model requires the convention
+    // to be reachable by ordinary handler dispatch, which means registered,
+    // not merely compiled. core-go registers it in its peer binary the same
+    // way (`cmd/entity-peer/main.go`, `WithHandler(HandlerPattern, …)`).
+    //
+    // **Admission is still the peer's.** `PeerBuilder::handler` mints the
+    // interface entity, the handler entity, the dispatch-index binding and
+    // the §6.9 grant; whether an unknown caller reaches `try` is decided by
+    // the peer's existing posture, exactly as for `--signaling-node` below.
+    // The §8 capability scoping inside the chain-consult substrate is
+    // unchanged and still fail-closed.
+    //
+    // **No `--substitute-allow-http` here, deliberately.** Go carries that
+    // flag as a testing escape hatch for loopback fixture registries; this
+    // handler refuses a non-`https://` prefix at consume time
+    // unconditionally (`url.rs`, `build_content_url`), which is TV-CDN-TLS-1's
+    // floor with no way to lower it. Do not add the flag to make some future
+    // fixture convenient — the refusal is the security property, and a peer
+    // running with it disabled is not TLS-conformant.
+    //
+    // **What this does NOT wire:** the §3 chain-consult orchestrator
+    // (`ChainConsultHook`) is still not installed as a `MissResolver`, so the
+    // `TV-SS-*` chain vectors remain undrivable here and their declared
+    // exclusion in `docs/validation/CONFORMANCE-EXCLUSIONS.md` stands on its
+    // first ground only (`claimed_source_peer_id` is dispatcher context, not
+    // a wire field — cohort-convergent across all three impls).
+    builder = builder.handler(std::sync::Arc::new(
+        entity_storage_substitute_http::HttpSubstituteHandler::new(peer_id.as_str()),
+    ));
+
     // EXTENSION-SIGNALING §4/§5: mount the rendezvous node on this peer.
     // Installed through the same public `PeerBuilder::handler` seam
     // `entity-signaling-node` uses — that seam mints the interface entity, the
