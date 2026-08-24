@@ -5799,7 +5799,37 @@ way today, and turning one reader keyed to satisfy an item's wording made a gree
 
 ---
 
-## EXTENSION-REGISTRY §4.1 step 2 — *"eligible for an unscoped name"* is the load-bearing term of a MUST, and it is defined only by example
+## ~~EXTENSION-REGISTRY §4.1 step 2 — *"eligible for an unscoped name"* is the load-bearing term of a MUST, and it is defined only by example~~ RESOLVED
+
+> **RULED — REGISTRY v1.19 §4.1b, *"Which patterns are 'broad' — the classifier
+> `[MUST, v1.19]`"*, with §4.1b.1's enumerated typed suffixes. RESOLVED; landed here
+> alongside R-16 and R-11 row 7.**
+>
+> **The ask was answered in the shape it asked for**: a grammar, in §4's own style —
+> NARROW iff **(a)** no `*`, **(b)** a literal `@`, **(c)** the literal head before the
+> first `*` ends in `:`, or **(d)** it ends in an **enumerated** typed suffix (§4.1b.1
+> = `{.eth}`) with no `*` after — otherwise BROAD, i.e. *"the pattern can match at
+> least one bare name."* And `REG-DISPATCH-CONFIG-REFUSED-1` gained the per-form row
+> (row 7, five patterns), which was the other half of the ask.
+>
+> **Two of the undetermined shapes above went against our interim reading, and the
+> ruling names both.** A bare literal (`alice`, `a.b`) is **NARROW** by (a) — we and
+> go both had it broad, and rule (a)'s argument is that a pattern with no `*` matches
+> exactly one name, which is a routing decision the operator wrote out. And a literal
+> dotted suffix is **not** a marker: `*.lab` is **BROAD**, because *"the line is not
+> 'does a literal exist' but 'does the literal identify an authority or a naming
+> system'"* — which is enumerated, precisely so that admitting one is a reviewed
+> privacy decision rather than an inference from pattern shape. Our `*.<literal>`
+> interim rule read `.lab`, `.com` and every other suffix as narrow; that was the
+> fail-open direction, and it was the one place our residual pointed the wrong way.
+> Rule (c) is also tighter than the `:`-anywhere test both seats shipped: in `*:foo`
+> the colon sits behind a star, so nothing constrains the head.
+>
+> Landed at `resolver::pattern_matches_unscoped_name` + `ENUMERATED_TYPED_SUFFIXES`,
+> pinned by `the_v1_19_broad_classifier_follows_the_four_rules` (rule by rule) and
+> `classifier_rows_decide_set_resolver_config_the_way_row_7_drives_them`. The in-tree
+> table was **rewritten** by this change, so it is not the witness for itself — row 7
+> on the wire is.
 
 **Spec:** `EXTENSION-REGISTRY` §4.1 step 2 (*"a distribution's shipped `resolver-config` MUST NOT
 make a name-transmitting backend eligible for an **unscoped** name"* `[MUST, v1.14]`) ⨯ §4.1a (the
@@ -5859,3 +5889,105 @@ reading across and starts refusing configurations a sibling accepts.
 **Not urgent, and specifically not a divergence report:** we measured go's classifier and ours as
 behaviourally identical on every pattern either spec section names. This is filed so the agreement
 stays a fact somebody chose rather than a coincidence nobody checked.
+
+---
+
+## ~~EXTENSION-REGISTRY §4.3 / §5 — the pin-delta MUST names `registry-pin`, but no capability *encoding* expresses "pin authority" (core-go `2026-08-20-a`)~~ RESOLVED
+
+> **RULED 2026-08-20 — arch `08841d8`, `PROPOSAL-REGISTRY-PIN-AUTHORITY-CAPABILITY-ENCODING`
+> §3, cohort item R-27. RESOLVED; landed here at the commit carrying this note.**
+>
+> **Option 1: pin authority is authority over the operation `pin-bindings` `[MUST]`** — the
+> interim choice both go and we shipped, ruled in. **The derivation is V7's, not the
+> cohort's**, which is the part worth reading: a grant scopes on path-scope and id-scope
+> only, and the path axis is *explicitly non-portable* (*"peers that diverge remain
+> conformant"* on path locations), so the **operation name is the sole portable
+> discriminator**. A path split was also unavailable in fact — `pinned_bindings` is a *field
+> of* `resolver-config`, not a path under it. Arch names all three seats independently
+> choosing the same string as corroboration and explicitly **not** as the argument (L18), and
+> states the operative test: had all three chosen a resource path, §2 would not change.
+>
+> **The defect underneath is arch's own, and it is the interesting half.** §5's maintained
+> rule — *"every row's operations column names an operation"* — was satisfied in letter and
+> not in substance: `registry-pin`'s column named *"the §4.3 write whose `pinned_bindings`
+> differ"*, which is **a condition on another row's operation**, and a runtime data condition
+> is not something a grant can carry. The rule had been written one incident too narrow
+> (against *"a bare tree-write"*), so it caught the absence of an enforcement point and missed
+> the absence of a **distinguishable** one.
+>
+> **Four clauses, and two of them were behaviour we had for reasons we had not written down:**
+> (1) the encoding, already shipped; (2) `pin-bindings` **MUST NOT be dispatchable** — pinned
+> because it is the one place a seat could diverge into a new wire surface; (3) the
+> **byte** comparison, which arch adopts rather than rules, crediting this seat's review of
+> go's decode-round-trip fail-open (go fixed at `f44ed4d`); (4) **capability checks precede
+> config validation**, whose reason is an information leak, not tidiness — §4.3's refusal body
+> is deliberately verbose, so validating first hands a config-shaped disclosure to a caller
+> with no authority to change anything.
+>
+> Gated here by `pin_bindings_is_a_discriminator_and_not_a_dispatchable_operation` (clause 2)
+> and `an_unauthorized_pin_change_answers_not_entitled_before_it_answers_policy_rejected`
+> (clause 4, with the control that keeps it from passing by always answering `not_entitled`).
+> **The deferral this entry existed to justify is discharged**: `REG-DISPATCH-CONFIG-REFUSED-1`
+> row 8 is on the wire and green against this peer, mutation-verified.
+>
+> **Fold owed by arch** — D1–D5 into `EXTENSION-REGISTRY` §4.3 / §5 / §11. The ruling is in
+> force ahead of the fold, so a reader of the landed spec text will not find clauses 2 and 4
+> yet; that is why they are quoted at the code here rather than only cited.
+
+**Spec:** `EXTENSION-REGISTRY` §4.3 (*"a write that changes `pinned_bindings` additionally
+requires `system/capability/registry-pin` … absent the latter, refuse `403 not_entitled` and
+write nothing"* `[MUST, v1.19]`) ⨯ §5's capability table.
+**Raised by:** `entity-core-go` implementing R-16 (go `a34c61f`); **mirrored here**, not
+independently filed — we implement the same behavior and inherit the same gap.
+
+**Status: RULED (see banner). The filing below is the original, kept for the argument it
+made.**
+
+### The gap
+
+The **behavior** is ruled and unambiguous. What is not fixed is how a capability *says* "pin
+authority": §5's names are descriptive, and in all three seats authorization is **grant-scoped**
+rather than a named-capability lookup — our `CAP_REGISTRY_PIN` constant is referenced by no check,
+exactly as go's `CapRegistryPin` was. So each seat must invent an encoding.
+
+### Why it blocks a vector rather than being an impl detail
+
+`REG-DISPATCH-CONFIG-REFUSED-1` row 8 has to **mint** a configure-only and a configure+pin
+capability and present them, and `validate-peer` is a shared harness that drives all three peers.
+A harness minting one seat's encoding gets `403 not_entitled` on the **configure+pin** row against
+a conformant peer that chose another — a false red on the row that proves the check is not a
+blanket refusal. That is the deceptive-green/false-red trap our own charter names, so row 8 stays
+in-tree in every seat until the encoding is fixed.
+
+### Interim choice (ours = go's, deliberately)
+
+Authority over a distinguished cap-check operation, `pin-bindings`, on the registry handler
+(`resolver::OP_PIN_BINDINGS`) — separated from `registry-configure` on the **operation** axis,
+because a resource split would collide with configure's own `system/registry/*`. We took go's
+encoding rather than a third one **because the encoding is open**: two seats guessing differently
+turns one routed question into a divergence report. It is not advertised in `operations()` — it is
+a cap discriminator, not an operation the handler answers.
+
+### ~~One place we are deliberately stricter than go~~ — CONVERGED: go adopted it, arch recorded it
+
+> **Closed 2026-08-20.** go fixed the decode-round-trip compare at `f44ed4d` (mutation-verified);
+> py decodes to a native mapping and never had the field-drop. Arch's §5 **adopts rather than
+> rules** it — *"§4.3's word was already 'byte-identical' and rust read it literally, which is the
+> correct reading"* — and records it because **the operation name and the byte rule are the two
+> halves of one check**: a fold landing the first without restating the second would be precise
+> about *who* and vague about *what changed*. The original note follows.
+
+
+Our pin-delta predicate compares the **raw CBOR bytes** of `pinned_bindings` (go compares the
+re-encoded decoded entries). §4.3's own word is *"byte-identical"*, and the decoded compare is
+fail-**open** on exactly the case §4.2 exists to permit: a pin entry carrying a key the codec does
+not model can be rewritten under a configure-only grant while the diff reports "no change". Absent
+and `[]` are normalized to the same fact, so the strictness costs nothing on a spelling. Pinned by
+`a_pin_field_this_codec_does_not_model_still_counts_as_a_pin_change` — mutation-verified as the
+one row that separates the two implementations, and reported to the cohort rather than left as a
+silent divergence.
+
+### Ask (go's, restated so this tree carries it)
+
+Name the pin-authority discriminator in §4.3/§5 — one sentence — **or** declare it
+implementation-defined and scope row 8 to in-process per seat. Either makes the vector honest.

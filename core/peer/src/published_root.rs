@@ -1040,7 +1040,10 @@ mod tests {
             client.resolve("system/k3").unwrap().unwrap().content_hash,
             leaves[3].content_hash
         );
-        assert!(client.resolve("system/nope").unwrap().is_none(), "control: a real absence");
+        assert!(
+            client.resolve("system/nope").unwrap().is_none(),
+            "control: a real absence"
+        );
 
         // The attack: serve a valid, well-formed entity for the TRIE ROOT's
         // hash. It decodes, it re-hashes to something else, and the walk cannot

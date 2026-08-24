@@ -4579,13 +4579,523 @@ fn the_recommended_default_dispatch_list_satisfies_its_own_catch_all_must() {
     for narrow in ["did:web:*", "did:key:*", "*.eth", "*@*.*", "*@*"] {
         assert!(!pattern_matches_unscoped_name(narrow), "{narrow} is scoped");
     }
-    for broad in ["*", "a*", "*.*", "alice"] {
+    for broad in ["*", "a*", "*.*"] {
         assert!(
             pattern_matches_unscoped_name(broad),
             "{broad} reaches a bare name — `*.*`'s suffix is a star, not a \
              literal, so it matches `alice.bob` as readily as a domain"
         );
     }
+}
+
+/// §4.1b's classifier, rule by rule `[MUST, v1.19]` — the grammar that replaced
+/// the predicate §4.1 step 2 had been turning on with no definition.
+///
+/// **Two of these rows moved when the ruling landed, and both are rows the
+/// ruling itself names as a seat's divergence.** `alice` / `a.b` are NARROW by
+/// rule (a) — we classified any pattern free of `@` and `:` as broad, so an
+/// exact literal came out broad. `*.lab` is BROAD — we accepted any literal
+/// dotted suffix, and *"the line is not 'does a literal exist' but 'does the
+/// literal identify an authority or a naming system'"*, which is enumerated in
+/// §4.1b.1 (`.eth`, and nothing else, growing only by spec revision).
+///
+/// **Rewriting a test's expectation destroys its value as evidence**, so the
+/// witness for this table is not this test: it is
+/// `REG-DISPATCH-CONFIG-REFUSED-1` row 7, which drives the five diverging
+/// patterns through `set-resolver-config` from core-go's harness. This test is
+/// the unit-level statement of the same rule, and the four `assert!`s below are
+/// grouped by the rule each row exercises so a future edit has to say which
+/// rule it thinks it is changing.
+#[test]
+fn the_v1_19_broad_classifier_follows_the_four_rules() {
+    // (a) no `*` — matches exactly one name, so it is a routing decision the
+    // operator wrote out. This is the row that moved.
+    for narrow in ["a.b", "alice", "alice.eth", "alice.lab", "billslab.com"] {
+        assert!(
+            !pattern_matches_unscoped_name(narrow),
+            "{narrow} has no `*` — rule (a) makes it narrow whatever it looks like"
+        );
+    }
+    // (b) a literal `@` anywhere — the user named an authority.
+    for narrow in ["*@*", "*@*.*", "*@example.org", "alice@*"] {
+        assert!(!pattern_matches_unscoped_name(narrow), "{narrow}: rule (b)");
+    }
+    // (c) the literal head before the FIRST `*` ends in `:` — a scheme prefix.
+    // `:` anywhere is not the rule: in `*:foo` the `:` sits behind a leading
+    // star, so nothing constrains the head and the pattern reaches bare names.
+    assert!(!pattern_matches_unscoped_name("did:web:*"), "rule (c)");
+    assert!(!pattern_matches_unscoped_name("did:key:*"), "rule (c)");
+    assert!(
+        pattern_matches_unscoped_name("*:foo"),
+        "`*:foo` has a `:` but not in its head — rule (c) does not fire"
+    );
+    // (d) ends in an enumerated typed suffix (§4.1b.1). `.eth` is the whole
+    // list; an unrecognized suffix leaves the pattern broad, which is the
+    // fail-safe direction.
+    assert_eq!(
+        crate::resolver::ENUMERATED_TYPED_SUFFIXES,
+        &[".eth"],
+        "the suffix list grows ONLY by spec revision — admitting one is a \
+         privacy decision, not an implementation choice"
+    );
+    assert!(!pattern_matches_unscoped_name("*.eth"), "rule (d)");
+    assert!(!pattern_matches_unscoped_name("alice*.eth"), "rule (d)");
+    assert!(
+        pattern_matches_unscoped_name("*.lab"),
+        "`.lab` is not enumerated — this is the row the ruling names, and \
+         reading it narrow discloses a namespace nobody reviewed"
+    );
+    assert!(
+        pattern_matches_unscoped_name("*.e*"),
+        "a trailing `*` means the pattern does not END in a fixed suffix"
+    );
+    // Otherwise broad.
+    for broad in ["*", "a*", "*.*", "*.com", "*b*"] {
+        assert!(pattern_matches_unscoped_name(broad), "{broad} is broad");
+    }
+}
+
+/// Row 7 of `REG-DISPATCH-CONFIG-REFUSED-1`, driven in-tree at the surface the
+/// wire check drives it at: five patterns that each name `did-web` with a
+/// `did-web` chain entry present, so the ONLY thing deciding 200 vs 403 is the
+/// §4.1b classification.
+#[tokio::test]
+async fn classifier_rows_decide_set_resolver_config_the_way_row_7_drives_them() {
+    for (pattern, refused) in [
+        ("*.*", true),
+        ("*.e*", true),
+        ("*.eth", false),
+        ("a.b", false),
+        ("*.lab", true),
+    ] {
+        let (cs, li) = stores();
+        let handler = registry(&cs, &li);
+        let cfg = ResolverConfigData {
+            resolver_chain: vec![chain_entry("local-name", 0), chain_entry("did-web", 1)],
+            name_format_dispatch: vec![dispatch(pattern, &["did-web"])],
+            ..Default::default()
+        };
+        let r = handler.handle(&set_config_ctx(&cfg, false)).await.unwrap();
+        if refused {
+            assert_eq!(r.status, 403, "row 7 {pattern}: a BROAD pattern discloses");
+            assert_eq!(
+                err_code(&r).as_deref(),
+                Some("policy_rejected"),
+                "{pattern}"
+            );
+            assert_eq!(
+                handler
+                    .handle(&no_params_ctx("get-resolver-config"))
+                    .await
+                    .unwrap()
+                    .status,
+                404,
+                "row 7 {pattern}: a refusal writes nothing"
+            );
+        } else {
+            assert_eq!(
+                r.status, 200,
+                "row 7 {pattern}: a NARROW pattern discloses nothing and MUST be accepted"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4.3 pin-delta `[MUST, v1.19]` — `system/capability/registry-pin`
+//
+// Row 8 of `REG-DISPATCH-CONFIG-REFUSED-1`, pinned HERE and deliberately not on
+// the wire. The row's discriminator is the *encoding* of "pin authority", and
+// §5 names `registry-pin` descriptively only — every seat enforces by grant
+// scope, so each has to invent an encoding, and a shared harness minting one
+// seat's would 403 a conformant peer that chose another (`entity-core-go`
+// spec-issue `2026-08-20-a`). We take go's encoding rather than a third one.
+// ---------------------------------------------------------------------------
+
+/// A capability whose grants cover the registry handler for `operations`.
+fn registry_cap(operations: &[&str]) -> entity_capability::CapabilityToken {
+    entity_capability::CapabilityToken {
+        grants: vec![entity_capability::GrantEntry {
+            handlers: entity_capability::PathScope::new(vec![format!("/{PEER}/system/registry")]),
+            resources: entity_capability::PathScope::new(vec![format!(
+                "/{PEER}/system/registry/*"
+            )]),
+            operations: entity_capability::IdScope::new(
+                operations.iter().map(|o| o.to_string()).collect(),
+            ),
+            peers: None,
+            constraints: None,
+            allowances: None,
+        }],
+        granter: entity_capability::Granter::Single(Hash::zero()),
+        grantee: Hash::zero(),
+        parent: None,
+        created_at: 0,
+        expires_at: None,
+        not_before: None,
+        delegation_caveats: None,
+    }
+}
+
+fn set_config_ctx_as(
+    cfg: &ResolverConfigData,
+    cap: entity_capability::CapabilityToken,
+) -> HandlerContext {
+    let execute = Entity::new(entity_types::TYPE_EXECUTE, to_ecf(&Value::Map(vec![]))).unwrap();
+    HandlerContext::builder(
+        execute,
+        set_config_request(&cfg.to_entity().unwrap(), false),
+    )
+    .operation("set-resolver-config".to_string())
+    .caller_capability(cap)
+    .build()
+}
+
+fn pinned(name: &str, target: &str) -> PinnedBinding {
+    PinnedBinding {
+        name: name.into(),
+        target_peer_id: target.into(),
+        reason: None,
+    }
+}
+
+/// The pin-delta MUST, all four dispositions.
+///
+/// **A pin is the most privileged row in the file** — §4.1 step 1 answers a
+/// pinned name *before* the step-2 disclosure filter and *before* the §6a.9.1
+/// resolver ceiling — so a `registry-configure` grant that could write it would
+/// let the less specific authority write the more privileged row.
+///
+/// The four rows are the whole rule, and three of them are what keep the check
+/// from being a blanket refusal: the byte-identical write goes through on
+/// configure alone, the pin+configure caller is not blocked, and the local
+/// owner (who presents no capability at all, because they are the root
+/// authority) is unaffected.
+#[tokio::test]
+async fn a_pin_change_needs_registry_pin_and_a_refusal_writes_nothing() {
+    let (cs, li) = stores();
+    let handler = registry(&cs, &li);
+    let configure_only = || registry_cap(&["set-resolver-config", "get-resolver-config"]);
+    let configure_and_pin =
+        || registry_cap(&["set-resolver-config", "get-resolver-config", "pin-bindings"]);
+
+    let base = ResolverConfigData {
+        resolver_chain: vec![chain_entry("local-name", 0)],
+        pinned_bindings: vec![pinned("alice", "z6MkAlice")],
+        ..Default::default()
+    };
+    // Seed out-of-band (§6a.9.2's store-first door), so the FIRST measured
+    // write is already a delta rather than the create.
+    install_config(&cs, &li, &base);
+    let stored_hash = base.to_entity().unwrap().content_hash;
+
+    // Row 8a — pins differ, configure-only → 403 not_entitled, nothing written.
+    let moved = ResolverConfigData {
+        pinned_bindings: vec![pinned("alice", "z6MkAttacker")],
+        ..base.clone()
+    };
+    let r = handler
+        .handle(&set_config_ctx_as(&moved, configure_only()))
+        .await
+        .unwrap();
+    assert_eq!(r.status, 403, "a pin change on a configure-only grant");
+    assert_eq!(err_code(&r).as_deref(), Some("not_entitled"));
+    let got = handler
+        .handle(&no_params_ctx("get-resolver-config"))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.result.content_hash, stored_hash,
+        "and nothing was written — the refusal precedes the store touch"
+    );
+
+    // Row 8b — the SAME write with pin authority → 200. Without this row a peer
+    // that refuses every pin-carrying write scores identically.
+    let r = handler
+        .handle(&set_config_ctx_as(&moved, configure_and_pin()))
+        .await
+        .unwrap();
+    assert_eq!(r.status, 200, "configure + pin writes the pin");
+    assert_eq!(
+        r.result.content_hash,
+        moved.to_entity().unwrap().content_hash
+    );
+
+    // Row 8c — a byte-identical pin list needs only `registry-configure`, even
+    // though the rest of the config changes. This is the row that separates the
+    // delta from "any write that mentions pins".
+    let elsewhere = ResolverConfigData {
+        resolver_chain: vec![chain_entry("local-name", 0), chain_entry("peer-issued", 1)],
+        ..moved.clone()
+    };
+    let r = handler
+        .handle(&set_config_ctx_as(&elsewhere, configure_only()))
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status, 200,
+        "the pin list is unchanged, so configure alone suffices"
+    );
+
+    // Row 8d — the local owner presents NO capability (they are the root
+    // authority, not a grantee), and is unaffected.
+    let owner_moved = ResolverConfigData {
+        pinned_bindings: vec![pinned("bob", "z6MkBob")],
+        ..elsewhere.clone()
+    };
+    let r = handler
+        .handle(&set_config_ctx(&owner_moved, false))
+        .await
+        .unwrap();
+    assert_eq!(r.status, 200, "no caller capability is the local owner");
+}
+
+/// Adding the FIRST pin to a config that had none is a change, and dropping the
+/// last one is too — the predicate is not "both sides have pins".
+///
+/// And the empty encodings are one fact: our encoder omits `pinned_bindings`
+/// when the list is empty, an operator MAY write `[]`, and demanding pin
+/// authority to move between those two spellings would be a refusal with
+/// nothing behind it (the same absent-is-empty rule the wire uses for every
+/// optional array).
+#[tokio::test]
+async fn the_pin_delta_covers_the_empty_edges_but_not_the_empty_spelling() {
+    let (cs, li) = stores();
+    let handler = registry(&cs, &li);
+    let configure_only = || registry_cap(&["set-resolver-config", "get-resolver-config"]);
+
+    let no_pins = ResolverConfigData {
+        resolver_chain: vec![chain_entry("local-name", 0)],
+        ..Default::default()
+    };
+    install_config(&cs, &li, &no_pins);
+
+    // none → one is a change.
+    let first_pin = ResolverConfigData {
+        pinned_bindings: vec![pinned("alice", "z6MkAlice")],
+        ..no_pins.clone()
+    };
+    let r = handler
+        .handle(&set_config_ctx_as(&first_pin, configure_only()))
+        .await
+        .unwrap();
+    assert_eq!(r.status, 403, "the first pin is a pin change");
+    assert_eq!(err_code(&r).as_deref(), Some("not_entitled"));
+
+    // absent vs. an explicitly-encoded empty array is NOT a change.
+    let explicit_empty = Entity::new(
+        entity_types::TYPE_REGISTRY_RESOLVER_CONFIG,
+        to_ecf(&Value::Map(vec![
+            (text("log_cache_hits"), Value::Bool(false)),
+            (text("pinned_bindings"), Value::Array(vec![])),
+            (text("resolution_log_capacity"), entity_ecf::integer(1024)),
+            (
+                text("resolver_chain"),
+                Value::Array(vec![Value::Map(vec![
+                    (text("backend_id"), text("x")),
+                    (text("backend_kind"), text("local-name")),
+                    (text("priority"), entity_ecf::integer(0)),
+                ])]),
+            ),
+        ])),
+    )
+    .unwrap();
+    let execute = Entity::new(entity_types::TYPE_EXECUTE, to_ecf(&Value::Map(vec![]))).unwrap();
+    let r = handler
+        .handle(
+            &HandlerContext::builder(execute, set_config_request(&explicit_empty, false))
+                .operation("set-resolver-config".to_string())
+                .caller_capability(configure_only())
+                .build(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status, 200,
+        "absent and `[]` are the same fact — no pin authority is owed for a spelling"
+    );
+
+    // one → none is a change, in the other direction.
+    install_config(&cs, &li, &first_pin);
+    let r = handler
+        .handle(&set_config_ctx_as(&no_pins, configure_only()))
+        .await
+        .unwrap();
+    assert_eq!(r.status, 403, "removing the last pin is a pin change");
+}
+
+/// The delta is over the **raw bytes**, so a pin entry carrying a key this
+/// codec does not model cannot be rewritten under a configure-only grant.
+///
+/// This is the row a decoded comparison cannot pass, and it is the reason the
+/// predicate is byte-level rather than a `Vec<PinnedBinding>` compare: the
+/// decoded form sees `{name, target_peer_id, reason}` and nothing else, so a
+/// forward-compat field (§4.2's own shape) could be changed — or a pin's whole
+/// meaning altered by one — while the diff reports "no change". A fail-open on
+/// the most privileged row in the file.
+#[tokio::test]
+async fn a_pin_field_this_codec_does_not_model_still_counts_as_a_pin_change() {
+    let (cs, li) = stores();
+    let handler = registry(&cs, &li);
+
+    let with_key = |value: &str| {
+        Entity::new(
+            entity_types::TYPE_REGISTRY_RESOLVER_CONFIG,
+            to_ecf(&Value::Map(vec![
+                (
+                    text("pinned_bindings"),
+                    Value::Array(vec![Value::Map(vec![
+                        (text("name"), text("alice")),
+                        (text("pin_policy_2027"), text(value)),
+                        (text("target_peer_id"), text("z6MkAlice")),
+                    ])]),
+                ),
+                (
+                    text("resolver_chain"),
+                    Value::Array(vec![Value::Map(vec![
+                        (text("backend_id"), text("x")),
+                        (text("backend_kind"), text("local-name")),
+                        (text("priority"), entity_ecf::integer(0)),
+                    ])]),
+                ),
+            ])),
+        )
+        .unwrap()
+    };
+    let stored = with_key("sticky");
+    let h = cs.put(stored.clone()).unwrap();
+    li.set(&crate::resolver_config_path(PEER), h);
+
+    let execute = Entity::new(entity_types::TYPE_EXECUTE, to_ecf(&Value::Map(vec![]))).unwrap();
+    let r = handler
+        .handle(
+            &HandlerContext::builder(execute, set_config_request(&with_key("revocable"), false))
+                .operation("set-resolver-config".to_string())
+                .caller_capability(registry_cap(&["set-resolver-config"]))
+                .build(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status, 403,
+        "the two configs decode to the SAME PinnedBinding — only the bytes differ, \
+         and the bytes are what §4.3 says the predicate is over"
+    );
+    assert_eq!(err_code(&r).as_deref(), Some("not_entitled"));
+    assert_eq!(
+        handler
+            .handle(&no_params_ctx("get-resolver-config"))
+            .await
+            .unwrap()
+            .result
+            .content_hash,
+        stored.content_hash,
+        "and nothing was written"
+    );
+}
+
+/// **R-27 clause 2 `[MUST]`** — `pin-bindings` is a capability-check
+/// discriminator and MUST NOT be dispatchable.
+///
+/// Both halves, because either alone is satisfiable by accident: it is absent
+/// from the advertised operation table (what `bootstrap_handler` publishes as
+/// this handler's contract), **and** an EXECUTE naming it is refused rather
+/// than silently routed. Arch pinned this clause because it is *"the one place
+/// a seat could diverge into a new wire surface"* — an operation name that is
+/// checkable but not callable is unusual enough that a seat might expose it,
+/// and exposing it adds an undeclared operation to the registry handler.
+#[tokio::test]
+async fn pin_bindings_is_a_discriminator_and_not_a_dispatchable_operation() {
+    let (cs, li) = stores();
+    let handler = registry(&cs, &li);
+
+    assert!(
+        !handler.operations().contains(&crate::OP_PIN_BINDINGS),
+        "`pin-bindings` MUST NOT appear in the advertised operation table — a \
+         peer that answers an operation it does not advertise is inconsistent \
+         with its own published interface, and one that ADVERTISES this is \
+         declaring a wire surface the ruling says does not exist"
+    );
+
+    let r = handler
+        .handle(&no_params_ctx(crate::OP_PIN_BINDINGS))
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status, 400,
+        "an EXECUTE naming `pin-bindings` MUST be refused — nothing routes to it"
+    );
+    assert_eq!(err_code(&r).as_deref(), Some("unknown_operation"));
+}
+
+/// **R-27 clause 4 `[MUST]`** — capability checks precede config validation, and
+/// the observable is the *code*, not the status.
+///
+/// The discriminating config both **changes pins** and **discloses** (a broad
+/// `*` rule naming a transmitting kind), submitted with configure-only
+/// authority and no acknowledgement. Both refusals are `403`, so a peer that
+/// validates first is invisible to any check that reads only the status: it
+/// answers `policy_rejected` where the ruling requires `not_entitled`.
+///
+/// **The reason is an information leak, not tidiness.** §4.3's refusal body is
+/// deliberately verbose — *"every violation, not the first"*, because an
+/// operator repairing a chain wants the whole list — so validating first hands
+/// a config-shaped disclosure to a caller with no authority to change anything.
+/// Authorize, then validate.
+///
+/// The second assertion is the control that keeps this from passing for the
+/// wrong reason: the *same* disclosing config, with the pin list left
+/// byte-identical, MUST still reach validation and answer `policy_rejected`. A
+/// peer that simply always answers `not_entitled` fails it.
+#[tokio::test]
+async fn an_unauthorized_pin_change_answers_not_entitled_before_it_answers_policy_rejected() {
+    let (cs, li) = stores();
+    let handler = registry(&cs, &li);
+    let configure_only = || registry_cap(&["set-resolver-config", "get-resolver-config"]);
+
+    let base = ResolverConfigData {
+        resolver_chain: vec![chain_entry("local-name", 0), chain_entry("did-web", 1)],
+        pinned_bindings: vec![pinned("alice", "z6MkAlice")],
+        name_format_dispatch: vec![dispatch("did:web:*", &["did-web"])],
+        ..Default::default()
+    };
+    install_config(&cs, &li, &base);
+
+    // Both faults at once: the pin moves AND the dispatch rule goes broad.
+    let both = ResolverConfigData {
+        pinned_bindings: vec![pinned("alice", "z6MkAttacker")],
+        name_format_dispatch: vec![dispatch("*", &["did-web"])],
+        ..base.clone()
+    };
+    let r = handler
+        .handle(&set_config_ctx_as(&both, configure_only()))
+        .await
+        .unwrap();
+    assert_eq!(r.status, 403);
+    assert_eq!(
+        err_code(&r).as_deref(),
+        Some("not_entitled"),
+        "authorization precedes validation (R-27 clause 4) — answering \
+         `policy_rejected` here would enumerate every disclosure violation in \
+         the submitted config to a caller who cannot change any of them"
+    );
+
+    // Control — same disclosure, pins untouched: validation IS reached.
+    let disclosure_only = ResolverConfigData {
+        name_format_dispatch: vec![dispatch("*", &["did-web"])],
+        ..base.clone()
+    };
+    let r = handler
+        .handle(&set_config_ctx_as(&disclosure_only, configure_only()))
+        .await
+        .unwrap();
+    assert_eq!(r.status, 403);
+    assert_eq!(
+        err_code(&r).as_deref(),
+        Some("policy_rejected"),
+        "a caller authorized for what it is changing still gets the full \
+         violation list — the ordering gates the leak, it does not remove it"
+    );
 }
 
 /// A config whose `content_hash` lies is refused `400` (V7 §1.8

@@ -41,7 +41,7 @@ pub use peer_issued::resolve_one as peer_issued_resolve_one;
 pub use registration::RegisterRequestHandler;
 pub use resolver::{
     disclosure_violations, is_name_transmitting_kind, pattern_matches_unscoped_name,
-    RegistryHandler,
+    RegistryHandler, ENUMERATED_TYPED_SUFFIXES, OP_PIN_BINDINGS,
 };
 
 use entity_hash::Hash;
@@ -53,6 +53,12 @@ use thiserror::Error;
 
 pub const CAP_REGISTRY_RESOLVE: &str = "system/capability/registry-resolve";
 pub const CAP_REGISTRY_CONFIGURE: &str = "system/capability/registry-configure";
+/// **Declarative only — nothing looks this string up.** §5 names the capability,
+/// but authorization here (as in every seat) is *grant-scoped*: the enforcement
+/// point §4.3 `[MUST, v1.19]` gives it is the pin-delta check, and what a grant
+/// actually scopes there is [`resolver::OP_PIN_BINDINGS`]. Read that constant
+/// before assuming this one is checked by name; the encoding is routed
+/// (core-go spec-issue `2026-08-20-a`, mirrored in `docs/SPEC-AMBIGUITIES.md`).
 pub const CAP_REGISTRY_PIN: &str = "system/capability/registry-pin";
 pub const CAP_REGISTRY_CACHE_CONTROL: &str = "system/capability/registry-cache-control";
 pub const CAP_REGISTRY_LOCAL_NAME_BIND: &str = "system/capability/registry-local-name-bind";

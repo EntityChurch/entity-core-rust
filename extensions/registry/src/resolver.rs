@@ -663,6 +663,52 @@ impl RegistryHandler {
             }
         };
 
+        // §4.3 pin-delta `[MUST, v1.19]` — a write that CHANGES
+        // `pinned_bindings` additionally requires
+        // `system/capability/registry-pin`.
+        //
+        // **This runs BEFORE the disclosure check, and that ordering is now
+        // RULED, not a house style** — R-27 clause 4 `[MUST]`: *"capability
+        // checks precede config validation."* When we ordered it this way it
+        // was an authz-before-validation convention that happened to match
+        // core-go; arch then made it normative for a reason neither seat had
+        // written down. §4.3's refusal body is deliberately verbose (*"every
+        // violation, not the first"*), so validating first would hand a
+        // **config-shaped disclosure to a caller who has no authority to change
+        // anything** — the order is an information-leak control, not a
+        // preference. Gated by
+        // `an_unauthorized_pin_change_answers_not_entitled_before_it_answers_policy_rejected`;
+        // moving this block below the disclosure check turns that test red.
+        if let Some(cap) = &ctx.caller_capability {
+            let stored = self.stored_config_entity();
+            if pinned_bindings_differ(stored.as_ref(), &config_entity) {
+                let path = resolver_config_path(&self.peer_id);
+                let authorized = entity_capability::check_permission(
+                    OP_PIN_BINDINGS,
+                    &self.qualified_pattern,
+                    &self.peer_id,
+                    Some(&entity_capability::ResourceTarget {
+                        targets: vec![path],
+                        exclude: vec![],
+                    }),
+                    cap,
+                    &self.peer_id,
+                );
+                if !authorized {
+                    return error(
+                        STATUS_FORBIDDEN,
+                        "not_entitled",
+                        "this set-resolver-config changes pinned_bindings, which \
+                         additionally requires system/capability/registry-pin (§4.3 \
+                         `[MUST, v1.19]`) — a pin is answered by §4.1 step 1, before \
+                         the step-2 disclosure filter and before the §6a.9.1 resolver \
+                         ceiling, so the less specific registry-configure grant does \
+                         not write it. Nothing was written.",
+                    );
+                }
+            }
+        }
+
         // §4.3 `[MUST]` — `acknowledge_name_disclosure` is the operator MAY,
         // made expressible, and it is read from the OPERATION's params. It is
         // never read from the config entity: a field there is written by
@@ -710,11 +756,7 @@ impl RegistryHandler {
     /// not exist — the same reason `get-issuer-policy` refuses to synthesize
     /// an `open` mode (§6a.9.2: unset is not a mode).
     fn handle_get_resolver_config(&self) -> HandlerResult {
-        match self
-            .location_index
-            .get(&resolver_config_path(&self.peer_id))
-            .and_then(|h| self.content_store.get(&h))
-        {
+        match self.stored_config_entity() {
             Some(e) => entity_result(e),
             None => error(
                 STATUS_NOT_FOUND,
@@ -724,6 +766,76 @@ impl RegistryHandler {
             ),
         }
     }
+
+    /// The stored `system/registry/resolver-config` entity as written, or
+    /// `None` when unset. The *entity*, not the decoded data: both readers of
+    /// this — `get-resolver-config` and the pin-delta — are byte-level.
+    fn stored_config_entity(&self) -> Option<Entity> {
+        self.location_index
+            .get(&resolver_config_path(&self.peer_id))
+            .and_then(|h| self.content_store.get(&h))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §4.3 pin-delta — `system/capability/registry-pin` `[MUST, v1.19]`
+// ---------------------------------------------------------------------------
+
+/// The cap-check discriminator standing for `system/capability/registry-pin`.
+///
+/// **It is NOT an operation this handler answers**, so it is deliberately
+/// absent from [`Handler::operations`] and from `bootstrap_handler`'s
+/// advertised interface — advertising it would publish a contract no dispatch
+/// can reach. It exists because §5 names `registry-pin` *descriptively*: in
+/// all three seats authorization is grant-scoped rather than a named-cap
+/// lookup, so "pin authority" has to be *encoded* as something a grant can
+/// scope, and the spec fixes no encoding.
+///
+/// **RULED — R-27, `PROPOSAL-REGISTRY-PIN-AUTHORITY-CAPABILITY-ENCODING` §3
+/// clauses 1 and 2 `[MUST]`.** `system/capability/registry-pin` *is* the
+/// authority to invoke `pin-bindings` on the registry handler, and that string
+/// is the **pinned wire surface**: it is what a grant carries and what a
+/// conformance harness mints. The derivation is V7's, not the cohort's — a
+/// grant scopes on path-scope and id-scope only, and the path axis is
+/// explicitly non-portable (*"peers that diverge remain conformant"*), so the
+/// operation name is the sole portable discriminator. (Three seats had
+/// independently shipped this string; arch cites that as corroboration and
+/// explicitly not as the argument.)
+///
+/// **Clause 2 `[MUST]`: it MUST NOT be dispatchable.** Nothing routes to it, it
+/// appears in no operation table, and a peer MUST NOT accept it as an EXECUTE
+/// operation — so it is absent from [`Handler::operations`] and from
+/// `bootstrap_handler`'s advertised interface, and the dispatch `match` in
+/// [`Handler::handle`] falls through to `400 unknown_operation`. Arch pinned
+/// this precisely because *"an operation name that is checkable but not
+/// callable is unusual"*, and a seat that exposed it would have added an
+/// undeclared operation to the registry handler. Gated by
+/// `pin_bindings_is_a_discriminator_and_not_a_dispatchable_operation`.
+pub const OP_PIN_BINDINGS: &str = "pin-bindings";
+
+/// Whether a submitted config changes `pinned_bindings` against the stored one
+/// — §4.3's *"a write that leaves the pin list **byte-identical** needs only
+/// `registry-configure`"*.
+///
+/// **Compared as raw CBOR bytes, not as decoded [`PinnedBinding`]s**, and the
+/// difference is load-bearing rather than stylistic. A decoded comparison sees
+/// only the keys this codec models, so a pin entry carrying a field we do not
+/// model — the forward-compat shape §4.2 exists to permit — could be rewritten
+/// under a configure-only grant and the diff would report "no change". That is
+/// a fail-**open** on the most privileged row in the file. Bytes are also the
+/// spec's own word for the predicate.
+///
+/// Absent and empty are the same fact, so both read as "no pins" (our encoder
+/// omits the key; an operator MAY write `[]`, and demanding pin authority to go
+/// from one to the other would be a refusal with nothing behind it). Under ECF
+/// an empty definite-length array is exactly one byte, `0x80`.
+fn pinned_bindings_differ(stored: Option<&Entity>, submitted: &Entity) -> bool {
+    fn pins(entity: &Entity) -> Option<&[u8]> {
+        entity_wire::cbor_map_field_raw(&entity.data, "pinned_bindings")
+            .filter(|raw| *raw != [0x80])
+    }
+    let prior = stored.and_then(pins);
+    prior != pins(submitted)
 }
 
 // ---------------------------------------------------------------------------
@@ -758,49 +870,73 @@ pub fn is_name_transmitting_kind(kind: &str) -> bool {
     )
 }
 
-/// Whether a dispatch pattern can match an **unscoped** name — a bare name a
-/// user types with no authority stated (contrast the scoped `alice@example.org`,
+/// §4.1b.1's enumerated typed suffixes — the only literal endings that make a
+/// pattern narrow under rule (d).
+///
+/// **The list is deliberately short and grows ONLY by spec revision `[MUST]`.**
+/// Admitting a suffix is a *privacy decision*: it declares that every name a
+/// user types ending in it may be disclosed to a third party. So it is not
+/// implementation-defined, not operator-extensible, and not inferable from the
+/// pattern's shape — an unrecognized suffix leaves the pattern **broad**, which
+/// is the fail-safe direction. As of v1.19 the list is exactly `.eth` (ENS).
+pub const ENUMERATED_TYPED_SUFFIXES: &[&str] = &[".eth"];
+
+/// Whether a dispatch pattern is **BROAD** — §4.1b's classifier `[MUST, v1.19]`.
+///
+/// Broad means the pattern can match at least one **bare** name: a name the
+/// user typed with no authority stated (contrast the scoped `alice@example.org`,
 /// which §4.1 calls *"the user stating which authority they are willing to
-/// tell"*).
+/// tell"*). §4.1 step 2's MUST turns on this predicate, and **until v1.19 it
+/// had no grammar** — the three seats split on `*.*`, `a.b` and `*.e*`, which
+/// is why the ruling replaced the derivation-from-examples this function used
+/// to carry.
 ///
-/// **The §4.1a recommended default list is the fixture that pins this, and it
-/// is the spec's own text rather than an external glob convention.** A
-/// distribution SHOULD ship that list and the catch-all MUST lives inside it,
-/// so every non-catch-all row must classify **narrow** or the recommended list
-/// would violate its own MUST. Row 3 is the decisive one: `*.eth` names
-/// `consensus-anchored`, a *transmitting* kind, so a classifier that calls
-/// `*.eth` broad refuses the very list §4.1a recommends. Rows 1–2 (`did:web:*`,
-/// `did:key:*`) and rows 4–5 (`*@*.*`, `*@*`) give the other two markers.
-/// Hence three scope markers, and nothing else:
+/// A pattern is **NARROW iff at least one** of §4.1b's four rules holds:
 ///
-/// - an `@` anywhere — the user names an authority (rows 4, 5);
-/// - a `:` anywhere — a scheme-typed prefix (rows 1, 2);
-/// - `*.<literal>` with no further `*` — a dotted literal suffix (row 3).
+/// | # | Condition | Why it is safe |
+/// |---|---|---|
+/// | a | no `*` at all | it matches exactly one name — a routing decision the operator wrote out |
+/// | b | a literal `@` | every match carries an `@authority`; the user named who they will tell |
+/// | c | the literal head before the first `*` ends in `:` | every match carries a `scheme:` prefix |
+/// | d | ends in an [enumerated typed suffix](ENUMERATED_TYPED_SUFFIXES), no `*` after | the name is in a naming system the user opted into by typing it |
 ///
-/// Everything else is **broad**: the catch-all `*`, a bare prefix `a*`, and
-/// `*.*` — whose suffix is a star, not a literal, so it matches `alice.bob`
-/// as readily as a domain. The asymmetry §4.1 draws settles the doubt: a false
-/// "broad" refuses a presently-harmless config and the operator edits one row,
-/// while a false "narrow" discloses every bare name a user types, silently and
-/// irreversibly.
+/// Otherwise **broad**. Two of these moved from our pre-ruling reading and both
+/// are the ruling's own named divergences: `a.b` / `alice` are **narrow** by (a)
+/// (we read any literal-free-of-markers pattern as broad), and `*.lab` is
+/// **broad** because `.lab` is not enumerated — *"the line is not 'does a
+/// literal exist' but 'does the literal identify an authority or a naming
+/// system'"*. Rule (c) is also narrower than the `:`-anywhere test it replaces:
+/// `*:foo` puts the `:` after the first `*`, so nothing constrains the head and
+/// the pattern is broad.
 ///
 /// **This is a pure function of the pattern text — no `resolver_chain` input.**
 /// That is what "kind-scoped" means (§4.1 `[MUST, v1.17/v1.18]`): a reviewed
 /// artifact stays reviewed, because its validity cannot be changed by what a
 /// downstream operator later adds to a chain the shipper will never see.
 ///
-/// **`REG-DISPATCH-CONFIG-REFUSED-1` only exercises two of the shapes** (`*`
-/// broad, `did:web:*` narrow), so the boundary between them is in-tree
-/// agreement, not wire-verified convergence. The spec defines "unscoped" by
-/// example rather than by grammar; filed in `docs/SPEC-AMBIGUITIES.md`.
+/// Wire-verified by `REG-DISPATCH-CONFIG-REFUSED-1` row 7 (five patterns), which
+/// is the independent witness for the in-tree table this ruling rewrote.
 pub fn pattern_matches_unscoped_name(pattern: &str) -> bool {
-    if pattern.contains('@') || pattern.contains(':') {
+    // (a) no `*` → the pattern matches exactly one name.
+    let Some(first_star) = pattern.find('*') else {
+        return false;
+    };
+    // (b) a literal `@` → the user names an authority. Every byte that is not
+    // `*` is a literal in this closed grammar (§4), so any `@` qualifies.
+    if pattern.contains('@') {
         return false;
     }
-    if let Some(rest) = pattern.strip_prefix("*.") {
-        if !rest.is_empty() && !rest.contains('*') {
-            return false;
-        }
+    // (c) the literal head before the first `*` ends in `:` → a scheme prefix.
+    if pattern[..first_star].ends_with(':') {
+        return false;
+    }
+    // (d) ends in an enumerated typed suffix — and ending in it is exactly
+    // "with no `*` after it", since the suffixes carry no `*`.
+    if ENUMERATED_TYPED_SUFFIXES
+        .iter()
+        .any(|suffix| pattern.ends_with(suffix))
+    {
+        return false;
     }
     true
 }

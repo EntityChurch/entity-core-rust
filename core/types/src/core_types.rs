@@ -3266,18 +3266,29 @@ fn system_registry_invalidate_cache_request() -> TypeDefinition {
 
 /// `set-resolver-config` params (§4.3 `[v1.18]`).
 ///
-/// `config` is typed `core/entity` — a genuine nested entity wrapper
-/// (`{type, data, content_hash}`), not a bare map — because the operation's
-/// whole contract is that the submitted config round-trips **byte-exact**:
-/// `get-resolver-config` MUST return the bytes that were written. A bare map
-/// would force the peer to re-author the entity and move its content hash.
+/// `config` carries a genuine nested entity wrapper (`{type, data,
+/// content_hash}`), not a bare map, because the operation's whole contract is
+/// that the submitted config round-trips **byte-exact**: `get-resolver-config`
+/// MUST return the bytes that were written, and a bare map would force the peer
+/// to re-author the entity and move its content hash.
+///
+/// Its `type_ref` is nonetheless the **precise** `system/registry/resolver-config`
+/// that §4.3's own table names, not the looser `core/entity` (R-17). The loose
+/// token erases the config's own fields from the type checker and diverges from
+/// py, which declared it precisely; this is the identical disposition already
+/// ruled for `system/substitute/try-request.entry` (SUBSTITUTE §2.3 /
+/// RULINGS-STORAGE-SUBSTITUTE-CROSS-IMPL Ruling 2), and core-go took it at
+/// `857a348`. Descriptive here either way — our phase-1 structural validator
+/// checks type match and required-field presence and does not descend a
+/// non-primitive `type_ref` — so the token is the *published contract*, which
+/// is what the cross-impl `type_system` check reads.
 ///
 /// `acknowledge_name_disclosure` is a parameter of the operation and is
 /// deliberately absent from `system/registry/resolver-config` (§4.3 `[MUST]` —
 /// a field is forgeable by whoever writes the bytes).
 fn system_registry_set_resolver_config_request() -> TypeDefinition {
     TypeDefBuilder::new("system/registry/set-resolver-config-request")
-        .field("config", t("core/entity"))
+        .field("config", t("system/registry/resolver-config"))
         .field("acknowledge_name_disclosure", opt("primitive/bool"))
         .build()
 }
@@ -3857,6 +3868,66 @@ mod tests {
                 type_name,
                 field_name,
                 constraint_path
+            );
+        }
+    }
+
+    /// R-17 — REGISTRY §4.3's own table types `set-resolver-config`'s `config`
+    /// as `system/registry/resolver-config`, and the **published** descriptor
+    /// MUST carry that precise token rather than the looser `core/entity`.
+    ///
+    /// The loose token erases the config's own fields from every reader of the
+    /// contract, and it is a cohort divergence rather than a preference: py
+    /// declared it precisely from the start, go loosened via struct reflection
+    /// and corrected at `857a348`, and this was our last open item on the §4.3
+    /// surface. Same disposition already ruled for
+    /// `system/substitute/try-request.entry` (SUBSTITUTE §2.3 /
+    /// RULINGS-STORAGE-SUBSTITUTE-CROSS-IMPL Ruling 2), asserted here too so
+    /// the precedent and the new row move together.
+    ///
+    /// Descriptive in our tree — the phase-1 structural validator checks type
+    /// match and required-field presence, and does not descend a non-primitive
+    /// `type_ref` — so the assertion is on what we *publish*, which is what the
+    /// cross-impl `type_system` check reads. Nothing about the wire shape
+    /// changes: `config` stays a nested `{type, data, content_hash}` wrapper,
+    /// because the operation's contract is a byte-exact round trip.
+    #[test]
+    fn nested_entity_fields_publish_their_precise_type_ref() {
+        let types = all_core_types();
+        for (type_name, field_name, want) in [
+            (
+                "system/registry/set-resolver-config-request",
+                "config",
+                "system/registry/resolver-config",
+            ),
+            (
+                "system/substitute/try-request",
+                "entry",
+                "system/substitute/source",
+            ),
+        ] {
+            let td = types
+                .iter()
+                .find(|t| t.name == type_name)
+                .unwrap_or_else(|| panic!("{} is not registered", type_name));
+            let spec = td
+                .fields
+                .get(field_name)
+                .unwrap_or_else(|| panic!("{}.{} is not declared", type_name, field_name));
+            assert_eq!(
+                spec.type_ref.as_deref(),
+                Some(want),
+                "{}.{} must name the precise type, not the looser core/entity",
+                type_name,
+                field_name
+            );
+            let entity = td.to_entity().expect("descriptor encodes");
+            assert!(
+                String::from_utf8_lossy(&entity.data).contains(want),
+                "{}.{}: the precise token must survive into the PUBLISHED \
+                 descriptor — that is the leg a sibling reads",
+                type_name,
+                field_name
             );
         }
     }
