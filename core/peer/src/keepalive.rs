@@ -21,8 +21,18 @@
 //! **Ownership:** the loop holds the pool and its own endpoint WEAKLY.
 //! The pool (`Arc<RemoteState>`) is owned by the `Peer`; when the peer
 //! is dropped the upgrade fails and the loop exits — a keepalive task
-//! must never keep a dropped peer's connection (or stores) alive, and
-//! must never outlive the binding it monitors.
+//! must never keep a dropped peer's connection (or stores) alive.
+//!
+//! **§5.4a — the escalation outlives the binding, `[MUST]`.** What the
+//! loop must NOT do is treat "my binding is gone" as "nothing is owed".
+//! The §A1 transport-error demotion evicts the binding *as* it writes
+//! `suspect` — one event — so a loop that returns on sight of a missing
+//! binding destroys the §5.4 `suspect → disconnected` escalation at the
+//! moment it becomes owed: the peer stays `suspect` forever, the
+//! disconnect subscription never fires, and §4.1 reconnect never
+//! triggers on the transport-error-first path (the common one). On an
+//! unbound tick the loop therefore takes §5.4's own grace step first
+//! and escalates from [`escalate_unbound_suspect`].
 //!
 //! **Liveness criterion:** any EXECUTE_RESPONSE that arrives counts as
 //! protocol-liveness even if its status is non-200 — the peer
@@ -43,13 +53,17 @@ use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
 use entity_crypto::IdentityKeypair;
+use entity_hash::Hash;
 use entity_store::{ContentStore, LocationIndex};
 
 use crate::liveness::{
-    demote_peer_on_keepalive_miss, episode_failing_since, now_ms, write_peer_status,
+    demote_peer_on_keepalive_miss, episode_failing_since, now_ms, read_peer_status,
+    write_peer_status,
 };
 use crate::peer_status::PEER_STATUS_REASON_KEEPALIVE_MISS;
-use crate::peer_status::{PeerStatusData, PEER_STATUS_CONNECTED, PEER_STATUS_SUSPECT};
+use crate::peer_status::{
+    PeerStatusData, PEER_STATUS_CONNECTED, PEER_STATUS_DISCONNECTED, PEER_STATUS_SUSPECT,
+};
 use crate::remote::{send_execute, RemoteEndpoint, RemoteState};
 use crate::PeerShared;
 
@@ -119,6 +133,11 @@ struct KeepaliveCtx {
     keypair: IdentityKeypair,
     local_peer_id: String,
     peer_id: String,
+    /// The remote's `system/peer` content hash — the positional key of
+    /// its status entity. Captured at spawn, when the endpoint is still
+    /// alive, because the §5.4a escalation writes status precisely when
+    /// the endpoint is gone and cannot be asked for it.
+    remote_identity_hash: Hash,
     cfg: KeepaliveConfig,
 }
 
@@ -157,6 +176,7 @@ pub(crate) fn spawn_keepalive(
         keypair: shared.keypair.clone_identity(),
         local_peer_id: shared.peer_id.as_str().to_string(),
         peer_id,
+        remote_identity_hash: endpoint.remote_identity_hash(),
         cfg: shared.config.keepalive.clone(),
     };
     crate::runtime::spawn(keepalive_loop(ctx));
@@ -175,7 +195,19 @@ async fn keepalive_loop(ctx: KeepaliveCtx) {
         // binding pings and writes liveness. Peer dropped or binding
         // replaced/evicted → a newer connection (with its own loop) owns
         // liveness now.
+        //
+        // §5.4a: losing the binding does NOT end the failure episode.
+        // Take §5.4's grace step before concluding anything (see
+        // [`escalate_after_grace`]), then hand off or escalate.
         let Some((_pool, endpoint)) = ctx.live_binding() else {
+            escalate_after_grace(&ctx).await;
+            if ctx.live_binding().is_some() {
+                // Our own endpoint was re-bound during the grace —
+                // §5.4's `reconnected(peer_id)` branch, and nobody else
+                // spawned a loop for it. Keep watching.
+                missed = 0;
+                continue;
+            }
             return;
         };
 
@@ -209,8 +241,11 @@ async fn keepalive_loop(ctx: KeepaliveCtx) {
         }
 
         // §5.4 escalation: suspect → grace → disconnected. The suspect
-        // write happens only while we are still the bound connection.
+        // write happens only while we are still the bound connection —
+        // but if we lost the binding between the ping and here, the §A1
+        // seam demoted underneath us and §5.4a still owes the follow-up.
         if ctx.live_binding().is_none() {
+            escalate_after_grace(&ctx).await;
             return;
         }
         let mut data = PeerStatusData::bare(endpoint.remote_peer_id(), PEER_STATUS_SUSPECT);
@@ -238,7 +273,13 @@ async fn keepalive_loop(ctx: KeepaliveCtx) {
         // (the new connection wrote its own `connected` and runs its own
         // loop — we just exit), or traffic resumed on THIS connection
         // during the grace (recover to connected and keep looping).
+        //
+        // Losing the binding here means the §A1 seam evicted during our
+        // grace. The grace has already elapsed, so §5.4a's escalation is
+        // owed NOW — with no second sleep, and with whatever `reason`
+        // opened the episode.
         let Some((pool, endpoint)) = ctx.live_binding() else {
+            escalate_unbound_suspect(&ctx);
             return;
         };
         if endpoint.last_activity_ms() > grace_start {
@@ -260,6 +301,104 @@ async fn keepalive_loop(ctx: KeepaliveCtx) {
         );
         return;
     }
+}
+
+/// §5.4's `escalate_after_grace(peer_id, timeout_ms)` for the entry
+/// point the pseudocode reaches with `not bound(peer_id)`: sleep the
+/// grace, then escalate if the episode is still open.
+///
+/// **The sleep comes first, and that ordering is normative (§5.4a).**
+/// The §A1 eviction and its `suspect` write are not one atomic event —
+/// the eviction lands under the pool lock and the status write follows
+/// it — so a status read taken at eviction time can still see
+/// `connected` and wrongly conclude nothing is owed.
+async fn escalate_after_grace(ctx: &KeepaliveCtx) {
+    sleep_ms(ctx.cfg.timeout_ms).await;
+    escalate_unbound_suspect(ctx);
+}
+
+/// §5.4a `[MUST]` — complete the `suspect → disconnected` escalation for
+/// a peer whose connection is already gone. Returns whether it fired.
+///
+/// This is the write the §A1 transport-error demotion leaves owed: that
+/// seam evicts the binding as it writes `suspect`, so by the time the
+/// escalation comes due there is no connection to escalate *on*. The
+/// escalation belongs to the failure EPISODE, not to the connection.
+///
+/// **The guard is the status entity, not the binding** — deliberately,
+/// because there is no binding here — and §5.4a pins it as scope, not
+/// defensive coding: escalate ONLY from `suspect`, i.e. only where a
+/// failure episode is genuinely open. That is what keeps this off the
+/// ordinary teardown paths. The §10.2 dispatch fallback and the RELAY
+/// terminal hop evict WITHOUT demoting (liveness.rs, ruling E), so those
+/// bindings are still `connected`; a released or shut-down peer is
+/// already `disconnected`. Neither is `suspect`, so neither escalates.
+/// *"An implementation that escalates on any unbound peer rather than on
+/// any `suspect` peer converts this rule into a new defect."*
+///
+/// **`reason` is carried, not chosen (§5.4a `[MUST]`)** — the escalating
+/// write repeats whatever the demotion that OPENED the episode wrote:
+/// `transport-error` from the §A1 seam, `keepalive-miss` from an idle
+/// miss. Re-stamping to `keepalive-miss` on the seam path would assert
+/// pings that were never sent (the connection was gone before the loop
+/// could send one) and would erase the only signal that distinguishes
+/// the transport-first path. An absent `reason` is preserved as absent:
+/// §A2 leaves it OPTIONAL to emit, and inventing one here is the same
+/// overclaim in the other direction.
+fn escalate_unbound_suspect(ctx: &KeepaliveCtx) -> bool {
+    let Some(pool) = ctx.pool.upgrade() else {
+        // The peer itself is gone; there is no tree to write a liveness
+        // observation into that anyone will read.
+        return false;
+    };
+    // §5.4's `reconnected(peer_id)`: ANY live binding (a re-dialed
+    // outbound, or a §6.11(b) inbound reentry) means the peer is back
+    // and whoever bound it owns liveness — it wrote its own `connected`
+    // and, on the outbound path, runs its own loop.
+    if pool.get(&ctx.peer_id).is_some() || pool.get_inbound(&ctx.peer_id).is_some() {
+        return false;
+    }
+
+    let Some(prev) = read_peer_status(
+        ctx.content_store.as_ref(),
+        ctx.location_index.as_ref(),
+        &ctx.local_peer_id,
+        &ctx.remote_identity_hash,
+    ) else {
+        return false;
+    };
+    if prev.status != PEER_STATUS_SUSPECT {
+        return false;
+    }
+
+    let mut data = PeerStatusData::bare(&ctx.peer_id, PEER_STATUS_DISCONNECTED);
+    data.reason = prev.reason.clone();
+    data.last_error = Some(format!(
+        "connection gone and no reconnect within the {}ms §5.4 grace",
+        ctx.cfg.timeout_ms
+    ));
+    // §A4: the demotion snapshot the opening write already took — the
+    // endpoint that observed it is gone, so there is nothing fresher.
+    data.last_seen = prev.last_seen;
+    data.failing_since = episode_failing_since(
+        ctx.content_store.as_ref(),
+        ctx.location_index.as_ref(),
+        &ctx.local_peer_id,
+        &ctx.remote_identity_hash,
+    );
+    write_peer_status(
+        ctx.content_store.as_ref(),
+        ctx.location_index.as_ref(),
+        &ctx.local_peer_id,
+        &ctx.remote_identity_hash,
+        &data,
+    );
+    // No `mark_connection_closed` here, unlike the two demotion seams:
+    // whoever evicted the binding was a demotion path (that is what the
+    // `suspect` guard just established) and it already flipped the §3.13
+    // record. A second write would be a redundant transition on an
+    // entity whose discipline is write-on-transition.
+    true
 }
 
 /// One §5.1 ping EXECUTE with a `timeout_ms` deadline. Returns whether

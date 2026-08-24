@@ -55,6 +55,12 @@ blurb = "The ROLE-specific ambiguity log (resolved), retained for traceability o
 group = "Spec findings"
 
 [[doc]]
+path  = "docs/validation/CONFORMANCE-EXCLUSIONS.md"
+title = "Declared conformance exclusions"
+blurb = "Pinned vectors NOT exercised at the wire against this peer, how each is satisfied instead, and the mutation proving the substitute has teeth. A declared exclusion is not a pass and is counted in no gate number."
+group = "Spec findings"
+
+[[doc]]
 path  = "docs/BACKLOG.md"
 title = "Implementation backlog"
 blurb = "Durable, spec-traced forward work for the Rust implementation (not a dated status snapshot)."

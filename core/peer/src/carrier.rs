@@ -141,9 +141,12 @@ impl Carrier for PeerCarrier {
         }
         .to_entity()
         .map_err(PunchError::from)?;
-        let (status, _) = self.execute(entity_signaling::OP_OFFER, params).await?;
+        let (status, result) = self.execute(entity_signaling::OP_OFFER, params).await?;
         if status != 200 {
-            return Err(PunchError::Carrier(format!("offer: status {}", status)));
+            return Err(PunchError::Carrier(format!(
+                "offer: {}",
+                remote::refusal_detail(status, &result)
+            )));
         }
         Ok(())
     }
@@ -156,7 +159,10 @@ impl Carrier for PeerCarrier {
         .map_err(PunchError::from)?;
         let (status, result) = self.execute(entity_signaling::OP_COLLECT, params).await?;
         if status != 200 {
-            return Err(PunchError::Carrier(format!("collect: status {}", status)));
+            return Err(PunchError::Carrier(format!(
+                "collect: {}",
+                remote::refusal_detail(status, &result)
+            )));
         }
         Ok(CollectResult::from_params(&result.data)
             .map_err(PunchError::from)?

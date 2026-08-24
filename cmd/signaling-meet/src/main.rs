@@ -145,14 +145,31 @@ struct Meet<'a> {
     uri: String,
 }
 
+/// The signaling node's error `code` from a refused response, empty when
+/// the body is not a `system/protocol/error`.
+fn err_code(result: &Entity) -> String {
+    entity_core::handler::decode_error_entity(result)
+        .and_then(|(code, _)| code)
+        .unwrap_or_default()
+}
+
 impl Meet<'_> {
-    async fn offer_message(&self, k: RendezvousKey, entity: &Entity) -> anyhow::Result<u32> {
+    /// Returns the node's status **and its refusal detail** — R-7
+    /// extractor audit (2026-08-12): this used to return `.0` and drop
+    /// the result entity, so both call sites below could only ever
+    /// report "status 403" for a node that told us exactly why.
+    async fn offer_message(
+        &self,
+        k: RendezvousKey,
+        entity: &Entity,
+    ) -> anyhow::Result<(u32, String)> {
         let params = OfferRequest {
             rendezvous_key: k,
             message: coordination::to_blob(entity),
         }
         .to_entity()?;
-        Ok(self.execute("offer", &params).await?.0)
+        let (status, result) = self.execute("offer", &params).await?;
+        Ok((status, err_code(&result)))
     }
 
     /// Container-aware (§6.3): a counterpart that has flipped its deposit path
@@ -167,7 +184,9 @@ impl Meet<'_> {
         let params = CollectRequest { rendezvous_key: *k }.to_entity()?;
         let (status, result) = self.execute("collect", &params).await?;
         if status != 200 {
-            anyhow::bail!("collect: status {}", status);
+            // The node's code, not only its status (R-7 extractor audit):
+            // bucket_full and unknown_operation are different meets.
+            anyhow::bail!("collect: {} {}", status, err_code(&result));
         }
         Ok(CollectResult::from_params(&result.data)?
             .messages
@@ -220,11 +239,11 @@ async fn run_initiator(
         Err(e) => return fail_with(&nonce_hex, format!("build connect-request: {}", e)),
     };
     match meet.offer_message(k, &entity).await {
-        Ok(200) => {}
-        Ok(status) => {
+        Ok((200, _)) => {}
+        Ok((status, code)) => {
             return fail_with(
                 &nonce_hex,
-                format!("offer connect-request: status {}", status),
+                format!("offer connect-request: {} {}", status, code),
             )
         }
         Err(e) => return fail_with(&nonce_hex, format!("offer connect-request: {}", e)),
@@ -302,12 +321,12 @@ async fn run_responder(
                     }
                 };
                 match meet.offer_message(k, &entity).await {
-                    Ok(200) => {}
-                    Ok(status) => {
+                    Ok((200, _)) => {}
+                    Ok((status, code)) => {
                         return responder_error(
                             answered,
                             initiators,
-                            format!("offer connect-response: status {}", status),
+                            format!("offer connect-response: {} {}", status, code),
                         )
                     }
                     Err(e) => {

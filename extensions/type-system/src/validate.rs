@@ -291,7 +291,16 @@ impl TypeHandler {
                 // classify as unknown_constraint per §1.2 fail-closed.
                 if res.status != STATUS_OK {
                     DispatchOutcome::DispatchFailed {
-                        reason: format!("handler status {}", res.status),
+                        reason: match entity_handler::decode_error_entity(&res.result) {
+                            // The handler's own code, not just its status
+                            // (R-7 extractor audit): "handler status 403"
+                            // and "403 capability_denied" send a constraint
+                            // author to very different places.
+                            Some((Some(code), _)) => {
+                                format!("handler status {} {}", res.status, code)
+                            }
+                            _ => format!("handler status {}", res.status),
+                        },
                     }
                 } else {
                     parse_dispatch_result(&res.result)

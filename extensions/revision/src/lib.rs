@@ -2762,7 +2762,12 @@ impl RevisionHandler {
             return Ok(error_result(
                 STATUS_BAD_GATEWAY,
                 "remote_fetch_failed",
-                &format!("revision/fetch on {}: status={}", remote, fetch_resp.status),
+                &format!(
+                    "revision/fetch on {}: status={} {}",
+                    remote,
+                    fetch_resp.status,
+                    remote_error_code(&fetch_resp.result)
+                ),
             ));
         }
         if fetch_resp.result.entity_type != entity_types::TYPE_ENVELOPE {
@@ -2866,10 +2871,11 @@ impl RevisionHandler {
                     STATUS_BAD_GATEWAY,
                     "remote_fetch_failed",
                     &format!(
-                        "revision/fetch-entities round {} on {}: status={}",
+                        "revision/fetch-entities round {} on {}: status={} {}",
                         round + 1,
                         remote,
-                        fe_resp.status
+                        fe_resp.status,
+                        remote_error_code(&fe_resp.result)
                     ),
                 ));
             }
@@ -3977,6 +3983,20 @@ fn build_envelope_result(
     let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(envelope_fields));
     Entity::new(entity_types::TYPE_ENVELOPE, data)
         .expect("envelope entity creation should not fail")
+}
+
+/// The remote peer's error `code`, rendered for a proxy-failure message
+/// (empty when the body is not a `system/protocol/error`).
+///
+/// R-7 extractor audit (2026-08-12): the two remote-fetch failure paths
+/// reported `status=NNN` and discarded `result`, so a `403
+/// capability_denied` from the far peer and a `404 not_found` read
+/// identically to whoever debugs the 502 we return in their place.
+fn remote_error_code(result: &Entity) -> String {
+    match entity_handler::decode_error_entity(result) {
+        Some((Some(code), _)) => code,
+        _ => String::new(),
+    }
 }
 
 fn error_result(status: u32, code: &str, message: &str) -> HandlerResult {

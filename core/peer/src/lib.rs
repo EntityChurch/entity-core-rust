@@ -9167,6 +9167,163 @@ mod tests {
         server_handle.abort();
     }
 
+    /// EXTENSION-NETWORK §5.4a `[MUST]` —
+    /// `NET-LIVENESS-ESCALATE-AFTER-EVICTION-1`, the positive half.
+    ///
+    /// The composition no vector in any implementation visited: an
+    /// episode that OPENS at the §A1 transport seam rather than at an
+    /// idle keepalive miss. §A1 evicts the pooled binding as it writes
+    /// `suspect` — one event — so a keepalive loop that exits on sight
+    /// of a missing binding kills the escalation exactly when it becomes
+    /// owed, and the peer stays `suspect` forever (no disconnect
+    /// subscription, so no §4.1 reconnect). Measured that way against
+    /// this peer by go's harness at `21eb223`.
+    ///
+    /// `interval_ms` is set well above the demotion's latency on
+    /// purpose: the transport seam must be what opens the episode, not a
+    /// keepalive miss racing it — the race that made go's own check read
+    /// as a 1-in-4 flake.
+    ///
+    /// Asserts the reason too: §5.4a preserves the episode's ORIGINATING
+    /// `transport-error`. Re-stamping to `keepalive-miss` would assert
+    /// pings that provably were not sent — the connection was gone
+    /// before the loop could send one.
+    #[tokio::test]
+    async fn a12_escalates_to_disconnected_after_the_a1_eviction() {
+        let short = keepalive::KeepaliveConfig {
+            interval_ms: 400,
+            timeout_ms: 60,
+            max_missed: 2,
+            enabled: true,
+        };
+        let (
+            _ss,
+            server_handle,
+            client,
+            client_shared,
+            server_pid,
+            server_hash,
+            _home_format_guard,
+        ) = a12_keepalive_pair(0x6c, short).await;
+
+        // Kill the server, then dispatch over the dead pooled conn: the
+        // §A1 seam demotes to suspect and evicts, all before the first
+        // keepalive tick.
+        server_handle.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let params = entity_entity::Entity::new(
+            "system/params",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+                entity_ecf::text("path"),
+                entity_ecf::text(format!("/{}/system/tree", server_pid)),
+            )])),
+        )
+        .unwrap();
+        assert!(
+            client
+                .execute(&format!("/{}/system/tree", server_pid), "get", params)
+                .await
+                .is_err(),
+            "expected a transport error dispatching over the dropped server"
+        );
+
+        let opened = liveness_status_of(&client_shared, &server_hash)
+            .expect("no status entity after the §A1 demotion");
+        assert_eq!(opened.status, crate::peer_status::PEER_STATUS_SUSPECT);
+        assert_eq!(
+            opened.reason.as_deref(),
+            Some(crate::peer_status::PEER_STATUS_REASON_TRANSPORT_ERROR)
+        );
+        assert!(
+            client_shared.remote.get(&server_pid).is_none(),
+            "precondition: the §A1 demotion evicts the binding it demotes"
+        );
+
+        // Nothing touches the peer from here. Only the grace path can
+        // move it — and §5.4a says it must.
+        let escalated = wait_liveness_status(
+            &client_shared,
+            &server_hash,
+            crate::peer_status::PEER_STATUS_DISCONNECTED,
+        )
+        .await;
+        assert_eq!(
+            escalated.reason.as_deref(),
+            Some(crate::peer_status::PEER_STATUS_REASON_TRANSPORT_ERROR),
+            "§5.4a [MUST]: the escalation carries the episode's originating reason"
+        );
+        assert_eq!(escalated.peer_id, server_pid);
+        assert_eq!(
+            escalated.failing_since, opened.failing_since,
+            "the escalation is the same episode — failing_since must not re-stamp"
+        );
+    }
+
+    /// EXTENSION-NETWORK §5.4a —
+    /// `NET-LIVENESS-NO-ESCALATION-WITHOUT-EPISODE-1`, the negative half
+    /// of the pair, and the reason the pair is a pair: an implementation
+    /// that escalates every *unbound* peer rather than every *`suspect`*
+    /// peer passes the positive vector above and breaks the §A1 seam's
+    /// deliberate exclusions.
+    ///
+    /// **In-process by declared exclusion**, per §5.4a's own
+    /// satisfaction mode: the state it needs — unbound yet still
+    /// `connected` — is reachable only from the §10.2 dispatch fallback
+    /// and the RELAY terminal hop, which evict without demoting, so no
+    /// conformance client can construct it over the wire against a peer
+    /// without those paths installed. Recorded at
+    /// `docs/validation/CONFORMANCE-EXCLUSIONS.md`; an in-process result
+    /// is never reported as a cross-impl vector pass.
+    ///
+    /// **Mutation it is verified against:** delete the
+    /// `prev.status != PEER_STATUS_SUSPECT` guard in
+    /// `keepalive::escalate_unbound_suspect` — this test must fail while
+    /// `a12_escalates_to_disconnected_after_the_a1_eviction` still
+    /// passes.
+    #[tokio::test]
+    async fn a12_no_escalation_without_an_open_failure_episode() {
+        let short = keepalive::KeepaliveConfig {
+            interval_ms: 60,
+            timeout_ms: 60,
+            max_missed: 2,
+            enabled: true,
+        };
+        let (
+            _ss,
+            server_handle,
+            _client,
+            client_shared,
+            server_pid,
+            server_hash,
+            _home_format_guard,
+        ) = a12_keepalive_pair(0x6e, short).await;
+
+        let baseline =
+            liveness_status_of(&client_shared, &server_hash).expect("connected baseline missing");
+        assert_eq!(baseline.status, crate::peer_status::PEER_STATUS_CONNECTED);
+
+        // The §A1 scope pin, reproduced: evict the binding and write NO
+        // status — what a §10.2 fallback / RELAY terminal-hop teardown
+        // does to a peer that is perfectly healthy. The server stays up,
+        // so nothing else can demote it either.
+        client_shared.remote.remove(&server_pid);
+
+        // Several keepalive intervals plus the grace: any escalation
+        // this teardown could manufacture has had its chance.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let after = liveness_status_of(&client_shared, &server_hash)
+            .expect("status entity vanished during the teardown");
+        assert_eq!(
+            after.status,
+            crate::peer_status::PEER_STATUS_CONNECTED,
+            "an evict-without-demote teardown was turned into a demotion — §5.4a scope pin: \
+             escalate only where a failure episode is open (status `suspect`)"
+        );
+
+        server_handle.abort();
+    }
+
     // -----------------------------------------------------------------
     // EXTENSION-NETWORK Amendment 12 rung 3 — the maintain-peer reconnect
     // lifecycle. In-process two-peer vectors over the full reactive stack

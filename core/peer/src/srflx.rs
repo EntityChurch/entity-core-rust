@@ -197,9 +197,9 @@ async fn observe_at(
 
     if resp.status != 200 {
         return Err(format!(
-            "srflx: reflector returned status {} (want 200; §6.7.4 makes network-reflect a \
+            "srflx: reflector refused: {} (want 200; §6.7.4 makes network-reflect a \
              broad default grant, so a 403 here means the reflector narrowed it)",
-            resp.status
+            crate::remote::refusal_detail(resp.status, &resp.result)
         ));
     }
     if resp.result.entity_type != TYPE_OBSERVE_ADDRESS_RESULT {

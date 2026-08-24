@@ -5016,3 +5016,42 @@ are **derived** from V7 §3.3's class rules rather than measured, asking impls t
 and both pass against the go oracle (`policy_allowlist_rejects_unlisted`,
 `register_open_name_taken`). Recorded so the rows stop being derived-only: two
 impls now agree on the wire, which is a stronger basis than the derivation alone.
+
+---
+
+## §6a.9's `202 pending_review` row pins a *code*; the section's own pseudocode pins a *field* — and all three impls chose differently
+
+**Status:** OPEN upstream (go routed it 2026-08-12, `spec-issues/2026-08-12-c-*`,
+recommending **the result field**). **rust holds its current shape.** No change
+here until arch rules — converging early on any sibling's shape would destroy the
+three-way evidence the ruling is being made on, and the recommendation is for the
+carrier rust already uses.
+
+**Spec:** `EXTENSION-REGISTRY` §6a.9. The ratified status table gives the `202`
+row a **Code** column reading `pending_review`, while the section's own handler
+pseudocode (step 5) says `status "pending_review"` — a *body field*. A code lives
+on `system/protocol/error`; a field lives on a success result. The two readings
+are not reconcilable, and each impl read one of them:
+
+| | result entity type | carrier |
+|---|---|---|
+| go `6aed8f1` | `system/protocol/error` | error **code** `pending_review` |
+| py `2c1aa1b` | `system/registry/register-result` | field `status` (+ `pending_hash`) |
+| rust `21eb223` | `system/protocol/status` | field `status` |
+
+**Rust's reading, unchanged:** a queued request is **not an error** — nothing was
+rejected and nothing was signed — so the answer is a success shape carrying the
+`status` the pseudocode names (`registration.rs` MODE_MANUAL →
+`status_result_with(STATUS_ACCEPTED, [status: "pending_review"])`). `202` was
+already our cohort-convergence choice on the code (entry above).
+
+**Measured, not assumed.** go loosened `policy_manual_queues` to accept either
+carrier, which unblocked the check that actually matters —
+`policy_manual_publishes_nothing`, which rust **passes**: a 202 that quietly
+published the binding would defeat the whole mode while satisfying a status-only
+assertion. go's packet reported us `18 P / 1 W` in `registry_issuer`; re-measured
+here against go's tip `c475a88` the category is **19 P / 0 W / 0 F** — the
+loosened check *passes* the result-field carrier and **WARNs only on the
+error-code carrier**, which is go's own shape, not ours. Their recommendation
+upstream is therefore against their own current answer, and we have nothing to
+change either way until arch rules.

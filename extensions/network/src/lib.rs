@@ -1646,9 +1646,13 @@ impl NetworkHandler {
             .await
             .map_err(|e| e.to_string())?;
         if res.status != STATUS_OK {
+            // The code, not just the status — the sibling `subscribe`
+            // above already reads it (R-7 extractor audit).
             return Err(format!(
-                "unsubscribe {} returned {}",
-                subscription_id, res.status
+                "unsubscribe {} returned {}: {}",
+                subscription_id,
+                res.status,
+                decode_text_field(&res.result.data, "code").unwrap_or_default()
             ));
         }
         Ok(())

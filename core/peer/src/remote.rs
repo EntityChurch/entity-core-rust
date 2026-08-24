@@ -1792,8 +1792,8 @@ pub async fn perform_connect_with_dispatch(
 
     if resp.status != 200 {
         return Err(PeerError::ConnectionError(format!(
-            "hello response status: {}",
-            resp.status
+            "hello refused: {}",
+            refusal_detail(resp.status, &resp.result)
         )));
     }
 
@@ -1843,8 +1843,8 @@ pub async fn perform_connect_with_dispatch(
 
     if auth_resp.status != 200 {
         return Err(PeerError::ConnectionError(format!(
-            "authenticate response status: {}",
-            auth_resp.status
+            "authenticate refused: {}",
+            refusal_detail(auth_resp.status, &auth_resp.result)
         )));
     }
 
@@ -2715,6 +2715,35 @@ pub fn generate_deliver_token(
     })
 }
 
+/// Render a refused response as `"<status> <code>: <message>"` for the
+/// dialer's error text, falling back to the bare status when the body is
+/// not a `system/protocol/error`.
+///
+/// **Why this exists (the R-7 extractor audit, 2026-08-12).** The four
+/// handshake refusal sites — hello and authenticate, over TCP/memory
+/// here and over HTTP in `http_connection.rs` — used to format the
+/// status and drop `resp.result` on the floor. The responder builds a
+/// properly coded error there (`incompatible_hash_format`,
+/// `unsupported_key_type`, `authentication_failed`,
+/// `unresolvable_grantee`, …) and the dialer threw the code away, so a
+/// whole class of handshake failure could only ever be asserted by its
+/// status. That is the same defect go found one layer below their
+/// checks in `regBind`, in our tree: not a check that forgot to assert
+/// the code, but an extractor that made the code unassertable.
+/// `entity_handler::decode_error_entity` already existed — the SDK's
+/// error mapping uses it; these sites simply never called it.
+pub(crate) fn refusal_detail(status: u32, result: &Entity) -> String {
+    match entity_handler::decode_error_entity(result) {
+        Some((code, message)) => match (code, message) {
+            (Some(c), Some(m)) => format!("{} {}: {}", status, c, m),
+            (Some(c), None) => format!("{} {}", status, c),
+            (None, Some(m)) => format!("{} ({}): {}", status, result.entity_type, m),
+            (None, None) => format!("{} ({}, undecodable body)", status, result.entity_type),
+        },
+        None => format!("{} ({})", status, result.entity_type),
+    }
+}
+
 /// Check if a URI targets a remote peer (different from local_peer_id).
 pub fn is_remote_uri(uri: &str, local_peer_id: &str) -> bool {
     // Extract peer_id from URI
@@ -2816,6 +2845,39 @@ mod tests {
         let entity = profile.to_entity();
         let hash = content_store.put(entity).expect("put profile entity");
         location_index.set(path, hash);
+    }
+
+    // ---------- refusal_detail (R-7 extractor audit) ----------
+
+    /// The refusal's `code` reaches the dialer's error text. Before the
+    /// audit these sites formatted `resp.status` alone, so every
+    /// handshake failure a responder coded precisely arrived as a bare
+    /// number — a whole class of failure that could only be asserted by
+    /// status, which is the defect go found in `regBind` one layer below
+    /// their checks.
+    #[test]
+    fn refusal_detail_carries_the_responders_code() {
+        let err = entity_handler::error_entity("incompatible_hash_format", "no common format");
+        let detail = refusal_detail(400, &err);
+        assert!(
+            detail.contains("incompatible_hash_format"),
+            "code dropped: {detail}"
+        );
+        assert!(detail.contains("400"), "status dropped: {detail}");
+        assert!(
+            detail.contains("no common format"),
+            "message dropped: {detail}"
+        );
+    }
+
+    /// A non-error result body is not forced into the error shape: the
+    /// type is reported instead, so "refused with a body we did not
+    /// expect" stays distinguishable from "refused with a coded error".
+    #[test]
+    fn refusal_detail_falls_back_to_the_result_type() {
+        let odd = Entity::new("system/protocol/status", vec![0xa0]).unwrap();
+        let detail = refusal_detail(503, &odd);
+        assert_eq!(detail, "503 (system/protocol/status)");
     }
 
     // ---------- resolve_transport_address (Chunk C — §6.5 shape) ----------

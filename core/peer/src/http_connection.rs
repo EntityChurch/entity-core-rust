@@ -168,8 +168,8 @@ impl HttpConnection {
             .map_err(|e| PeerError::ConnectionError(format!("parse hello response: {}", e)))?;
         if hello_resp.status != 200 {
             return Err(PeerError::ConnectionError(format!(
-                "hello envelope status: {}",
-                hello_resp.status
+                "hello refused: {}",
+                crate::remote::refusal_detail(hello_resp.status, &hello_resp.result)
             )));
         }
         let remote_hello = entity_protocol::HelloData::from_entity(&hello_resp.result)
@@ -220,8 +220,8 @@ impl HttpConnection {
             .map_err(|e| PeerError::ConnectionError(format!("parse auth response: {}", e)))?;
         if auth_parsed.status != 200 {
             return Err(PeerError::ConnectionError(format!(
-                "authenticate envelope status: {}",
-                auth_parsed.status
+                "authenticate refused: {}",
+                crate::remote::refusal_detail(auth_parsed.status, &auth_parsed.result)
             )));
         }
 
