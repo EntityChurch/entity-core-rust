@@ -257,10 +257,42 @@ fn connect_seed() -> Vec<(String, Vec<GrantEntry>)> {
 /// who speaks first; two implementations that resolve it differently produce
 /// either a crossed handshake or two peers both waiting, on a connection that
 /// punched perfectly.
-async fn verify_as_client(conn: Connection, keypair: &IdentityKeypair) -> anyhow::Result<bool> {
-    let remote_conn = remote::perform_connect(conn, keypair, entity_hash::HASH_ALGORITHM_SHA256)
-        .await
-        .map_err(|e| anyhow::anyhow!("handshake over the punched path: {}", e))?;
+///
+/// **The initiator is also the §6.5 (b) minter, so it needs a dispatch stack.**
+/// A punch meets at a §3 rendezvous key, which is the symmetric establishment
+/// EXTENSION-SIGNALING §6.5 (b) describes: the dialer mints the reciprocal grant
+/// for the acceptor, and — the half that fails silently — must *serve* the
+/// reach-back that wields it (V7 §6.11(b) dialer-side reentry). Both halves need
+/// a local `PeerShared`. This driver used to call the bare `perform_connect`,
+/// i.e. `reentry = None` and `established_via_rendezvous_key = false`, so it
+/// minted nothing however symmetric the establishment was — which is why the
+/// cross-impl V3 direction-B cell (Rust minter → Go acceptor) measured 0/4 and
+/// was reported as unscorable rather than as a divergence.
+///
+/// The flag is read off the `LivePath` rather than hardcoded: the classification
+/// belongs to the establisher that produced the path (§4.4), and a driver that
+/// asserted `true` on its own would be exactly the one-sided field §7.4.1 rules
+/// out.
+async fn verify_as_client(
+    conn: Connection,
+    keypair: &IdentityKeypair,
+    established_via_rendezvous_key: bool,
+) -> anyhow::Result<Verified> {
+    let peer = PeerBuilder::new()
+        .identity_keypair(keypair.clone_identity())
+        .with_seed_policy(connect_seed())
+        .build()
+        .map_err(|e| anyhow::anyhow!("build dialing peer: {}", e))?;
+    let shared = peer.shared();
+    let remote_conn = remote::perform_connect_with_dispatch(
+        conn,
+        keypair,
+        entity_hash::HASH_ALGORITHM_SHA256,
+        Some(shared),
+        established_via_rendezvous_key,
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("handshake over the punched path: {}", e))?;
 
     // One ordinary operation. `ping` is the §5.2 keepalive verb every peer
     // answers, which makes it the cheapest thing both implementations already
@@ -283,7 +315,11 @@ async fn verify_as_client(conn: Connection, keypair: &IdentityKeypair) -> anyhow
         remote_conn.remote_peer_id,
         entity_protocol::CONNECT_PATH
     );
-    let resp = remote::send_execute(
+    // The mint has already happened or not by now, and the answer must survive a
+    // failing ping — a `?` here would report `grant_sent:false` for a grant that
+    // was sent, which is the same conflation this field exists to remove.
+    let grant_sent = remote_conn.reciprocal_grant_sent();
+    let ping = remote::send_execute(
         &remote_conn,
         keypair,
         &uri,
@@ -295,9 +331,172 @@ async fn verify_as_client(conn: Connection, keypair: &IdentityKeypair) -> anyhow
         &std::collections::HashMap::new(),
         None,
     )
+    .await;
+
+    // **Linger before dropping the connection** (`entity-core-go` ask 1). The
+    // acceptor is about to originate under the grant this seat just minted it,
+    // and `remote_conn`'s `Drop` aborts the reader task that would serve it — so
+    // returning here severs the reach-back mid-flight. The wait happens on every
+    // outcome: the mint landed at handshake time, so the counterpart's reach is
+    // in flight regardless of what the ping did. See `LINGER_AFTER_VERIFY_MS`.
+    tokio::time::sleep(Duration::from_millis(LINGER_AFTER_VERIFY_MS)).await;
+    drop(remote_conn);
+
+    match ping {
+        Ok(resp) if resp.status == 200 => Ok(Verified {
+            ok: true,
+            grant_sent,
+            why: None,
+        }),
+        Ok(resp) => Ok(Verified {
+            ok: false,
+            grant_sent,
+            why: Some(format!(
+                "ping over the punched path answered {}",
+                resp.status
+            )),
+        }),
+        Err(e) => Ok(Verified {
+            ok: false,
+            grant_sent,
+            why: Some(format!("ping over the punched path: {}", e)),
+        }),
+    }
+}
+
+/// What the initiator learned on the punched path. `grant_sent` is deliberately
+/// independent of `ok`: the §6.5 (b) mint happens at handshake time, so it is a
+/// fact even when the ping that follows it fails.
+struct Verified {
+    ok: bool,
+    grant_sent: bool,
+    why: Option<String>,
+}
+
+/// How long the initiator holds the punched connection open after its pong —
+/// the mirror of `entity-core-go`'s `lingerAfterVerify`, same 2s.
+///
+/// **`entity-core-go` ask 1, and the symmetric twin of a bug they fixed for us.**
+/// On 2026-08-01 their responder returned the moment it observed establishment
+/// and dropped the socket under an initiator still waiting on its pong; they
+/// added a linger. Our initiator then did the same thing one role over — exiting
+/// ~1.4 ms after its pong, under an acceptor about to exercise the very
+/// authority that initiator had just granted it. Their measurement: the reach
+/// dispatch started 0.2 ms after the grant landed and died on `connection
+/// closed`, never a 401/403. **A symmetric establishment wants a symmetric
+/// linger**, and until it exists no harness on either side can measure reach in
+/// direction B.
+///
+/// It is a driver artifact being compensated for, not a protocol timing: a real
+/// peer keeps a punched transport pooled for reuse, and a one-shot driver that
+/// tears it down the instant it verifies is the thing that does not resemble a
+/// peer.
+const LINGER_AFTER_VERIFY_MS: u64 = 2000;
+
+/// §6.5 (b) REACH leg — this seat is the acceptor: if the dialer minted us a
+/// reciprocal grant, originate back over the connection *they* opened and report
+/// what came of it. `entity-core-go` ask 2, and the mirror of the leg they built
+/// in `26fd7b7`; the field names match theirs deliberately so one JSON contract
+/// spans both drivers.
+///
+/// **Triggered on the grant landing, not on the establishment poll** — core-go's
+/// ordering lesson, paid for twice on their side (first as `no transport
+/// profile`, which reads like a resolution bug and is a lifetime bug, then as
+/// `connection closed`). The grant landing is the moment authority exists *and*
+/// the counterpart is still up; anything sequenced after the counterpart's own
+/// round trip is racing its teardown.
+///
+/// Two facts, never folded into `ok`: `reciprocal_grant_received` says whether
+/// the counterpart minted to us at all (the mirror of `reciprocal_grant_sent`),
+/// and `reciprocal_reach_status` is what one dispatch under that grant returned.
+/// `200` is reach; `401`/`403` is a grant that verifies and authorizes nothing —
+/// the failure the whole mechanism exists to prevent, and the one invisible to
+/// every test that stops at installation. Neither gates `ok`, because the punch's
+/// own contract is about the punch and a counterpart that has not adopted §6.5
+/// (b) must degrade to one-directional rather than fail a punch that worked.
+async fn reciprocal_reach_back(
+    shared: &Arc<entity_peer::PeerShared>,
+    initiator_id: &str,
+    keypair: &IdentityKeypair,
+) -> Vec<(String, Json)> {
+    // Wait the CONFORMANCE FLOOR, not our own production bound (§6.5 (b)
+    // Delivery + timing, arch Q3): a vector that waits only as long as this peer
+    // would is a verdict about our impatience, not about the peer under test.
+    let polls = entity_peer::remote::RECIPROCAL_GRANT_VECTOR_FLOOR_MS / 25;
+    let mut endpoint = None;
+    for _ in 0..polls {
+        if let Some(e) = shared.remote.get_inbound(initiator_id) {
+            if e.originating_capability().is_some() {
+                endpoint = Some(e);
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let Some(endpoint) = endpoint else {
+        return vec![("reciprocal_grant_received".into(), Json::Bool(false))];
+    };
+    let mut out = vec![("reciprocal_grant_received".into(), Json::Bool(true))];
+
+    // The §4.4 FLOOR's own scope — `system/tree` `get` over `system/type/*`.
+    // Every peer seeds its type entities, so this reaches a real entity on any
+    // conformant counterpart without assuming anything the floor does not grant,
+    // and it stays in scope even against a counterpart that still mints the bare
+    // floor rather than the assembled set. Same target core-go's leg uses.
+    //
+    // `mode` is left ABSENT rather than sent as `hash`: optional fields SHOULD be
+    // absent, and `mode:hash` is a known gap in this repo's own tree handler
+    // (docs/BACKLOG.md) — sending a field we do not serve would make the vector
+    // depend on the counterpart implementing something we do not.
+    let path = format!("/{}/system/type/system/peer", initiator_id);
+    let params_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+        entity_ecf::text("path"),
+        entity_ecf::text(&path),
+    )]));
+    let params = match entity_entity::Entity::new("system/tree/get-params", params_data) {
+        Ok(p) => p,
+        Err(e) => {
+            out.push((
+                "reciprocal_reach_error".into(),
+                Json::Str(format!("build get request: {}", e)),
+            ));
+            return out;
+        }
+    };
+    let resource = entity_capability::ResourceTarget {
+        targets: vec![path.clone()],
+        exclude: vec![],
+    };
+
+    match remote::send_execute(
+        endpoint.as_ref(),
+        keypair,
+        &format!("/{}/system/tree", initiator_id),
+        "get",
+        &params,
+        Some(&resource),
+        None,
+        None,
+        &std::collections::HashMap::new(),
+        None,
+    )
     .await
-    .map_err(|e| anyhow::anyhow!("ping over the punched path: {}", e))?;
-    Ok(resp.status == 200)
+    {
+        Ok(resp) => {
+            out.push((
+                "reciprocal_reach_status".into(),
+                Json::Num(resp.status as usize),
+            ));
+            out.push(("reciprocal_reach".into(), Json::Bool(resp.status == 200)));
+        }
+        // A transport failure is not a verdict on the grant, so it is reported
+        // as its own field rather than as a status.
+        Err(e) => out.push((
+            "reciprocal_reach_error".into(),
+            Json::Str(format!("originate under reciprocal grant: {}", e)),
+        )),
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -573,10 +772,20 @@ async fn run(args: &Args) -> anyhow::Result<Vec<(String, Json)>> {
     let deadline =
         || EstablishCtx::dispatch(web_time::Instant::now() + Duration::from_secs_f64(args.timeout));
 
-    let mut why: Option<String> = None;
+    let why: Option<String>;
+    // §6.5 (b): initiator-only. `false` on the responder seat is a fact about
+    // the role, not a failure — the acceptor does not mint.
+    let mut reciprocal_grant_sent = false;
+    // §6.5 (b) REACH, responder-only — `reciprocal_grant_received`,
+    // `reciprocal_reach_status`, `reciprocal_reach`, `reciprocal_reach_error`,
+    // matching `entity-core-go`'s field names so one JSON contract covers both
+    // drivers. Absent on the initiator seat: only the acceptor can wield.
+    let mut reach_fields: Vec<(String, Json)> = Vec::new();
     let (punched, remote_peer, verified) = if args.role == "initiator" {
         match establisher.establish_live(deadline(), "").await {
             Ok(path) => {
+                // §4.4: the establisher classifies, the driver carries.
+                let rendezvous = path.established_via_rendezvous_key;
                 let conn = path.connection;
                 let remote_addr = conn.remote_addr.clone();
                 // **Keep the cause.** A bare `verified:false` from this side is
@@ -584,11 +793,11 @@ async fn run(args: &Args) -> anyhow::Result<Vec<(String, Json)>> {
                 // a failed handshake — which is exactly the ambiguity that made
                 // the Go-reported Rust-initiator divergence un-diagnosable from
                 // the JSON line alone.
-                match verify_as_client(conn, &keypair).await {
-                    Ok(true) => (true, remote_addr, true),
-                    Ok(false) => {
-                        why = Some("ping over the punched path answered non-200".to_string());
-                        (true, remote_addr, false)
+                match verify_as_client(conn, &keypair, rendezvous).await {
+                    Ok(v) => {
+                        reciprocal_grant_sent = v.grant_sent;
+                        why = v.why;
+                        (true, remote_addr, v.ok)
                     }
                     Err(e) => {
                         why = Some(e.to_string());
@@ -621,24 +830,37 @@ async fn run(args: &Args) -> anyhow::Result<Vec<(String, Json)>> {
                     .build()
                     .map_err(|e| anyhow::anyhow!("build serving peer: {}", e))?;
                 let shared = peer.shared();
-                let served = tokio::time::timeout(
-                    Duration::from_secs_f64(args.timeout),
-                    entity_peer::connection::handle_connection(conn, shared),
-                )
-                .await;
+                // Serving is spawned rather than awaited so the REACH leg below
+                // can run **while the connection is still up**. Awaiting it here
+                // is what made the acceptor's own authority unmeasurable from
+                // this seat: by the time `handle_connection` returns, the thing
+                // the grant authorizes is gone.
+                let serving = shared.clone();
+                let served_task = tokio::spawn(async move {
+                    entity_peer::connection::handle_connection(conn, serving).await
+                });
+
+                // §6.5 (b) REACH — `entity-core-go` ask 2. This seat is the
+                // ACCEPTOR, so it is the only one that can wield the reciprocal
+                // grant, and a crossing that shows only the grant arriving
+                // proves installation, not reach.
+                reach_fields = reciprocal_reach_back(&shared, &initiator_id, &keypair).await;
+
+                let served =
+                    tokio::time::timeout(Duration::from_secs_f64(args.timeout), served_task).await;
                 // **Clean end-of-stream only.** The initiator closes once its
-                // ping is answered, so `Ok(Ok(()))` is a served handshake
-                // followed by an ordinary disconnect. A `handle_connection`
-                // error is a handshake that did not complete — counting it
-                // would report `verified` on the exact failure this field
-                // exists to catch.
-                let verified = matches!(served, Ok(Ok(())));
+                // ping is answered and its linger elapses, so `Ok(Ok(Ok(())))`
+                // is a served handshake followed by an ordinary disconnect. A
+                // `handle_connection` error is a handshake that did not
+                // complete — counting it would report `verified` on the exact
+                // failure this field exists to catch.
+                let verified = matches!(&served, Ok(Ok(Ok(()))));
                 why = match &served {
-                    Ok(Ok(())) => None,
-                    Ok(Err(e)) => Some(format!("serving the punched path failed: {}", e)),
+                    Ok(Ok(Ok(()))) => None,
+                    Ok(Ok(Err(e))) => Some(format!("serving the punched path failed: {}", e)),
+                    Ok(Err(e)) => Some(format!("the serving task did not finish: {}", e)),
                     Err(_) => Some("served path did not close within the timeout".to_string()),
                 };
-                let _ = initiator_id;
                 (true, remote_addr, verified)
             }
             None => {
@@ -649,7 +871,7 @@ async fn run(args: &Args) -> anyhow::Result<Vec<(String, Json)>> {
     };
 
     let dialed_outbound = establisher.outbound_attempts() > 0;
-    Ok(vec![
+    let mut fields = vec![
         ("ok".into(), Json::Bool(punched && verified)),
         ("role".into(), Json::Str(args.role.clone())),
         ("mode".into(), Json::Str(args.mode.clone())),
@@ -659,6 +881,15 @@ async fn run(args: &Args) -> anyhow::Result<Vec<(String, Json)>> {
         ("node_peer_id".into(), Json::Str(node_peer_id)),
         ("punched".into(), Json::Bool(punched)),
         ("dialed_outbound".into(), Json::Bool(dialed_outbound)),
+        // §6.5 (b), initiator-only, additive to the CLI/JSON contract: whether
+        // this seat minted and sent the reciprocal reentry grant. It makes the
+        // cross-impl V3 direction-B cell scorable from the output line — a
+        // `false` here says the *minter* declined, a `true` with no grant at the
+        // acceptor says the acceptance path dropped it.
+        (
+            "reciprocal_grant_sent".into(),
+            Json::Bool(reciprocal_grant_sent),
+        ),
         ("local_addr".into(), Json::Str(local_addr.to_string())),
         ("srflx".into(), Json::Str(srflx_addr)),
         ("srflx_source".into(), Json::Str(srflx_source.to_string())),
@@ -668,7 +899,12 @@ async fn run(args: &Args) -> anyhow::Result<Vec<(String, Json)>> {
             "detail".into(),
             Json::Str(why.unwrap_or_else(|| String::from("ok"))),
         ),
-    ])
+    ];
+    // Responder-only, and appended rather than always-present: a field that is
+    // absent says "this seat cannot wield" (it is the minter), which a `false`
+    // would blur into "it tried and got nothing".
+    fields.extend(reach_fields);
+    Ok(fields)
 }
 
 #[cfg(test)]

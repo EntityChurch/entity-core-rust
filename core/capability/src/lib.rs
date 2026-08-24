@@ -931,31 +931,13 @@ fn grant_subset(
     parent_granter_peer_id: &str,
     local_peer_id: &str,
 ) -> bool {
-    // Handlers: no §PR-8 frame — both sides canonicalize under local_peer_id.
-    if !scope_subset_path(
-        &child.handlers,
-        &parent.handlers,
-        local_peer_id,
-        local_peer_id,
-    ) {
-        return false;
-    }
-    if !scope_subset_id(&child.operations, &parent.operations) {
-        return false;
-    }
-    // Resources: §PR-8 per-link granter frame (child vs parent granter).
-    if !scope_subset_path(
-        &child.resources,
-        &parent.resources,
+    if !grant_axes_subset(
+        child,
+        parent,
         child_granter_peer_id,
         parent_granter_peer_id,
+        local_peer_id,
     ) {
-        return false;
-    }
-    let default_peers = IdScope::new(vec![local_peer_id.into()]);
-    let child_peers = child.peers.as_ref().unwrap_or(&default_peers);
-    let parent_peers = parent.peers.as_ref().unwrap_or(&default_peers);
-    if !scope_subset_id(child_peers, parent_peers) {
         return false;
     }
 
@@ -985,6 +967,101 @@ fn grant_subset(
     }
 
     true
+}
+
+/// The **four-axis** half of [`grant_subset`] — handlers, operations,
+/// resources, peers — without §5.6's constraint/allowance attenuation.
+///
+/// Split out because the §3 advertisement filter names exactly these four
+/// (see [`advertisement_covers`]) while delegation attenuation needs both
+/// halves. Delegation's behavior is unchanged: `grant_subset` calls this first
+/// and then applies §5.6 as before.
+fn grant_axes_subset(
+    child: &GrantEntry,
+    parent: &GrantEntry,
+    child_granter_peer_id: &str,
+    parent_granter_peer_id: &str,
+    local_peer_id: &str,
+) -> bool {
+    // Handlers: no §PR-8 frame — both sides canonicalize under local_peer_id.
+    if !scope_subset_path(
+        &child.handlers,
+        &parent.handlers,
+        local_peer_id,
+        local_peer_id,
+    ) {
+        return false;
+    }
+    if !scope_subset_id(&child.operations, &parent.operations) {
+        return false;
+    }
+    // Resources: §PR-8 per-link granter frame (child vs parent granter).
+    if !scope_subset_path(
+        &child.resources,
+        &parent.resources,
+        child_granter_peer_id,
+        parent_granter_peer_id,
+    ) {
+        return false;
+    }
+    let default_peers = IdScope::new(vec![local_peer_id.into()]);
+    let child_peers = child.peers.as_ref().unwrap_or(&default_peers);
+    let parent_peers = parent.peers.as_ref().unwrap_or(&default_peers);
+    scope_subset_id(child_peers, parent_peers)
+}
+
+/// Does an advertised served-scope **cover** a grant entry?
+///
+/// The §4.4 / EXTENSION-SIGNALING §6.5 (b) *advertisement filter* (arch ruling
+/// 2026-08-05): an assembled entry is retained iff some advertised entry covers
+/// it under the **same four-axis `scope_subset` relation the chain uses for
+/// attenuation** — i.e. [`grant_subset`], the one already used for delegation.
+/// Exact-op-match and namespace-prefix-match are explicitly non-conformant, so
+/// this deliberately reuses the relation rather than re-deriving a filter.
+///
+/// **Four axes only.** The ruling says *four-axis*, so this uses
+/// [`grant_axes_subset`], not `grant_subset` — §5.6's allowance rule ("child
+/// MUST NOT add keys the parent lacks") is right for delegation and wrong here:
+/// a handler manifest expresses no allowances, so applying it would drop every
+/// operator-authored entry carrying one, silently and entry-wide.
+///
+/// **Entry-level, and drop-not-narrow.** An entry that is only partly covered
+/// is dropped whole; rewriting its scope would hand the counterpart a grant no
+/// operator authored.
+///
+/// All three granter frames collapse to `local_peer_id`: the advertised scope
+/// and the assembled entry are both authored by *this* peer at the same moment,
+/// so §PR-8's per-link granter frame has no two links to distinguish.
+pub fn advertisement_covers(
+    advertised: &[GrantEntry],
+    entry: &GrantEntry,
+    local_peer_id: &str,
+) -> bool {
+    // UNIVERSAL-HANDLER CARVE-OUT — the boundary the ruling does not address.
+    //
+    // An advertised served-scope is a finite set of registered handlers, so no
+    // union of advertised entries can cover a `handlers: ["*"]` claim. Under a
+    // literal "uncovered entries drop, not narrow", every open-access grant is
+    // deleted and such a peer hands its counterparts exactly nothing.
+    //
+    // That does not close a divergence — the ruling's worked example is a
+    // *narrower* mismatch (`system/tree:put` against an advertised `foo/*`),
+    // which is what the four-axis relation genuinely fixes. A `*` grant
+    // dispatched at a registered handler works, and at an unregistered one 404s
+    // — the same outcome an absent grant reaches one layer later.
+    //
+    // So bare `*` is retained iff this peer serves anything at all: "backed by
+    // whatever we serve", not "always backed". `entity-core-go` reached the same
+    // carve-out independently (`advertisedCovers`, `core/protocol/connect.go`)
+    // and routed it; this is convergence on their landed shape, not two
+    // implementations agreeing by construction. Routed to arch — if the literal
+    // reading is ruled, this block deletes and the pin below changes with it.
+    if entry.handlers.include.iter().any(|p| p == "*") {
+        return !advertised.is_empty();
+    }
+    advertised
+        .iter()
+        .any(|a| grant_axes_subset(entry, a, local_peer_id, local_peer_id, local_peer_id))
 }
 
 /// Compare two ciborium::Values by their canonical CBOR encoding.
@@ -2065,6 +2142,154 @@ mod tests {
                 LOCAL_PEER
             ),
             "R-5: --debug-grants MUST permit cross-namespace tree:put"
+        );
+    }
+
+    // --- §3 advertisement filter (arch ruling 2026-08-05) ---
+
+    /// One advertised entry in the shape `advertised_served_scope` builds:
+    /// a handler, everything else unconstrained.
+    fn advertised_entry(handler: &str, ops: Vec<&str>) -> GrantEntry {
+        GrantEntry {
+            handlers: PathScope::new(vec![handler.into()]),
+            resources: PathScope::new(vec!["*".into()]),
+            operations: IdScope::new(ops.into_iter().map(String::from).collect()),
+            peers: None,
+            constraints: None,
+            allowances: None,
+        }
+    }
+
+    fn grant_entry(handlers: Vec<&str>, ops: Vec<&str>) -> GrantEntry {
+        GrantEntry {
+            handlers: PathScope::new(handlers.into_iter().map(String::from).collect()),
+            resources: PathScope::new(vec![]),
+            operations: IdScope::new(ops.into_iter().map(String::from).collect()),
+            peers: None,
+            constraints: None,
+            allowances: None,
+        }
+    }
+
+    /// The ruled matching rule: entry ⊆ advertised on the four axes, under the
+    /// same relation the chain uses for attenuation. Exact-op-match and
+    /// namespace-prefix-match are named non-conformant, so the cases that
+    /// distinguish them are the load-bearing ones.
+    #[test]
+    fn test_advertisement_filter_matching_rule() {
+        let advertised = vec![advertised_entry("foo/bar", vec!["*"])];
+
+        // Ordinary attenuation direction — covered.
+        assert!(
+            advertisement_covers(
+                &advertised,
+                &grant_entry(vec!["foo/bar"], vec!["get"]),
+                LOCAL_PEER
+            ),
+            "entry ⊆ advertised on every axis is exactly the retained case"
+        );
+
+        // A sibling under the same namespace prefix is NOT covered: the
+        // advertised scope names `foo/bar`, not `foo/*`. Namespace-prefix
+        // matching is what the ruling calls non-conformant.
+        assert!(
+            !advertisement_covers(
+                &advertised,
+                &grant_entry(vec!["foo/baz"], vec!["get"]),
+                LOCAL_PEER
+            ),
+            "namespace-prefix matching is non-conformant — `foo/baz` is not served"
+        );
+
+        // A wildcard subtree claim exceeds the single advertised handler.
+        assert!(
+            !advertisement_covers(
+                &advertised,
+                &grant_entry(vec!["foo/*"], vec!["get"]),
+                LOCAL_PEER
+            ),
+            "`foo/*` claims more than the one handler advertised under it"
+        );
+
+        // Operations narrow correctly against an advertised operation set.
+        let narrow = vec![advertised_entry("foo/bar", vec!["get"])];
+        assert!(advertisement_covers(
+            &narrow,
+            &grant_entry(vec!["foo/bar"], vec!["get"]),
+            LOCAL_PEER
+        ),);
+        assert!(
+            !advertisement_covers(
+                &narrow,
+                &grant_entry(vec!["foo/bar"], vec!["put"]),
+                LOCAL_PEER
+            ),
+            "an operation the advertised scope does not carry is not covered"
+        );
+    }
+
+    /// **Drop, not narrow** — the half of the ruling a rewrite would quietly
+    /// violate. A mixed entry naming one served and one unserved handler is
+    /// dropped whole; it is NOT rewritten to the served half, because that
+    /// would hand a counterpart a grant no operator authored.
+    #[test]
+    fn test_advertisement_filter_drops_a_mixed_entry_whole() {
+        let advertised = vec![advertised_entry("foo/bar", vec!["*"])];
+        let mixed = grant_entry(vec!["foo/bar", "app/echo"], vec!["get"]);
+
+        assert!(
+            !advertisement_covers(&advertised, &mixed, LOCAL_PEER),
+            "an entry is retained only if ALL of it is covered — any-include \
+             matching would retain this one and grant `app/echo` authority the \
+             peer does not serve"
+        );
+    }
+
+    /// §5.6 constraint/allowance attenuation is deliberately NOT applied: the
+    /// ruling names four axes, and an advertised scope is a statement about
+    /// what this peer serves, not a parent capability. Applying the allowance
+    /// rule ("child MUST NOT add keys the parent lacks") against a manifest
+    /// that expresses no allowances would drop every operator entry carrying
+    /// one, silently and entry-wide.
+    #[test]
+    fn test_advertisement_filter_ignores_constraints_and_allowances() {
+        let advertised = vec![advertised_entry("foo/bar", vec!["*"])];
+        let mut entry = grant_entry(vec!["foo/bar"], vec!["get"]);
+        let mut allowances = std::collections::BTreeMap::new();
+        allowances.insert(
+            "scope".to_string(),
+            ciborium::Value::Text("content_store".into()),
+        );
+        entry.allowances = Some(allowances);
+
+        assert!(
+            advertisement_covers(&advertised, &entry, LOCAL_PEER),
+            "an operator-authored allowance is not an unadvertised handler"
+        );
+    }
+
+    /// The universal-handler carve-out, pinned so that a later arch ruling
+    /// against it is a visible test change rather than silent drift.
+    ///
+    /// No finite advertised scope covers `handlers: ["*"]`, so the literal
+    /// "drop, not narrow" deletes open access entirely. Retained iff this peer
+    /// serves anything at all. Converged with `entity-core-go`'s
+    /// `advertisedCovers`; both routed.
+    #[test]
+    fn test_advertisement_filter_keeps_the_universal_carve_out() {
+        let advertised = vec![advertised_entry("foo/bar", vec!["*"])];
+        let universal = grant_entry(vec!["*"], vec!["*"]);
+
+        assert!(
+            advertisement_covers(&advertised, &universal, LOCAL_PEER),
+            "the universal grant was dropped — that is the literal reading, and \
+             it deletes open access on every peer. If arch rules for the literal \
+             reading this test changes deliberately"
+        );
+        assert!(
+            !advertisement_covers(&[], &universal, LOCAL_PEER),
+            "a peer that serves nothing advertises nothing — the carve-out is \
+             'backed by whatever we serve', not 'always backed'"
         );
     }
 

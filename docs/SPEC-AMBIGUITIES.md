@@ -4379,6 +4379,67 @@ illustrative. If illustrative, spell check (a) parametrically over `key_type` as
 <summary><b>§6.5 symmetric originate — who authorizes the answerer's outbound dispatch?</b>
 (EXTENSION-SIGNALING §6.5 trigger (b) × GUIDE-CONFORMANCE §7a.2a) — <i>2026-08-05, live rung-1 run</i></summary>
 
+> **RESOLVED — IMPLEMENTED + VALIDATED (2026-08-05):** ruling **option 1 (mutual minting)** selected
+> by the maintainer, implemented in this repo, and proven on the rung-1 two-browser rig (BIDIRECTIONAL
+> 2/2, roles swapped) plus a native regression guard (`test_s65_acceptor_originates_after_reciprocal_
+> grant`). The acceptor now acquires originating authority from the dialer's reciprocal reentry grant.
+> Design spec + validation: `docs/PROPOSAL-SYMMETRIC-REENTRY-MUTUAL-MINTING.md`. Routing to
+> `entity-system-architecture` for cross-impl pinning (the wire addition is protocol-visible).
+>
+> **SCOPED AND CLOSED ON OUR SIDE (2026-08-05):** arch reframed the proposal on establishment
+> symmetry (rev 3, `entity-system-architecture` `5f62374`) and ruled the discriminator onto the
+> **rendezvous key**: mint iff a §3 key (`pair`/`tag`/`secret`/`lobby`) was mutually brought —
+> locally derived, never wire-carried. Narrowing built here: `LivePath.established_via_rendezvous_key`
+> gates the mint, so a dial-by-address no longer grants reciprocal authority (both establishers in
+> this crate report `true` — the §7 punch meets at the §3.2 `pair` key). The §6.11(b) consumer this
+> repo reported is resolved by the same ruling as **row 2**, not row 3: async inbox delivery now
+> authorizes under the caller's `deliver_token`. Remaining: arch folds the spec text on core-go's
+> ack. See `docs/status/ROUTING-2026-08-05-the-narrowing-is-in-and-the-discriminator-confirmed-to-arch.md`.
+>
+> **FOLDED (2026-08-06):** arch folded Q1–Q4 + a new reach-back-serving MUST at
+> `entity-system-architecture` `f8f736a`. Absorbed here: **Q2** — the reciprocal grant is now the
+> §4.4 **assembled** inbound-dialer grant, not the flat floor (`connection::assemble_inbound_grants`,
+> one assembly, two callers); **Q3** — `remote::RECIPROCAL_GRANT_VECTOR_FLOOR_MS` names the
+> conformance floor separately from our impl-local `REENTRY_GRANT_POLLS`; the **reach-back-serving
+> MUST** was already satisfied (dialer-side §6.11(b) reentry has been wired since `0eccb3f`). One
+> sub-clause of Q2 is *not* closed here — see the advertisement-filtering entry below. **Q1 (carriage)
+> is core-go's push-back, not ours**, and this repo ships the same connect-phase-frame shape they do.
+>
+> **Q1 update, 2026-08-05.** Arch ruled a two-phase carriage: deliver the cap's **content hash**,
+> wield via the §7a.2a triple **as references** the granter resolves. `entity-core-go` reviewed it and
+> recommends **adopting phase (2), keeping phase (1)** — a bare hash contradicts the mint bullet two
+> paragraphs above it in the same §6.5 (b) ("verify the granter signature at acceptance … MUST check
+> only the legs the frame carries": a hash carries none) and leaves the acceptor holding something it
+> cannot open or fail closed on. It also reuses §7a.2a's ratified field names with a different payload
+> type, which is a ×N keystone change or a type-discriminate-by-context ambiguity. **This repo concurs
+> and has built the phase (2) receiver only.** The carrier question we filed is answered by Go and
+> needs no ruling: `EXECUTE uri=system/protocol/connect operation=reentry-grant` is a new *operation*,
+> not a new frame, and is already what both impls ship — only the `params` payload was ever at issue.
+>
+> **What is built here (`connection::dispatch_request`, `PeerShared::minted_reentry_grants`):** the
+> receiver supplies the triple from what it minted **and delivered** to that specific counterpart, on
+> a retry taken only after a first verification failure. That ordering is what makes it landable ahead
+> of the flag day: a frame carrying today's inlined chain verifies on the first attempt and never
+> reaches the new path, so the shipped wire shape cannot move. **The sender still inlines** —
+> `originating_chain_bundle` is untouched, and deleting it is the flag day proper, to be flipped with
+> Go and the vector file re-emitted. Two things the build confirmed that the text does not say, both
+> matching Go's findings independently reproduced here:
+>
+> 1. **The supplier must not be a content-store lookup.** Read literally, "resolves from its own
+>    content store" makes *naming* a cap equivalent to *holding* it — a cap minted and never delivered
+>    becomes wieldable. `grantee == author` still binds it to the named peer, so this is not
+>    third-party escalation, but it erases "we minted this for you" from "you hold this". Scoped to
+>    minted-and-delivered, keyed by recipient, written only after the frame write succeeds.
+> 2. **A naive flip emits a *partial* reference frame, not a references-only one.**
+>    `build_authenticated_execute` inlines the capability unconditionally (Go's
+>    `CreateAuthenticatedExecute` likewise), so dropping the supporting set yields cap-present /
+>    signature-and-granter-absent, which dies at the chain walk as **`missing_signature`** — not as a
+>    missing cap. Any impl that flips by "stop attaching the chain" ships exactly this and will
+>    misread the failure. A true references-only sender needs an envelope-builder change.
+>
+> Pinned by `test_q1_phase2_references_only_wielding_is_scoped_to_minted_and_delivered`, whose third
+> assertion fails if resolution ever widens past the recipient key.
+
 **The passages.**
 
 `EXTENSION-SIGNALING.md` §6.5, *Two establishment triggers*, trigger (b): two peers that publish no
@@ -4439,5 +4500,99 @@ ruling on rather than having two implementations pick differently:
 `[§11.5.1]` flavour worth noting: this is invisible to a same-implementation *loopback* test, because
 it only appears once the two peers occupy genuinely different roles across a real negotiated channel.
 Our native suite never constructs the acceptor's originating path at all.
+
+</details>
+
+---
+
+<details>
+<summary><b>§6.5 (b) Contents — what does "advertisement-filtered" match against?</b> — <b>RULED
+and built; two sub-questions re-routed</b>
+(EXTENSION-SIGNALING §6.5 (b) × ENTITY-CORE-PROTOCOL §3 advertisement discipline) — <i>2026-08-06,
+folding arch `f8f736a`; ruled by arch `977667f`, built 2026-08-05</i></summary>
+
+**The passage.** The Q2 ruling defines the reciprocal grant as the §4.4 handshake union
+"**advertisement-filtered** (`ENTITY-CORE-PROTOCOL.md` §3 advertisement discipline — a peer MUST NOT
+grant authority it does not advertise it serves)", and §11.1's client-role row repeats it.
+
+**What is unclear.** The filter's *matching rule* is not stated, and a grant's handler scope is a
+`PathScope` — an include/exclude list that may hold wildcards. So a filter has to answer, at minimum:
+
+1. Does a grant entry survive if **any** of its `handlers.include` patterns resolves to a registered
+   handler, or only if **all** do? (An entry naming `system/tree` and `app/echo` on a peer serving
+   only the first is the case that decides it.)
+2. What does a wildcard include (`app/*`, `*`) match against — the registry's *current* pattern set,
+   evaluated when? A grant assembled at handshake outlives the handshake; a handler registered a
+   second later was not advertised then and is now.
+3. Is the filter over grant **entries** (drop the whole entry) or over the patterns **inside** one
+   entry (rewrite the scope)? These differ observably for a mixed entry, and a rewritten scope is a
+   grant the operator did not author.
+
+**Interim choice — no filter, and a reason it is not merely deferral.** This repo already absorbed
+the *capability-handler-advertisement ruling* the other way round: rather than filter an advertised
+grant it could not serve, it **registers the handler** (Resolution B — `core/peer/src/lib.rs`, the
+`capability-handler` block), so the §4.4 floor names only handlers this peer serves, by construction.
+That is the discipline's substance for the floor. What is unfiltered is the **policy-table union** —
+operator-authored entries, which is exactly where the three questions above bite and where a wrong
+answer silently narrows an operator's intent.
+
+Crucially, this is **not** an asymmetry between the two directions, which is what the Q2 ruling was
+about: the reciprocal mint and the §6.6 handshake read the *same* `assemble_inbound_grants`, so
+whatever discipline the inbound direction has, the reciprocal direction has identically. A filter
+added later lands in one function and moves both.
+
+**Question for arch.** State the matching rule (entry-level vs pattern-level, any-vs-all, wildcard
+semantics, evaluation time), or rule that Resolution B — refusing to *advertise* a grant naming an
+unregistered handler at the point the grant is authored — discharges the MUST, in which case the
+policy table is the surface to validate at write time rather than the mint to filter at read time.
+`entity-core-go` implemented an entry-level filter with a regression test; two impls converging by
+reading each other's source is the cohort-consistency trap, so the rule wants writing down.
+
+---
+
+**RULED (arch `977667f`) and built.** The matching rule is: an assembled entry is retained iff the
+advertised served-scope **covers** it under the same four-axis `scope_subset` relation the chain uses
+for attenuation. Entry-level, **drop not narrow**; exact-op-match and namespace-prefix-match are
+non-conformant. That answers all three questions above: entry-level (Q3), all-not-any (Q1 — every
+include must be covered), and the chain's own pattern semantics (Q2). Evaluation time is assembly
+time, the only time the assembly exists.
+
+Landed in `entity_capability::advertisement_covers` + `connection::advertised_served_scope`, applied
+once at the end of `connection::assemble_inbound_grants` — so the §6.6 handshake and the §6.5 (b)
+reciprocal mint filter identically, which is the property the Q2 extraction bought. Skipped under
+`debug_open_grants`, which already documents itself as bypassing all authorization scoping.
+
+**Two sub-questions the ruling does not reach, both re-routed:**
+
+1. **The `operations` axis of the advertised scope.** The ruling says an unexpressed axis question is
+   settled by "covers", but not what a handler manifest *expresses*. Our `system/handler/{pattern}`
+   interface entities carry an `operations` list, so constraining that axis is the more faithful
+   reading of "MUST NOT grant authority it does not advertise it serves". `entity-core-go`
+   (`advertisedServedScope`, `core/peer/peer.go`) advertises `operations: ["*"]` and routes
+   per-handler narrowing through a handler-declared `MaxScope` instead. **We converged on Go's
+   shape**, against our own reading: the filter only ever *drops*, so the stricter reading would hand
+   a counterpart strictly less authority than a Go peer in the same configuration — a cross-impl
+   divergence in grant *contents*, invisible to a same-side round-trip. Which is right is arch's call.
+   `resources` and `peers` are unconstrained on both impls; that half is not in question, and the
+   *empty* reading is ruled out by construction — the §4.4 floor's first entry carries
+   `resources: [system/type/*, system/handler/*]`, so under "empty" the floor filters itself away.
+   Pinned by `test_advertisement_filter_drops_unserved_entries_from_the_assembly`, whose floor-survives
+   assertion fails loudly if any axis is ever read as empty.
+
+2. **The universal-handler carve-out.** No finite advertised scope covers a `handlers: ["*"]` claim,
+   so a literal "drop, not narrow" deletes every open-access grant and such a peer hands its
+   counterparts nothing. That does not close a divergence: a `*` grant dispatched at a registered
+   handler works and at an unregistered one 404s — the same outcome an absent grant reaches one layer
+   later. Both impls retain bare `*` iff the peer serves anything at all. **State the provenance
+   precisely:** `entity-core-go` reached this independently and filed it; we adopted their landed
+   shape after reading their source, so this is convergence on one impl's answer, **not** independent
+   convergence. Pinned by `test_advertisement_filter_keeps_the_universal_carve_out` so a ruling for
+   the literal reading is a visible test change rather than silent drift.
+
+Also settled in passing: the ruled relation is **four axes**, so it is not the whole of
+`grant_subset`. §5.6's allowance rule ("child MUST NOT add keys the parent lacks") is right for
+delegation and wrong here — a manifest expresses no allowances, so applying it would drop every
+operator entry carrying one, entry-wide and silently. Split out as `grant_axes_subset`; delegation's
+behavior is unchanged. Go reached the same split (`coversFourAxes`) for the same reason.
 
 </details>

@@ -206,6 +206,28 @@ pub struct PeerShared {
     /// same map — dedup state is per-peer, not per-connection.
     pub preserved_requests:
         Arc<std::sync::Mutex<std::collections::HashMap<(String, String), String>>>,
+    /// `remote_peer_id → the §6.5 (b) reentry grant we minted **and delivered**
+    /// to that peer` (the cap, its signature, and our identity — the §7a.2a
+    /// triple).
+    ///
+    /// This is the supply side of the ruled two-phase carriage (Q1): an
+    /// acceptor wielding our reciprocal grant may send the triple **as
+    /// references**, and we resolve them here rather than requiring them
+    /// re-inlined in an envelope we authored ourselves.
+    ///
+    /// **Deliberately not a content-store lookup**, which is the trap in
+    /// reading "resolves from its own content store" literally: the store also
+    /// holds caps we minted and never sent, and every cap we hold for any
+    /// reason — so naming a cap would become as good as holding one. Scoped to
+    /// minted-and-delivered, keyed by the peer we delivered it to, written only
+    /// after the frame write succeeds. `grantee == author` still binds the cap
+    /// to the named peer independently, so widening this would not be
+    /// third-party escalation — it would erase the difference between "we
+    /// minted this for you" and "you hold it", which is the distinction the
+    /// §6.5 (b) send path depends on. `entity-core-go` reached the same
+    /// scoping and pinned it the same way.
+    pub minted_reentry_grants:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<entity_entity::Entity>>>>,
     /// Observe-only dispatch hooks registered via `PeerBuilder::with_dispatch_hook`.
     /// Fired in registration order at request-entry (before `handler.handle`)
     /// and request-exit (after the handler returns) per GUIDE-INSPECTABILITY
@@ -277,6 +299,12 @@ pub struct Peer {
     /// `shared()` snapshots so dedup applies peer-wide
     /// (EXTENSION-DURABILITY §5 / Amendment 1).
     preserved_requests: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), String>>>,
+    /// `remote_peer_id` → the §6.5 (b) reentry grant minted and delivered to
+    /// it. Shared across all `shared()` snapshots: the mint happens on the dial
+    /// task and the supply happens on a spawned dispatch, so a per-snapshot map
+    /// would record in one place and be read in another.
+    minted_reentry_grants:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<entity_entity::Entity>>>>,
     /// `local/files` handler instance — held so reverse-write can be
     /// wired in `start_engines` and so external callers can register
     /// root mappings.
@@ -374,6 +402,7 @@ impl Peer {
             grant_resolver: self.grant_resolver.clone(),
             live_establish: self.live_establish.clone(),
             preserved_requests: self.preserved_requests.clone(),
+            minted_reentry_grants: self.minted_reentry_grants.clone(),
             dispatch_hooks: self.dispatch_hooks.clone(),
             wire_hooks: self.wire_hooks.clone(),
         })
@@ -2539,6 +2568,9 @@ impl PeerBuilder {
             #[cfg(feature = "network")]
             network_handler,
             preserved_requests: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            minted_reentry_grants: Arc::new(
+                std::sync::Mutex::new(std::collections::HashMap::new()),
+            ),
             #[cfg(all(feature = "local-files", not(target_arch = "wasm32")))]
             local_files_handler,
             dispatch_hooks: self.dispatch_hooks,
@@ -6611,6 +6643,13 @@ mod tests {
         calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
         /// What the caller declared about retry ownership (§10.3 obligation 4).
         saw_caller_owns_retry: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// What this stub reports as its §4.4 classification — i.e. whether it
+        /// stands in for a policy that met the counterpart at a §3 rendezvous
+        /// key (`pair`/`tag`/`secret`/`lobby`) or one that dialed a resolved
+        /// address. Both real establishers in this crate report `true`; the
+        /// default here is `false` so the seam's own tests keep exercising the
+        /// asymmetric case.
+        rendezvous_key: bool,
     }
 
     impl StubEstablisher {
@@ -6625,6 +6664,19 @@ mod tests {
                 saw_caller_owns_retry: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
                     false,
                 )),
+                rendezvous_key: false,
+            }
+        }
+
+        /// The same stub, standing in for a §6.5 (b) symmetric establishment:
+        /// both peers brought the same §3 key and met at it.
+        fn rendezvous(
+            registry: std::sync::Arc<transport::MemoryTransportRegistry>,
+            target: String,
+        ) -> Self {
+            Self {
+                rendezvous_key: true,
+                ..Self::new(registry, target)
             }
         }
     }
@@ -6656,6 +6708,11 @@ mod tests {
                     // This double dials a memory transport, so exactly one side
                     // connected and §7.4.1 is settled the ordinary way.
                     role: live_establish::HandshakeRole::Initiator,
+                    // §4.4: whichever establishment this stub stands in for.
+                    // Default `false` — a plain address dial, no §3 key
+                    // mutually brought — which also makes the default stub the
+                    // negative vector for the mint gate.
+                    established_via_rendezvous_key: self.rendezvous_key,
                 })
                 .map_err(|e| live_establish::LiveEstablishError::NoPath {
                     substrate: "memory",
@@ -7155,6 +7212,712 @@ mod tests {
             server_minted.hash, client_held.hash,
             "bidirectional invariant: server's minted_capability.hash must equal client's held_capability.hash"
         );
+
+        server_handle.abort();
+    }
+
+    /// §6.5 mutual minting (PROPOSAL-SYMMETRIC-REENTRY-MUTUAL-MINTING): after a
+    /// **§6.5 (b) symmetric establishment** C→S, the ACCEPTOR S acquires
+    /// originating authority from C's reciprocal reentry grant and can originate
+    /// a dispatch back to C over the same connection.
+    ///
+    /// This constructs the acceptor's originating path end-to-end — the path the
+    /// native suite never built, which is exactly how the §6.5 gap shipped. It is
+    /// the regression guard for the whole chain: C mints + sends the grant on
+    /// establishment; S intercepts it in the message loop, verifies granter == C,
+    /// and installs it (with its signature + granter identity) on the reentry
+    /// endpoint; S then originates under it, and the merged chain bundle makes the
+    /// single-sig cap verify at C (before the fix this was `no originating
+    /// authority`, then `403 missing_signature`).
+    ///
+    /// The establishment runs through the §10.3 seam reporting
+    /// `established_via_rendezvous_key = true` (§4.4) — a plain dial no longer
+    /// mints, which is the point of its negative twin below.
+    #[tokio::test]
+    async fn test_s65_acceptor_originates_after_reciprocal_grant() {
+        use transport::{MemoryListener, MemoryTransportRegistry};
+
+        let registry = MemoryTransportRegistry::new();
+        let server = PeerBuilder::new()
+            .keypair(Keypair::from_seed([60u8; 32]))
+            .build()
+            .unwrap();
+        let server_pid = server.peer_id().to_string();
+        let server_shared = server.shared();
+        let listener = MemoryListener::bind(server_pid.clone(), registry.clone()).unwrap();
+        server.start_engines(&server_shared);
+        let server_shared_for_task = server_shared.clone();
+        let server_handle = tokio::spawn(async move {
+            let _ = server::run(listener, server_shared_for_task).await;
+        });
+        tokio::task::yield_now().await;
+
+        let mut client = PeerBuilder::new()
+            .keypair(Keypair::from_seed([61u8; 32]))
+            .build()
+            .unwrap();
+        client.local_only();
+        // The §10.3 seam stands in for a policy that met S at a §3 rendezvous
+        // key. S publishes no transport profile into C's tree, so step 3b is the
+        // only way through and the seam's classification is the one in play.
+        client.set_live_establish(std::sync::Arc::new(StubEstablisher::rendezvous(
+            registry.clone(),
+            server_pid.clone(),
+        )));
+        let client_pid = client.peer_id().to_string();
+        let client_shared = client.shared();
+        client.start_engines(&client_shared);
+
+        // C establishes to S through the seam WITH C's dispatch context, so C
+        // mints and sends the reciprocal reentry grant.
+        remote::get_or_connect(
+            &client_shared.remote,
+            &server_pid,
+            &client_shared.keypair,
+            client_shared.content_store.as_ref(),
+            client_shared.location_index.as_ref(),
+            &client_pid,
+            client_shared.connector.as_ref(),
+            client_shared.config.home_hash_format,
+            Some(client_shared.clone()),
+        )
+        .await
+        .expect("§10.3: the rendezvous seam should have produced a live connection");
+
+        // The grant lands a beat after the handshake. Poll S's inbound endpoint
+        // for C until it gains originating authority (it starts with none).
+        let mut endpoint = None;
+        for _ in 0..200 {
+            if let Some(e) = server_shared.remote.get_inbound(&client_pid) {
+                if e.originating_capability().is_some() {
+                    endpoint = Some(e);
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let endpoint = endpoint.expect(
+            "§6.5: acceptor MUST acquire originating authority from the reciprocal reentry grant",
+        );
+
+        // S ORIGINATES back to C over the reentry endpoint with no explicit
+        // dispatch_cap — so it authors under the reciprocal cap and its bundled
+        // signature + granter identity. `get` on C's own `system/tree` returns
+        // the handler descriptor (200), the same shape the rung-1 rig sees.
+        let empty_params = entity_entity::Entity::new(
+            "system/params",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![])),
+        )
+        .unwrap();
+        let resp = remote::send_execute(
+            endpoint.as_ref(),
+            server.keypair(),
+            &format!("/{}/system/tree", client_pid),
+            "get",
+            &empty_params,
+            None,
+            None,
+            None,
+            &std::collections::HashMap::new(),
+            None,
+        )
+        .await
+        .expect("§6.5: acceptor→dialer originate must not error at the transport layer");
+        assert_eq!(
+            resp.status, 200,
+            "§6.5: acceptor→dialer originate must authorize (got {}: {:?})",
+            resp.status, resp.result
+        );
+
+        server_handle.abort();
+    }
+
+    /// The §6.5 (b) **Contents** ruling (arch `f8f736a`, 2026-08-05) measured on
+    /// both directions of one peer: the reciprocal grant C mints for S is the
+    /// grant C would issue S **as an inbound dialer** — the assembled §4.4 set,
+    /// not the flat `default_connection_grants` floor.
+    ///
+    /// The defect this catches is not a wrong grant list; it is the two
+    /// directions *drifting apart*. So the assertion is a comparison, never a
+    /// hardcoded expectation: C is given a resolver that answers with a
+    /// distinguishable non-floor set, S meets C both ways — once at the
+    /// rendezvous (C mints the reciprocal grant) and once as an ordinary inbound
+    /// dialer (C mints the §6.6 handshake cap) — and the two grant lists must be
+    /// the same. A test that pinned today's list would go stale the next time
+    /// the assembly changes and would still pass while the directions diverged.
+    ///
+    /// The second assertion is the anti-vacuity one: the set must not be the
+    /// floor, or the comparison would hold for the pre-ruling build too.
+    #[tokio::test]
+    async fn test_s65_reciprocal_grant_is_the_assembled_inbound_grant() {
+        use transport::{MemoryConnector, MemoryListener, MemoryTransportRegistry};
+
+        /// C's assembled answer for any counterpart: the floor plus one entry
+        /// nothing in `default_connection_grants` carries.
+        ///
+        /// The extra entry names a handler C **actually serves**. It used to
+        /// name `app/echo`, which C does not register — and once the §3
+        /// advertisement filter landed in `assemble_inbound_grants` that entry
+        /// was correctly dropped, collapsing the assembly back to the floor and
+        /// tripping this test's own "off the floor" guard. The guard was right:
+        /// an unadvertised entry is no longer part of any assembly, so it can no
+        /// longer be what distinguishes one.
+        fn assembled() -> Vec<entity_capability::GrantEntry> {
+            let mut grants = entity_capability::default_connection_grants();
+            grants.push(entity_capability::GrantEntry {
+                handlers: entity_capability::PathScope::new(vec!["system/tree".into()]),
+                resources: entity_capability::PathScope::new(vec![]),
+                operations: entity_capability::IdScope::new(vec!["list".into()]),
+                peers: None,
+                constraints: None,
+                allowances: None,
+            });
+            grants
+        }
+
+        fn grants_of(cap: &entity_entity::Entity) -> Vec<entity_capability::GrantEntry> {
+            entity_capability::CapabilityToken::from_entity(cap)
+                .expect("a minted capability decodes")
+                .grants
+        }
+
+        let registry = MemoryTransportRegistry::new();
+
+        // S — the acceptor at the rendezvous, and the inbound dialer afterwards.
+        let server = PeerBuilder::new()
+            .keypair(Keypair::from_seed([66u8; 32]))
+            .connector(std::sync::Arc::new(MemoryConnector::new(registry.clone())))
+            .build()
+            .unwrap();
+        let server_pid = server.peer_id().to_string();
+        let server_shared = server.shared();
+        let server_listener = MemoryListener::bind(server_pid.clone(), registry.clone()).unwrap();
+        server.start_engines(&server_shared);
+        let server_shared_for_task = server_shared.clone();
+        let server_handle = tokio::spawn(async move {
+            let _ = server::run(server_listener, server_shared_for_task).await;
+        });
+
+        // C — the minter. Its resolver is the one assembly both directions read.
+        let mut client = PeerBuilder::new()
+            .keypair(Keypair::from_seed([67u8; 32]))
+            .build()
+            .unwrap();
+        client.set_grant_resolver(std::sync::Arc::new(|_peer, _hash| Some(assembled())));
+        client.set_live_establish(std::sync::Arc::new(StubEstablisher::rendezvous(
+            registry.clone(),
+            server_pid.clone(),
+        )));
+        let client_pid = client.peer_id().to_string();
+        let client_shared = client.shared();
+        let client_listener = MemoryListener::bind(client_pid.clone(), registry.clone()).unwrap();
+        client.start_engines(&client_shared);
+        let client_shared_for_task = client_shared.clone();
+        let client_handle = tokio::spawn(async move {
+            let _ = server::run(client_listener, client_shared_for_task).await;
+        });
+        tokio::task::yield_now().await;
+
+        // Direction 1 — the rendezvous. C establishes to S through the seam and
+        // mints the reciprocal grant.
+        remote::get_or_connect(
+            &client_shared.remote,
+            &server_pid,
+            &client_shared.keypair,
+            client_shared.content_store.as_ref(),
+            client_shared.location_index.as_ref(),
+            &client_pid,
+            client_shared.connector.as_ref(),
+            client_shared.config.home_hash_format,
+            Some(client_shared.clone()),
+        )
+        .await
+        .expect("§10.3: the rendezvous seam should have produced a live connection");
+
+        let mut reciprocal = None;
+        for _ in 0..(remote::RECIPROCAL_GRANT_VECTOR_FLOOR_MS / 10) {
+            if let Some(e) = server_shared.remote.get_inbound(&client_pid) {
+                if let Some(cap) = e.originating_capability() {
+                    reciprocal = Some(cap);
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let reciprocal = reciprocal.expect("§6.5 (b): the reciprocal grant must arrive");
+
+        // Direction 2 — the ordinary inbound dial. S dials C by address, so C
+        // runs the same assembly for the §6.6 handshake cap.
+        let inbound = remote::connect_and_pool(&server_shared, &format!("memory://{}", client_pid))
+            .await
+            .expect("S should be able to dial C by address");
+
+        assert_eq!(
+            grants_of(&reciprocal),
+            grants_of(inbound.capability()),
+            "§6.5 (b) Contents: the reciprocal grant MUST be the grant C issues \
+             an inbound dialer — the assembled set, not a second construction"
+        );
+        assert_ne!(
+            grants_of(&reciprocal),
+            entity_capability::default_connection_grants(),
+            "the fixture must put C's assembly off the floor, or this proves nothing"
+        );
+
+        server_handle.abort();
+        client_handle.abort();
+    }
+
+    /// Taxonomy **row 2** end-to-end (PROPOSAL-SYMMETRIC-REENTRY-MUTUAL-MINTING
+    /// §3 / §7 ruling): a cross-peer async delivery is authorized by the
+    /// caller's `deliver_token` and by nothing else.
+    ///
+    /// The topology is the one that makes the claim testable at all. C dials S
+    /// by address and publishes no transport profile, so:
+    /// - S reaches C only through the §6.11(b) inbound-reentry fallback, and
+    /// - after the §7 narrowing S holds **no** reciprocal grant on that
+    ///   connection (its asymmetric twin above pins exactly that),
+    ///
+    /// so the delivery has no connection authority to fall back on — and
+    /// `default_connection_grants` never covered `system/inbox receive` anyway.
+    /// If the delivery arrives, the token is what carried it.
+    ///
+    /// This is the vector the native suite never had: the only async-delivery
+    /// coverage was a single-peer simulation, which cannot see a wire authority
+    /// decision at all. `entity-core-go` found the same defect in `deliverToInbox`
+    /// the same way — green on a dialed connection, `401` on the profile-less path.
+    #[tokio::test]
+    async fn test_row2_async_delivery_authorizes_under_the_deliver_token() {
+        use transport::{MemoryConnector, MemoryListener, MemoryTransportRegistry};
+
+        let registry = MemoryTransportRegistry::new();
+        let server = PeerBuilder::new()
+            .keypair(Keypair::from_seed([64u8; 32]))
+            .build()
+            .unwrap();
+        let server_pid = server.peer_id().to_string();
+        let server_shared = server.shared();
+        let listener = MemoryListener::bind(server_pid.clone(), registry.clone()).unwrap();
+        server.start_engines(&server_shared);
+        let server_shared_for_task = server_shared.clone();
+        let server_handle = tokio::spawn(async move {
+            let _ = server::run(listener, server_shared_for_task).await;
+        });
+        tokio::task::yield_now().await;
+
+        let client = PeerBuilder::new()
+            .keypair(Keypair::from_seed([65u8; 32]))
+            .connector(std::sync::Arc::new(MemoryConnector::new(registry.clone())))
+            .build()
+            .unwrap();
+        client.local_only();
+        let client_pid = client.peer_id().to_string();
+        let client_shared = client.shared();
+        client.start_engines(&client_shared);
+
+        client
+            .connect_to(&format!("memory://{}", server_pid))
+            .await
+            .unwrap();
+        let endpoint = client_shared
+            .remote
+            .get(&server_pid)
+            .expect("C should hold the connection it dialed");
+
+        // C mints the delivery authority: granter = C (it owns the inbox),
+        // grantee = S (the peer that will deliver), scoped to `receive` at
+        // exactly this inbox URI.
+        let deliver_uri = format!("/{}/system/inbox", client_pid);
+        let deliver_params = remote::generate_deliver_token(
+            &client_shared.keypair,
+            endpoint.remote_identity_hash(),
+            &deliver_uri,
+            "receive",
+        )
+        .unwrap();
+
+        let empty_params = entity_entity::Entity::new(
+            "system/params",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![])),
+        )
+        .unwrap();
+        let resp = remote::send_execute(
+            endpoint.as_ref(),
+            &client_shared.keypair,
+            &format!("/{}/system/tree", server_pid),
+            "get",
+            &empty_params,
+            None,
+            Some(&deliver_params),
+            None,
+            &std::collections::HashMap::new(),
+            None,
+        )
+        .await
+        .expect("the deliver_to request itself rides C's connection grant");
+        assert_eq!(
+            resp.status, 202,
+            "EXTENSION-INBOX §4.5: a deliver_to request is accepted, not answered"
+        );
+
+        // S runs the handler, then delivers back over the inbound endpoint,
+        // authoring under C's deliver_token. The result lands under the inbox
+        // URI keyed by the delivery's own request_id.
+        let prefix = format!("{}/", deliver_uri);
+        let mut delivered = false;
+        for _ in 0..200 {
+            if !client_shared.location_index.list(&prefix).is_empty() {
+                delivered = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            delivered,
+            "row 2: the async delivery MUST authorize under the deliver_token — \
+             nothing else on this connection could have carried it"
+        );
+
+        server_handle.abort();
+    }
+
+    /// Q1 phase (2), the **receiver** half: an acceptor may wield our §6.5 (b)
+    /// reciprocal grant by *reference*, and we — the peer that authored those
+    /// entities — resolve them instead of demanding them back.
+    ///
+    /// The frame this pins is the one `entity-core-go` found and warned about,
+    /// and it is not the tidy "references-only" shape the ruling describes:
+    /// `build_authenticated_execute` inlines the capability **unconditionally**,
+    /// so a sender that simply stops attaching the supporting set emits a
+    /// *partial* reference frame — cap present, its signature and the granter
+    /// identity absent. That dies at the chain walk as `missing_signature`, not
+    /// as a missing cap. Any impl that flips by "stop attaching the chain" will
+    /// ship exactly this, so it is the shape the receiver has to handle.
+    ///
+    /// Three assertions, and the third is the one that matters:
+    ///
+    /// 1. Without the ledger the partial frame is refused — this is today's
+    ///    shipped behavior, and it is what makes assertion 2 a change rather
+    ///    than a tautology.
+    /// 2. With the grant recorded as minted-and-delivered to *this* peer, the
+    ///    same bytes verify.
+    /// 3. **Resolution does not widen.** The same cap, minted and recorded
+    ///    against a *different* counterpart, is refused. Read literally,
+    ///    "the dialer resolves from its own content store" would make naming a
+    ///    cap as good as holding one; the ledger is scoped to who we actually
+    ///    delivered to, so a mint that went elsewhere — or never went out at
+    ///    all — stays unwieldable. If this assertion ever flips to 200, the
+    ///    supplier has become a general store lookup and the scope is gone.
+    #[tokio::test]
+    async fn test_q1_phase2_references_only_wielding_is_scoped_to_minted_and_delivered() {
+        use std::collections::HashMap;
+
+        fn status_of(env: &entity_entity::Envelope) -> i128 {
+            let val: entity_ecf::Value =
+                ciborium::from_reader(env.root.data.as_slice()).expect("response decodes");
+            let map = val.as_map().expect("response is a map");
+            map.iter()
+                .find(|(k, _): &&(entity_ecf::Value, entity_ecf::Value)| {
+                    k.as_text() == Some("status")
+                })
+                .and_then(|(_, v)| v.as_integer())
+                .map(i128::from)
+                .expect("response carries a status")
+        }
+
+        /// Does the response body carry this error code? Scans the encoded
+        /// bytes rather than re-deriving the nested error shape — the point is
+        /// which rejection fired, and that string is the whole signal.
+        fn carries(env: &entity_entity::Envelope, needle: &str) -> bool {
+            env.root
+                .data
+                .windows(needle.len())
+                .any(|w| w == needle.as_bytes())
+        }
+
+        let peer = PeerBuilder::new()
+            .keypair(Keypair::from_seed([81u8; 32]))
+            .build()
+            .unwrap();
+        let shared = peer.shared();
+        let local_pid = shared.peer_id.as_str().to_string();
+        let fmt = shared.config.home_hash_format;
+
+        // The acceptor: the peer we mint FOR and who wields back at us.
+        let acceptor = IdentityKeypair::from(Keypair::from_seed([82u8; 32]));
+        let acceptor_identity = acceptor.peer_entity().expect("acceptor identity");
+        let acceptor_pid = acceptor.peer_id().as_str().to_string();
+
+        // The §6.5 (b) mint, through the same builder the live dial uses.
+        let grant_env = remote::build_reentry_grant_envelope(
+            &shared.keypair,
+            acceptor_identity.content_hash,
+            fmt,
+            entity_capability::default_connection_grants(),
+        )
+        .expect("the reciprocal grant mints");
+        let bundle: Vec<entity_entity::Entity> = grant_env.included.values().cloned().collect();
+        let cap_entity = bundle
+            .iter()
+            .find(|e| e.entity_type == entity_types::TYPE_CAP_TOKEN)
+            .expect("the minted bundle carries the capability")
+            .clone();
+
+        // The wielding frame, with an EMPTY supporting set — the partial
+        // reference shape described above.
+        let get_path = format!("/{}/system/type/system/peer", local_pid);
+        let params = entity_entity::Entity::new(
+            entity_types::TYPE_TREE_GET_REQ,
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+                entity_ecf::text("uri"),
+                entity_ecf::text(&get_path),
+            )])),
+        )
+        .expect("tree get params");
+        let resource = entity_capability::ResourceTarget {
+            targets: vec![get_path.clone()],
+            exclude: vec![],
+        };
+        let wield = remote::build_authenticated_execute(
+            &acceptor,
+            &cap_entity,
+            &HashMap::new(),
+            &HashMap::new(),
+            "q1-phase2-req",
+            &format!("entity://{}/system/tree", local_pid),
+            "get",
+            &params,
+            Some(&resource),
+            None,
+            None,
+        )
+        .expect("the acceptor can author its origination");
+
+        // 1. No ledger entry — refused, as today.
+        let refused =
+            connection::dispatch_request(&wield, shared.clone(), Some(&acceptor_pid)).await;
+        assert_eq!(
+            (status_of(&refused), carries(&refused, "missing_signature")),
+            (403, true),
+            "a partial reference frame MUST be refused when nothing says we \
+             minted this cap for this peer — and it MUST fail as \
+             `missing_signature` at the chain walk, not as a missing cap, \
+             because the sender still inlined the cap itself. That exact code \
+             is `entity-core-go`'s finding, pinned here so a future refactor \
+             cannot quietly turn this into a different rejection"
+        );
+
+        // 3. Recorded against a DIFFERENT counterpart — still refused. Written
+        //    before the positive case so a supplier that ignores the key cannot
+        //    pass by having been primed correctly first.
+        shared
+            .minted_reentry_grants
+            .lock()
+            .unwrap()
+            .insert("2KsomeOtherCounterparty".to_string(), bundle.clone());
+        let wrong_peer =
+            connection::dispatch_request(&wield, shared.clone(), Some(&acceptor_pid)).await;
+        assert_eq!(
+            (
+                status_of(&wrong_peer),
+                carries(&wrong_peer, "missing_signature")
+            ),
+            (403, true),
+            "resolution widened: a grant we minted for someone ELSE was \
+             supplied to this peer. The supplier has become a store lookup, \
+             and naming a cap is now as good as holding one"
+        );
+
+        // 2. Recorded as delivered to this peer — the same bytes verify.
+        shared
+            .minted_reentry_grants
+            .lock()
+            .unwrap()
+            .insert(acceptor_pid.clone(), bundle);
+        let accepted =
+            connection::dispatch_request(&wield, shared.clone(), Some(&acceptor_pid)).await;
+        assert!(
+            !carries(&accepted, "missing_signature"),
+            "§7a.2a: the acceptor wielded a grant WE minted and delivered to it, \
+             by reference. Re-carrying our own entities back to us is the waste \
+             the two-phase carriage exists to delete"
+        );
+    }
+
+    /// The §3 advertisement filter, on the real assembly rather than on the
+    /// relation (arch ruling 2026-08-05). `assemble_inbound_grants` is the one
+    /// function both the §6.6 handshake and the §6.5 (b) reciprocal mint read,
+    /// so filtering here moves both directions at once — the property the Q2
+    /// extraction bought.
+    ///
+    /// The fixture is the case the discipline exists for: an operator-authored
+    /// entry naming a handler this peer does **not** register. It is dropped;
+    /// the entry naming a handler it does register survives; the §4.4 floor
+    /// survives whole, which is the non-negotiable part — every floor entry
+    /// names a handler this peer serves by construction (Resolution B), so a
+    /// filter that ate any of it would be filtering the peer's own admission
+    /// control away.
+    #[tokio::test]
+    async fn test_advertisement_filter_drops_unserved_entries_from_the_assembly() {
+        let served = entity_capability::GrantEntry {
+            handlers: entity_capability::PathScope::new(vec!["system/tree".into()]),
+            resources: entity_capability::PathScope::new(vec![]),
+            operations: entity_capability::IdScope::new(vec!["list".into()]),
+            peers: None,
+            constraints: None,
+            allowances: None,
+        };
+        let unserved = entity_capability::GrantEntry {
+            handlers: entity_capability::PathScope::new(vec!["app/echo".into()]),
+            resources: entity_capability::PathScope::new(vec![]),
+            operations: entity_capability::IdScope::new(vec!["invoke".into()]),
+            peers: None,
+            constraints: None,
+            allowances: None,
+        };
+
+        let mut peer = PeerBuilder::new()
+            .keypair(Keypair::from_seed([71u8; 32]))
+            .build()
+            .unwrap();
+        let (served_c, unserved_c) = (served.clone(), unserved.clone());
+        peer.set_grant_resolver(std::sync::Arc::new(move |_peer, _hash| {
+            let mut grants = entity_capability::default_connection_grants();
+            grants.push(served_c.clone());
+            grants.push(unserved_c.clone());
+            Some(grants)
+        }));
+        let shared = peer.shared();
+
+        let assembled = connection::assemble_inbound_grants(
+            &shared,
+            &entity_hash::Hash::zero(),
+            &entity_crypto::PeerId::from("2Ksome-counterpart"),
+        );
+
+        assert!(
+            !assembled.contains(&unserved),
+            "§3: a peer MUST NOT grant authority it does not advertise it \
+             serves — `app/echo` is not registered here"
+        );
+        assert!(
+            assembled.contains(&served),
+            "the filter drops only what is unadvertised; `system/tree` is served"
+        );
+        for floor_entry in entity_capability::default_connection_grants() {
+            assert!(
+                assembled.contains(&floor_entry),
+                "the §4.4 floor MUST survive its own filter — every floor entry \
+                 names a handler this peer registers by construction. If this \
+                 fires, the advertised served-scope is being read as empty on \
+                 some axis the manifest does not express, and the floor is \
+                 filtering itself away: {:?}",
+                floor_entry
+            );
+        }
+    }
+
+    /// The §8.2 asymmetric non-regression vector (arch ruling, 2026-08-05): a
+    /// peer reached by **ordinary dial-by-address** MUST NOT gain reciprocal
+    /// originating authority.
+    ///
+    /// This is the vector the pre-narrowing build would fail — it fired the
+    /// reciprocal grant from the shared client handshake, so *every* full-peer
+    /// dial handed the acceptor reach-back into the dialer. No §3 rendezvous key
+    /// is brought here, so the establishment is the asymmetric one §6.6
+    /// describes: C asked S for service, and nothing about that authorizes S to
+    /// originate into C.
+    ///
+    /// Paired with its positive twin above, this is what makes the discriminator
+    /// observable at all: the two tests differ *only* in how the connection was
+    /// established, and the authority outcome must follow that difference.
+    #[tokio::test]
+    async fn test_s65_dial_by_address_grants_no_reciprocal_authority() {
+        use transport::{MemoryConnector, MemoryListener, MemoryTransportRegistry};
+
+        let registry = MemoryTransportRegistry::new();
+        let server = PeerBuilder::new()
+            .keypair(Keypair::from_seed([62u8; 32]))
+            .build()
+            .unwrap();
+        let server_pid = server.peer_id().to_string();
+        let server_shared = server.shared();
+        let listener = MemoryListener::bind(server_pid.clone(), registry.clone()).unwrap();
+        server.start_engines(&server_shared);
+        let server_shared_for_task = server_shared.clone();
+        let server_handle = tokio::spawn(async move {
+            let _ = server::run(listener, server_shared_for_task).await;
+        });
+        tokio::task::yield_now().await;
+
+        let client = PeerBuilder::new()
+            .keypair(Keypair::from_seed([63u8; 32]))
+            .connector(std::sync::Arc::new(MemoryConnector::new(registry.clone())))
+            .build()
+            .unwrap();
+        client.local_only();
+        let client_pid = client.peer_id().to_string();
+        let client_shared = client.shared();
+        client.start_engines(&client_shared);
+
+        // C dials S by address — `connect_to` → `connect_and_pool`, with C's
+        // dispatch context present. Before the narrowing that context was the
+        // whole condition for minting.
+        client
+            .connect_to(&format!("memory://{}", server_pid))
+            .await
+            .unwrap();
+
+        // Give a grant every chance to arrive: the endpoint registers at
+        // handshake, and the grant would follow within a beat of it.
+        let mut endpoint = None;
+        for _ in 0..50 {
+            if let Some(e) = server_shared.remote.get_inbound(&client_pid) {
+                endpoint = Some(e);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let endpoint =
+            endpoint.expect("S should hold an inbound endpoint for the peer that dialed");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert!(
+            endpoint.originating_capability().is_none(),
+            "§8.2: a dial-by-address acceptor MUST NOT hold reciprocal originating authority"
+        );
+
+        // And the refusal is local and named, not a misleading remote status.
+        let empty_params = entity_entity::Entity::new(
+            "system/params",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![])),
+        )
+        .unwrap();
+        let outcome = remote::send_execute(
+            endpoint.as_ref(),
+            server.keypair(),
+            &format!("/{}/system/tree", client_pid),
+            "get",
+            &empty_params,
+            None,
+            None,
+            None,
+            &std::collections::HashMap::new(),
+            None,
+        )
+        .await;
+        match outcome {
+            Err(e) => assert!(
+                e.to_string().contains("no originating authority"),
+                "the refusal must name the condition, got: {}",
+                e
+            ),
+            Ok(resp) => panic!(
+                "§8.2: originating over an asymmetric connection must fail closed, \
+                 got status {}",
+                resp.status
+            ),
+        }
 
         server_handle.abort();
     }

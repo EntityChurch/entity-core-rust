@@ -776,6 +776,11 @@ impl LiveEstablish for BrowserWebRtcEstablisher {
                 "webrtc",
             ),
             role,
+            // §4.4: the browser leg is §6.5 trigger (b) by construction — both
+            // peers drove this seam off `party.key`, a §3 rendezvous key, and
+            // the channel exists only because the two keys matched. This is the
+            // establishment the reciprocal grant was designed for.
+            established_via_rendezvous_key: true,
         })
     }
 }

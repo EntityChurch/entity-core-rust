@@ -1,6 +1,6 @@
 # entity-core-rust — status
 
-_Updated: 2026-08-04 · public: v0.8.0 (master)_
+_Updated: 2026-08-05 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -34,6 +34,34 @@ and tree semantics are interop-validated against the Go and Python peers, not
 just self-tested.
 
 ## Where we left off
+
+_2026-08-05 — **the §6.5 (b) reciprocal-grant arc, in one place.**_ Four routing docs cover it; this
+is the thread, newest first. (`ROUTING-2026-08-05-direction-b-was-our-driver-and-q2-is-folded-to-go.md`,
+`…-the-narrowing-is-in-and-the-discriminator-confirmed-to-arch.md`,
+`…-the-6.5-narrowing-has-a-consumer-to-arch.md`,
+`…-rung1-transport-is-solid-two-asks-out-of-our-court.md`.)
+
+A rung-1 finding — an acceptor on a §6.5 (b) channel holds no authority to originate back — became a
+spec gap, a proposal, four arch rulings, and a cross-impl crossing. Where it stands:
+
+- **Mutual minting is built and narrowed.** The dialer mints the acceptor's reciprocal grant at the
+  handshake; the mint fires **iff** a §3 rendezvous key was mutually brought
+  (`LivePath.established_via_rendezvous_key`, local, never on the wire). Both establishers in this
+  crate classify `true` — the §7 punch meets at the §3.2 `pair` key — and a dial-by-address grants
+  nothing, pinned by a negative twin that differs *only* in establishment.
+- **Q2 folded (arch `f8f736a`):** the reciprocal grant is the **assembled** inbound-dialer grant
+  (`connection::assemble_inbound_grants`, one assembly, two callers), not the flat §4.4 floor. The
+  pin test measures byte-identity between the two directions of one peer rather than a grant list
+  that goes stale. Q3: the conformance floor (`RECIPROCAL_GRANT_VECTOR_FLOOR_MS`) is named apart from
+  our impl-local wait. The reach-back-serving MUST was already satisfied (dialer-side §6.11(b)).
+- **Cross-impl:** `entity-core-go` scored V3 direction A (Go minter → Rust acceptor) **4/4**.
+  Direction B measured 0/4 and was **ours** — `cmd/signaling-punch`'s initiator dialed through the
+  bare `perform_connect`, so it carried neither the dispatch stack nor the classification and minted
+  nothing however symmetric the punch was. Fixed; the driver now reports `reciprocal_grant_sent` so
+  the cell is scorable from its output line. **Go re-runs B.**
+- **Open, routed, not guessed:** the Q2(a) advertisement filter's matching rule (logged in
+  `docs/SPEC-AMBIGUITIES.md`); Q1's carriage sentence (core-go's push-back — this repo ships the same
+  shape they do and would ratify it).
 
 _2026-08-04 (late) — **the live cross-impl sealed §6.1 punch ran; `PUNCH_TRUST` is `Require`.**_
 (`docs/status/ROUTING-2026-08-04-the-live-sealed-punch-ran-and-require-is-on-to-go.md`.)
@@ -717,13 +745,126 @@ up only if a future profile shows `verify_request` back on the hot path.
 > one that is merely incomplete. The punch/WebRTC arc (2026-08-01 → 04) now leads
 > the list, because that is where the work actually is.
 
-0. **The browser leg — S5, and it is the only real evidence.** S3 is built here
-   (`worker_webrtc`, the §6.3 container, §6.5 `Require`); S4 is
-   `entity-browser-rust`'s and built; **S5 has never run** and rung-1 is red. The
-   next fact is their acceptance re-run, which is unblocked — nothing is owed to
-   them from this tree
-   (`ROUTING-2026-08-04-the-establisher-was-swallowing-its-errors-to-browser-rust.md`).
-   Coordination-green is not transport-works.
+0. **The browser leg — S5.** S3 is built here (`worker_webrtc`, the §6.3
+   container, §6.5 `Require`); S4 is `entity-browser-rust`'s and built; **S5 has
+   never run** and **rung-1 is still red** — but the transport layer is now
+   repeatably sound and both remaining blockers are outside this repo.
+
+   **State as of 2026-08-05 (`d2850e5`), four consecutive rig runs from this
+   tree:** data channel opens (1/peer/run), handshake completes 4/4, responder
+   receives frames 4/4, zero panics, zero relay fallback, and **initiator→responder
+   application payload reaches the handler 4/4**. Roles swapped in run 4 and
+   behaviour followed the role, not the peer.
+
+   **Four faults found and fixed to get there, all ours:** the unconditional
+   `Drop` destroying working connections (`5e0c131`); the §7.4.1 handshake-role
+   collision (`f00170c`); `verify_request` panicking on wasm32 — `std::time`
+   instead of `web_time`, our own documented rule (`81ae207`); and inbound frames
+   dropped between channel-open and pump-wiring (`9e65317`). Plus the acceptor
+   authority refusal (`d2850e5`).
+
+   **The two blockers are no longer ours:** (a) the rig calls `list`, which is not
+   a `system/tree` operation — browser-rust's; (b) an acceptor holds no
+   originating authority under §6.5 trigger (b) — a spec gap logged at `8e0eabf`
+   and routed to arch, where one candidate ruling (mutual minting at handshake) is
+   protocol-visible and not ours to pick
+   (`ROUTING-2026-08-05-rung1-transport-is-solid-two-asks-out-of-our-court.md`).
+
+   **Caveat:** the frame-buffering fix targets a race that reproduced ~1-in-2.
+   4/4 clean is reasonable evidence, not proof, and `webrtc_session.rs` has no
+   automated coverage of any kind — rig runs are the only check it gets.
+   Coordination-green is not transport-works, and transport-works is not S5.
+
+   **Their acceptance re-run has now happened (2026-08-04) and it moved the wall.**
+   `included_count=0` is gone: rendezvous is sound end-to-end, both peers derive
+   one key and share one bucket. The failure is now a §6.5 negotiation that ends
+   in `Timeout` with a populated bucket — no `RTCDataChannel`. **That is ours**
+   (`worker_webrtc.rs` + `wasm-worker-proxy/webrtc_session.rs`; browser-rust owns
+   no `RTCPeerConnection`), so this item is no longer "nothing is owed to them."
+
+   Instrumented at `40294ed` — `Timeout` carries `role` / `sdp_exchange` /
+   `counterpart_msgs` / `channel wait`, plus a per-tick `trace!`. **Diagnosis, not
+   a fix.** Two structural hypotheses were checked and cleared (data-channel
+   create/receive symmetry; every broker arm replies), and one piece of their
+   evidence was retracted: the missing main-thread "data channel did not open"
+   line was never a log line, so its absence never pointed anywhere.
+
+   **Their re-run against that HEAD discriminated in one run (3×, 2026-08-04).**
+   Offerer: `role=offerer, sdp_exchange=complete, channel wait: data channel
+   closed before it opened`. So it is **not** rendezvous and **not** SDP
+   correlation. Load-bearing control: their bare-WebRTC falsifier on the same
+   containers/bridge, `iceServers:0`, host candidates → connects, opens,
+   round-trips, PASS. **§6.5 fails where bare WebRTC succeeds**, which clears the
+   network and puts it on the trickle path.
+
+   **Verdict in (2026-08-05, their run vs `3dcd484`):** `role=answerer,
+   sdp_exchange=complete, candidates posted=3/fed=3, channel wait: closed before
+   it opened (ice=Disconnected)`. `fed=3` **refutes both leading theories** —
+   theirs (candidates not landing) and mine (`candidates_for` correlation) — by
+   counter, not argument. Three lifecycle faults found and fixed at `5e0c131`:
+   (1) `webrtc_call` awaited with **no timeout** while `negotiate` checks the
+   deadline only at loop top, so every round trip ignored `deadline_ms` — the
+   tick=2 hang; now `call_bounded` against the remaining window. (2) the
+   post-answer iteration paid `wait_open` *plus* a full `sleep(poll_interval)`,
+   doubling the period exactly while ICE holds a pair; now only the shortfall.
+   (3) **`Drop` posted `WebRtcClose` unconditionally**, and the broker answers it
+   with `pc.close()` — so on the success path every negotiation that *worked*
+   would have been torn down before a byte moved. Latent only because rung-1 has
+   never gone green; unexercised by any gate.
+
+   **Reframe that matters:** `pc.close()` on any peer gives its counterpart
+   exactly `ice=Disconnected` + closed channel. So the answerer's line is the
+   offerer's teardown *observed* — the open question is why the offerer's window
+   closed, and no round has yet quoted the offerer's terminal warn
+   (`ROUTING-2026-08-05-three-lifecycle-faults-and-your-answerer-is-the-victim-to-browser-rust.md`).
+
+   Answered at `3dcd484` with the two instruments that decided it: `wait_open`
+   errors now append the `ice=`/`conn=` verdict (`Failed` = pairs tried and none
+   worked; `New` = remote candidates never reached the agent; `Connected` = ICE
+   fine, trickle hypothesis wrong), and `Timeout` carries
+   `candidates posted=N/fed=M`. The whole trickle chain was read for the
+   `67e6d96` shape first and no defect found — session adoption, blob-exact
+   skip-own, `addIceCandidate` always after `setRemoteDescription`, ufrag
+   absent-stays-absent, monotonic `negotiation_id` all hold. **Not found, not
+   proven absent.** Next fact is their re-run; `fed=0` is mine in
+   `candidates_for`, `fed>0` + `ice=Failed` is a timing/usability bug and a
+   different fix
+   (`ROUTING-2026-08-04-the-ice-verdict-is-now-readable-and-the-trickle-is-counted-to-browser-rust.md`).
+0a. ~~**The §10.3 seam takes `Result` — ruled 2026-08-04.**~~ **LANDED `f43f0e0`
+   (2026-08-05)**, after both peer repos endorsed (browser-rust: "land it,
+   independent of rung-1"; Go deferred the call here). `LiveEstablishError` draws
+   `NoPath` / `Refused` / `NotAttempted`. **Control flow unchanged** — every
+   variant falls through to relay exactly as `None` did; only the log differs
+   (`Refused` is `warn!` and names itself as policy, not connectivity).
+   Two call sites stopped lying: `cmd/signaling-punch` reported "no direct path
+   within the deadline" for every outcome *including* a `Require` refusal, and
+   the punch round-trip test's panic said which half failed but not why.
+   Original ruling follows.
+   `LiveEstablish::establish_live` returns `Option<Connection>`, so a failure
+   reason is destroyed inside the impl and `try_establish_live` has nothing to
+   log. Go's suggestion that the reason may already be available at the call site
+   does not transfer — theirs returns `(*Connection, error)`; a `None` carries
+   nothing. Decided on three instances of the same patch in two days: the browser
+   establisher (`485e269`), the punch establisher, and `negotiate`'s
+   `if let Ok(channel) = io.wait_open(..)` (`40294ed`), which cost browser-rust a
+   root-cause. ~8 sites (trait, two impls, real call site, test double, test call
+   sites). **Constraint: every `Err` maps to the same relay fall-through** —
+   reason for observability, never a branch for control flow; "no live path →
+   relay" (§7.1 step 6 / §7.3.1 pin 1) stays deliberate. Both peer repos have
+   registered and deferred the call here
+   (`ROUTING-2026-08-04-the-6.1-row-now-lies-in-the-payload-and-the-seam-ruling-to-go.md`).
+
+0b. **The §6.1 false-claim vector row — re-emitted, awaiting Go's `-verify`.**
+   The row lied only in its own `claimed_peer_id` over a truthful payload, so a
+   payload-driven collector (which every real §6.1 read path is) saw a consistent
+   message and returned ok — it could not catch the regression it names. Go found
+   it by running their verifier against our file and reported `40·1W·0F`. Fixed at
+   `36fce4a`, re-emitted `40·0F @ 36fce4a` (`50b99c3`). **Our count could not
+   move** — our verifier is row-driven for signed-blob rows — so this is only
+   decidable from Go's seat. Until their `W` clears, the payload-lying §6.1 shape
+   is crossed **one way only**. Pin adopted and seconded to arch: on a §6.1 row,
+   `claimed_peer_id` MUST equal the author field inside the signed payload.
+
 1. **Two questions routed to architecture — waiting on the model answer, not on
    Rust.** (a) Retention: is a self-collection MUST warranted, or does §5 stay a
    MAY? (`ROUTING-2026-07-17-marker-feasibility-and-retention-rust.md`).

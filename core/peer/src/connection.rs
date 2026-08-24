@@ -109,6 +109,13 @@ pub async fn handle_connection(
         .remote_peer_id
         .clone()
         .expect("remote_peer_id set after process_authenticate");
+    // The remote's authored identity hash — guaranteed Some after
+    // `process_authenticate`. Hoisted to the loop scope: both the reentry
+    // endpoint (below) and the §6.5 reentry-grant intercept (in the message
+    // loop) need it.
+    let remote_identity_hash = conn
+        .remote_identity_hash
+        .expect("remote identity hash set after authenticate");
     tracing::info!("handshake complete with {}", remote_peer_id);
 
     // --- Message loop ---
@@ -151,10 +158,7 @@ pub async fn handle_connection(
     // falls back to this endpoint when the peer has no dialable transport.
     let reentry_pending = crate::remote::new_pending();
     let reentry_endpoint: Option<Arc<dyn crate::remote::RemoteEndpoint>> = {
-        // Guaranteed Some — `build_authenticate_response_envelope` required it.
-        let remote_identity_hash = conn
-            .remote_identity_hash
-            .expect("remote identity hash set after authenticate");
+        // `remote_identity_hash` hoisted above (guaranteed Some after auth).
         // Placeholder connection cap (never read on the reentry path —
         // dispatch always supplies the explicit §7a.2a cap). Prefer the
         // connection cap we just minted; fall back to our identity entity.
@@ -212,6 +216,10 @@ pub async fn handle_connection(
             self.pending.lock().unwrap().clear();
         }
     }
+    // §6.5 mutual minting: keep a handle to the reentry endpoint so the message
+    // loop's `reentry-grant` intercept can install the reciprocal capability the
+    // dialer mints for us. Cloned before the guard moves the original.
+    let reentry_ep_handle = reentry_endpoint.clone();
     let _reentry_guard = ReentryGuard {
         shared: shared.clone(),
         peer_id: remote_peer_id.to_string(),
@@ -294,6 +302,28 @@ pub async fn handle_connection(
             continue;
         }
 
+        // §6.5 mutual minting: an inbound `reentry-grant` connect-EXECUTE carries
+        // the reciprocal capability the dialer minted FOR us (granter = the
+        // dialer, grantee = us). Intercept it before generic dispatch — like the
+        // EXECUTE_RESPONSE branch above — and install it on our reentry endpoint,
+        // giving this acceptor authority to originate back over this same §6.5
+        // channel. Self-verifying (the enclosed cap's granter must be the peer we
+        // authenticated); the narrow connection grant never has to authorize it.
+        // See docs/PROPOSAL-SYMMETRIC-REENTRY-MUTUAL-MINTING.md.
+        if envelope.root.entity_type == entity_types::TYPE_EXECUTE {
+            if let Ok(fields) = entity_protocol::decode_execute_fields(&envelope.root.data) {
+                if fields.operation == "reentry-grant" {
+                    accept_reentry_grant(
+                        &envelope,
+                        remote_peer_id.as_str(),
+                        remote_identity_hash,
+                        reentry_ep_handle.as_ref(),
+                    );
+                    continue;
+                }
+            }
+        }
+
         // Spawn dispatch — the §4.8 invariant fix. Each frame's handler runs
         // concurrently with subsequent reads; the writer task serializes
         // responses back onto the wire.
@@ -365,6 +395,290 @@ pub(crate) fn build_hello_response_envelope(
     Ok(hello_response)
 }
 
+/// §6.5 mutual minting: validate an inbound `reentry-grant` and install the
+/// reciprocal capability on our acceptor endpoint, giving us originating
+/// authority back over this connection. Best-effort — a malformed or
+/// mis-granted frame is logged and dropped, leaving us without originating
+/// authority (the pre-mutual-minting state), never breaking the connection.
+/// See docs/PROPOSAL-SYMMETRIC-REENTRY-MUTUAL-MINTING.md.
+fn accept_reentry_grant(
+    envelope: &Envelope,
+    remote_peer_id: &str,
+    remote_identity_hash: entity_hash::Hash,
+    endpoint: Option<&Arc<dyn crate::remote::RemoteEndpoint>>,
+) {
+    let endpoint = match endpoint {
+        Some(ep) => ep,
+        None => return, // reentry disabled for this connection — nothing to hold it
+    };
+    // The reciprocal cap is the sole capability-token carried in `included`.
+    let cap = match envelope
+        .included
+        .values()
+        .find(|e| e.entity_type == entity_types::TYPE_CAP_TOKEN)
+    {
+        Some(c) => c.clone(),
+        None => {
+            tracing::warn!(
+                remote_peer = %remote_peer_id,
+                "§6.5 reentry-grant: no capability token in included — dropped"
+            );
+            return;
+        }
+    };
+    // Structural integrity: the claimed content hash must recompute (a
+    // substituted entity would otherwise index under the wrong hash).
+    if cap.validate().is_err() {
+        tracing::warn!(
+            remote_peer = %remote_peer_id,
+            "§6.5 reentry-grant: capability failed hash validation — dropped"
+        );
+        return;
+    }
+    // The grant MUST be authored (granter) by the peer we authenticated. A cap
+    // with any other granter is useless anyway — the far side verifies
+    // `granter == its own identity` at use-time — but rejecting here keeps the
+    // authority we store honest and attributable.
+    match entity_capability::CapabilityToken::from_entity(&cap) {
+        Ok(token) => match token.granter {
+            entity_capability::Granter::Single(g) if g == remote_identity_hash => {}
+            _ => {
+                tracing::warn!(
+                    remote_peer = %remote_peer_id,
+                    "§6.5 reentry-grant: granter is not the connected peer — dropped"
+                );
+                return;
+            }
+        },
+        Err(e) => {
+            tracing::warn!(
+                remote_peer = %remote_peer_id,
+                error = %e,
+                "§6.5 reentry-grant: capability decode failed — dropped"
+            );
+            return;
+        }
+    }
+    // Fail-fast on the granter signature, here at acceptance, instead of letting
+    // the far side's chain walk be the only thing that ever checks it. An
+    // unverifiable grant can authorize nothing, so installing it only trades this
+    // named local drop for a `403 missing_signature` one dispatch later — at the
+    // cross-peer seam, where it is hardest to attribute. Same three checks the
+    // §5.5 walk runs on a single-sig root link (signature present for this
+    // target, signer == granter, signature verifies under the granter's key),
+    // and nothing more: the grantee/attenuation legs of the walk need entities
+    // this frame does not carry.
+    if let Err(reason) = verify_grant_signature(envelope, &cap, remote_identity_hash) {
+        tracing::warn!(
+            remote_peer = %remote_peer_id,
+            reason = %reason,
+            "§6.5 reentry-grant: granter signature did not verify — dropped"
+        );
+        return;
+    }
+    // The cap's supporting entities travel in the same grant: its signature
+    // (signer = granter) and the granter's identity. A single-sig cap is rejected
+    // `missing_signature` without them, and our reentry endpoint's `auth_included`
+    // is empty — so capture them here (everything in `included` except the cap
+    // itself) and hand them to the endpoint to inject when it originates.
+    let supporting: Vec<_> = envelope
+        .included
+        .values()
+        .filter(|e| e.content_hash != cap.content_hash)
+        .cloned()
+        .collect();
+    endpoint.set_originating_capability(cap, supporting);
+    tracing::info!(
+        remote_peer = %remote_peer_id,
+        "§6.5: accepted reciprocal reentry grant — this acceptor may now originate"
+    );
+}
+
+/// The single-sig signature leg of the §5.5 chain walk, run at grant-acceptance
+/// time on the reciprocal cap. Returns the reason on failure so the caller logs
+/// something attributable. Deliberately not `verify_capability_chain`: that also
+/// resolves the *grantee* identity out of `included`, and the grantee here is
+/// **us** — our own identity entity is not in a grant the dialer authored, so
+/// the full walk would reject every well-formed grant.
+fn verify_grant_signature(
+    envelope: &Envelope,
+    cap: &entity_entity::Entity,
+    granter_hash: entity_hash::Hash,
+) -> Result<(), &'static str> {
+    let sig =
+        entity_entity::find_signature_for_target(envelope.included.values(), &cap.content_hash)
+            .ok_or("no signature entity targets the capability")?;
+    let sig_data =
+        entity_types::SignatureData::from_entity(sig).map_err(|_| "signature decode failed")?;
+    if sig_data.signer != granter_hash {
+        return Err("signer is not the granter");
+    }
+    let granter_entity = envelope
+        .included
+        .get(&granter_hash)
+        .ok_or("granter identity entity absent from included")?;
+    let granter = entity_types::PeerData::from_entity(granter_entity)
+        .map_err(|_| "granter identity decode failed")?;
+    let key_type = entity_crypto::KeyType::from_label(&granter.key_type)
+        .map_err(|_| "unallocated key_type")?;
+    entity_crypto::verify_for_key_type(
+        key_type,
+        &granter.public_key,
+        &cap.content_hash.to_bytes(),
+        &sig_data.signature,
+    )
+    .map_err(|_| "signature does not verify under the granter's key")
+}
+
+/// The §4.4 initial-scope assembly: the grants this peer issues a counterpart
+/// that dials **in** — the resolver's answer (EXTENSION-ROLE §4.7) or the static
+/// floor, unioned with any matching `system/capability/policy/{peer}` entry.
+///
+/// **One assembly, two callers** (arch ruling 2026-08-05, EXTENSION-SIGNALING
+/// §6.5 (b) *Contents*): the §6.6 handshake below, and the §6.5 (b) reciprocal
+/// mint in [`crate::remote::build_reentry_grant_envelope`]. The reciprocal grant
+/// is *the grant the minting peer would issue this counterpart as an inbound
+/// dialer* — the assembled set, **not** the flat `default_connection_grants`
+/// floor. Minting the bare floor while an inbound dialer receives the assembled
+/// set gives the establishment whose justification is *symmetry* asymmetric
+/// authority; both impls shipped that defect and `entity-core-go` measured it.
+///
+/// The mirror is symmetric **construction**, not identical grant sets: each peer
+/// runs its own assembly against the counterpart, so A→B and B→A differ exactly
+/// as A's and B's policy tables differ. That is correct — authority is
+/// target-owned. There is no separate reciprocal-narrowing pass: the §4.4 union
+/// happens here, once, in the one policy table.
+///
+/// A second copy of this logic is how the two directions drifted apart in the
+/// first place, so the extraction is the fix as much as the call site is.
+pub(crate) fn assemble_inbound_grants(
+    shared: &Arc<PeerShared>,
+    grantee_hash: &entity_hash::Hash,
+    remote_peer_id: &entity_crypto::PeerId,
+) -> Vec<entity_capability::GrantEntry> {
+    // Resolver-first, static fallback. Matches the recognize-on-attestation
+    // handoff §7 / Go's reference.
+    let static_fallback = || {
+        if shared.config.debug_open_grants {
+            tracing::warn!("using debug open grants — all operations permitted");
+            entity_capability::debug_open_grants()
+        } else {
+            entity_capability::default_connection_grants()
+        }
+    };
+    let mut grants = if let Some(resolver) = shared.grant_resolver.as_ref() {
+        match resolver(remote_peer_id, grantee_hash) {
+            Some(g) => {
+                tracing::debug!(
+                    grant_count = g.len(),
+                    "grant resolver returned connection grants"
+                );
+                g
+            }
+            None => static_fallback(),
+        }
+    } else {
+        static_fallback()
+    };
+    // V7.62 §4.4 policy-table consultation: union the SHOULD floor with
+    // any matched `system/capability/policy/{peer_pattern}` entry for
+    // the connecting peer. Conditional on the capability handler being
+    // registered (no-op when absent — backward-compat for peers without
+    // the §6.2 handler).
+    if shared
+        .handler_registry
+        .get(&format!("/{}/system/capability", shared.peer_id))
+        .is_some()
+    {
+        if let Some(extras) =
+            lookup_capability_policy_grants(shared, grantee_hash, remote_peer_id.as_str())
+        {
+            tracing::debug!(
+                added = extras.len(),
+                "§4.4 union: policy entry added grants to initial scope"
+            );
+            grants.extend(extras);
+        }
+    }
+    // §3 advertisement discipline: a peer MUST NOT grant authority it does not
+    // advertise it serves (arch ruling 2026-08-05). Applied here, once, so the
+    // §6.6 handshake and the §6.5 (b) reciprocal mint filter identically.
+    //
+    // Skipped under `debug_open_grants`, which is documented as bypassing all
+    // authorization scoping — its wildcard handler scope is covered by no
+    // single registered handler, so filtering would empty it. A posture that
+    // already says "never use in production" does not get a second, subtler
+    // production-only guarantee layered under it.
+    if shared.config.debug_open_grants {
+        return grants;
+    }
+    let advertised = advertised_served_scope(shared);
+    let before = grants.len();
+    grants.retain(|entry| {
+        entity_capability::advertisement_covers(&advertised, entry, shared.peer_id.as_str())
+    });
+    if grants.len() != before {
+        tracing::debug!(
+            dropped = before - grants.len(),
+            retained = grants.len(),
+            "§3 advertisement filter dropped uncovered grant entries"
+        );
+    }
+    grants
+}
+
+/// The **advertised served-scope** this peer filters its §4.4 assembly
+/// against: one grant entry per registered handler, naming that handler with
+/// the other three axes unconstrained.
+///
+/// **The unexpressed axes are unconstrained, not empty.** A handler manifest
+/// says which handler and (here) which operations; it says nothing about
+/// resources or peers. Reading an unexpressed axis as *empty* would make the
+/// §4.4 floor filter itself away — its first entry carries
+/// `resources: [system/type/*, system/handler/*]` — so *unconstrained* is the
+/// only reading under which the ruling has a fixed point.
+///
+/// **`operations` is `*` deliberately, and it is the one place we did not
+/// build to our own reading.** Our interface entities *do* express an
+/// operations list, so constraining that axis is the more faithful reading of
+/// "MUST NOT grant authority it does not advertise it serves". `entity-core-go`
+/// (`advertisedServedScope`, `core/peer/peer.go`) advertises `*` and routes the
+/// per-handler narrowing through a handler-declared `MaxScope` instead. The
+/// filter only ever *drops*, so a stricter reading here would hand a
+/// counterpart strictly less authority than a Go peer in the same
+/// configuration — an observable cross-impl divergence in grant contents, for a
+/// question arch has not ruled on. Converged and routed rather than shipped.
+///
+/// Evaluated at assembly time, which is the only time the assembly exists: a
+/// handler registered a second later was not advertised when the grant was
+/// authored, and the grant is not retroactively widened.
+fn advertised_served_scope(shared: &Arc<PeerShared>) -> Vec<entity_capability::GrantEntry> {
+    let qualified_prefix = format!("/{}/", shared.peer_id);
+    shared
+        .handler_registry
+        .patterns()
+        .into_iter()
+        .map(|pattern| {
+            // Registry keys are peer-qualified (`/{peer_id}/system/tree`);
+            // grant handler scopes are bare (`system/tree`) and canonicalize
+            // to the qualified form. Compare in the bare frame so both sides
+            // canonicalize under `local_peer_id` identically.
+            let bare = pattern
+                .strip_prefix(&qualified_prefix)
+                .unwrap_or(&pattern)
+                .to_string();
+            entity_capability::GrantEntry {
+                handlers: entity_capability::PathScope::new(vec![bare]),
+                resources: entity_capability::PathScope::new(vec!["*".into()]),
+                operations: entity_capability::IdScope::new(vec!["*".into()]),
+                peers: None,
+                constraints: None,
+                allowances: None,
+            }
+        })
+        .collect()
+}
+
 /// Build the authenticate-response envelope for a received authenticate
 /// EXECUTE.
 ///
@@ -411,50 +725,9 @@ pub(crate) fn build_authenticate_response_envelope(
         .remote_identity_hash
         .ok_or_else(|| PeerError::ConnectionError("remote identity hash not captured".into()))?;
 
-    // Connection grants (resolver-first, static fallback). Matches
-    // the recognize-on-attestation handoff §7 / Go's reference.
-    let static_fallback = || {
-        if shared.config.debug_open_grants {
-            tracing::warn!("using debug open grants — all operations permitted");
-            entity_capability::debug_open_grants()
-        } else {
-            entity_capability::default_connection_grants()
-        }
-    };
-    let mut grants = if let Some(resolver) = shared.grant_resolver.as_ref() {
-        match resolver(&remote_peer_id, &grantee_hash) {
-            Some(g) => {
-                tracing::debug!(
-                    grant_count = g.len(),
-                    "grant resolver returned connection grants"
-                );
-                g
-            }
-            None => static_fallback(),
-        }
-    } else {
-        static_fallback()
-    };
-    // V7.62 §4.4 policy-table consultation: union the SHOULD floor with
-    // any matched `system/capability/policy/{peer_pattern}` entry for
-    // the connecting peer. Conditional on the capability handler being
-    // registered (no-op when absent — backward-compat for peers without
-    // the §6.2 handler).
-    if shared
-        .handler_registry
-        .get(&format!("/{}/system/capability", shared.peer_id))
-        .is_some()
-    {
-        if let Some(extras) =
-            lookup_capability_policy_grants(shared, &grantee_hash, remote_peer_id.as_str())
-        {
-            tracing::debug!(
-                added = extras.len(),
-                "§4.4 union: policy entry added grants to initial scope"
-            );
-            grants.extend(extras);
-        }
-    }
+    // Connection grants — the §4.4 assembly, shared with the §6.5 (b)
+    // reciprocal mint (see `assemble_inbound_grants`).
+    let grants = assemble_inbound_grants(shared, &grantee_hash, &remote_peer_id);
     let now_ms = web_time::SystemTime::now()
         .duration_since(web_time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -730,6 +1003,24 @@ pub(crate) async fn dispatch_session_envelope(
         status = tracing::field::Empty,
     ),
 )]
+/// The verification-failure response, extracted verbatim so both the first
+/// attempt and the §7a.2a supplied retry produce byte-identical errors.
+fn verification_error_response(
+    envelope: &Envelope,
+    request_id: &str,
+    e: entity_protocol::ProtocolError,
+) -> Envelope {
+    let status = e.wire_status_code();
+    // v7.66 §4.4 surface 6: registry-entry codes win over the
+    // generic verification_failed default. AGILITY-UNKNOWN-1 +
+    // FORMAT-CODE-INTERPRETATION-1 + CAP-FREEZE-1 assert on the
+    // dedicated codes returned via `wire_error_code()`.
+    let code = e.wire_error_code().unwrap_or("verification_failed");
+    tracing::warn!(request_id = %request_id, status = status, error = %e, "request verification failed");
+    build_error_response(request_id, status, code, &e.to_string())
+        .unwrap_or_else(|_| Envelope::new(envelope.root.clone()))
+}
+
 pub(crate) async fn dispatch_request(
     envelope: &Envelope,
     shared: Arc<PeerShared>,
@@ -808,7 +1099,41 @@ pub(crate) async fn dispatch_request(
     let verify_ctx = entity_protocol::VerifyContext::new(&pid_string).with_revocation(true);
     let store = shared.content_store.clone();
     let li = shared.location_index.clone();
-    let included_for_resolve = envelope.included.clone();
+    // Q1 phase (2), the half the first pass missed: the REVOCATION resolver
+    // needs the supplied triple too, not just the verification envelope.
+    //
+    // `verify_request_with_ctx` runs two walks over the same leaf. The first
+    // reads `envelope.included` directly; the second is `is_revoked`, which
+    // re-walks the chain through THIS closure — and on an unresolvable chain
+    // it returns `true` (verify.rs, "Err(_) => return true"), i.e. a cap we
+    // cannot resolve is reported REVOKED. Augmenting only the envelope
+    // therefore turns a references-only frame into `403 capability_revoked`:
+    // the chain verifies, and then the revocation walk cannot see the cap we
+    // ourselves minted, because it lives in the minted ledger and was never
+    // written to our content store.
+    //
+    // Measured, not theorised: entity-core-go flipped its sender and V3
+    // direction B went 200 -> 403 `capability revoked`, bisected against the
+    // same node with the flip as the only variable.
+    //
+    // Seeded here rather than inside the retry so BOTH attempts share one
+    // resolver. That does not weaken the additive property: this map is read
+    // only by the revocation walk, the first verification attempt still sees
+    // the unaugmented envelope, and the entities added are exactly the ones
+    // we minted AND delivered to this very peer.
+    let mut included_for_resolve = envelope.included.clone();
+    if let Some(bundle) = session_peer_id.and_then(|peer| {
+        shared
+            .minted_reentry_grants
+            .lock()
+            .unwrap()
+            .get(peer)
+            .cloned()
+    }) {
+        for e in bundle {
+            included_for_resolve.entry(e.content_hash).or_insert(e);
+        }
+    }
     let resolve = |h: &entity_hash::Hash| {
         // Store-first then envelope `included` fallback per V7 §5.1
         // convention for revocation lookups.
@@ -827,24 +1152,92 @@ pub(crate) async fn dispatch_request(
                 .collect()
         })
     };
+    // Q1 phase (2) — the references-only wielding path.
+    //
+    // The ruled shape lets an acceptor wield our §6.5 (b) reciprocal grant by
+    // *reference*: it sends the §7a.2a triple as hashes and we, the granter,
+    // resolve them. Rust's chain walk resolves from `envelope.included` only
+    // (`verify::verify_capability_chain`), so a references-only frame fails
+    // here — and, per `entity-core-go`'s finding, it fails as
+    // `missing_signature` at the chain walk rather than as a missing cap,
+    // because a sender that merely drops the supporting set still inlines the
+    // cap itself. That partial shape is what any impl flipping by "stop
+    // attaching the chain" will actually emit, so the receiver has to supply
+    // whatever is missing rather than assume the whole triple is.
+    //
+    // Retry-on-failure rather than pre-augment, and that ordering is the
+    // additive property: an envelope carrying the currently-shipped inlined
+    // chain verifies on the first attempt and never reaches this path, so
+    // landing this ahead of the flag day cannot move the shipped shape. Only a
+    // frame that would otherwise have been **rejected** gets a second look, and
+    // it gets it against entities we ourselves minted and delivered to this
+    // exact peer — never a general store lookup (see
+    // `PeerShared::minted_reentry_grants`). Nothing here can make a forged
+    // signature verify; it can only stop us from demanding our own entities back.
+    let supplied_envelope;
+    let mut envelope: &Envelope = envelope;
+    // The three resolver closures are borrowed rather than moved because the
+    // supplied retry below calls them a second time; `&F` satisfies the same
+    // `Fn` bounds. Clippy's suggestion to drop the `&` is correct only for a
+    // single call site.
+    #[allow(clippy::needless_borrows_for_generic_args)]
     let verified = match entity_protocol::verify_request_with_ctx(
         envelope,
         &verify_ctx,
-        resolve,
-        locate,
-        capability_path_for,
+        &resolve,
+        &locate,
+        &capability_path_for,
     ) {
         Ok(v) => v,
-        Err(e) => {
-            let status = e.wire_status_code();
-            // v7.66 §4.4 surface 6: registry-entry codes win over the
-            // generic verification_failed default. AGILITY-UNKNOWN-1 +
-            // FORMAT-CODE-INTERPRETATION-1 + CAP-FREEZE-1 assert on the
-            // dedicated codes returned via `wire_error_code()`.
-            let code = e.wire_error_code().unwrap_or("verification_failed");
-            tracing::warn!(request_id = %request_id, status = status, error = %e, "request verification failed");
-            return build_error_response(&request_id, status, code, &e.to_string())
-                .unwrap_or_else(|_| Envelope::new(envelope.root.clone()));
+        Err(first_err) => {
+            let supply = session_peer_id
+                .and_then(|peer| {
+                    shared
+                        .minted_reentry_grants
+                        .lock()
+                        .unwrap()
+                        .get(peer)
+                        .cloned()
+                })
+                .filter(|bundle| {
+                    // Only worth a retry if the bundle actually adds something
+                    // the envelope did not already carry.
+                    bundle
+                        .iter()
+                        .any(|e| !envelope.included.contains_key(&e.content_hash))
+                });
+            match supply {
+                Some(bundle) => {
+                    let mut augmented = envelope.clone();
+                    for e in bundle {
+                        augmented
+                            .included
+                            .entry(e.content_hash)
+                            .or_insert_with(|| e.clone());
+                    }
+                    supplied_envelope = augmented;
+                    envelope = &supplied_envelope;
+                    match entity_protocol::verify_request_with_ctx(
+                        envelope,
+                        &verify_ctx,
+                        &resolve,
+                        &locate,
+                        &capability_path_for,
+                    ) {
+                        Ok(v) => {
+                            tracing::debug!(
+                                request_id = %request_id,
+                                remote_peer = ?session_peer_id,
+                                "§7a.2a: supplied the reentry grant we minted for this peer — \
+                                 references-only wielding verified"
+                            );
+                            v
+                        }
+                        Err(e) => return verification_error_response(envelope, &request_id, e),
+                    }
+                }
+                None => return verification_error_response(envelope, &request_id, first_err),
+            }
         }
     };
 
@@ -1369,6 +1762,42 @@ pub(crate) async fn dispatch_request(
             "async delivery: returning 202, processing in background"
         );
 
+        // Row 2 of the back-direction-authority taxonomy (PROPOSAL-SYMMETRIC-
+        // REENTRY-MUTUAL-MINTING §3, arch ruling 2026-08-05): the delivery we
+        // are about to make back to the caller is authorized by the caller's own
+        // `deliver_token` — granter = the caller (it owns the inbox), grantee =
+        // us — and by nothing else. Capture it, with the entities its chain
+        // needs (its signature, and the granter identity), so the delivery
+        // dispatch can author under it instead of falling through to whatever
+        // connection authority happens to exist. `default_connection_grants`
+        // never covered `system/inbox receive`, so the fall-through could not
+        // have been right; and on a §6.11(b) return path there may be no
+        // connection grant at all. `entity-core-go` found and fixed the same
+        // shape in `deliverToInbox`.
+        let delivery_auth: Option<(entity_entity::Entity, HashMap<entity_hash::Hash, _>)> =
+            envelope
+                .included
+                .get(&deliver_token_hash)
+                .cloned()
+                .map(|token| {
+                    let mut bundle: HashMap<entity_hash::Hash, entity_entity::Entity> =
+                        HashMap::new();
+                    if let Some(sig) = entity_entity::find_signature_for_target(
+                        envelope.included.values(),
+                        &deliver_token_hash,
+                    ) {
+                        bundle.insert(sig.content_hash, sig.clone());
+                    }
+                    if let Ok(fields) = entity_capability::CapabilityToken::from_entity(&token) {
+                        if let entity_capability::Granter::Single(granter) = fields.granter {
+                            if let Some(id) = envelope.included.get(&granter) {
+                                bundle.insert(id.content_hash, id.clone());
+                            }
+                        }
+                    }
+                    (token, bundle)
+                });
+
         // Spawn async processing task
         let request_id_owned = verified.request_id.clone();
         let handler_name = resolved_handler_name(&resolved).to_string();
@@ -1381,6 +1810,7 @@ pub(crate) async fn dispatch_request(
                 &request_id_owned,
                 &handler_name,
                 shared_for_delivery,
+                delivery_auth,
             )
             .await;
         });
@@ -1634,6 +2064,12 @@ fn fire_wire_hooks(
 /// Process an async delivery: execute handler, wrap result, deliver to inbox.
 /// Per INBOX spec §4.1 and §4.5.
 /// If deliver_to targets a remote peer, uses outbound connection to deliver.
+/// `delivery_auth` is the caller's `deliver_token` and the entities its chain
+/// needs (signature + granter identity) — taxonomy row 2, the authority for the
+/// delivery leg. `None` only if the token vanished between validation and here,
+/// in which case the dispatch falls back to connection authority and will fail
+/// closed at the far side, which is the correct outcome.
+#[allow(clippy::too_many_arguments)]
 async fn process_async_delivery(
     ctx: HandlerContext,
     deliver_to: &DeliverySpec,
@@ -1641,6 +2077,10 @@ async fn process_async_delivery(
     original_request_id: &str,
     handler_name: &str,
     shared: std::sync::Arc<PeerShared>,
+    delivery_auth: Option<(
+        entity_entity::Entity,
+        HashMap<entity_hash::Hash, entity_entity::Entity>,
+    )>,
 ) {
     // Execute the handler via execute_fn (internal dispatch).
     // We re-dispatch to the same handler+operation with the same params.
@@ -1819,10 +2259,16 @@ async fn process_async_delivery(
             exclude: vec![],
         };
 
-        // Async inbox delivery rides the connection grant (the deliver_token
-        // is the authority here) — not a continuation cross-peer dispatch, so
-        // no scoped dispatch_capability override and no chain bundle.
+        // Taxonomy row 2: the delivery authors under the caller's `deliver_token`
+        // (granter = the caller, grantee = us, scoped to `system/inbox receive`
+        // at exactly this `deliver_to` URI), carrying that token's own chain —
+        // never under the connection grant, which does not cover `system/inbox`
+        // and may not exist at all on a §6.11(b) return path.
         let no_chain = std::collections::HashMap::new();
+        let (dispatch_cap, chain_bundle) = match delivery_auth {
+            Some((ref token, ref bundle)) => (Some(token), bundle),
+            None => (None, &no_chain),
+        };
         match crate::remote::send_execute(
             conn.as_ref(),
             &shared.keypair,
@@ -1831,8 +2277,8 @@ async fn process_async_delivery(
             &delivery_entity,
             Some(&resource),
             None, // delivery dispatch — no nested deliver_to
-            None, // no scoped dispatch_capability override
-            &no_chain,
+            dispatch_cap,
+            chain_bundle,
             None, // async delivery of a finished result — no chain bounds
         )
         .await
@@ -2765,6 +3211,17 @@ pub fn make_execute_fn(
                             &request_id_for_delivery,
                             &log_name_for_delivery,
                             shared_for_delivery,
+                            // No row-2 token to pass: a handler-initiated
+                            // `deliver_to` (D1) carries no `deliver_token` —
+                            // `ExecuteOptions` has no field for one — so this
+                            // branch dispatches exactly as it did before. Local
+                            // delivery is unaffected (no wire authority is
+                            // involved); a D1 delivery whose target is REMOTE
+                            // still has no row-2 authority and fails closed at
+                            // the far side, unchanged. Threading the token
+                            // through `ExecuteOptions` is the fix, and it is a
+                            // handler-API change, not this one.
+                            None,
                         )
                         .await;
                     });
@@ -3431,6 +3888,131 @@ fn extract_request_id(envelope: &Envelope) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod reentry_grant_tests {
+    use super::*;
+    use entity_crypto::{IdentityKeypair, Keypair};
+
+    const FMT: u8 = 0x00;
+
+    fn kp(seed: u8) -> IdentityKeypair {
+        IdentityKeypair::Ed25519(Keypair::from_seed([seed; 32]))
+    }
+
+    fn identity_hash(kp: &IdentityKeypair) -> entity_hash::Hash {
+        kp.peer_entity_with_format(FMT).unwrap().content_hash
+    }
+
+    /// These four are acceptance-side (signature) tests, so the grant *set* is
+    /// not what they measure — the floor stands in for whatever
+    /// `assemble_inbound_grants` would return on a live dialer. The Contents
+    /// ruling is measured on the wire instead, by
+    /// `test_s65_reciprocal_grant_is_the_assembled_inbound_grant`.
+    fn grant_from(dialer: &IdentityKeypair, grantee: entity_hash::Hash) -> Envelope {
+        crate::remote::build_reentry_grant_envelope(
+            dialer,
+            grantee,
+            FMT,
+            entity_capability::default_connection_grants(),
+        )
+        .unwrap()
+    }
+
+    fn cap_of(envelope: &Envelope) -> entity_entity::Entity {
+        envelope
+            .included
+            .values()
+            .find(|e| e.entity_type == entity_types::TYPE_CAP_TOKEN)
+            .expect("grant carries its capability")
+            .clone()
+    }
+
+    /// The producer's own frame satisfies the acceptance check — the pin that
+    /// keeps `build_reentry_grant_envelope` and this verifier from drifting
+    /// apart (they are the two halves of one cross-peer contract, and only a
+    /// test that runs both catches a divergence before a live channel does).
+    #[test]
+    fn a_well_formed_grant_passes_acceptance() {
+        let dialer = kp(70);
+        let acceptor = kp(71);
+        let envelope = grant_from(&dialer, identity_hash(&acceptor));
+        let cap = cap_of(&envelope);
+        assert!(verify_grant_signature(&envelope, &cap, identity_hash(&dialer)).is_ok());
+    }
+
+    /// A grant whose signature was stripped is refused at acceptance instead of
+    /// being installed and failing `403 missing_signature` at first originate.
+    #[test]
+    fn a_grant_stripped_of_its_signature_is_refused() {
+        let dialer = kp(72);
+        let acceptor = kp(73);
+        let mut envelope = grant_from(&dialer, identity_hash(&acceptor));
+        let cap = cap_of(&envelope);
+        envelope
+            .included
+            .retain(|_, e| e.entity_type != entity_entity::TYPE_SIGNATURE);
+        assert!(verify_grant_signature(&envelope, &cap, identity_hash(&dialer)).is_err());
+    }
+
+    /// A signature that is well-formed and correctly targeted but signs under a
+    /// key that is not the granter's does not verify. This is the case the
+    /// structural checks (hash validation, granter == the authenticated peer)
+    /// cannot see: the cap names the right granter and the signature names the
+    /// right target — only the cryptography disagrees.
+    #[test]
+    fn a_grant_signed_by_someone_else_is_refused() {
+        let dialer = kp(74);
+        let acceptor = kp(75);
+        let impostor = kp(76);
+        let envelope = grant_from(&dialer, identity_hash(&acceptor));
+        let cap = cap_of(&envelope);
+
+        // Re-sign the same cap with the impostor's key, still claiming the
+        // dialer as `signer` — the shape a forged grant would take.
+        let sig_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+            (
+                entity_ecf::text("algorithm"),
+                entity_ecf::text(impostor.key_type().label()),
+            ),
+            (
+                entity_ecf::text("signature"),
+                entity_ecf::Value::Bytes(impostor.sign(&cap.content_hash.to_bytes())),
+            ),
+            (
+                entity_ecf::text("signer"),
+                entity_ecf::Value::Bytes(identity_hash(&dialer).to_bytes().to_vec()),
+            ),
+            (
+                entity_ecf::text("target"),
+                entity_ecf::Value::Bytes(cap.content_hash.to_bytes().to_vec()),
+            ),
+        ]));
+        let forged =
+            entity_entity::Entity::new_with_format(entity_entity::TYPE_SIGNATURE, sig_data, FMT)
+                .unwrap();
+        let mut forged_envelope = envelope.clone();
+        forged_envelope
+            .included
+            .retain(|_, e| e.entity_type != entity_entity::TYPE_SIGNATURE);
+        forged_envelope.include(forged);
+
+        assert!(verify_grant_signature(&forged_envelope, &cap, identity_hash(&dialer)).is_err());
+    }
+
+    /// A grant from a peer other than the one we authenticated fails the signer
+    /// leg — the local mirror of the `granter == connected peer` structural
+    /// check, at the signature level.
+    #[test]
+    fn a_grant_attributed_to_another_peer_is_refused() {
+        let dialer = kp(77);
+        let acceptor = kp(78);
+        let stranger = kp(79);
+        let envelope = grant_from(&dialer, identity_hash(&acceptor));
+        let cap = cap_of(&envelope);
+        assert!(verify_grant_signature(&envelope, &cap, identity_hash(&stranger)).is_err());
+    }
 }
 
 #[cfg(test)]

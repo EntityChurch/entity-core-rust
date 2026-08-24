@@ -2014,10 +2014,26 @@ async fn handle_connect_peer(
             };
         }
     };
-    let remote = match entity_peer::remote::perform_connect(
+    let remote = match entity_peer::remote::perform_connect_with_dispatch(
         conn,
         &shared.keypair,
         shared.config.home_hash_format,
+        // §6.11(b) dialer-side reentry — the reach-back-serving MUST
+        // (EXTENSION-SIGNALING §6.5 (b), folded 2026-08-05). Without a dispatch
+        // context the reader drops every inbound EXECUTE on a connection we
+        // dialed as an orphan: a subscription notification, a continuation
+        // join, an inbox delivery. This seat is the one where that always
+        // matters — a browser peer runs no listener anyone could dial, so the
+        // connection it opened is the *only* way back to it.
+        //
+        // The two sibling paths doing this same job have always threaded it
+        // (`remote::connect_and_pool` behind `Peer::connect_to`, and
+        // `SdkPeerContext::connect_to` on **both** targets); this one said it
+        // mirrored them and did not. Drift, not a design choice.
+        Some(shared.clone()),
+        // §4.4: dial-by-address — no §3 rendezvous key was mutually brought, so
+        // no reciprocal grant. Same value the two siblings pass.
+        false,
     )
     .await
     {

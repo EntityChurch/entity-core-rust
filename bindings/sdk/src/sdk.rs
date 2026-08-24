@@ -4134,6 +4134,10 @@ impl PeerContext {
             // §6.11(b): receive deliveries the remote pushes back over
             // this connection (we may run no listener it could dial).
             Some(self.shared.clone()),
+            // §4.4 (PROPOSAL-SYMMETRIC-REENTRY-MUTUAL-MINTING): dial-by-address,
+            // no §3 rendezvous key mutually brought — so no reciprocal grant.
+            // This is the asymmetric establishment §6.6 describes.
+            false,
         )
         .await
         .map_err(|e| SdkError::HandlerError(format!("connect_to({addr}): handshake: {e}")))?;
@@ -4159,6 +4163,10 @@ impl PeerContext {
             // §6.11(b): receive deliveries the remote pushes back over
             // this connection (we may run no listener it could dial).
             Some(self.shared.clone()),
+            // §4.4 (PROPOSAL-SYMMETRIC-REENTRY-MUTUAL-MINTING): dial-by-address,
+            // no §3 rendezvous key mutually brought — so no reciprocal grant.
+            // This is the asymmetric establishment §6.6 describes.
+            false,
         )
         .await
         .map_err(|e| SdkError::HandlerError(format!("connect_to({addr}): handshake: {e}")))?;

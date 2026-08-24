@@ -482,6 +482,12 @@ impl LiveEstablish for PeerPunchEstablisher {
                 Ok(LivePath {
                     connection: conn,
                     role: HandshakeRole::Initiator,
+                    // §4.4: this punch met the counterpart at the §3.2 `pair`
+                    // key derived above — both peers computed it independently
+                    // from the two peer-ids and only met because they matched.
+                    // A punch is not "asymmetric because it is a punch"; what
+                    // classifies it is the key, and this one has one.
+                    established_via_rendezvous_key: true,
                 })
             }
             // A §6.3 refusal is not "no live path" in the sense the rest of this

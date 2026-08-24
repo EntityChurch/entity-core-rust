@@ -239,14 +239,45 @@ pub enum HandshakeRole {
     Responder,
 }
 
-/// A traversed transport plus the handshake role that governs it.
+/// A traversed transport plus the two facts about its establishment that the
+/// caller cannot recover from the transport itself.
 ///
-/// The two are returned together because a `Connection` alone is unusable: the
-/// caller cannot know from the transport which half of the handshake to run,
-/// and guessing produces one of §7.4.1's two failures. See [`HandshakeRole`].
+/// A `Connection` alone is unusable: the caller cannot know from it which half
+/// of the handshake to run (guessing produces one of §7.4.1's two failures,
+/// see [`HandshakeRole`]), nor whether the establishment was symmetric
+/// (see [`established_via_rendezvous_key`](LivePath::established_via_rendezvous_key)).
+/// Only the establisher knows either, so both ride back with the connection.
 pub struct LivePath {
     pub connection: Connection,
     pub role: HandshakeRole,
+    /// Whether this establishment was reached by **meeting at a §3 rendezvous
+    /// key** (`pair` / `tag` / `secret` / `lobby`).
+    ///
+    /// `EXTENSION-SIGNALING.md` §6.5 (b) / `PROPOSAL-SYMMETRIC-REENTRY-MUTUAL-
+    /// MINTING` §4.4 `[cross-peer seam — MUST]`: this is the discriminator for
+    /// **symmetric** establishment, and therefore for whether the dialer mints
+    /// the reciprocal reentry grant. A §3 key is one **both** peers brought
+    /// independently, and §3.4's rendezvous-hash routing means they meet only
+    /// if both used the *same* key — so the joint bringing of the key **is** the
+    /// mutual-authorization act, regardless of why either peer showed up.
+    ///
+    /// **Not "traversed", and not the substrate.** A punch may itself be
+    /// key-established — this crate's is: [`PeerPunchEstablisher`] derives the
+    /// §3.2 `pair` key from the two peer-ids. The classifying question is only
+    /// *was a §3 key mutually brought*, never *what carried the bytes*. (Rev 2
+    /// of the proposal classified on "rendezvous- vs profile-driven" and
+    /// `entity-core-go` showed that to be a Rust-shaped fact stated as a
+    /// general one; in a dialer's seat both can be true of one event.)
+    ///
+    /// **Locally derived, never wire-carried `[MUST]`.** Each establisher sets
+    /// this from *its own* use of the key. It MUST NOT become a field the
+    /// counterpart asserts — a one-sided field is precisely the §7.4.1 failure
+    /// shape. It need not be: meeting at the key proves both brought the same
+    /// one, so the two peers classify independently and **agree by
+    /// construction**.
+    ///
+    /// [`PeerPunchEstablisher`]: crate::punch_establisher::PeerPunchEstablisher
+    pub established_via_rendezvous_key: bool,
 }
 
 /// Why a §10.3 traversal produced no live path.

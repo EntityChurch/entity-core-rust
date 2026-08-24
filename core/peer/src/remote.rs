@@ -164,9 +164,25 @@ pub trait RemoteEndpoint: Send + Sync {
     /// See `docs/SPEC-AMBIGUITIES.md`, "§6.5 symmetric originate" — how an
     /// acceptor acquires originating authority is a genuine spec gap, and this
     /// method deliberately does not invent one.
-    fn originating_capability(&self) -> Option<&Entity> {
-        Some(self.capability())
+    fn originating_capability(&self) -> Option<Entity> {
+        Some(self.capability().clone())
     }
+    /// The supporting entities a §6.5 reciprocal originating cap needs to
+    /// verify at the far side — the cap's own signature (signer = granter) and
+    /// the granter's identity. A single-sig root cap is rejected with
+    /// `missing_signature` without them (`verify_capability_chain`), and an
+    /// acceptor endpoint's `auth_included` is empty, so they must ride here.
+    /// Default empty: a dialed endpoint's cap chain already travels via
+    /// `auth_included`. See `docs/PROPOSAL-SYMMETRIC-REENTRY-MUTUAL-MINTING.md`.
+    fn originating_chain_bundle(&self) -> Vec<Entity> {
+        Vec::new()
+    }
+    /// Install an originating capability (and its supporting chain entities)
+    /// acquired *after* construction — the §6.5 reciprocal reentry grant (mutual
+    /// minting). Default no-op: only an acceptor endpoint
+    /// (`InboundReentryEndpoint`) has an authority slot to fill; a dialed endpoint
+    /// already carries the grant the remote issued it.
+    fn set_originating_capability(&self, _cap: Entity, _chain: Vec<Entity>) {}
     fn auth_included(&self) -> &HashMap<Hash, Entity>;
     fn next_request_id(&self) -> String;
     fn transport_type(&self) -> &'static str;
@@ -263,12 +279,30 @@ pub struct RemoteConnection {
     /// Wall-clock ms of the last successful response on this connection
     /// (see `RemoteEndpoint::last_activity_ms`). 0 = none yet.
     last_activity_ms: AtomicU64,
+    /// §6.5 (b): whether this dial minted and sent the reciprocal reentry grant.
+    ///
+    /// Diagnostic, not authority — the *acceptor* decides what it does with the
+    /// grant, and this side never learns that. It exists because "no grant
+    /// arrived" at a cross-impl acceptor is otherwise indistinguishable between
+    /// "the dialer classified the establishment as asymmetric and correctly
+    /// minted nothing" and "the dialer minted and the acceptor dropped it" —
+    /// which is exactly the ambiguity that left the V3 direction-B cell reported
+    /// as unscorable instead of as a result.
+    reciprocal_grant_sent: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl Drop for RemoteConnection {
     fn drop(&mut self) {
         self.reader_task.abort();
+    }
+}
+
+impl RemoteConnection {
+    /// §6.5 (b) diagnostic: did this dial mint and send the reciprocal reentry
+    /// grant? See the field for why it is worth reporting.
+    pub fn reciprocal_grant_sent(&self) -> bool {
+        self.reciprocal_grant_sent
     }
 }
 
@@ -371,6 +405,19 @@ pub struct InboundReentryEndpoint {
     /// Empty — the reentry authority chain rides via `chain_bundle`
     /// (`extra_included`), not the connection's auth set.
     auth_included: HashMap<Hash, Entity>,
+    /// §6.5 mutual minting: the reciprocal reentry capability the *remote* (the
+    /// dialer) minted FOR us after the handshake — `granter = the dialer`,
+    /// `grantee = us` — paired with its supporting chain entities (the cap's
+    /// signature and the granter's identity, without which a single-sig cap is
+    /// rejected `missing_signature`). `None` until the `reentry-grant` frame
+    /// arrives; once set,
+    /// [`originating_capability`](RemoteEndpoint::originating_capability) returns
+    /// the cap and [`originating_chain_bundle`](RemoteEndpoint::originating_chain_bundle)
+    /// its support, giving this acceptor authority to originate spontaneously
+    /// back over the one §6.5 data channel (trigger (b)). Interior-mutable
+    /// because the endpoint is shared as `Arc<dyn RemoteEndpoint>` and the grant
+    /// lands after construction. See PROPOSAL-SYMMETRIC-REENTRY-MUTUAL-MINTING.
+    held_grant: Mutex<Option<(Entity, Vec<Entity>)>>,
     /// Monotonic counter in a distinct `reentry-N` namespace so these IDs
     /// never collide with the inbound EXECUTE `request_id`s the remote chose
     /// (which we never place in `pending`).
@@ -392,6 +439,7 @@ impl InboundReentryEndpoint {
             remote_identity_hash,
             capability,
             auth_included: HashMap::new(),
+            held_grant: Mutex::new(None),
             request_seq: AtomicU64::new(0),
         }
     }
@@ -407,17 +455,33 @@ impl RemoteEndpoint for InboundReentryEndpoint {
     fn capability(&self) -> &Entity {
         &self.capability
     }
-    /// **No originating authority.** `self.capability` is the cap this peer
-    /// MINTED FOR the remote (grantee = the counterpart), kept only to satisfy
-    /// the trait — the field's own comment says `send_execute` never reads it.
-    /// That held until the §7.4.1 responder path (`f00170c`) routed a
-    /// spontaneous outbound dispatch through this endpoint with no
-    /// `dispatch_cap`, and the blanket fallback happily authored under it.
+    /// §6.5 mutual minting: the reciprocal capability the dialer granted us,
+    /// once the `reentry-grant` frame has landed (our `held_grant` slot). Before
+    /// that it is `None` — no originating authority — but that is now a transient
+    /// startup window, not the permanent gap it was. `self.capability` remains
+    /// the cap we MINTED FOR the remote (grantee = the counterpart) and is NOT a
+    /// valid originating cap; only the `held_grant` cap (granter = the remote,
+    /// grantee = us) is. See `docs/PROPOSAL-SYMMETRIC-REENTRY-MUTUAL-MINTING.md`.
     ///
     /// The §7a.2a reentry flow is unaffected: it passes the caller-minted cap
     /// explicitly as `dispatch_cap`, which takes precedence over this.
-    fn originating_capability(&self) -> Option<&Entity> {
-        None
+    fn originating_capability(&self) -> Option<Entity> {
+        self.held_grant
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(cap, _)| cap.clone())
+    }
+    fn originating_chain_bundle(&self) -> Vec<Entity> {
+        self.held_grant
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|(_, chain)| chain.clone())
+            .unwrap_or_default()
+    }
+    fn set_originating_capability(&self, cap: Entity, chain: Vec<Entity>) {
+        *self.held_grant.lock().unwrap() = Some((cap, chain));
     }
     fn auth_included(&self) -> &HashMap<Hash, Entity> {
         &self.auth_included
@@ -648,6 +712,10 @@ pub(crate) async fn connect_and_pool(
         &shared.keypair,
         shared.config.home_hash_format,
         Some(shared.clone()),
+        // §4.4: dial-by-address. No §3 rendezvous key was mutually brought, so
+        // this is the **asymmetric** establishment §6.6 describes — one party
+        // requested service — and it MUST NOT mint the reciprocal grant.
+        false,
     )
     .await?;
     let remote_peer_id = remote.remote_peer_id.clone();
@@ -764,6 +832,9 @@ pub async fn get_or_connect(
                     // §7.4.1: the establisher reports the role; this path never
                     // guesses one, which is what produced the crossed handshake.
                     path.role,
+                    // §4.4: and it reports whether a §3 rendezvous key was
+                    // mutually brought, which decides the reciprocal mint.
+                    path.established_via_rendezvous_key,
                 )
                 .await;
             }
@@ -841,6 +912,10 @@ pub async fn get_or_connect(
         // An ordinary dial settles §7.4.1 for free: exactly one side dialed, so
         // this side is the client. Unchanged behaviour, now stated.
         crate::live_establish::HandshakeRole::Initiator,
+        // §4.4: this arm dialed a *resolved transport endpoint* — a durable
+        // profile address. No §3 key was mutually brought, so no reciprocal
+        // mint. (Resolution is not authority: §7 ruling, 2026-08-05.)
+        false,
     )
     .await
 }
@@ -873,6 +948,7 @@ async fn adopt_transport_connection(
     transport_conn: crate::transport::Connection,
     addr: &str,
     role: crate::live_establish::HandshakeRole,
+    established_via_rendezvous_key: bool,
 ) -> Result<Arc<dyn RemoteEndpoint>, PeerError> {
     // §7.4.1 `[cross-peer seam — MUST]`: the handshake role follows the
     // signaling role, and only the establisher knows it. An ordinary dial is
@@ -884,9 +960,19 @@ async fn adopt_transport_connection(
     // The dispatch context is threaded to the reader (reentry) AND to the
     // §5 keepalive spawn below — clone the Arc before the move.
     let keepalive_shared = reentry.clone();
-    let conn = perform_connect_with_dispatch(transport_conn, keypair, home_format, reentry)
-        .await
-        .map_err(|e| PeerError::ConnectionError(format!("handshake with {}: {}", peer_id, e)))?;
+    let conn = perform_connect_with_dispatch(
+        transport_conn,
+        keypair,
+        home_format,
+        reentry,
+        // §4.4: the establisher's own classification, carried on `LivePath`.
+        // True for both establishers in this crate — the §7 punch meets at the
+        // §3.2 `pair` key and the §6.5 browser leg at its rendezvous key — but
+        // it is the key that decides, never the fact of having traversed.
+        established_via_rendezvous_key,
+    )
+    .await
+    .map_err(|e| PeerError::ConnectionError(format!("handshake with {}: {}", peer_id, e)))?;
 
     // R6 (PROPOSAL §9 rulings) — write the dialer-side
     // `held_capability` on `/{local_peer_id}/system/peer/session/
@@ -1011,8 +1097,24 @@ fn serve_traversed_connection(
         // rather than from a `pool` handle that may not be the same `RemoteState`.
         for _ in 0..RESPONDER_REENTRY_POLLS {
             if let Some(endpoint) = shared.remote.get_inbound(peer_id) {
+                // §6.5 mutual minting: the counterpart (the dialer) sends its
+                // reciprocal reentry grant a beat AFTER its client handshake
+                // completes — just after the endpoint registers here. We are
+                // about to dispatch back over this endpoint, so wait briefly for
+                // the grant to land, otherwise this first dispatch races it and
+                // fails with `no originating authority`. Best-effort: if it never
+                // arrives (a counterpart that sends none), fall through and
+                // return the endpoint anyway — unchanged pre-mutual-minting
+                // behavior. See PROPOSAL-SYMMETRIC-REENTRY-MUTUAL-MINTING.
+                for _ in 0..REENTRY_GRANT_POLLS {
+                    if endpoint.originating_capability().is_some() {
+                        break;
+                    }
+                    crate::runtime::sleep_ms(RESPONDER_REENTRY_POLL_MS).await;
+                }
                 tracing::debug!(
                     remote_peer = %peer_id,
+                    have_grant = endpoint.originating_capability().is_some(),
                     "§7.4.1: served the traversed handshake; dispatching back over it"
                 );
                 return Ok(endpoint);
@@ -1046,6 +1148,32 @@ type ServedHandshake<'a> = std::pin::Pin<
 /// flight, so this waits on one round trip.
 const RESPONDER_REENTRY_POLLS: u64 = 200;
 const RESPONDER_REENTRY_POLL_MS: u64 = 25;
+/// §6.5 mutual minting: how many `RESPONDER_REENTRY_POLL_MS` beats the responder
+/// waits for the dialer's reciprocal reentry grant to land before dispatching
+/// back (≈1s). Short — the grant is one frame the counterpart sends immediately
+/// after its handshake, already in flight on the open channel.
+///
+/// **This is our production bound and it is deliberately not
+/// [`RECIPROCAL_GRANT_VECTOR_FLOOR_MS`]** — see that constant for why the two
+/// must not be merged.
+const REENTRY_GRANT_POLLS: u64 = 40;
+
+/// The **conformance-vector** floor for the §6.5 (b) grant-received wait
+/// (EXTENSION-SIGNALING §6.5 (b) *Delivery + timing*, arch ruling 2026-08-05 Q3;
+/// `entity-core-go`'s `peer.ReciprocalGrantVectorFloor` is the same 2s).
+///
+/// A vector that waits only as long as *this* peer's production bound fails a
+/// slower-but-correct counterpart, which is a conformance verdict about our own
+/// impatience rather than about the peer under test. So a test that measures the
+/// reciprocal grant waits the floor.
+///
+/// **It must never be collapsed into [`REENTRY_GRANT_POLLS`]**, in either
+/// direction: the production bound is impl-local by ruling (§11.4) and MAY be
+/// shorter — ours is, at ≈1s — while the floor is a cross-impl tolerance that
+/// MUST NOT shrink to whatever we happen to run today. They are the same order
+/// of magnitude by coincidence, and a future tuning of one is not a licence to
+/// move the other.
+pub const RECIPROCAL_GRANT_VECTOR_FLOOR_MS: u64 = 2000;
 
 /// Consult the §10.3 seam, if one is registered on this dispatch context.
 ///
@@ -1513,7 +1641,9 @@ pub async fn perform_connect(
     keypair: &IdentityKeypair,
     home_format: u8,
 ) -> Result<RemoteConnection, PeerError> {
-    perform_connect_with_dispatch(conn, keypair, home_format, None).await
+    // No dispatch context and no §3 key: a bare client handshake (carrier,
+    // srflx probe, tests) never mints the reciprocal grant.
+    perform_connect_with_dispatch(conn, keypair, home_format, None, false).await
 }
 
 /// As [`perform_connect`], but with an optional dialer-side §6.11(b) reentry
@@ -1529,6 +1659,7 @@ pub async fn perform_connect_with_dispatch(
     keypair: &IdentityKeypair,
     home_format: u8,
     reentry: Option<Arc<crate::PeerShared>>,
+    established_via_rendezvous_key: bool,
 ) -> Result<RemoteConnection, PeerError> {
     let (mut reader, mut writer) = (conn.reader, conn.writer);
 
@@ -1678,6 +1809,84 @@ pub async fn perform_connect_with_dispatch(
 
     tracing::info!(remote_peer = %remote_peer_id, "outbound: handshake complete");
 
+    // --- §6.5 mutual minting (PROPOSAL-SYMMETRIC-REENTRY-MUTUAL-MINTING) ---
+    //
+    // The handshake is complete, so we finally know the acceptor's authored
+    // identity (`remote_identity_hash`) — which we could not know when we built
+    // the authenticate request (Hello carries `peer_id` only, the public key
+    // first crosses in authenticate). Mint the RECIPROCAL reentry capability now
+    // — `granter = us`, `grantee = the acceptor` — and hand it over the
+    // just-opened connection as a `reentry-grant` frame. This is what gives the
+    // acceptor authority to originate spontaneously back over a single §6.5 data
+    // channel (trigger (b)); without it only the dialer holds a grant.
+    //
+    // **Gated on `established_via_rendezvous_key`** (proposal §4.4 / §7, arch
+    // ruling 2026-08-05): only a **symmetric** establishment — one where both
+    // peers independently brought the same §3 rendezvous key and met at it —
+    // carries the mutual-authorization act that justifies granting the acceptor
+    // reach-back. A dial-by-address is asymmetric: one party requested service,
+    // and §6.6's one-directional mint stands. This gate is the whole of the
+    // narrowing; before it, every full-peer dial granted reciprocal authority
+    // that only a rendezvous peer had any business holding.
+    //
+    // Also guarded on `reentry.is_some()`: the grant only matters if we run a
+    // local dispatch stack to serve what the acceptor sends back (the same
+    // context the reader loop below uses for inbound EXECUTEs). A relay
+    // forwarder / test harness with no dispatch stack drops those anyway. Also
+    // skipped when the remote identity is unknown (zero) — a zero grantee is
+    // `unresolvable_grantee` and would never verify. Best-effort: a send error
+    // is logged, not fatal.
+    let mut reciprocal_grant_sent = false;
+    if let (true, Some(shared), false) = (
+        established_via_rendezvous_key,
+        reentry.as_ref(),
+        remote_identity_hash == Hash::zero(),
+    ) {
+        // Q2 (arch ruling 2026-08-05): the reciprocal grant is the grant WE
+        // would issue this peer as an inbound dialer — the §4.4 assembly, not
+        // the flat floor. One assembly, two callers.
+        let grants = crate::connection::assemble_inbound_grants(
+            shared,
+            &remote_identity_hash,
+            &entity_crypto::PeerId::from(remote_peer_id.as_str()),
+        );
+        match build_reentry_grant_envelope(keypair, remote_identity_hash, active_format, grants) {
+            Ok(grant) => {
+                let frame = encode_envelope(&grant);
+                match write_frame(&mut writer, &frame).await {
+                    Ok(()) => {
+                        reciprocal_grant_sent = true;
+                        // Q1 phase (2): record what we minted for THIS peer, so
+                        // that when the acceptor wields it we can resolve the
+                        // §7a.2a triple ourselves instead of requiring it
+                        // re-inlined in an envelope we authored.
+                        //
+                        // After the write, never before: the ledger's meaning is
+                        // "minted AND delivered". A mint that failed to send is
+                        // authority the counterpart never received, and it must
+                        // not become wieldable by being named.
+                        shared.minted_reentry_grants.lock().unwrap().insert(
+                            remote_peer_id.clone(),
+                            grant.included.values().cloned().collect(),
+                        );
+                        tracing::debug!(
+                            remote_peer = %remote_peer_id,
+                            "§6.5: sent reciprocal reentry grant — acceptor may now originate"
+                        )
+                    }
+                    Err(e) => tracing::debug!(
+                        remote_peer = %remote_peer_id, error = %e,
+                        "§6.5: failed to send reciprocal reentry grant (best-effort)"
+                    ),
+                }
+            }
+            Err(e) => tracing::debug!(
+                remote_peer = %remote_peer_id, error = %e,
+                "§6.5: could not mint reciprocal reentry cap (best-effort)"
+            ),
+        }
+    }
+
     // Spawn the reader task — it owns the read half from here on,
     // demuxing inbound frames into per-request oneshot channels.
     // The connection's `Drop` aborts this task; explicit pool removal
@@ -1705,7 +1914,96 @@ pub async fn perform_connect_with_dispatch(
         request_seq: AtomicU64::new(0),
         reader_task,
         last_activity_ms: AtomicU64::new(0),
+        reciprocal_grant_sent,
     })
+}
+
+/// §6.5 mutual minting: mint the reciprocal reentry capability and wrap it in a
+/// `reentry-grant` connect-EXECUTE for delivery over a just-completed dial.
+///
+/// `granter = us` (the dialer's authored identity under the connection's active
+/// format), `grantee = grantee_hash` (the acceptor). `grants` is supplied by the
+/// caller and MUST be [`crate::connection::assemble_inbound_grants`]' answer for
+/// this counterpart — the grant we would issue it as an inbound dialer, per the
+/// §6.5 (b) *Contents* ruling. It is a parameter rather than assembled here so
+/// this builder stays a pure wire-shape function the acceptance-side tests can
+/// drive; the *decision* lives at the one call site that has the establishment
+/// in hand. The far side, when it later originates a dispatch carrying this
+/// cap, is verified by *us*: `verify_request` checks `grantee == author` (the
+/// acceptor) and the chain roots at `granter == our identity` — exactly what this
+/// token satisfies. The cap is both the connect-EXECUTE's `params` and its sole
+/// `included` capability-token, so the acceptor recovers it with a single scan.
+///
+/// Unsigned like `hello`/`authenticate` (a connect-shaped EXECUTE): the enclosed
+/// cap's granter identity is the authorization, not a connection grant — the
+/// receiver self-verifies it against the peer it authenticated.
+pub(crate) fn build_reentry_grant_envelope(
+    keypair: &IdentityKeypair,
+    grantee_hash: Hash,
+    active_format: u8,
+    grants: Vec<entity_capability::GrantEntry>,
+) -> Result<Envelope, PeerError> {
+    let now_ms = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    let local_identity = keypair
+        .peer_entity_with_format(active_format)
+        .map_err(|e| PeerError::ConnectionError(format!("build identity: {}", e)))?;
+    let cap_token = entity_capability::CapabilityToken {
+        grants,
+        granter: entity_capability::Granter::Single(local_identity.content_hash),
+        grantee: grantee_hash,
+        parent: None,
+        created_at: now_ms,
+        expires_at: None,
+        not_before: None,
+        delegation_caveats: None,
+    };
+    let cap_entity = cap_token
+        .to_entity_with_format(active_format)
+        .map_err(|e| PeerError::ConnectionError(format!("build reciprocal cap: {}", e)))?;
+
+    // A single-sig root cap is rejected `missing_signature` unless a signature
+    // entity (signer = granter) targeting the cap's content hash travels with it
+    // (`verify_capability_chain`). Sign it exactly as the acceptor signs the
+    // connection cap it mints in `build_authenticate_response_envelope`.
+    let cap_sig_bytes = keypair.sign(&cap_entity.content_hash.to_bytes());
+    let cap_sig_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+        (
+            entity_ecf::text("algorithm"),
+            entity_ecf::text(keypair.key_type().label()),
+        ),
+        (
+            entity_ecf::text("signature"),
+            entity_ecf::Value::Bytes(cap_sig_bytes),
+        ),
+        (
+            entity_ecf::text("signer"),
+            entity_ecf::Value::Bytes(local_identity.content_hash.to_bytes().to_vec()),
+        ),
+        (
+            entity_ecf::text("target"),
+            entity_ecf::Value::Bytes(cap_entity.content_hash.to_bytes().to_vec()),
+        ),
+    ]));
+    let cap_sig_entity =
+        Entity::new_with_format(entity_entity::TYPE_SIGNATURE, cap_sig_data, active_format)
+            .map_err(|e| PeerError::ConnectionError(format!("build reciprocal cap sig: {}", e)))?;
+
+    let exec = entity_protocol::build_connect_execute(
+        "connect-reentry-grant",
+        "reentry-grant",
+        &cap_entity,
+    )
+    .map_err(|e| PeerError::ConnectionError(format!("build reentry-grant execute: {}", e)))?;
+    let mut envelope = Envelope::new(exec);
+    // The reentry-grant carries everything the acceptor needs to later originate
+    // under this cap: the cap, its signature, and our (the granter's) identity.
+    envelope.include(cap_entity);
+    envelope.include(cap_sig_entity);
+    envelope.include(local_identity);
+    Ok(envelope)
 }
 
 /// Reader task body. Loops reading frames off the connection's read half,
@@ -2115,30 +2413,62 @@ pub async fn send_execute(
     // §3.6 step 5: the dispatched EXECUTE's capability is the continuation's
     // scoped dispatch_capability when present — never a silent fallback to
     // the broad connection grant (V7 §6.8). Ordinary dispatches pass None.
+    // Owned holder for the originating cap in the `None` arm — `originating_
+    // capability()` returns an owned `Entity` (§6.5 mutual minting stores it
+    // behind interior mutability on the acceptor endpoint), so bind it here and
+    // borrow, keeping `effective_cap` a `&Entity` for both arms.
+    let originating_owned;
     let effective_cap = match dispatch_cap {
         Some(cap) => cap,
-        // Not every endpoint holds originating authority. An acceptor's
-        // `capability()` is the cap it minted FOR the remote, so falling back to
-        // it authors a request under a grant that was never ours — which the
-        // far side reports as `401 unresolvable_grantee`, a status that points
-        // at marshalling rather than at the real condition. Refuse here so the
-        // failure is local, named, and attributable.
-        None => conn.originating_capability().ok_or_else(|| {
-            PeerError::ConnectionError(format!(
-                "no originating authority for {}: this endpoint holds no capability granted \
-                 to us by the remote, only one we minted for it. A dispatch over an accepted \
-                 connection must carry the caller-minted reentry capability explicitly \
-                 (§7a.2a). See docs/SPEC-AMBIGUITIES.md '§6.5 symmetric originate'.",
-                conn.remote_peer_id()
-            ))
-        })?,
+        // Not every endpoint holds originating authority yet. An acceptor's
+        // `capability()` is the cap it minted FOR the remote; the valid
+        // originating cap is the reciprocal §6.5 grant the remote minted for us
+        // (`held_capability`), which lands a beat after channel-open. Until it
+        // arrives this is `None` — refuse locally so the failure is named and
+        // attributable rather than a misleading `401 unresolvable_grantee`.
+        None => {
+            originating_owned = conn.originating_capability().ok_or_else(|| {
+                PeerError::ConnectionError(format!(
+                    "no originating authority for {}: this endpoint holds no capability granted \
+                     to us by the remote, only one we minted for it. A dispatch over an accepted \
+                     connection must carry the caller-minted reentry capability explicitly \
+                     (§7a.2a). See docs/SPEC-AMBIGUITIES.md '§6.5 symmetric originate'.",
+                    conn.remote_peer_id()
+                ))
+            })?;
+            &originating_owned
+        }
+    };
+
+    // §6.5 mutual minting: when we originate under an acceptor endpoint's
+    // reciprocal cap (the `None`/`originating_capability` path), its signature +
+    // granter identity are NOT in `auth_included` (that map is empty for a
+    // reentry endpoint) — they ride in the endpoint's originating chain bundle.
+    // Merge them into the transported set so the single-sig cap verifies at the
+    // far side instead of failing `missing_signature`.
+    let mut merged_bundle;
+    let effective_bundle: &HashMap<Hash, Entity> = {
+        let extra = if dispatch_cap.is_none() {
+            conn.originating_chain_bundle()
+        } else {
+            Vec::new()
+        };
+        if extra.is_empty() {
+            chain_bundle
+        } else {
+            merged_bundle = chain_bundle.clone();
+            for e in extra {
+                merged_bundle.entry(e.content_hash).or_insert(e);
+            }
+            &merged_bundle
+        }
     };
 
     let envelope = build_authenticated_execute(
         keypair,
         effective_cap,
         conn.auth_included(),
-        chain_bundle,
+        effective_bundle,
         &request_id,
         uri,
         operation,
@@ -3334,6 +3664,8 @@ mod tests {
             request_seq: AtomicU64::new(0),
             reader_task,
             last_activity_ms: AtomicU64::new(0),
+            // No handshake ran on this pipe, so nothing was minted.
+            reciprocal_grant_sent: false,
         }
     }
 
