@@ -324,7 +324,10 @@ pub const TYPE_REGISTRY_LOCAL_NAME_CONFIG: &str = "system/registry/local-name-co
 pub const TYPE_REGISTRY_RESOLUTION_LOG: &str = "system/registry/resolution-log";
 // Peer-issued live registration (EXTENSION-REGISTRY §6a.9).
 pub const TYPE_REGISTRY_REGISTER_REQUEST: &str = "system/registry/register-request";
+pub const TYPE_REGISTRY_REGISTER_RESULT: &str = "system/registry/register-result";
 pub const TYPE_REGISTRY_ISSUER_POLICY: &str = "system/registry/issuer-policy";
+// The manual-approval queue entry (§6a.9.3).
+pub const TYPE_REGISTRY_PENDING_BINDING: &str = "system/registry/pending-binding";
 
 // Discovery (EXTENSION-DISCOVERY v1.0) — find-and-prompt substrate
 // §2.1 candidate/decision entity types; §2.2.1 identity-claim.

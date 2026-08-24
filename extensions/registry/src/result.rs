@@ -24,15 +24,34 @@ pub(crate) fn status_result(fields: Vec<(Value, Value)>) -> HandlerResult {
     status_result_with(entity_handler::STATUS_OK, fields)
 }
 
-/// [`status_result`] at an explicit non-200 success status — REGISTRY §6a.9's
-/// `manual` queue answers `202`, which is a success shape and not an error
-/// entity: the body carries the `pending_review` status the spec pins.
+/// [`status_result`] at an explicit non-200 success status.
 pub(crate) fn status_result_with(status: u32, fields: Vec<(Value, Value)>) -> HandlerResult {
     let result = Entity::new(
         entity_types::TYPE_PROTOCOL_STATUS,
         to_ecf(&Value::Map(fields)),
     )
     .expect("status entity");
+    HandlerResult {
+        status,
+        result,
+        included: HashMap::new(),
+    }
+}
+
+/// `register-request`'s own result entity — REGISTRY §6a.9 `[RULED 2026-08-12]`.
+///
+/// One type for both branches, with `status` discriminating: `bound` carries
+/// `binding_hash`, `pending_review` carries `pending_hash`. The ruling rejects
+/// `system/protocol/status` (what this handler previously returned) **on
+/// structure** — a carrier with room for neither hash pushes the payload
+/// somewhere else and re-opens the divergence one field down — and forbids
+/// borrowing another operation's result type on payload coincidence.
+pub(crate) fn register_result(status: u32, fields: Vec<(Value, Value)>) -> HandlerResult {
+    let result = Entity::new(
+        entity_types::TYPE_REGISTRY_REGISTER_RESULT,
+        to_ecf(&Value::Map(fields)),
+    )
+    .expect("register-result entity");
     HandlerResult {
         status,
         result,

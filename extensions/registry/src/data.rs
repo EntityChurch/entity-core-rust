@@ -11,8 +11,8 @@ use entity_entity::Entity;
 use entity_hash::Hash;
 use entity_types::{
     TYPE_REGISTRY_BINDING, TYPE_REGISTRY_ISSUER_POLICY, TYPE_REGISTRY_LOCAL_NAME_CONFIG,
-    TYPE_REGISTRY_REGISTER_REQUEST, TYPE_REGISTRY_RESOLUTION_LOG, TYPE_REGISTRY_RESOLVER_CONFIG,
-    TYPE_REGISTRY_REVOCATION,
+    TYPE_REGISTRY_PENDING_BINDING, TYPE_REGISTRY_REGISTER_REQUEST, TYPE_REGISTRY_RESOLUTION_LOG,
+    TYPE_REGISTRY_RESOLVER_CONFIG, TYPE_REGISTRY_REVOCATION,
 };
 use unicode_normalization::UnicodeNormalization;
 
@@ -37,6 +37,13 @@ pub const TRUST_PEER_ISSUED_PREFIX: &str = "peer_issued:";
 pub const STATUS_RESOLVED: &str = "resolved";
 pub const STATUS_NOT_FOUND: &str = "not_found";
 pub const STATUS_CHAIN_EXHAUSTED: &str = "chain_exhausted";
+
+// `system/registry/register-result` statuses (§6a.9 `[RULED 2026-08-12]`) —
+// the field that discriminates the operation's two success branches. Normative
+// values: a client branches on these, and snake_case is pinned by
+// STYLE-NAMING-CONVENTIONS regardless of which field carries a status code.
+pub const STATUS_BOUND: &str = "bound";
+pub const STATUS_PENDING_REVIEW: &str = "pending_review";
 
 // ---------------------------------------------------------------------------
 // system/registry/binding (§3 / §6.3)
@@ -198,6 +205,121 @@ impl RegisterRequestData {
             fields.push((text("transports"), Value::Array(self.transports.clone())));
         }
         encode(TYPE_REGISTRY_REGISTER_REQUEST, fields)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// system/registry/pending-binding (§6a.9.3) — the manual-approval queue entry
+// ---------------------------------------------------------------------------
+
+// Decision states (§6a.9.3). `denied` exists because deny is NOT a delete: a
+// requester polling a vanished pointer cannot tell *denied* from *never
+// received*, and a silent drop is what the substrate floor forbids.
+pub const PENDING_STATUS_REVIEW: &str = "pending_review";
+pub const PENDING_STATUS_APPROVED: &str = "approved";
+pub const PENDING_STATUS_DENIED: &str = "denied";
+
+/// A queued `register-request` at rest (§6a.9.3).
+///
+/// **The hash of this entity is registry-local by ruling and MUST NOT be gated
+/// on cross-peer reproducibility.** `queued_at` is a local wall-clock reading,
+/// so two registries will not agree on the bytes — and never need to: a
+/// pending-binding is pre-decision, single-registry state that no aggregator
+/// republishes (§8 republishes *bindings*). This is the one content-hash in the
+/// corpus that runs opposite to `EXTENSION-COMPUTE` §2.4, which is exactly why
+/// `queued_at` stays in the body instead of being stripped to chase a
+/// determinism this surface does not require.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingBindingData {
+    pub name: String,
+    pub target_peer_id: String,
+    pub transports: Vec<Value>,
+    pub requested_ttl: Option<u64>,
+    pub queued_at: u64,
+    pub status: String,
+    /// REQUIRED on `approved`, absent otherwise.
+    pub binding_hash: Option<Hash>,
+    /// OPTIONAL on `denied`. Operator-supplied and **never parsed** — it is
+    /// carried for a human reader, so nothing branches on its content.
+    pub reason: Option<String>,
+}
+
+impl PendingBindingData {
+    /// A freshly queued request, before any operator decision.
+    pub fn queued(req: &RegisterRequestData, normalized_name: &str, queued_at: u64) -> Self {
+        Self {
+            name: normalized_name.to_string(),
+            target_peer_id: req.target_peer_id.clone(),
+            transports: req.transports.clone(),
+            requested_ttl: req.requested_ttl,
+            queued_at,
+            status: PENDING_STATUS_REVIEW.into(),
+            binding_hash: None,
+            reason: None,
+        }
+    }
+
+    /// The decided successor of this head. Replace-whole: a decision writes a
+    /// NEW body and repoints, so the queued body stays auditable at its own
+    /// content-addressed path.
+    pub fn decided(
+        &self,
+        status: &str,
+        binding_hash: Option<Hash>,
+        reason: Option<String>,
+    ) -> Self {
+        Self {
+            status: status.to_string(),
+            binding_hash,
+            reason,
+            ..self.clone()
+        }
+    }
+
+    pub fn is_decided(&self) -> bool {
+        self.status != PENDING_STATUS_REVIEW
+    }
+
+    pub fn from_entity(entity: &Entity) -> Result<Self, RegistryError> {
+        if entity.entity_type != TYPE_REGISTRY_PENDING_BINDING {
+            return Err(RegistryError::Decode(format!(
+                "expected {}, got {}",
+                TYPE_REGISTRY_PENDING_BINDING, entity.entity_type
+            )));
+        }
+        let map = decode_map(&entity.data)?;
+        Ok(Self {
+            name: field_text(&map, "name")?,
+            target_peer_id: field_text(&map, "target_peer_id")?,
+            transports: field_array(&map, "transports"),
+            requested_ttl: field_u64_opt(&map, "requested_ttl")?,
+            queued_at: field_u64(&map, "queued_at")?,
+            status: field_text(&map, "status")?,
+            binding_hash: field_hash_opt(&map, "binding_hash")?,
+            reason: field_text_opt(&map, "reason"),
+        })
+    }
+
+    pub fn to_entity(&self) -> Result<Entity, RegistryError> {
+        let mut fields: Vec<(Value, Value)> = vec![
+            (text("name"), text(&self.name)),
+            (text("queued_at"), integer(self.queued_at as i64)),
+            (text("status"), text(&self.status)),
+            (text("target_peer_id"), text(&self.target_peer_id)),
+        ];
+        if let Some(h) = &self.binding_hash {
+            fields.push((text("binding_hash"), bytes(h)));
+        }
+        if let Some(r) = &self.reason {
+            fields.push((text("reason"), text(r)));
+        }
+        if let Some(t) = self.requested_ttl {
+            fields.push((text("requested_ttl"), integer(t as i64)));
+        }
+        if !self.transports.is_empty() {
+            fields.push((text("transports"), Value::Array(self.transports.clone())));
+        }
+        encode(TYPE_REGISTRY_PENDING_BINDING, fields)
     }
 }
 

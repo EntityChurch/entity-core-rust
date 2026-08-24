@@ -755,3 +755,124 @@ async fn rejects_read_through_intermediate_symlinked_directory() {
         "the containment walk must not reject paths that simply do not exist yet"
     );
 }
+
+/// §8.3 containment, the cohort audit shape (arch `ROUTING-2026-08-13-p`,
+/// relaying `entity-core-go`'s `containment_wire_test.go` at `2cd5da9`).
+///
+/// **`list` through an escaping PARENT** — the case the other two vectors above
+/// do not cover. `rejects_list_through_symlinked_directory` puts the link at the
+/// leaf of a `list`; `rejects_read_through_intermediate_symlinked_directory`
+/// puts it mid-path but the op is `read`. This is mid-path *and* `list`, which
+/// is the combination that hid the leak in python: their `403` branch was
+/// correct and unreachable because `exists()` answered `404` first, so a
+/// helper-level test passed while `list` leaked.
+///
+/// **Every case carries fixture teeth.** A refusal test passes for free if the
+/// attack was never possible, so each assertion is preceded by a direct
+/// filesystem read proving the kernel *would* have served the outside bytes
+/// through this exact path. Without that, a typo in the fixture turns the whole
+/// vector into a tautology.
+///
+/// **Outside contents are asserted absent regardless of status code** — not
+/// merely that some error came back. A peer that returned `200` with an empty
+/// body would satisfy a status-only assertion while still having walked out.
+#[tokio::test]
+async fn containment_holds_at_the_handler_for_list_read_and_escaping_parents() {
+    const MARKER: &[u8] = b"outside the sandbox\n";
+    let (h, _cs, _li, tmp) = build_handler();
+    let outside = TempDir::new().unwrap();
+    std::fs::create_dir(outside.path().join("nested")).unwrap();
+    std::fs::write(outside.path().join("nested/secret.txt"), MARKER).unwrap();
+    std::fs::write(outside.path().join("top-secret.txt"), MARKER).unwrap();
+    std::os::unix::fs::symlink(outside.path(), tmp.path().join("escape-dir")).unwrap();
+
+    // --- fixture teeth: the filesystem really would serve all three ---------
+    let via_link = tmp.path().join("escape-dir");
+    assert!(
+        std::fs::read_dir(&via_link)
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name() == "top-secret.txt"),
+        "fixture has no teeth: the symlink does not enumerate the outside dir"
+    );
+    assert!(
+        std::fs::read_dir(via_link.join("nested"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .any(|e| e.file_name() == "secret.txt"),
+        "fixture has no teeth: the escaping PARENT does not enumerate"
+    );
+    assert_eq!(
+        std::fs::read(via_link.join("nested/secret.txt")).unwrap(),
+        MARKER,
+        "fixture has no teeth: the outside file is not readable through the link"
+    );
+
+    // --- the three wire cases ----------------------------------------------
+    // Each case names the token that WOULD appear if it leaked. They differ by
+    // op: a `list` leaks the outside FILENAMES it enumerated, while a `read`
+    // leaks a `content` handle to a blob the handler has already written into
+    // the store — the bytes never appear inline, so a body-only byte scan reads
+    // as clean on the very case that leaks hardest.
+    //
+    // Failures are collected rather than panicked at the first, so a mutation
+    // run reports every case a broken defense lets through, not the earliest.
+    let mut leaks: Vec<String> = Vec::new();
+    for (op, resource, needle) in [
+        // 1. list of an escaping symlink
+        ("list", "local/files/shared/escape-dir", "top-secret.txt"),
+        // 2. list THROUGH an escaping parent — the leaf (`nested`) is an
+        //    ordinary directory, so a leaf-only defense admits it.
+        ("list", "local/files/shared/escape-dir/nested", "secret.txt"),
+        // 3. read through an escaping parent
+        (
+            "read",
+            "local/files/shared/escape-dir/nested/secret.txt",
+            "content",
+        ),
+    ] {
+        let res = h
+            .handle(&make_ctx(op, resource, empty_params()))
+            .await
+            .unwrap();
+
+        // The contents test, which holds whatever the status is.
+        let body = res.result.data.as_slice();
+        if body.windows(MARKER.len()).any(|w| w == MARKER) {
+            leaks.push(format!("{op} {resource}: outside BYTES reached the caller"));
+        }
+        let decoded: Value = ciborium::from_reader(body).unwrap();
+        let map = decoded.into_map().unwrap();
+        let leaked = match op {
+            // A `read` that got out returns a handle to the outside blob.
+            "read" => map.iter().any(|(k, _)| k.as_text() == Some(needle)),
+            // A `list` that got out enumerates the outside directory.
+            _ => String::from_utf8_lossy(body).contains(needle),
+        };
+        if leaked {
+            leaks.push(format!(
+                "{op} {resource}: outside content reached the caller (`{needle}`)"
+            ));
+        }
+
+        // …and the refusal is the containment defense, not an incidental error.
+        if res.status != 403 {
+            leaks.push(format!("{op} {resource}: want 403, got {}", res.status));
+            continue;
+        }
+        let code = map
+            .into_iter()
+            .find(|(k, _)| k.as_text() == Some("code"))
+            .and_then(|(_, val)| val.as_text().map(|s| s.to_string()));
+        if code.as_deref() != Some("path_traversal_rejected") {
+            leaks.push(format!(
+                "{op} {resource}: code {code:?} — something other than containment stopped this"
+            ));
+        }
+    }
+    assert!(
+        leaks.is_empty(),
+        "containment failures:\n  {}",
+        leaks.join("\n  ")
+    );
+}

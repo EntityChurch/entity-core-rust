@@ -1,6 +1,6 @@
 # entity-core-rust — status
 
-_Updated: 2026-08-10 · public: v0.8.0 (master)_
+_Updated: 2026-08-13 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -34,6 +34,98 @@ and tree semantics are interop-validated against the Go and Python peers, not
 just self-tested.
 
 ## Where we left off
+
+_2026-08-13 — **§6a.9.3 built the same day it was ruled, containment audited clean, and the
+rexec seam is a verifier MUST the bundler cannot keep.**_
+
+Four items came in from arch and core-go; all four are answered. Gate: `make test`
+**2044 / 0F / 0S** · clippy · fmt · wasm — all green. Outgoing packet:
+`ROUTING-2026-08-13-q-*`.
+
+**`EXTENSION-REGISTRY` §6a.9 + §6a.9.3 are built.** The 08-12 carrier ruling closed our
+three-way divergence — `register-request` answers in its own
+`system/registry/register-result` on both branches, and the 200 was the worse half (a bare
+`{binding_hash}` under `system/protocol/status`, with the ruling's discriminator absent from
+the success branch and nothing measuring it). Arch then filled §6a.9.3 the next day and
+**named the withheld `pending_hash` as their own defect** — *a `MUST` may not name a referent
+the corpus does not define*. Holding was the right call; the referent now exists. Body,
+by-request pointer, supersession, approve/deny, retention, and both new vectors
+(`REG-PENDING-HANDLE-1`, `REG-PENDING-DECIDE-1`) are in.
+
+**Building it found three unpinned things**, two of which core-go hit independently: `deny`
+returns a `status` the result type does not declare (the same self-recorded defect §6a.9 was
+written to fix, reproduced one section down), the decision ops have no input type, and no code
+is pinned for deciding a **superseded** head — a case §6a.9.3's own supersession rule creates,
+and one our first draft let through. All three in `SPEC-AMBIGUITIES`, routed.
+
+**Path containment: clean, and clean for a different reason.** Our resolver walks every
+component below the root, so the escaping-parent case never had a leaf-only defense to slip
+past — that walk exists because we hit §8.3 V4a from the other direction (a trailing `/` makes
+`lstat` resolve the link). Three impls, three mechanisms, and all three had a *correct helper*
+— which is the argument for auditing at the handler. The audit still found two real gaps: no
+`list` through an escaping **parent**, and no fixture teeth. Both closed, mutation-verified —
+and the mutation taught us that a `read` leak rides a `content` handle rather than inline
+bytes, so a body-byte assertion reads clean on the case that leaks hardest.
+
+**`EXTENSION-SUBSTITUTE` is worse than unmeasured — it has no trigger.** Exhaustively: no
+crate outside `extensions/storage-substitute-*` depends on either crate, `ChainConsultHook` is
+constructed only in its own test, and the content handler passes `claimed_source_peer_id:
+None`. Now a declared exclusion with an executed mutation.
+
+**`rexec_delivered` — B rejects, and it is a spec seam we routed back.** Two verifier MUSTs
+(step 2a per-link grantee resolution → 401; PR-8 granter canonicalization → 403) depend on
+identity entities that `collect_chain_bundle` collects **best-effort** — identically in rust
+and go. §4.2 case 3 puts a third-party installer in the chain, so whether B can authorize
+depends on whether A's store happened to hold that installer's `system/peer` entity. A
+self-rooted cap collapses granter and grantee onto peers both sides already have, which is why
+go→go and go→python pass. **The mechanism is verified and pinned by two new tests; the
+incident is not** — we have not run core-go's repro, and the packet names the one-run probe
+that separates the two candidates.
+
+---
+
+_2026-08-12 — **go measured us and F-1 was ours too — structurally, not intermittently.**_
+(`ROUTING-2026-08-12-your-f1-was-ours-too-and-the-audit-found-it-on-our-handshake.md`;
+evidence `docs/validation/reports/2026-08-12-the-a1-eviction-orphaned-our-escalation-too.md`.)
+
+Three commits, answering the packet's sections 1, 3 and 5. Measured against Go oracle
+`c475a88`, peers built from `7aad422`:
+
+| Pass | Result |
+|---|---|
+| 1 — all surfaces, closure scope | `1594 · 1580 P / 10 W / 4 F / 0 S` (29 `[self]`; peer-attributable 1565) |
+| 2 — `serving_mode`, namespace scope | `55 · 55 P / 0 W / 0 F / 0 S` |
+| 3 — `registry_issuer` | `19 · 19 P / 0 W / 0 F / 0 S` |
+
+`make test` 2033/0 · clippy · fmt · wasm green. Zero skips on every pass —
+`origination` and `peer_issued` are armed, not allowlisted. **The 4 F are a harness
+posture artifact, proven with a control**: a *go* peer under the same
+`--publish-root --serve-closure-root` posture fails the same four `serving_mode` T4 rows
+with the same text, because `seed_out_of_scope` binds where only *namespace* scope makes
+it out of scope. They pass 55/55 in pass 2.
+
+- **§5.4a `[MUST]` — the §A1 eviction was killing the loop that owes the escalation**
+  (`bb34557`). `liveness_escalate_after_eviction` FAILed at `21eb223` (19.161 s, terminal
+  `suspect`/`transport-error`); now 5/5 over four consecutive runs. **Worse here than in
+  go:** theirs read as a 1-in-4 flake because two paths raced; ours had no race, so on a
+  transport-first episode the escalation was unreachable 100% of the time — the peer
+  stayed `suspect` forever and §4.1 reconnect never fired. Both halves vectored; the
+  negative half is in-process per §5.4a's satisfaction mode, mutation-verified, and
+  declared at `docs/validation/CONFORMANCE-EXCLUSIONS.md` (a declared exclusion is not a
+  pass and is counted in no number above).
+- **R-7 — the extractors, not the checks** (`d19ac29`). Thirteen sites in seven files
+  dropped the peer's error `code` on a non-2xx. The handshake was the bad one: hello and
+  authenticate discarded `resp.result`, so every coded refusal a responder builds reached
+  the dialer as a bare number — our negotiation vectors assert those codes only
+  responder-side. Five surfaces audited clean and said so.
+- **§6a.9's 202 carrier — holding, not converging** (`7aad422`). Logged in
+  `SPEC-AMBIGUITIES` while `spec-issues/2026-08-12-c` is open. One packet number
+  corrected by measurement: `registry_issuer` is 19 P / 0 W here, not 18 P / 1 W — the
+  loosened check WARNs on the *error-code* carrier, which is go's shape.
+
+<details>
+<summary>2026-08-11 (b) — core-go's peer packet is through, and it led with a live
+security hole in our tree</summary>
 
 _2026-08-11 (b) — **core-go's peer packet is through, and it led with a live security
 hole in our tree.**_
@@ -90,6 +182,12 @@ with go's exact envelope, spread **5.039–5.045 s** — a 6 ms band where go's 
 bimodal 1-in-4. Rules out the validator and jitter; the ordering means go's suspected
 suspect-then-demote interaction was exercised and stayed green against a second impl.
 Report: `docs/validation/reports/2026-08-11-rust-delegated-cap-answer-and-f1-liveness-data.md`.
+
+*Superseded 2026-08-12: that 8/8 was an honest pass over a surface it could not reach.
+`liveness_escalate_after_eviction` did not exist yet, and the composition it probes —
+an episode opened at the §A1 seam — failed here too once go pinned a vector for it.*
+
+</details>
 
 <details>
 <summary>2026-08-10 — the cohort's four items are through, and the gate is clean for the

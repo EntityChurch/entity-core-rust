@@ -1213,6 +1213,18 @@ async fn register_policy_allowlist() {
         .await
         .unwrap();
     assert_eq!(ok.status, 200);
+    // §6a.9 step 3 `[RULED 2026-08-12]` — register-request's OWN result type,
+    // with `status: "bound"` discriminating the branch. Both halves are
+    // cross-peer-observable and neither was carried before the ruling: the
+    // type was `system/protocol/status` and the status field was absent.
+    assert_eq!(
+        ok.result.entity_type,
+        entity_types::TYPE_REGISTRY_REGISTER_RESULT
+    );
+    assert_eq!(
+        result_field(&decode_result(&ok), "status").and_then(|v| v.as_text()),
+        Some("bound")
+    );
     let bh = binding_hash_of(&ok);
 
     let resolved = peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com")
@@ -1292,25 +1304,501 @@ async fn register_manual_queues_pending_review() {
             ..Default::default()
         },
     );
+    let request = mk_request("billslab.com", owner.peer_id().as_str(), b"nm");
+    let request_hash = request.content_hash;
     let result = reg_handler(&cs, &li, &registry)
-        .handle(&register_ctx(
-            mk_request("billslab.com", owner.peer_id().as_str(), b"nm"),
-            &owner,
-        ))
+        .handle(&register_ctx(request, &owner))
         .await
         .unwrap();
-    // 202, not 200: nothing was signed, so "done" is the wrong answer. §6a.9
-    // pins the body and names no code; go and py both answer 202.
+    // 202, not 200: nothing was signed, so "done" is the wrong answer.
     assert_eq!(result.status, 202);
+    // §6a.9 `[RULED 2026-08-12]` — the carrier is register-request's own result
+    // type, not `system/protocol/status` (rejected on structure) and not
+    // `system/protocol/error` (an error entity on a success status).
+    assert_eq!(
+        result.result.entity_type,
+        entity_types::TYPE_REGISTRY_REGISTER_RESULT
+    );
     let map = decode_result(&result);
     assert_eq!(
         result_field(&map, "status").and_then(|v| v.as_text()),
         Some("pending_review")
     );
+    // REG-PENDING-HANDLE-1 (§6a.9.3). The distinctness half: a hash the client
+    // computed before it dispatched is not a handle.
+    let pending_hash = pending_hash_of(&result);
+    assert_ne!(
+        pending_hash, request_hash,
+        "pending_hash must name the STORED entity, not the request"
+    );
+    // The resolvability half — the reason §6a.9.3 exists. Before the schema
+    // landed, a handle naming nothing fetchable was indistinguishable from a
+    // conformant one, so this is the assertion that has teeth.
+    let body = cs.get(&pending_hash).expect("pending_hash resolves");
+    let pb = PendingBindingData::from_entity(&body).expect("a pending-binding");
+    assert_eq!(pb.status, "pending_review");
+    assert_eq!(pb.name, "billslab.com");
+    assert_eq!(pb.target_peer_id, owner.peer_id().as_str());
+    assert!(pb.binding_hash.is_none());
+    // The by-request pointer resolves to the same body.
+    assert_eq!(
+        li.get(&crate::pending_by_request_path(
+            &rid,
+            owner.peer_id().as_str(),
+            "billslab.com"
+        )),
+        Some(pending_hash)
+    );
     // Nothing was published.
     assert!(li
         .get(&crate::by_name_pointer_path(&rid, "billslab.com"))
         .is_none());
+}
+
+// ---------------------------------------------------------------------------
+// REG-PENDING-DECIDE-1 (§6a.9.3) — the operator decisions
+// ---------------------------------------------------------------------------
+
+fn pending_hash_of(r: &entity_handler::HandlerResult) -> Hash {
+    let map = decode_result(r);
+    let b = result_field(&map, "pending_hash")
+        .and_then(|v| v.as_bytes())
+        .expect("pending_hash present");
+    Hash::from_bytes(b).unwrap()
+}
+
+/// Queue one request in `manual` mode and hand back its head hash.
+async fn queue_one(
+    cs: &Arc<dyn ContentStore>,
+    li: &Arc<dyn LocationIndex>,
+    registry: &IdentityKeypair,
+    owner: &Keypair,
+    name: &str,
+    nonce: &[u8],
+) -> Hash {
+    queue_one_ttl(cs, li, registry, owner, name, nonce, 86_400_000).await
+}
+
+/// [`queue_one`] with an explicit `requested_ttl`.
+///
+/// The supersession vectors need two queued requests whose **bodies differ**.
+/// `nonce` alone will not do it: §6a.9.3's `pending-binding` schema carries no
+/// nonce, so two retries of one intent inside a single millisecond encode to
+/// identical bytes and content-address to one body. That is correct — one head,
+/// one hash — but it makes supersession unobservable, so these vectors vary a
+/// field the schema actually carries.
+async fn queue_one_ttl(
+    cs: &Arc<dyn ContentStore>,
+    li: &Arc<dyn LocationIndex>,
+    registry: &IdentityKeypair,
+    owner: &Keypair,
+    name: &str,
+    nonce: &[u8],
+    ttl: u64,
+) -> Hash {
+    let req = RegisterRequestData {
+        name: name.into(),
+        target_peer_id: owner.peer_id().as_str().to_string(),
+        transports: vec![Value::Text("tcp://billslab.com:9000".into())],
+        requested_ttl: Some(ttl),
+        nonce: nonce.to_vec(),
+        issued_at: crate::log::now_ms(),
+    }
+    .to_entity()
+    .unwrap();
+    let result = reg_handler(cs, li, registry)
+        .handle(&register_ctx(req, owner))
+        .await
+        .unwrap();
+    assert_eq!(result.status, 202);
+    pending_hash_of(&result)
+}
+
+fn decision_ctx(op: &str, pending_hash: Hash, reason: Option<&str>) -> HandlerContext {
+    let mut fields = vec![(
+        text("pending_hash"),
+        Value::Bytes(pending_hash.to_bytes().to_vec()),
+    )];
+    if let Some(r) = reason {
+        fields.push((text("reason"), text(r)));
+    }
+    ctx(op, fields)
+}
+
+async fn manual_registry() -> (
+    Arc<dyn ContentStore>,
+    Arc<dyn LocationIndex>,
+    IdentityKeypair,
+    String,
+    Keypair,
+) {
+    let (cs, li) = stores();
+    let registry = IdentityKeypair::Ed25519(Keypair::generate());
+    let rid = registry.peer_id().as_str().to_string();
+    install_policy(
+        &cs,
+        &li,
+        &rid,
+        &IssuerPolicyData {
+            mode: MODE_MANUAL.into(),
+            ..Default::default()
+        },
+    );
+    (cs, li, registry, rid, Keypair::generate())
+}
+
+// approve issues a binding that resolves by name AND leaves an `approved` head
+// carrying the binding_hash.
+#[tokio::test]
+async fn approve_issues_the_binding_and_leaves_an_approved_head() {
+    let (cs, li, registry, rid, owner) = manual_registry().await;
+    let ph = queue_one(&cs, &li, &registry, &owner, "billslab.com", b"q1").await;
+
+    let res = reg_handler(&cs, &li, &registry)
+        .handle(&decision_ctx("approve-request", ph, None))
+        .await
+        .unwrap();
+    assert_eq!(res.status, 200);
+    assert_eq!(
+        res.result.entity_type,
+        entity_types::TYPE_REGISTRY_REGISTER_RESULT
+    );
+    let map = decode_result(&res);
+    assert_eq!(
+        result_field(&map, "status").and_then(|v| v.as_text()),
+        Some("bound")
+    );
+    let binding_hash = binding_hash_of(&res);
+
+    // The binding resolves by name end-to-end.
+    let resolved = peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com")
+        .expect("resolvable");
+    assert!(resolved.is_resolved());
+    assert_eq!(resolved.binding, Some(binding_hash));
+
+    // …and the head is `approved`, carrying the binding it produced. The head
+    // MOVED: the decision writes a new body rather than mutating the queued one.
+    let head = li
+        .get(&crate::pending_by_request_path(
+            &rid,
+            owner.peer_id().as_str(),
+            "billslab.com",
+        ))
+        .expect("pointer still resolves");
+    assert_ne!(head, ph, "a decision writes a new body, replace-whole");
+    let decided = PendingBindingData::from_entity(&cs.get(&head).unwrap()).unwrap();
+    assert_eq!(decided.status, "approved");
+    assert_eq!(decided.binding_hash, Some(binding_hash));
+    // The queued body stays auditable at its own content-addressed path.
+    assert!(cs.get(&ph).is_some());
+}
+
+// deny leaves a `denied` head AND publishes nothing — the negative half, which
+// is the load-bearing one: a deny that silently issued would pass a check that
+// only looked at the response.
+#[tokio::test]
+async fn deny_leaves_a_denied_head_and_publishes_nothing() {
+    let (cs, li, registry, rid, owner) = manual_registry().await;
+    let ph = queue_one(&cs, &li, &registry, &owner, "billslab.com", b"q2").await;
+
+    let res = reg_handler(&cs, &li, &registry)
+        .handle(&decision_ctx("deny-request", ph, Some("not entitled")))
+        .await
+        .unwrap();
+    assert_eq!(res.status, 200);
+    assert_eq!(
+        result_field(&decode_result(&res), "status").and_then(|v| v.as_text()),
+        Some("denied")
+    );
+
+    // Nothing signed, nothing published — assert the NAME does not resolve.
+    assert!(li
+        .get(&crate::by_name_pointer_path(&rid, "billslab.com"))
+        .is_none());
+    let resolved = peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com");
+    assert!(resolved.is_none_or(|r| !r.is_resolved()));
+
+    // Deny is NOT a delete: the head persists, or a requester polling a vanished
+    // pointer could not tell `denied` from `never received`.
+    let head = li
+        .get(&crate::pending_by_request_path(
+            &rid,
+            owner.peer_id().as_str(),
+            "billslab.com",
+        ))
+        .expect("a denied request keeps a reachable head");
+    let decided = PendingBindingData::from_entity(&cs.get(&head).unwrap()).unwrap();
+    assert_eq!(decided.status, "denied");
+    assert_eq!(decided.reason.as_deref(), Some("not entitled"));
+    assert!(decided.binding_hash.is_none());
+}
+
+// A second decision on either outcome is 409 already_decided — approve and deny
+// are not idempotent-by-replay, and re-approving would mint a second binding for
+// one request.
+#[tokio::test]
+async fn a_second_decision_is_409_already_decided() {
+    let (cs, li, registry, rid, owner) = manual_registry().await;
+    let h = reg_handler(&cs, &li, &registry);
+
+    for (first, second, name, nonce) in [
+        ("approve-request", "approve-request", "one.com", b"q3a"),
+        ("approve-request", "deny-request", "two.com", b"q3b"),
+        ("deny-request", "deny-request", "three.com", b"q3c"),
+        ("deny-request", "approve-request", "four.com", b"q3d"),
+    ] {
+        let ph = queue_one(&cs, &li, &registry, &owner, name, nonce).await;
+        assert_eq!(
+            h.handle(&decision_ctx(first, ph, None))
+                .await
+                .unwrap()
+                .status,
+            200,
+            "first decision {first}"
+        );
+        // The decision moved the head, so replaying the ORIGINAL handle names a
+        // superseded body and would measure supersession instead. Re-read the
+        // current head and decide that.
+        let head = li
+            .get(&crate::pending_by_request_path(
+                &rid,
+                owner.peer_id().as_str(),
+                name,
+            ))
+            .expect("head survives a decision");
+        let again = h.handle(&decision_ctx(second, head, None)).await.unwrap();
+        assert_eq!(again.status, 409, "{first} then {second}");
+        assert_eq!(
+            result_field(&decode_result(&again), "code").and_then(|v| v.as_text()),
+            Some("already_decided")
+        );
+    }
+}
+
+// A superseded head is NOT decidable — the hole that a first draft of this
+// handler had. Supersession moves only the pointer, so the old `pending_review`
+// body stays fetchable forever; deciding it would issue a binding on terms the
+// operator's queue no longer shows.
+#[tokio::test]
+async fn a_superseded_head_is_not_decidable() {
+    let (cs, li, registry, _rid, owner) = manual_registry().await;
+    let first = queue_one_ttl(
+        &cs,
+        &li,
+        &registry,
+        &owner,
+        "billslab.com",
+        b"s1",
+        3_600_000,
+    )
+    .await;
+    let _second = queue_one_ttl(
+        &cs,
+        &li,
+        &registry,
+        &owner,
+        "billslab.com",
+        b"s2",
+        86_400_000,
+    )
+    .await;
+
+    // Fixture teeth: the superseded body is still there, so the refusal below
+    // is about decidability and not about a missing entity.
+    assert!(
+        cs.get(&first).is_some(),
+        "supersession must move only the pointer"
+    );
+
+    let res = reg_handler(&cs, &li, &registry)
+        .handle(&decision_ctx("approve-request", first, None))
+        .await
+        .unwrap();
+    assert_eq!(res.status, 404, "approving a superseded head");
+    // Nothing was issued.
+    assert!(li
+        .get(&crate::by_name_pointer_path(
+            registry.peer_id().as_str(),
+            "billslab.com"
+        ))
+        .is_none());
+}
+
+// A superseding request leaves exactly ONE head for the (target, name) pair.
+// Retries carry a fresh nonce by construction, so without replace-whole an
+// operator's queue fills with duplicates of a single intent.
+#[tokio::test]
+async fn a_superseding_request_leaves_exactly_one_head() {
+    let (cs, li, registry, rid, owner) = manual_registry().await;
+    let first = queue_one_ttl(
+        &cs,
+        &li,
+        &registry,
+        &owner,
+        "billslab.com",
+        b"n1",
+        3_600_000,
+    )
+    .await;
+    let second = queue_one_ttl(
+        &cs,
+        &li,
+        &registry,
+        &owner,
+        "billslab.com",
+        b"n2",
+        86_400_000,
+    )
+    .await;
+    assert_ne!(first, second, "a re-submitted request is a distinct body");
+
+    let pointer = crate::pending_by_request_path(&rid, owner.peer_id().as_str(), "billslab.com");
+    assert_eq!(li.get(&pointer), Some(second), "the pointer repoints");
+
+    // Exactly one head for the pair — enumerated the way an operator would,
+    // which is also why §6a.9.3 defines no `list-pending` operation.
+    let heads = li.list(&crate::pending_by_request_prefix(&rid));
+    assert_eq!(heads.len(), 1, "one head per (target_peer_id, name)");
+}
+
+// §6a.9.3 retention `[SHOULD]` — a DECIDED head's pointer is collected once the
+// window elapses; a `pending_review` head is NEVER collected, because expiring
+// live queue state silently drops a request no operator has seen.
+#[tokio::test]
+async fn retention_collects_decided_heads_and_never_live_ones() {
+    let (cs, li, registry, rid, owner) = manual_registry().await;
+
+    // Decided, and eligible: a 1 ms window is elapsed by the time the next
+    // queue-path sweep runs.
+    let decided = queue_one(&cs, &li, &registry, &owner, "decided.com", b"r1").await;
+    reg_handler(&cs, &li, &registry)
+        .handle(&decision_ctx("deny-request", decided, None))
+        .await
+        .unwrap();
+    // Still live at this point — nothing has swept yet.
+    let denied_pointer =
+        crate::pending_by_request_path(&rid, owner.peer_id().as_str(), "decided.com");
+    assert!(li.get(&denied_pointer).is_some());
+
+    // A later queue triggers the opportunistic sweep.
+    let live = queue_one_ttl(
+        &cs,
+        &li,
+        &registry,
+        &Keypair::generate(),
+        "live.com",
+        b"r2",
+        60_000,
+    )
+    .await;
+    // The window is compared as `now - queued_at < window`, so the elapsed time
+    // must actually exceed it or the sweep is a no-op and this test would pass
+    // for the wrong reason.
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let handler = reg_handler(&cs, &li, &registry).with_pending_retention(1);
+    let sweeper = Keypair::generate();
+    handler
+        .handle(&register_ctx(
+            mk_request("sweep.com", sweeper.peer_id().as_str(), b"r3"),
+            &sweeper,
+        ))
+        .await
+        .unwrap();
+
+    // The decided head's POINTER is gone…
+    assert!(
+        li.get(&denied_pointer).is_none(),
+        "a decided head past its window should be collected"
+    );
+    // …but its BODY stays content-addressed and auditable.
+    assert!(
+        cs.get(&decided).is_some(),
+        "retention removes the pointer, never the body"
+    );
+    // And the live queue is untouched, however old it gets.
+    assert!(cs.get(&live).is_some());
+    let live_heads: Vec<_> = li
+        .list(&crate::pending_by_request_prefix(&rid))
+        .into_iter()
+        .filter_map(|e| cs.get(&e.hash))
+        .filter_map(|ent| PendingBindingData::from_entity(&ent).ok())
+        .filter(|p| p.status == "pending_review")
+        .collect();
+    assert_eq!(
+        live_heads.len(),
+        2,
+        "pending_review heads are never GC-eligible"
+    );
+}
+
+// 404 when pending_hash names no stored pending-binding.
+#[tokio::test]
+async fn a_decision_on_an_unknown_handle_is_404() {
+    let (cs, li, registry, _rid, _owner) = manual_registry().await;
+    let bogus = Entity::new(
+        entity_types::TYPE_PROTOCOL_STATUS,
+        to_ecf(&Value::Map(vec![])),
+    )
+    .unwrap()
+    .content_hash;
+    let res = reg_handler(&cs, &li, &registry)
+        .handle(&decision_ctx("approve-request", bogus, None))
+        .await
+        .unwrap();
+    assert_eq!(res.status, 404);
+    assert_eq!(
+        result_field(&decode_result(&res), "code").and_then(|v| v.as_text()),
+        Some("not_found")
+    );
+}
+
+// §6a.9.3 `[MUST]` — the queue is not a reservation. If the name went to another
+// peer between queue and approval, approving anyway would silently overwrite a
+// live binding.
+#[tokio::test]
+async fn approving_a_name_taken_since_queueing_is_409_name_taken() {
+    let (cs, li, registry, rid, owner) = manual_registry().await;
+    let ph = queue_one(&cs, &li, &registry, &owner, "billslab.com", b"q5").await;
+
+    // Someone else takes the name in the meantime. Only the body + by-name
+    // pointer are seeded: the collision check reads the bound target, and
+    // signature verification is a different vector's subject.
+    let other = Keypair::generate();
+    let taken = BindingData {
+        name: "billslab.com".into(),
+        kind: KIND_PEER_ISSUED.into(),
+        target_peer_id: other.peer_id().as_str().to_string(),
+        transports: vec![],
+        issued_at: crate::log::now_ms(),
+        ttl: None,
+        supersedes: None,
+        issuer_attestation: None,
+        metadata: None,
+    }
+    .to_entity()
+    .unwrap();
+    let taken_hash = taken.content_hash;
+    cs.put(taken).unwrap();
+    li.set(&by_name_pointer_path(&rid, "billslab.com"), taken_hash);
+
+    let res = reg_handler(&cs, &li, &registry)
+        .handle(&decision_ctx("approve-request", ph, None))
+        .await
+        .unwrap();
+    assert_eq!(res.status, 409);
+    assert_eq!(
+        result_field(&decode_result(&res), "code").and_then(|v| v.as_text()),
+        Some("name_taken")
+    );
+    // The head is untouched — a refused decision is not a decision.
+    let head = li
+        .get(&crate::pending_by_request_path(
+            &rid,
+            owner.peer_id().as_str(),
+            "billslab.com",
+        ))
+        .unwrap();
+    assert_eq!(head, ph);
 }
 
 // `open` mode: a free name is first-come-first-serve; a second target claiming

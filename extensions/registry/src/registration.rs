@@ -70,14 +70,16 @@ use entity_types::{SignatureData, TYPE_REGISTRY_BINDING};
 
 use crate::data::{
     decode_map, get_field, normalize_name, validate_name_safety, BindingData, IssuerPolicyData,
-    RegisterRequestData, RevocationData, KIND_PEER_ISSUED, MODE_ALLOWLIST, MODE_DOMAIN_CONTROL,
-    MODE_MANUAL, MODE_OPEN,
+    PendingBindingData, RegisterRequestData, RevocationData, KIND_PEER_ISSUED, MODE_ALLOWLIST,
+    MODE_DOMAIN_CONTROL, MODE_MANUAL, MODE_OPEN, PENDING_STATUS_APPROVED, PENDING_STATUS_DENIED,
+    STATUS_BOUND, STATUS_PENDING_REVIEW,
 };
 use crate::log::now_ms;
 use crate::resolver::{find_binding_signature, glob_match, peer_pubkey_from_entity};
-use crate::result::{entity_result, error, hash_result, status_result, status_result_with};
+use crate::result::{entity_result, error, hash_result, register_result, status_result};
 use crate::{
-    binding_body_path, by_name_pointer_path, issuer_policy_path, register_nonce_path,
+    binding_body_path, by_name_pointer_path, issuer_policy_path, pending_body_path,
+    pending_by_request_path, pending_by_request_prefix, register_nonce_path,
     revocation_by_target_path, revocation_prefix, signature_pointer_path,
 };
 
@@ -99,7 +101,16 @@ pub struct RegisterRequestHandler {
     peer_id: String,
     signer: IdentityKeypair,
     qualified_pattern: String,
+    /// §6a.9.3 retention `[SHOULD]` — ms after `queued_at` before a **decided**
+    /// head's pointer is collected. `0` disables. A deployment knob (§7: "all
+    /// retention windows are operator-configurable"), not a wire field.
+    pending_retention_ms: u64,
 }
+
+/// Default §6a.9.3 retention window for decided pending-bindings: 30 days.
+/// Conservative per §7's "defaults conservative (unlimited / off / largest)" —
+/// long enough that an operator's audit trail outlives any plausible dispute.
+pub const DEFAULT_PENDING_RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 impl RegisterRequestHandler {
     /// `local_peer_id` is the registry's own peer-id; `signer` is `K_registry`
@@ -118,6 +129,52 @@ impl RegisterRequestHandler {
             peer_id: local_peer_id,
             signer,
             qualified_pattern,
+            pending_retention_ms: DEFAULT_PENDING_RETENTION_MS,
+        }
+    }
+
+    /// Override the §6a.9.3 retention window (ms). `0` disables collection.
+    pub fn with_pending_retention(mut self, ms: u64) -> Self {
+        self.pending_retention_ms = ms;
+        self
+    }
+
+    /// §6a.9.3 retention `[SHOULD]` — collect the pointers of **decided** heads
+    /// once the window has elapsed since `queued_at`.
+    ///
+    /// A `pending_review` head is **never** eligible: it is live queue state,
+    /// and expiring it would silently drop a request no operator has seen —
+    /// the same deliver-or-signal violation that deny-is-not-a-delete forbids.
+    ///
+    /// **Only the pointer is removed.** The body stays content-addressed and
+    /// auditable independently of the pointer, exactly as the ruling specifies.
+    ///
+    /// Opportunistic rather than timer-driven: it runs on the queue path, so
+    /// the sweep is bounded by the traffic that creates the entries it
+    /// collects, and a registry with no traffic has no queue to leak. No task,
+    /// no background clock.
+    fn gc_decided_pending(&self) {
+        if self.pending_retention_ms == 0 {
+            return;
+        }
+        let now = now_ms();
+        for entry in self
+            .location_index
+            .list(&pending_by_request_prefix(&self.peer_id))
+        {
+            let Some(entity) = self.content_store.get(&entry.hash) else {
+                continue;
+            };
+            let Ok(pending) = PendingBindingData::from_entity(&entity) else {
+                continue;
+            };
+            if !pending.is_decided() {
+                continue;
+            }
+            if now < pending.queued_at || now - pending.queued_at < self.pending_retention_ms {
+                continue;
+            }
+            self.location_index.remove(&entry.path);
         }
     }
 
@@ -171,6 +228,8 @@ impl Handler for RegisterRequestHandler {
             "register-request" => Ok(self.handle_register(ctx)),
             "revoke-request" => Ok(self.handle_revoke(ctx)),
             "renew-request" => Ok(self.handle_renew(ctx)),
+            "approve-request" => Ok(self.handle_approve(ctx)),
+            "deny-request" => Ok(self.handle_deny(ctx)),
             "set-issuer-policy" => Ok(self.handle_set_issuer_policy(ctx)),
             "get-issuer-policy" => Ok(self.handle_get_issuer_policy()),
             other => Ok(error(
@@ -194,6 +253,13 @@ impl Handler for RegisterRequestHandler {
             "register-request",
             "revoke-request",
             "renew-request",
+            // §6a.9.3 `[RULED 2026-08-13]`. The operator's decisions on the
+            // manual queue, both gated by the EXISTING
+            // `system/capability/registry-issue-binding` — approving a queued
+            // request *is* issuing a binding, so the section defines no new
+            // capability and this handler invents none.
+            "approve-request",
+            "deny-request",
             // §6a.9.2 `[RATIFIED 2026-08-10]`. Operator surface, gated by
             // `system/capability/registry-manage-issuer-policy` — never
             // reachable from the `registry-request-binding` a publisher
@@ -293,18 +359,40 @@ impl RegisterRequestHandler {
                 // Queue for out-of-band operator approval. Record the nonce so a
                 // resubmission of the *same* request can't double-queue; the
                 // pending request body is content-addressable for review.
-                let _ = self.content_store.put(ctx.params.clone());
                 self.location_index.set(&nonce_path, request_hash);
-                // 202, not 200. §6a.9 pins the BODY (`status: "pending_review"`)
-                // and names no status code; 200 says "done" for an operation
-                // whose entire point is that nothing was signed. go and py both
-                // answer 202 and each recorded converging on the other, so rust
-                // was the sole outlier on a cross-impl-observable answer. Logged
-                // in SPEC-AMBIGUITIES and routed for ratification — this is
-                // cohort convergence on a silent spec, not oracle-following.
-                return status_result_with(
+                // §6a.9.3 — store the queued request as a `pending-binding` and
+                // return a handle that names IT, never the request. A hash the
+                // client computed before it dispatched is not a handle.
+                //
+                // Supersession: one head per (target_peer_id, name). A retry
+                // carries a fresh nonce and is a distinct request by
+                // construction, so without replace-whole an operator's queue
+                // fills with duplicates of a single intent. The superseded body
+                // stays at its own content-addressed path — only the pointer
+                // moves.
+                let pending = PendingBindingData::queued(&req, &norm, now_ms());
+                let pending_hash = match self.store_pending(&pending) {
+                    Ok(h) => h,
+                    Err(result) => return result,
+                };
+                self.location_index.set(
+                    &pending_by_request_path(&self.peer_id, &req.target_peer_id, &norm),
+                    pending_hash,
+                );
+                self.gc_decided_pending();
+                // 202 in `system/registry/register-result` — §6a.9 `[RULED
+                // 2026-08-12]`. The status is a result FIELD on a success shape,
+                // not a code on an error entity, and the type is
+                // register-request's own.
+                return register_result(
                     STATUS_ACCEPTED,
-                    vec![(text("status"), text("pending_review"))],
+                    vec![
+                        (text("status"), text(STATUS_PENDING_REVIEW)),
+                        (
+                            text("pending_hash"),
+                            Value::Bytes(pending_hash.to_bytes().to_vec()),
+                        ),
+                    ],
                 );
             }
             MODE_DOMAIN_CONTROL => {
@@ -329,7 +417,20 @@ impl RegisterRequestHandler {
         self.location_index.set(&nonce_path, request_hash);
         let ttl = req.requested_ttl.or(policy.default_ttl);
         match self.issue_binding(&norm, &req.target_peer_id, req.transports, ttl, None) {
-            Ok(binding_hash) => hash_result("binding_hash", binding_hash),
+            // §6a.9 step 3 `[RULED 2026-08-12]`: `{status: "bound", binding_hash}`
+            // in register-request's own result type. Previously a bare
+            // `{binding_hash}` under `system/protocol/status`, which left the
+            // discriminator the ruling turns on absent from the success branch.
+            Ok(binding_hash) => register_result(
+                entity_handler::STATUS_OK,
+                vec![
+                    (text("status"), text(STATUS_BOUND)),
+                    (
+                        text("binding_hash"),
+                        Value::Bytes(binding_hash.to_bytes().to_vec()),
+                    ),
+                ],
+            ),
             Err(result) => result,
         }
     }
@@ -498,6 +599,207 @@ impl RegisterRequestHandler {
     // -------------------------------------------------------------------
     // §6a.9.2 policy management — `set-issuer-policy` / `get-issuer-policy`
     // -------------------------------------------------------------------
+
+    // -------------------------------------------------------------------
+    // §6a.9.3 :approve-request / :deny-request — the operator decisions
+    // -------------------------------------------------------------------
+
+    /// `approve-request` (§6a.9.3) — issue the queued binding, then record the
+    /// decision.
+    ///
+    /// Gated by the **existing** `system/capability/registry-issue-binding`:
+    /// approving a queued request *is* issuing a binding, so §6a.9.3 defines no
+    /// new capability for it.
+    fn handle_approve(&self, ctx: &HandlerContext) -> HandlerResult {
+        let pending = match self.load_pending_for_decision(ctx) {
+            Ok(v) => v,
+            Err(result) => return result,
+        };
+
+        // §6a.9.3 `[MUST]` — the queue is NOT a reservation. If the name went to
+        // someone else between queue and approval, issuing anyway would silently
+        // overwrite a live binding, so the decision refuses instead. Checked
+        // against the *target*, because a head already pointing at this same
+        // requester is this request's own intent, not a collision.
+        if let Some(existing) = self
+            .location_index
+            .get(&by_name_pointer_path(&self.peer_id, &pending.name))
+        {
+            if let Ok(bound) = self.load_binding(&existing) {
+                if bound.target_peer_id != pending.target_peer_id {
+                    return error(
+                        STATUS_CONFLICT,
+                        "name_taken",
+                        "name was bound to another peer between queue and approval",
+                    );
+                }
+            }
+        }
+
+        let binding_hash = match self.issue_binding(
+            &pending.name,
+            &pending.target_peer_id,
+            pending.transports.clone(),
+            pending.requested_ttl,
+            None,
+        ) {
+            Ok(h) => h,
+            Err(result) => return result,
+        };
+
+        if let Err(result) =
+            self.record_decision(&pending, PENDING_STATUS_APPROVED, Some(binding_hash), None)
+        {
+            return result;
+        }
+
+        register_result(
+            entity_handler::STATUS_OK,
+            vec![
+                (text("status"), text(STATUS_BOUND)),
+                (
+                    text("binding_hash"),
+                    Value::Bytes(binding_hash.to_bytes().to_vec()),
+                ),
+            ],
+        )
+    }
+
+    /// `deny-request` (§6a.9.3) — record the refusal. **Nothing is signed and
+    /// nothing is published.**
+    ///
+    /// **Deny is not a delete `[MUST]`.** The denied head stays reachable
+    /// through the by-request pointer, because a requester polling a *vanished*
+    /// pointer cannot distinguish `denied` from `never received` — and a silent
+    /// drop is what the substrate's deliver-or-signal floor forbids.
+    fn handle_deny(&self, ctx: &HandlerContext) -> HandlerResult {
+        let pending = match self.load_pending_for_decision(ctx) {
+            Ok(v) => v,
+            Err(result) => return result,
+        };
+        // Operator-supplied and never parsed — carried verbatim for a human
+        // reader, so nothing downstream branches on its content.
+        let reason = decode_map(&ctx.params.data)
+            .ok()
+            .and_then(|m| get_field(&m, "reason").and_then(|v| v.as_text().map(str::to_string)));
+
+        if let Err(result) = self.record_decision(&pending, PENDING_STATUS_DENIED, None, reason) {
+            return result;
+        }
+
+        register_result(
+            entity_handler::STATUS_OK,
+            vec![(text("status"), text(PENDING_STATUS_DENIED))],
+        )
+    }
+
+    /// Shared prologue for both decisions: read `pending_hash`, resolve the
+    /// body, and refuse a second decision.
+    #[allow(clippy::result_large_err)]
+    fn load_pending_for_decision(
+        &self,
+        ctx: &HandlerContext,
+    ) -> Result<PendingBindingData, HandlerResult> {
+        // §6a.9.3 declares no input entity type for these ops (routed by
+        // core-go as a gap), so the params are read as a bare map rather than
+        // gated on a type this handler would have to invent.
+        let map = decode_map(&ctx.params.data)
+            .map_err(|e| error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string()))?;
+        let pending_hash = get_field(&map, "pending_hash")
+            .and_then(|v| v.as_bytes())
+            .and_then(|b| Hash::from_bytes(b).ok())
+            .ok_or_else(|| {
+                error(
+                    STATUS_BAD_REQUEST,
+                    "invalid_params",
+                    "pending_hash required (system/hash)",
+                )
+            })?;
+
+        let entity = self.content_store.get(&pending_hash).ok_or_else(|| {
+            error(
+                STATUS_NOT_FOUND,
+                "not_found",
+                "pending_hash names no stored pending-binding",
+            )
+        })?;
+        let pending = PendingBindingData::from_entity(&entity)
+            .map_err(|e| error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string()))?;
+
+        // **A superseded head is not decidable.** Supersession repoints the
+        // by-request pointer and deliberately leaves the old body in place for
+        // audit, so a stale `pending_review` body stays fetchable forever.
+        // Without this check, approving a superseded hash would mint a binding
+        // on terms the operator's queue no longer shows and leave the pointer
+        // naming a different head than the one decided — an inconsistency no
+        // later read could untangle. §6a.9.3's "one head per pair" is a rule
+        // about what is DECIDABLE, not only about what is listed.
+        //
+        // §6a.9.3 pins a code for "names no stored pending-binding" and none for
+        // "names a superseded one". Reusing the pinned `404` with a message that
+        // names supersession beats inventing a cohort-divergent code; core-go
+        // reached the same reading independently and routed the gap
+        // (`spec-issues/2026-08-13-d`). Converged on the argument, not the count.
+        let head = self.location_index.get(&pending_by_request_path(
+            &self.peer_id,
+            &pending.target_peer_id,
+            &pending.name,
+        ));
+        if head != Some(pending_hash) {
+            return Err(error(
+                STATUS_NOT_FOUND,
+                "not_found",
+                "pending_hash names a superseded head — a later register-request \
+                 replaced it (§6a.9.3, one head per pair), or retention removed it",
+            ));
+        }
+
+        // Approve and deny are not idempotent-by-replay: re-approving would mint
+        // a second binding for one request.
+        if pending.is_decided() {
+            return Err(error(
+                STATUS_CONFLICT,
+                "already_decided",
+                "this request already carries a decision",
+            ));
+        }
+        Ok(pending)
+    }
+
+    /// Write the decided successor body and repoint. Replace-whole: the prior
+    /// body stays at its own content-addressed path, so the queue's history
+    /// remains auditable independently of the pointer.
+    #[allow(clippy::result_large_err)]
+    fn record_decision(
+        &self,
+        pending: &PendingBindingData,
+        status: &str,
+        binding_hash: Option<Hash>,
+        reason: Option<String>,
+    ) -> Result<Hash, HandlerResult> {
+        let decided = pending.decided(status, binding_hash, reason);
+        let decided_hash = self.store_pending(&decided)?;
+        self.location_index.set(
+            &pending_by_request_path(&self.peer_id, &pending.target_peer_id, &pending.name),
+            decided_hash,
+        );
+        Ok(decided_hash)
+    }
+
+    /// Store a pending-binding body at its content-addressed §6a.9.3 path.
+    #[allow(clippy::result_large_err)]
+    fn store_pending(&self, pending: &PendingBindingData) -> Result<Hash, HandlerResult> {
+        let entity = pending
+            .to_entity()
+            .map_err(|e| error(STATUS_BAD_REQUEST, "encode_failed", &e.to_string()))?;
+        let hash = entity.content_hash;
+        self.content_store
+            .put(entity)
+            .map_err(|e| error(STATUS_BAD_REQUEST, "store_failed", &e.to_string()))?;
+        self.location_index
+            .set(&pending_body_path(&self.peer_id, &hash), hash);
+        Ok(hash)
+    }
 
     /// `set-issuer-policy` (§6a.9.2 `[RATIFIED 2026-08-10]`).
     ///

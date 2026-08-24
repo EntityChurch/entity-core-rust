@@ -2852,6 +2852,7 @@ pub fn all_core_types() -> Vec<TypeDefinition> {
         // Peer-issued live registration (EXTENSION-REGISTRY §6a.9)
         system_registry_register_request(),
         system_registry_register_result(),
+        system_registry_pending_binding(),
         system_registry_issuer_policy(),
         system_registry_revoke_request(),
         system_registry_renew_request(),
@@ -3331,11 +3332,33 @@ fn system_registry_register_request() -> TypeDefinition {
 }
 
 fn system_registry_register_result() -> TypeDefinition {
-    // `binding_hash` present on approval; `status` carries "pending_review"
-    // (manual mode) when no binding was issued.
+    // §6a.9 [RULED 2026-08-12] — the one result type for both branches of
+    // register-request. `status` discriminates: "bound" carries `binding_hash`,
+    // "pending_review" carries `pending_hash`. Each hash is REQUIRED on its own
+    // branch and absent on the other, which the type system expresses as two
+    // optionals rather than a variant.
     TypeDefBuilder::new("system/registry/register-result")
-        .field("binding_hash", opt("system/hash"))
         .field("status", opt("primitive/string"))
+        .field("binding_hash", opt("system/hash"))
+        .field("pending_hash", opt("system/hash"))
+        .build()
+}
+
+fn system_registry_pending_binding() -> TypeDefinition {
+    // §6a.9.3 — a queued register-request at rest. `status` carries the decision
+    // state; `binding_hash` is REQUIRED on "approved" and `reason` is optional on
+    // "denied", so both are `opt` here and the branch invariant lives in the
+    // handler. `queued_at` is deliberately part of the body: this hash is
+    // registry-local by ruling and needs no cross-peer agreement.
+    TypeDefBuilder::new("system/registry/pending-binding")
+        .field("name", t("primitive/string"))
+        .field("target_peer_id", t("system/peer-id"))
+        .field("transports", opt_arr(t("primitive/string")))
+        .field("requested_ttl", opt("primitive/uint"))
+        .field("queued_at", t("primitive/uint"))
+        .field("status", t("primitive/string"))
+        .field("binding_hash", opt("system/hash"))
+        .field("reason", opt("primitive/string"))
         .build()
 }
 

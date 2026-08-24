@@ -5021,11 +5021,21 @@ impls now agree on the wire, which is a stronger basis than the derivation alone
 
 ## §6a.9's `202 pending_review` row pins a *code*; the section's own pseudocode pins a *field* — and all three impls chose differently
 
-**Status:** OPEN upstream (go routed it 2026-08-12, `spec-issues/2026-08-12-c-*`,
-recommending **the result field**). **rust holds its current shape.** No change
-here until arch rules — converging early on any sibling's shape would destroy the
-three-way evidence the ruling is being made on, and the recommendation is for the
-carrier rust already uses.
+**Status:** **RULED 2026-08-12** (arch `81e73ae`, `EXTENSION-REGISTRY` §6a.9;
+routing `ROUTING-2026-08-12-e`). **Applied here 2026-08-13** — the carrier and
+both status values are built; `pending_hash` is blocked on a spec delta arch
+named as owed in the same ruling (see *What is still open* below).
+
+The ruling: `system/registry/register-result` `[MUST]` on **both** branches,
+`{status: "bound" | "pending_review", binding_hash?, pending_hash?}`.
+`system/protocol/error` MUST NOT carry the 202, and a generic status type is
+rejected **on structure** — a carrier with room for neither hash pushes the
+payload one field down and re-opens the divergence. Arch's finding is that this
+was **their** defect, not any implementation's: the operation's declared return
+type enumerated two outcomes while its own pseudocode introduced a third, so
+`pending_hash` appeared nowhere in the specification and each impl invented a
+carrier. Holding our shape was the right call — it kept the three-way evidence
+the ruling was made on intact.
 
 **Spec:** `EXTENSION-REGISTRY` §6a.9. The ratified status table gives the `202`
 row a **Code** column reading `pending_review`, while the section's own handler
@@ -5033,25 +5043,134 @@ pseudocode (step 5) says `status "pending_review"` — a *body field*. A code li
 on `system/protocol/error`; a field lives on a success result. The two readings
 are not reconcilable, and each impl read one of them:
 
+The three pre-ruling shapes, kept because the ruling was made on them:
+
 | | result entity type | carrier |
 |---|---|---|
 | go `6aed8f1` | `system/protocol/error` | error **code** `pending_review` |
 | py `2c1aa1b` | `system/registry/register-result` | field `status` (+ `pending_hash`) |
 | rust `21eb223` | `system/protocol/status` | field `status` |
 
-**Rust's reading, unchanged:** a queued request is **not an error** — nothing was
-rejected and nothing was signed — so the answer is a success shape carrying the
-`status` the pseudocode names (`registration.rs` MODE_MANUAL →
-`status_result_with(STATUS_ACCEPTED, [status: "pending_review"])`). `202` was
-already our cohort-convergence choice on the code (entry above).
+py's shape was closest to what arch ruled, and arrived at it independently.
 
-**Measured, not assumed.** go loosened `policy_manual_queues` to accept either
-carrier, which unblocked the check that actually matters —
-`policy_manual_publishes_nothing`, which rust **passes**: a 202 that quietly
-published the binding would defeat the whole mode while satisfying a status-only
-assertion. go's packet reported us `18 P / 1 W` in `registry_issuer`; re-measured
-here against go's tip `c475a88` the category is **19 P / 0 W / 0 F** — the
-loosened check *passes* the result-field carrier and **WARNs only on the
-error-code carrier**, which is go's own shape, not ours. Their recommendation
-upstream is therefore against their own current answer, and we have nothing to
-change either way until arch rules.
+**Rust's reading was half of the ruled answer** — success shape, `status` as a
+result field — and half of it was the rejected carrier. Both halves are now
+corrected (`registration.rs` MODE_MANUAL and the approve arm →
+`register_result(...)`; `STATUS_BOUND` / `STATUS_PENDING_REVIEW` in `data.rs`).
+The 200 branch changed more than the 202 did: it was a bare `{binding_hash}`
+under `system/protocol/status`, so the discriminator the ruling turns on was
+**absent from the success branch entirely** and nothing measured it.
+
+**`pending_hash` — CLOSED `[2026-08-13]`.** It was withheld here because the
+ruling MUSTed it while naming §6a.9.3 — the `pending-binding` schema it points
+at — as a spec delta still owed. Arch filled §6a.9.3 the next day (REGISTRY
+v1.3, `f162953`) and **named the gap as their own defect**: *"a `MUST` may not
+name a referent the corpus does not define; if the referent waits, the `MUST`
+waits with it."* Withholding was recorded as the correct posture for all three
+seats' behaviour, not just ours.
+
+§6a.9.3 is now built here — body, by-request pointer, supersession, approve /
+deny, retention — so `pending_hash` names a fetchable entity and the
+withholding assertion in `register_manual_queues_pending_review` has been
+replaced by the resolvability half of `REG-PENDING-HANDLE-1`.
+
+**Two cohort divergences found while applying this — routed, not converged on:**
+
+- **go emits `status: "registered"` on the 200** (`RegisterStatusRegistered`,
+  `core/types/registry_peerissued.go`; written at
+  `ext/registry/peerissued/register.go`), where the ruling pins **`"bound"`**.
+  No oracle check asserts the 200's status value, so it is a live MUST
+  divergence that nothing measures — and it is why applying the ruled value
+  here cost us no check.
+- **go's stored pending entity is `system/registry/pending-registration`**;
+  the ruling names `system/registry/pending-binding`. go marks theirs
+  PROVISIONAL at the point of invention and expects replacement when §6a.9.3
+  lands, which is the honest posture — but the name is the one anchor the
+  ruling *did* give, and two impls inventing under it is how the next
+  three-way divergence starts.
+
+**Prior measurement, superseded but kept:** before the ruling, go's
+`policy_manual_queues` accepted either carrier and rust measured `19 P / 0 W /
+0 F` in `registry_issuer` against go `c475a88`. go then measured us `17/19` on
+2026-08-12 and attributed both failures to the withheld `pending_hash`, which
+§6a.9.3 has now closed. Re-measure against a post-`f162953` oracle.
+
+---
+
+## §6a.9.3 leaves three things unpinned, found by building it
+
+**Status:** OPEN upstream. All three surfaced while implementing REGISTRY v1.3
+§6a.9.3; `entity-core-go` independently hit the first two and routed them
+(`spec-issues/2026-08-13-d`). Recorded here because rust made the same calls and
+they should converge or be corrected together, not settle by whoever built last.
+
+**1. `deny-request` returns a `status` the result type does not declare.**
+§6a.9.3's operation table says `deny-request` answers
+`system/registry/register-result {status: "denied"}`, but that type's own
+declaration two screens up enumerates `"bound" | "pending_review"` only. This is
+the *same defect* §6a.9 recorded about itself on 2026-08-12 — an operation whose
+declared return type does not enumerate every branch of its own pseudocode —
+reproduced in the section written to fix it. **Interim:** rust emits `"denied"`
+as the table says and treats the enumeration as the stale half.
+
+**2. The decision ops have no input entity type.** `approve-request` /
+`deny-request` take `{pending_hash}` and `{pending_hash, reason?}`, and no
+`system/registry/*` type is declared for either. Every other write op on this
+handler gates on a params type. **Interim:** rust reads a bare CBOR map rather
+than inventing `system/registry/approve-request`, because a type invented here
+is a type the next impl invents differently.
+
+**3. No code is pinned for deciding a SUPERSEDED head — and the section's own
+supersession rule creates the case.** Supersession repoints the by-request
+pointer and deliberately leaves the prior body in the store for audit, so a
+stale `pending_review` body stays fetchable forever. Deciding one would issue a
+binding on terms the operator's queue no longer shows, and leave the pointer
+naming a different head than the one decided.
+
+**Interim, and it is a convergence on the argument rather than the count:**
+answer the **pinned `404 not_found`** with a message naming supersession, rather
+than invent a code. core-go reached the same reading independently and records
+that their first draft let the case through. §6a.9.3's "one head per pair" is a
+rule about what is **decidable**, not only about what is listed — that sentence
+is what we would like added.
+
+---
+
+## A verifier MUST that depends on entities the bundler only collects best-effort
+
+**Status:** OPEN upstream — routed with `ROUTING-2026-08-13-m`'s reply. This is
+the seam behind `convergence.rexec_delivered` failing go(A) → rust(B) while
+go→go and go→python pass.
+
+**Spec:** V7 §5.5 + §3.6 per-link grantee resolution (as
+`PROPOSAL-ROLE-V2.0-PRODUCTION-READINESS` PR-3 lands it), against
+EXTENSION-CONTINUATION §4.3's chain-bundle contract.
+
+**The two halves disagree.** `verify_capability_chain` step 2a enforces that
+**every** cap in the chain has a `grantee` resolving to a present `system/peer`
+entity in `included`, else `UnresolvableGrantee` → 401. PR-8 then requires the
+leaf **granter**'s identity to canonicalize the grant's resource patterns
+against the granter's namespace, else fail-closed deny → 403. But
+`collect_chain_bundle` gathers those identity entities **best-effort** — an
+identity the bundler cannot resolve locally is silently omitted. **rust and go
+are structurally identical here** (`core/protocol/src/verify.rs` vs
+`core/capability/chainbundle.go`: both `continue` on an unresolvable signer),
+and neither collects *grantee* identities at all except where a grantee happens
+also to be a granter.
+
+**Why §4.2 case 3 is where it bites.** The case-3 chain is root
+`(granter=B, grantee=installer)` → leaf `(granter=installer, grantee=A)`. The
+installer is a third peer that is neither the EXECUTE author nor the peer
+serving the request, so whether B can authorize at all depends on whether **A's
+store happened to hold the installer's `system/peer` entity** when A built the
+bundle. A self-rooted cap never exposes this: granter and grantee collapse onto
+peers both sides already have.
+
+**A MUST on the verifier paired with best-effort on the bundler is an interop
+bug by construction** — the same shape as the `pending_hash`-with-no-referent
+trap arch corrected on 2026-08-13, one layer out. **The ask:** pin whether
+EXTENSION-CONTINUATION §4.3's bundle MUST carry an identity entity for every
+granter *and* grantee in the chain. If it must, `collect_chain_bundle`'s
+best-effort omission becomes an error in all three impls and this is an
+implementation gap. If it must not, the verifier cannot require what the wire
+does not guarantee, and step 2a needs a different failure mode than 401.

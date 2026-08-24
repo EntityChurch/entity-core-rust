@@ -530,6 +530,28 @@ fn try_send_event(entry: &mut SubscriptionEntry, ev: ChangeEvent) {
     }
 }
 
+/// Mirror-lifecycle tracing: every removal and snapshot, with the set of
+/// subscriptions still holding the path afterwards.
+///
+/// **Kept deliberately, debug-only.** The mirrors are invisible from outside
+/// this crate, and that blindness is what made
+/// entity-browser-rust's `AUDIT-THEME-DELETE-STALE-DROPDOWN-2026-08-13` cost a
+/// session: a stale read surface with no way to ask which mirror was holding
+/// the path. `remaining_holders` is the line that finally answered it.
+///
+/// `debug_assertions` rather than a cargo feature: the consumers that need it
+/// (dev builds and the e2e, which captures `console.*` into
+/// `window.__entity_browser_log`) are exactly the debug ones, and the shipped
+/// `wasm-release` artifact compiles it out entirely — no feature plumbing, no
+/// runtime cost where it isn't wanted.
+///
+/// `console` rather than `tracing` because this crate carries no `tracing`
+/// dependency, and taking one for diagnostics is a bad trade.
+#[cfg(debug_assertions)]
+fn audit_log(msg: &str) {
+    web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(msg));
+}
+
 async fn demultiplex(
     mut events: mpsc::UnboundedReceiver<Event>,
     subscriptions: Rc<RefCell<SubscriptionRegistry>>,
@@ -539,6 +561,18 @@ async fn demultiplex(
         let mut reg = subscriptions.borrow_mut();
         match event {
             Event::Snapshot { sub_id, entries } => {
+                // AUDIT F2: a snapshot CLEARS and repopulates the mirror, so a
+                // snapshot delivered after a removal would resurrect the path.
+                // Upstream argues that cannot happen (`wasm-worker-host`
+                // `handle_subscribe`); log it so the argument is checked
+                // against the wire rather than trusted.
+                #[cfg(debug_assertions)]
+                audit_log(&format!(
+                    "worker-proxy: snapshot sub=#{sub_id} entries={} known_sub={}",
+                    entries.len(),
+                    reg.entries.contains_key(&sub_id)
+                ));
+                let mut snapshot_paths: Vec<String> = Vec::new();
                 if let Some(entry) = reg.entries.get_mut(&sub_id) {
                     entry.mirror.clear();
                     for (path, e) in entries {
@@ -557,6 +591,18 @@ async fn demultiplex(
                     }
                     entry.snapshot_received = true;
                     let _ = entry.notify_tx.try_send(());
+                    // Collected inside the mutable borrow, used after it ends.
+                    snapshot_paths = entry.mirror.keys().cloned().collect();
+                }
+                // Same read-vs-invalidation scope rule as the `Change` arm
+                // below: this rewrote a mirror that `cache_get` / `cache_list`
+                // expose to EVERY reader, so a reader subscribed on an
+                // overlapping prefix can gain or lose entries here without its
+                // own subscription ever seeing an event.
+                for (id, e) in reg.entries.iter_mut() {
+                    if *id != sub_id && snapshot_paths.iter().any(|p| prefix_covers(&e.prefix, p)) {
+                        let _ = e.notify_tx.try_send(());
+                    }
                 }
                 // sub_id unknown → registry entry was removed (SubHandle
                 // dropped, or SubscriptionLost arrived earlier). Drop event.
@@ -566,11 +612,22 @@ async fn demultiplex(
                 path,
                 new_entity,
             } => {
-                if let Some(entry) = reg.entries.get_mut(&sub_id) {
-                    if !entry.snapshot_received {
-                        // Invariant #1: snapshot must arrive first.
-                        continue;
-                    }
+                // `changed_path` / `mirror_mutated` are LOAD-BEARING for the
+                // cross-subscription wake-up below, not diagnostics — don't
+                // remove them with the audit logging.
+                #[cfg(debug_assertions)]
+                let is_removal = new_entity.is_none();
+                let changed_path = path.clone();
+                let mut mirror_mutated = false;
+                // Invariant #1: the snapshot must arrive first. Checked up front
+                // so the apply path below keeps one level of nesting.
+                let dropped_pre_snapshot = reg
+                    .entries
+                    .get(&sub_id)
+                    .is_some_and(|e| !e.snapshot_received);
+                if dropped_pre_snapshot {
+                    // Drop it — the snapshot that follows carries the value.
+                } else if let Some(entry) = reg.entries.get_mut(&sub_id) {
                     // Compute the previous_hash BEFORE mutating the mirror
                     // so we can derive Created/Updated/Removed correctly
                     // for the event channel.
@@ -609,6 +666,62 @@ async fn demultiplex(
                         }
                     }
                     let _ = entry.notify_tx.try_send(());
+                    mirror_mutated = true;
+                }
+                // Wake EVERY subscription whose prefix covers this path, not
+                // just the one the event was addressed to.
+                //
+                // Reads are global, so invalidation must be too. `cache_get` /
+                // `cache_list` answer from the UNION of all mirrors, but each
+                // `Change` is addressed to one `sub_id` and used to poke only
+                // that entry's `notify_tx`. With N subscriptions on a prefix a
+                // removal arrives as N separate events, so a reader whose own
+                // event lands FIRST wakes, reads a union the other N-1 have not
+                // cleaned yet, and is never woken again — the events that
+                // finish cleaning it belong to other subscribers. Its view stays
+                // stale forever, and which reader loses is decided by delivery
+                // order, so it presents as a flaky stale surface.
+                //
+                // Measured downstream: a deleted theme held by 4 subscriptions
+                // drained #14 → #1 → #8 → #17; the reader owning #1 reconciled
+                // after its own event, saw the 2 mirrors still holding the path,
+                // and never reconciled again
+                // (entity-browser-rust AUDIT-THEME-DELETE-STALE-DROPDOWN-2026-08-13).
+                //
+                // Cost is bounded: `notify_tx` is capacity-1 with newest-wins
+                // coalescing, so a subscriber already dirty absorbs this for
+                // free, and only prefix-covering subscriptions are touched.
+                //
+                // Purely additive — the addressed entry is still notified above,
+                // so this cannot *remove* a wake-up even if `prefix_covers`
+                // disagrees with the worker's routing for some prefix shape
+                // (see the exact-match asymmetry in `docs/SPEC-AMBIGUITIES.md`).
+                if mirror_mutated {
+                    for e in reg.entries.values_mut() {
+                        if prefix_covers(&e.prefix, &changed_path) {
+                            let _ = e.notify_tx.try_send(());
+                        }
+                    }
+                }
+                // AUDIT probe — kept while the downstream audit is open. After a
+                // removal, which subscriptions still hold the path? With the
+                // fan-out above this should now be harmless (every holder is
+                // also woken), so a stale surface surviving this line means the
+                // cause is NOT notification scope.
+                #[cfg(debug_assertions)]
+                if is_removal {
+                    let holders: Vec<String> = reg
+                        .entries
+                        .iter()
+                        .filter(|(_, e)| e.mirror.contains_key(&changed_path))
+                        .map(|(id, e)| format!("#{id}<{}>", e.prefix))
+                        .collect();
+                    audit_log(&format!(
+                        "worker-proxy: removal sub=#{sub_id} path={changed_path} \
+                         gated={dropped_pre_snapshot} applied={mirror_mutated} \
+                         total_subs={} remaining_holders={holders:?}",
+                        reg.entries.len()
+                    ));
                 }
             }
             Event::SubscriptionLost { sub_id, reason: _ } => {

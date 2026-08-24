@@ -166,6 +166,42 @@ pub fn issuer_policy_path(peer_id: &str) -> String {
     format!("/{}/system/registry/issuer-policy", peer_id)
 }
 
+/// Pending-binding body path `/{registry}/system/registry/pending/{hex}` (§6a.9.3).
+/// Immutable and content-addressed, matching §3's universal `binding/{hash}` rule —
+/// the body/pointer split here is §6.3's, deliberately not a second pattern.
+pub fn pending_body_path(registry_peer_id: &str, pending_hash: &Hash) -> String {
+    format!(
+        "/{}/system/registry/pending/{}",
+        registry_peer_id,
+        pending_hash.to_hex()
+    )
+}
+
+/// By-request pointer `/{registry}/system/registry/pending/by-request/{target}/{name}`
+/// holding the bare hash of the current head pending-binding (§6a.9.3) — the handle
+/// a requester polls once it no longer holds the 202 response.
+///
+/// **`target_peer_id` precedes `name` and the order is normative.** A peer-id is one
+/// Base58 segment; a `name` is name-path-safe but NOT guaranteed single-segment, so
+/// the variable-depth value goes last or the prefix stops being parseable and
+/// [`pending_by_request_prefix`] stops being enumerable at fixed depth.
+pub fn pending_by_request_path(
+    registry_peer_id: &str,
+    target_peer_id: &str,
+    normalized_name: &str,
+) -> String {
+    format!(
+        "/{}/system/registry/pending/by-request/{}/{}",
+        registry_peer_id, target_peer_id, normalized_name
+    )
+}
+
+/// Prefix for enumerating a registry's queued requests (§6a.9.3). This is why
+/// there is no `list-pending` operation: a tree walk already answers it.
+pub fn pending_by_request_prefix(registry_peer_id: &str) -> String {
+    format!("/{}/system/registry/pending/by-request/", registry_peer_id)
+}
+
 /// Per-requester seen-nonce marker `/{registry}/system/registry/register-nonce/{requester}/{hex}`
 /// (§6a.9 replay defense). Presence = the nonce was already consumed.
 pub fn register_nonce_path(

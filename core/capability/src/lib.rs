@@ -1715,6 +1715,62 @@ mod tests {
 
     const LOCAL_PEER: &str = "2DFfrCdapVgjiNBPRUdNpwKLfLsmUaKHod4jmhakzBDs3W";
 
+    // --- resolve_granter_peer_id (PR-8 / V7 §5.5) ---
+    //
+    // These pin the B-side decision point behind the cross-impl
+    // `convergence.rexec_delivered` seam (arch `ROUTING-2026-08-13-m`,
+    // relaying `entity-core-go`). Under EXTENSION-CONTINUATION §4.2 case 3 the
+    // leaf granter is the INSTALLER — a third peer that is neither the EXECUTE
+    // author (A) nor the peer serving the request (B). PR-8 canonicalizes the
+    // grant's resource patterns against the GRANTER's namespace, so B must know
+    // the installer's peer-id, and the only place it can learn it is the
+    // granter's `system/peer` entity riding in `envelope.included`.
+    //
+    // `collect_chain_bundle` gathers those identities **best-effort** — an
+    // identity the bundler cannot resolve locally is silently omitted. So the
+    // dispatcher decides whether B can authorize at all, and B has no way to
+    // ask for what is missing.
+
+    #[test]
+    fn granter_identity_absent_from_included_denies_fail_closed() {
+        let installer = entity_crypto::Keypair::generate();
+        let installer_id = installer.peer_entity().unwrap();
+
+        // The §4.2 case-3 leaf: granter is the installer, not the local peer.
+        let granter = Granter::Single(installer_id.content_hash);
+
+        // B receives a bundle WITHOUT the installer's identity entity.
+        let resolved = resolve_granter_peer_id(&granter, LOCAL_PEER, |_| None);
+
+        assert_eq!(
+            resolved, None,
+            "an unresolvable granter MUST deny rather than fall back to the              local peer — falling back would canonicalize a foreign bare-`*`              grant into THIS peer's namespace"
+        );
+    }
+
+    #[test]
+    fn granter_identity_present_in_included_resolves_to_the_installer() {
+        let installer = entity_crypto::Keypair::generate();
+        let installer_id = installer.peer_entity().unwrap();
+        let expected = installer.peer_id().as_str().to_string();
+        let granter = Granter::Single(installer_id.content_hash);
+
+        let resolved = resolve_granter_peer_id(&granter, LOCAL_PEER, |h| {
+            (*h == installer_id.content_hash).then_some(&installer_id)
+        });
+
+        assert_eq!(
+            resolved.as_deref(),
+            Some(expected.as_str()),
+            "with the identity present the leaf granter resolves to the              installer — NOT to the local peer"
+        );
+        assert_ne!(
+            resolved.as_deref(),
+            Some(LOCAL_PEER),
+            "resolving to the local peer would silently widen a foreign grant"
+        );
+    }
+
     // --- Pattern matching ---
 
     #[test]
