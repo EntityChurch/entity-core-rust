@@ -37,6 +37,12 @@ PODMAN_BUILD_ARGS := --build-arg GIT_COMMIT=$(GIT_STAMP) --build-arg GIT_DIRTY=$
 # own build). Re-measure if the workspace grows: container cgroup memory.peak.
 CAP_MEM           ?= 4g         # hard memory ceiling per container
 CAP_SWAP          ?= $(CAP_MEM) # keep == CAP_MEM (no swap); raise only deliberately
+# `make godot` only. `godot 0.4`'s `codegen-full` is ONE rustc invocation that
+# peaks at 4.44 GiB — more than every other crate in this workspace put together
+# (2.12 GiB) — so it gets its own ceiling instead of forcing CAP_MEM to 8g for
+# every `make test` on every machine. That asymmetry is exactly why
+# `bindings/godot` is out of `default-members` and in this lane; see Cargo.toml.
+GODOT_CAP_MEM     ?= 8g
 CAP_PIDS          ?= 2048       # max procs/threads (RUN only) — stops fork bombs
 CAP_CPUS          ?= 4          # CPU cores at runtime (RUN only; fractional ok)
 CAP_CGROUP_PARENT ?=            # optional host slice to nest under, e.g. dev-heavy.slice
@@ -49,7 +55,7 @@ PODMAN_BUILD_CAPS := --memory=$(CAP_MEM) --memory-swap=$(CAP_SWAP) $(_cap_cgp)
 PODMAN_RUN_CAPS   := --memory=$(CAP_MEM) --memory-swap=$(CAP_SWAP) \
                      --pids-limit=$(CAP_PIDS) --cpus=$(CAP_CPUS) $(_cap_cgp)
 
-.PHONY: help build image toolchain test clippy lint fmt check clean wasm probe-webkit
+.PHONY: help build image toolchain test clippy lint fmt check clean wasm godot probe-webkit
 
 .DEFAULT_GOAL := help
 
@@ -63,9 +69,10 @@ help:
 	@echo "  test     cargo test --release across the workspace"
 	@echo "  lint     cargo clippy -D warnings + cargo fmt --check (read-only)"
 	@echo "  fmt      cargo fmt (writes)"
-	@echo "  check    lint + test (the green gate)"
+	@echo "  check    lint + test + godot (the green gate)"
 	@echo "  clean    remove the build + toolchain images"
 	@echo "  clippy   clippy only · wasm   wasm32 cross-compile check"
+	@echo "  godot    clippy + test bindings/godot + the sdk features only it enables"
 	@echo "  probe-webkit  run a browser probe under WebKitGTK (PROBE=<file.html>)"
 
 # Release build: compiles the `entity` CLI inside the container (Dockerfile
@@ -98,6 +105,21 @@ define RUN_TOOLCHAIN
 		sh -c '$(1)'
 endef
 
+# Same, with an explicit memory ceiling as $(1) — for the one lane whose peak is
+# set by a dependency rather than by our own code (see GODOT_CAP_MEM).
+define RUN_TOOLCHAIN_MEM
+	mkdir -p $(CARGO_CACHE) $(TARGET_CACHE)
+	podman run --rm --memory=$(1) --memory-swap=$(1) \
+		--pids-limit=$(CAP_PIDS) --cpus=$(CAP_CPUS) $(_cap_cgp) \
+		-e CARGO_TARGET_DIR=/target \
+		-v $(CURDIR):/work:Z \
+		-v $(CARGO_CACHE):/usr/local/cargo/registry:Z \
+		-v $(TARGET_CACHE):/target:Z \
+		-w /work \
+		$(IMAGE)-toolchain \
+		sh -c '$(2)'
+endef
+
 test: toolchain
 	$(call RUN_TOOLCHAIN,cargo test --release)
 
@@ -114,8 +136,36 @@ lint: toolchain
 fmt: toolchain
 	$(call RUN_TOOLCHAIN,cargo fmt)
 
-# Tier-1 check = the green gate (lint + test).
-check: lint test
+# ----------------------------------------------------------------------------
+# bindings/godot — the one member outside `default-members` that a NATIVE lane
+# has to cover
+# ----------------------------------------------------------------------------
+# `make test` / `make lint` run `default-members`, and `bindings/godot` is not in
+# it: `godot 0.4`'s `codegen-full` is a single rustc peaking at 4.44 GiB, against
+# 2.12 GiB for the whole rest of the workspace, so folding it in would force
+# CAP_MEM to 8g for every `make test` everywhere. This lane is the trade — the
+# same shape as `make wasm`, and stated at the Cargo.toml exclusion so the reason
+# lives beside the exclusion rather than in a commit message.
+#
+# clippy AND test, because the default set gets both and a lane that only builds
+# would silently drop the binding's lint coverage. Run it when you touch
+# `core/*`, `bindings/sdk`, `bindings/shell` or the binding itself; `make check`
+# runs it for you.
+#
+# `-p entity-sdk` rides along deliberately, and it is not padding. `entity-sdk`'s
+# `identity` / `role` / `quorum` / `attestation` / `compute` features are off by
+# default (wasm consumers pay for them in binary size) and `bindings/godot` is
+# the only crate in the tree that turns them on. Selecting both packages puts
+# them in ONE feature-unification group, so the sdk's test build gets those
+# features and the **43 sdk tests gated behind them** run — measured: 216 in
+# `make test`, 259 here. Drop the `-p entity-sdk` and those 43 are back to being
+# reachable from no lane at all, which is the exact defect this whole
+# arrangement exists to close.
+godot: toolchain
+	$(call RUN_TOOLCHAIN_MEM,$(GODOT_CAP_MEM),cargo clippy -p entity-core-godot --all-targets -- -D warnings && cargo test --release -p entity-core-godot -p entity-sdk)
+
+# Tier-1 check = the green gate (lint + test + the godot lane).
+check: lint test godot
 
 # ----------------------------------------------------------------------------
 # Per-feature gating sweep — the thing `test` and `clippy` structurally cannot

@@ -61,20 +61,45 @@ members = [
     # crosses the coordination half, never transport.
     "cmd/webrtc-vectors",
     "bindings/ffi",
-    "bindings/godot",
     "bindings/sdk",
     "bindings/shell",
+    # Intentionally NOT in default-members — the `make godot` lane (which
+    # `make check` depends on) clippies and tests it. Reason is memory, and it
+    # is measured, not assumed: `godot 0.4`'s `codegen-full` produces a single
+    # rustc invocation that peaks at **4.44 GiB**, where EVERY OTHER crate in
+    # this workspace put together peaks at 2.12 GiB (container cgroup
+    # `memory.peak`, cold target dir, 4 CPUs, 2026-08-23). Folding it into the
+    # default set would have forced `CAP_MEM` from 4g to 8g for every `make
+    # test` on every machine so one finished binding could ride the same lane,
+    # and it is not worth that — so `make godot` carries its own
+    # `GODOT_CAP_MEM` ceiling instead. Cost of the lane: ~95 s and ~500 MiB of
+    # artifacts on a cold build, for 21 godot tests — plus `entity-sdk`'s full
+    # 259 (vs 216 in `make test`), because godot is the only crate that enables
+    # the sdk's default-off `identity` / `role` / `quorum` / `attestation` /
+    # `compute` features and the lane selects `-p entity-sdk` with it.
+    "bindings/godot",
     # WASM-only proxy/host pair for browser-deployed peers. Each crate is
     # #![cfg(target_arch = "wasm32")] at root so native builds compile them
-    # to an empty module. Intentionally NOT in default-members — explicit
-    # `cargo check --target wasm32-unknown-unknown -p ...` lanes in CI
-    # exercise them.
+    # to an empty module. Intentionally NOT in default-members — the
+    # `make wasm` lane cross-compiles them
+    # (`cargo build --target wasm32-unknown-unknown -p ...`); a native build
+    # would compile them to nothing and see no break in them.
     "bindings/wasm-worker-protocol",
     "bindings/wasm-worker-host",
     "bindings/wasm-worker-proxy",
     "bindings/wasm-worker-example",
 ]
 
+# `cargo test` / `cargo clippy` / `cargo fmt` with no `-p` and no `--workspace`
+# run THIS list, and those three are the whole gate (`make test` / `make lint`).
+#
+# **A member left out of this list carries a written reason naming the lane that
+# covers it, or it belongs here.** There are exactly five exclusions and each
+# states its reason + lane at its `members` entry above: the four
+# `bindings/wasm-worker-*` crates (`make wasm`) and `bindings/godot`
+# (`make godot`). Do NOT "fix" the wasm four by adding `--workspace` to
+# `make test`: it would compile them natively to empty modules, which is
+# coverage that looks like coverage and is not.
 default-members = [
     "core/ecf",
     "core/hash",
@@ -124,6 +149,38 @@ default-members = [
     "cmd/signaling-meet",
     "cmd/signaling-punch",
     "cmd/webrtc-vectors",
+    # ------------------------------------------------------------------------
+    # Added 2026-08-23. These five were excluded with no stated reason and no
+    # covering lane, so nothing ever built or ran them: this repo has no CI
+    # workflows, and every `make` verb except `test`/`clippy`/`lint`/`fmt` names
+    # its packages explicitly (`build` → `-p entity-cli`, `wasm` → `-p
+    # entity-peer` + the worker crates, `features` → `-p entity-peer`). Excluded
+    # from `default-members` therefore meant excluded from the gate, full stop.
+    #
+    # It cost us: `7c21d04` changed `make_execute_fn`'s signature and broke
+    # `entity-sdk`'s compile outright, `90e60c0` repaired the call sites, and the
+    # §5.2 D1 ceiling it introduced left
+    # `follow_continuation_standing_leg_fires_cross_peer` RED on `dev` for five
+    # days. Both commits reported "make test 115 suites green" and both were
+    # telling the truth about the set they ran.
+    #
+    # 407 tests came in with them — sdk 216 · shell 163 · durability 18 ·
+    # wire-conformance 10 — plus compile + clippy coverage for `bindings/ffi`,
+    # which carries no tests but consumes the same core APIs and breaks the same
+    # way. (`entity-sdk` has 259; the other 43 are gated behind `identity` /
+    # `role` / `quorum` / `attestation` / `compute`, which are off by default and
+    # which only `bindings/godot` turns on — so the `make godot` lane selects
+    # `-p entity-sdk` alongside it and runs all 259 in one feature-unified
+    # build.) Cold-build cost of the five, measured (container cgroup
+    # `memory.peak`, fresh target dir, 4 CPUs): peak 2.12 → 2.37 GiB and 136 →
+    # 161 s, so `CAP_MEM` stays at 4g and keeps its ~60% headroom.
+    # `bindings/godot` was the sixth and is the one that did NOT come in — see
+    # its `members` entry for the measurement and the lane that covers it.
+    "cmd/wire-conformance",
+    "extensions/durability",
+    "bindings/ffi",
+    "bindings/sdk",
+    "bindings/shell",
 ]
 
 [workspace.package]

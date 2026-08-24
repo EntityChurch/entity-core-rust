@@ -57,7 +57,8 @@ class ecosystem-wide).
 ## Setup / environment
 
 - **Cargo workspace.** Build via `make` over podman (host needs only `make` + podman);
-  see `Makefile` for the verb set — `make test` / `make clippy` / `make fmt` / `make wasm`.
+  see `Makefile` for the verb set — `make test` / `make clippy` / `make fmt` / `make godot` /
+  `make wasm`.
 - **Edition / MSRV:** edition 2021; toolchain pinned to **1.94.1** via `rust-toolchain.toml`
   (ships `clippy`, `rustfmt`, and the `wasm32-unknown-unknown` target).
 - Cross-compile target for browser builds: `wasm32-unknown-unknown`.
@@ -68,12 +69,14 @@ class ecosystem-wide).
 ## Build & test
 
 ```bash
-make test                      # full suite (cargo build + cargo test all)
+make test                      # full suite over default-members (see below)
 make clippy                    # lint
 make fmt                       # format
 cargo test -p entity-core      # single crate (use -p <crate> for any other)
+make godot                     # bindings/godot lane — NOT in default-members (see below)
 make wasm                      # wasm32 CI build (see below)
 make features                  # 27-configuration cfg matrix — see below
+make check                     # lint + test + godot
 ```
 
 **Run `make features` whenever a change adds or moves a guard, and always when it
@@ -88,6 +91,41 @@ cfg-gating hazard already named below, from the other direction: not a gated sym
 misread as an absent surface, but a gated symbol quietly removing a guard that
 depends on it. **A security invariant of the dispatch core must not be reachable
 only through an extension's feature gate** — say so at the `fn` when you un-gate one.
+
+**And the same shape one level out, at the PACKAGE set: `make test` / `make clippy` /
+`make fmt` run `default-members`, so a member left out of that list is out of the gate
+entirely — and the gate will report a green number for the set it ran.** This repo has
+no CI workflows; every other `make` verb names its packages explicitly (`build` → `-p
+entity-cli`, `wasm` → `-p entity-peer` + the worker crates, `features` → `-p
+entity-peer`), so `default-members` **is** the coverage boundary, not a build-speed
+knob. Six members sat outside it with no stated reason: `7c21d04` then changed
+`make_execute_fn`'s signature and broke `entity-sdk`'s **compile**, `90e60c0` repaired
+the call sites, and the §5.2 ceiling it introduced left `entity-sdk`'s
+`follow_continuation_standing_leg_fires_cross_peer` red on `dev` for five days. Both
+commits reported *"make test 115 suites green"* and both were honest about the set they
+ran. Five of the six joined the list (2220 → 2628 tests, 116 → 127 suites, cold peak
+2.12 → 2.37 GiB); `bindings/godot` got **`make godot`** instead, because `godot 0.4`'s
+`codegen-full` is one rustc peaking at **4.44 GiB** against 2.12 GiB for the entire rest
+of the workspace, and folding it in would have forced `CAP_MEM` from 4g to 8g for every
+`make test` on every machine. That lane also selects `-p entity-sdk`: the sdk's
+`identity`/`role`/`quorum`/`attestation`/`compute` features are default-off and godot is
+the only crate that enables them, so 43 sdk tests live only in that unification group
+(216 in `make test`, 259 in `make godot`). **A second lane is not a place to put a crate
+you'd rather not build — it is a place where something is actually run, and you owe the
+count that proves it.** **Enforcement, written at the `default-members` block
+itself: an excluded member owes a comment naming the lane that covers it, exactly as the
+four `bindings/wasm-worker-*` crates do** (`make wasm`) — or it belongs in the list. The
+wrong fix is `--workspace` on `make test`: it compiles the wasm-only crates natively to
+empty modules, which is coverage that reads as coverage and is not. Same check for any
+*new* crate: `cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name'`
+against the default set before you claim the gate covers it. And when the reason for an
+exclusion is **cost**, measure it — `cat /sys/fs/cgroup/memory.peak` inside the run
+container, against a fresh `CARGO_TARGET_DIR` — rather than asserting the crate is heavy.
+
+**So the gate is now four commands, not three: `make test` · `make lint` · `make godot`
+· `make wasm`** (`make check` = the first three; `make features` on top whenever a change
+adds or moves a `cfg` guard). Two of them exist because two members are deliberately out
+of `default-members`, and each of those exclusions names its lane at the exclusion.
 
 If the podman build fails with `could not parse/generate dep info … Permission
 denied (os error 13)`, that is an SELinux MCS relabel race against the shared
