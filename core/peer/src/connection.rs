@@ -2873,19 +2873,27 @@ pub fn make_execute_fn(
                         ) {
                             Ok(bundle) => (Some(cap), bundle),
                             Err(e) => {
-                                // Chain not fully resolvable locally (unexpected —
-                                // install persists it per §3.2 step 5). Send the
-                                // scoped leaf cap anyway; B fails closed on its
-                                // VerifyChain. That is safe and conformant — we
-                                // never substitute the connection grant, so this
-                                // is not a §6.8 escalation.
+                                // EXTENSION-CONTINUATION v1.22 §4.3: a bundler
+                                // that cannot resolve a chain link — or the
+                                // `system/peer` identity of any granter or
+                                // grantee in it — MUST fail HERE with
+                                // `chain_unreachable` rather than dispatch an
+                                // incomplete bundle. The prior behaviour sent
+                                // the leaf alone and let B fail closed; that is
+                                // not an escalation, but it is non-conformant
+                                // and it moved a defect the dispatcher can see
+                                // (and name) into a 401 on the far side that
+                                // reads as the target's problem.
                                 tracing::warn!(
                                     cap = %cap.content_hash,
                                     error = %e,
-                                    "continuation dispatch: authority chain \
-                                     unresolvable; sending scoped leaf cap only"
+                                    "continuation dispatch: authority chain or a \
+                                     granter/grantee identity is unresolvable; \
+                                     refusing to dispatch an incomplete bundle"
                                 );
-                                (Some(cap), std::collections::HashMap::new())
+                                return Err(HandlerError::Internal(
+                                    "chain_unreachable".to_string(),
+                                ));
                             }
                         },
                         None => (None, empty_bundle),

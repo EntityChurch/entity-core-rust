@@ -1,6 +1,6 @@
 # entity-core-rust — status
 
-_Updated: 2026-08-13 · public: v0.8.0 (master)_
+_Updated: 2026-08-14 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -34,6 +34,88 @@ and tree semantics are interop-validated against the Go and Python peers, not
 just self-tested.
 
 ## Where we left off
+
+_2026-08-14 (b) — **the admin-seeded posture is expressible on rust's wire; `--seed-policy` is the
+flag core-go asked for.**_
+
+Core-go's `2026-08-14-c` report was accurate about us: `entity-peer` had `--debug-grants` and
+nothing between it and the bare §4.4 floor, so the EXTENSION-ROLE §4.7 initial-grant gating family
+could not be measured against a rust peer at all — open access hides the gate, and full restriction
+denies the validator its own setup. Built the third posture: `entity peer start --seed-policy
+<file>` reading the **keystone canonical** schema (`{version:1, entries:[{grantee, grants}]}`), the
+same document go's `--seed-policy-file` and python's `--seed-policy` take; `PeerBuilder::
+with_seed_policy_from_file` closes the builder-doc deferral that was waiting on exactly that
+ratification. `self` skipped, `version != 1` refused, and both pre-convergence shapes (go's old
+`[{pattern,grants}]` array, python's keyed object) refused with the expected shape in the error.
+Gate: `make test` **2067 / 0F** · clippy · fmt · wasm. Outgoing packet:
+`ROUTING-2026-08-14-rust-wired-the-seed-policy-flag-*`.
+
+**Three things went back with it.** `peer-manager` cannot start a rust peer in the posture yet for
+two reasons that are ours to name: the seed file is written to the host's `os.TempDir()`, which is
+not inside the `~/.entity`-only bind mount a containerized rust peer sees; and `startRustPeer`
+appends `--debug-grants` unconditionally, which rust now **refuses** alongside `--seed-policy` at
+argument parse — a misconfigured admin-seeded peer fails to start rather than coming up green and
+silently non-restrictive. Third: we fail closed on `bounds`/`constraints`/`allowances` where go's
+loader accepts and silently drops them (all three narrow authority, so dropping one widens the
+grant); that divergence in what a peer *accepts* is routed to go + the format owners rather than
+settled unilaterally. Also flagged to keystone: the canonical example carries a `_comment` inside
+an entry, which its own `additionalProperties: false` schema forbids. **Not claimed:** that the
+three `role_stage2_recognize_on_attest_*` rows pass against rust — they remain unmeasured until
+`peer-manager` can start the peer.
+
+_2026-08-14 — **core-go's control row caught a merge defect we had built from the pseudocode,
+and four blocked rows were hiding three more.**_
+
+Their §4 packet carried two items: one filed as a finding, one filed explicitly as *not* a bug
+report because their probe could not establish it. **The one they did not file is the defect.**
+Outgoing packet: `ROUTING-2026-08-14-your-observation-was-a-defect-*`.
+
+**§4.4.4 states the oscillation check twice and the two disagree.** Invariant (3) (v3.2, A.3)
+is normative and pins the comparison to the candidate's **full identity** —
+`{root, sorted_parents}` — naming the consequence of getting it wrong: same-root-different-parents
+is a legitimate cross-link, and treating it as oscillation *"leaves heads stuck at divergent
+terminals — convergence becomes impossible."* The `detect_oscillation` pseudocode two screens
+down takes no parents and compares the root alone. **We had built the pseudocode.** When every
+conflicted path keeps its local side — `three-way`, `target-wins`, `manual` all do — the merged
+root equals the local head's root, so the check fired on the first merge against any diverging
+remote, on a fresh peer, with none of §4.4.4's four cycling preconditions present. Fixed to the
+invariant; the pseudocode contradiction is logged and routed.
+
+**Behind their control sat three more, all ours, none visible while it failed.** Per-type
+merge-config was skipped for the canonical shape (our decoder demanded a `pattern` field that a
+type-scoped config has no reason to carry); step 1 consulted one type instead of §5.1's
+local-then-remote; and `lww` / `handler` were swept into the default arm — the exact v3.10
+defect, in our tree — instead of degrading to a conflict entity. Their item 1 (the `handler`
+sentinel with no companion path, now `400 invalid_strategy` at config-write) is built with its
+own accepted-with-path control.
+
+`revision` **97 P / 6 F → 103 P / 0 F**; full surface **1452 P / 18 W / 0 F / 28 S (1498)**,
+zero failures anywhere. Four mutations executed, each failing exactly the rows that claim it.
+
+**CONTINUATION v1.22 §4.3 landed in the same cycle**, and it closes the ambiguity we routed on
+08-13: arch ruled the bundle MUST carry a `system/peer` for every granter **and grantee**, and a
+bundler that cannot resolve one MUST fail at bundle time with `chain_unreachable` rather than
+dispatch an incomplete bundle. Built both halves — grantee collection (previously picked up only
+where a grantee happened also to be a granter, which is why a self-rooted cap passed and a §4.2
+case-3 chain did not) and the fail-closed dispatch. Convergence is **99 P / 0 F in both
+directions**, including **rust(A) → go(B)** — the pairing that drives our bundler and that no
+prior run had exercised. §3.6a and §3.6b remain unbuilt.
+
+**One finding routed outward rather than fixed:** the three `role_stage2_recognize_on_attest_*`
+convergence rows are order-dependent — green on a fresh peer, red on a peer that has served one
+full single-peer run — and **go's own peer reproduces it identically**. The handshake unions the
+resolver's answer with the `system/capability/policy` table's `default` entry (V7 §4.4/§8, which
+go implements the same way), and an earlier category leaves such an entry carrying the
+validator's own wildcard grants. Same shape as the leak core-go caught in themselves this cycle.
+Measured on four runs across both implementations before routing it, because our first sighting
+was on a peer that had served a full run and reading it as our regression would have been wrong.
+
+**Named, not glossed:** §5.3 delegation is unbuilt here — we degrade unconditionally, so the
+degrade row passes against us for a reason weaker than it looks, and we take no position on
+A-6 E1 until we have something on the wire to be wrong about. `system/substitute/http` is still
+unwired (the crate has no consumer; registering it is a caller-triggered outbound-GET posture
+decision, not a line). CONTINUATION v1.22 is next, starting with §4.3 bundle completeness —
+which is also arch's answer to the ambiguity we routed on 08-13.
 
 _2026-08-13 — **§6a.9.3 built the same day it was ruled, containment audited clean, and the
 rexec seam is a verifier MUST the bundler cannot keep.**_

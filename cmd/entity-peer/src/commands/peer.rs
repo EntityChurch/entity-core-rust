@@ -106,6 +106,7 @@ pub async fn start(
     serve_closure_root: bool,
     storage_override: Option<&str>,
     debug_grants: bool,
+    seed_policy: Option<&str>,
     history_flag: Option<&str>,
     files_flag: Option<&str>,
     hash_type: &str,
@@ -214,6 +215,20 @@ pub async fn start(
     let mut builder = PeerBuilder::new()
         .identity_keypair(keypair)
         .config(peer_config);
+
+    // V7 §6.9a: the declared identity → capability seed policy, in the
+    // keystone-owned canonical file format every impl reads. This is the ONLY
+    // admission posture between `--debug-grants` (everything, to everyone) and
+    // the bare §4.4 discovery floor (nothing beyond read + request, to anyone)
+    // — the third posture a gating check needs: a named operator identity can
+    // stage its own setup while unknown peers stay gated by the initial-grant
+    // policy. clap makes it exclusive with `--debug-grants`, which would union
+    // open grants onto every connection and hide exactly the gate this
+    // declares.
+    if let Some(path) = seed_policy {
+        builder = builder.with_seed_policy_from_file(path)?;
+        println!("  seed policy: {} (§6.9a)", path);
+    }
 
     // EXTENSION-NETWORK §2.3 keepalive overrides. Zero-valued fields keep
     // their spec defaults, so an untouched CLI leaves the builder alone.

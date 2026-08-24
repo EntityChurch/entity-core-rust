@@ -1362,16 +1362,43 @@ mod tests {
         );
     }
 
-    /// Best-effort: a link whose identity / bound signature is not locally
-    /// resolvable is omitted — the resolvable cap is still bundled, no error.
+    /// EXTENSION-CONTINUATION v1.22 §4.3: an identity the bundle MUST carry
+    /// and cannot resolve fails at BUNDLE time. The pre-v1.22 behaviour
+    /// omitted it and dispatched anyway, which turned a defect the dispatcher
+    /// could name into a `401 UnresolvableGrantee` on the far side.
     #[test]
-    fn test_collect_chain_bundle_best_effort() {
+    fn test_collect_chain_bundle_unresolvable_identity_fails_closed() {
         let kp = Keypair::generate();
         let id = kp.peer_entity().unwrap();
-        // Cap present; NO identity entity and NO bound signature in the store.
+        // Cap present; NO identity entity in the store.
         let cap = make_cap_entity(id.content_hash, id.content_hash, None);
         let store: std::collections::HashMap<Hash, Entity> =
             [(cap.content_hash, cap.clone())].into();
+        let li: std::collections::HashMap<String, Hash> = std::collections::HashMap::new();
+
+        let err = collect_chain_bundle(
+            &cap.content_hash,
+            |h| store.get(h).cloned(),
+            |p| li.get(p).cloned(),
+        )
+        .expect_err("an unresolvable granter identity MUST fail the bundle");
+        assert!(matches!(err, ChainWalkError::Unreachable));
+    }
+
+    /// The other half of the same rule: signatures stay best-effort. With the
+    /// identity present but no bound signature at the invariant-pointer path,
+    /// the bundle succeeds and simply carries no signature — B fails closed if
+    /// it needed one.
+    #[test]
+    fn test_collect_chain_bundle_signature_stays_best_effort() {
+        let kp = Keypair::generate();
+        let id = kp.peer_entity().unwrap();
+        let cap = make_cap_entity(id.content_hash, id.content_hash, None);
+        let store: std::collections::HashMap<Hash, Entity> = [
+            (cap.content_hash, cap.clone()),
+            (id.content_hash, id.clone()),
+        ]
+        .into();
         let li: std::collections::HashMap<String, Hash> = std::collections::HashMap::new();
 
         let bundle = collect_chain_bundle(
@@ -1381,14 +1408,55 @@ mod tests {
         )
         .unwrap();
 
-        assert!(
-            bundle.contains_key(&cap.content_hash),
-            "resolvable cap still bundled"
-        );
+        assert!(bundle.contains_key(&cap.content_hash), "cap bundled");
+        assert!(bundle.contains_key(&id.content_hash), "identity bundled");
         assert!(
             !bundle.values().any(|e| e.entity_type == TYPE_SIGNATURE),
             "no signature should be present (none was resolvable)"
         );
+    }
+
+    /// v1.22 §4.3: the grantee's identity travels too — "not only for those
+    /// that happen to also be a granter". This is the §4.2 case-3 shape: a
+    /// third-party grantee that is neither the author nor the serving peer.
+    #[test]
+    fn test_collect_chain_bundle_carries_grantee_identity() {
+        let granter_kp = Keypair::generate();
+        let grantee_kp = Keypair::generate();
+        let granter_id = granter_kp.peer_entity().unwrap();
+        let grantee_id = grantee_kp.peer_entity().unwrap();
+
+        let cap = make_cap_entity(granter_id.content_hash, grantee_id.content_hash, None);
+        let mut store: std::collections::HashMap<Hash, Entity> = [
+            (cap.content_hash, cap.clone()),
+            (granter_id.content_hash, granter_id.clone()),
+            (grantee_id.content_hash, grantee_id.clone()),
+        ]
+        .into();
+        let li: std::collections::HashMap<String, Hash> = std::collections::HashMap::new();
+
+        let bundle = collect_chain_bundle(
+            &cap.content_hash,
+            |h| store.get(h).cloned(),
+            |p| li.get(p).cloned(),
+        )
+        .unwrap();
+        assert!(
+            bundle.contains_key(&grantee_id.content_hash),
+            "grantee identity MUST be in the bundle — V7 §5.5 step 2a resolves \
+             every link's grantee against `included`"
+        );
+
+        // Drop the grantee identity: the same bundle MUST now fail, which is
+        // what makes the row above load-bearing rather than incidental.
+        store.remove(&grantee_id.content_hash);
+        let err = collect_chain_bundle(
+            &cap.content_hash,
+            |h| store.get(h).cloned(),
+            |p| li.get(p).cloned(),
+        )
+        .expect_err("an unresolvable grantee identity MUST fail the bundle");
+        assert!(matches!(err, ChainWalkError::Unreachable));
     }
 
     // -------------------------------------------------------------------

@@ -616,19 +616,15 @@ impl RevisionHandler {
                     .as_ref()
                     .ok_or_else(|| HandlerError::InvalidParams("missing_config".into()))?;
 
-                // EXTENSION-REVISION v3.1 §2.3 strategy-rejection contract:
-                // `deletion_resolution: lww` / `keep-both` MUST be rejected
-                // with 400 `invalid_strategy` at config-write time.
-                if let Some(rejected) = validate_merge_config_for_write(config_data) {
+                // EXTENSION-REVISION §2.3 strategy-rejection contract:
+                // `deletion_resolution: lww` / `keep-both`, and the `handler`
+                // sentinel without its companion path, MUST be rejected with
+                // 400 `invalid_strategy` at config-write time.
+                if let Some(reason) = validate_merge_config_for_write(config_data) {
                     return Ok(error_result(
                         STATUS_BAD_REQUEST,
                         "invalid_strategy",
-                        &format!(
-                            "deletion_resolution: {:?} is not a valid value (see EXTENSION-REVISION §2.3); \
-                             use one of preserve-on-conflict | deletion-wins | three-way-fallthrough \
-                             | deterministic | <handler-path>",
-                            rejected
-                        ),
+                        &reason,
                     ));
                 }
 
@@ -768,21 +764,58 @@ fn decode_merge_config_params(data: &[u8]) -> Result<MergeConfigParams, HandlerE
 }
 
 /// Validate a `system/revision/merge-config` entity's `data` for write.
-/// Returns `Some(rejected_value)` if `deletion_resolution` carries a
-/// MUST-reject value (`lww` or `keep-both`); `None` otherwise.
-/// EXTENSION-REVISION v3.1 §2.3 lines 217–219.
+/// Returns `Some(reason)` when the config MUST be rejected `400
+/// invalid_strategy` at config-write time; `None` otherwise. Two rules,
+/// both EXTENSION-REVISION §2.3:
+///
+/// 1. `deletion_resolution: lww` / `keep-both` — explicitly invalid values
+///    (v3.1 Amendment 4).
+/// 2. `strategy: "handler"` with no companion `handler` path (v3.9's
+///    correction: the sentinel names the dispatch, the `handler` field
+///    carries the target). Such a config can never dispatch, so accepting
+///    it defers the misconfiguration to some later merge on an unrelated
+///    path instead of reporting it at the write that caused it.
+///
+/// Non-sentinel `strategy` values are NOT rejected here: v3.10 rules `lww`
+/// accepted-but-unresolvable (it MUST degrade to a conflict entity, §5.1),
+/// and the write-time rejection contract is pinned to the two cases above.
 fn validate_merge_config_for_write(data: &[u8]) -> Option<String> {
     let val: ciborium::Value = ciborium::from_reader(data).ok()?;
     let map = val.as_map()?;
+
+    let mut strategy = None;
+    let mut handler = None;
     for (k, v) in map {
-        if k.as_text() == Some("deletion_resolution") {
-            if let Some(s) = v.as_text() {
-                if merge::DeletionResolution::is_rejected_at_config_write(s) {
-                    return Some(s.to_string());
+        match k.as_text() {
+            Some("deletion_resolution") => {
+                if let Some(s) = v.as_text() {
+                    if merge::DeletionResolution::is_rejected_at_config_write(s) {
+                        return Some(format!(
+                            "deletion_resolution: {:?} is not a valid value (see EXTENSION-REVISION \
+                             §2.3); use one of preserve-on-conflict | deletion-wins | \
+                             three-way-fallthrough | deterministic | <handler-path>",
+                            s
+                        ));
+                    }
                 }
             }
+            Some("strategy") => strategy = v.as_text(),
+            Some("handler") => handler = v.as_text(),
+            _ => {}
         }
     }
+
+    if strategy == Some(merge::STRATEGY_HANDLER_SENTINEL)
+        && handler.is_none_or(|h| h.trim().is_empty())
+    {
+        return Some(
+            "strategy: \"handler\" is the custom-dispatch sentinel and requires the companion \
+             `handler` path (EXTENSION-REVISION §2.3, corrected v3.9); without it the config can \
+             never dispatch"
+                .to_string(),
+        );
+    }
+
     None
 }
 
@@ -1677,6 +1710,12 @@ impl RevisionHandler {
             trie::build_trie(self.content_store.as_ref(), &merge_result.merged_bindings)
                 .map_err(HandlerError::Internal)?;
 
+        // The merge version's identity — root plus sorted parents. Built here
+        // rather than after the oscillation check because §4.4.4 invariant (3)
+        // compares the *full* identity against recent ancestors.
+        let mut parents = vec![local_head, remote_version];
+        trie::sorted_parents(&mut parents);
+
         // Oscillation detection
         // W6: oscillation_depth from config, clamped to min 2
         let osc_depth = prefix_config
@@ -1687,6 +1726,7 @@ impl RevisionHandler {
         if detect_oscillation(
             self.content_store.as_ref(),
             merged_root,
+            &parents,
             local_head,
             osc_depth,
         ) {
@@ -1701,9 +1741,6 @@ impl RevisionHandler {
         }
 
         // Create merge version using RevisionEntryData
-        let mut parents = vec![local_head, remote_version];
-        trie::sorted_parents(&mut parents);
-
         let entry_data = RevisionEntryData {
             root: merged_root,
             parents,
@@ -4458,6 +4495,85 @@ mod tests {
         // Binding is present at the canonical path.
         let path = format!("/{}/system/revision/config/merge/path/test", test_peer_id());
         assert!(li.get(&path).is_some());
+    }
+
+    /// Build merge-config params carrying the sentinel's companion `handler`
+    /// field, which `make_merge_config_params` does not model.
+    fn make_handler_config_params(name: &str, handler: Option<&str>) -> Entity {
+        let mut config_fields: Vec<(entity_ecf::Value, entity_ecf::Value)> = vec![
+            (entity_ecf::text("pattern"), entity_ecf::text(name)),
+            (entity_ecf::text("strategy"), entity_ecf::text("handler")),
+        ];
+        if let Some(h) = handler {
+            config_fields.push((entity_ecf::text("handler"), entity_ecf::text(h)));
+        }
+        let fields: Vec<(entity_ecf::Value, entity_ecf::Value)> = vec![
+            (entity_ecf::text("scope"), entity_ecf::text("path")),
+            (entity_ecf::text("name"), entity_ecf::text(name)),
+            (entity_ecf::text("action"), entity_ecf::text("set")),
+            (
+                entity_ecf::text("config"),
+                entity_ecf::Value::Map(config_fields),
+            ),
+        ];
+        let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(fields));
+        Entity::new("system/revision/merge-config-params", data).unwrap()
+    }
+
+    #[tokio::test]
+    async fn merge_config_rejects_handler_sentinel_without_companion_path() {
+        // EXTENSION-REVISION §2.3 (corrected v3.9): `strategy: "handler"` is
+        // the sentinel; the companion `handler` field carries the target. A
+        // sentinel with no target can never dispatch, so accepting it defers
+        // the misconfiguration to some later merge on an unrelated path
+        // instead of reporting it at the write that caused it.
+        let (store, li) = make_stores();
+        let handler = make_handler(store.clone(), li.clone());
+        let ctx = make_ctx("merge-config", make_handler_config_params("nopath", None));
+        let result = handler.handle(&ctx).await.unwrap();
+        assert_eq!(
+            result.status, STATUS_BAD_REQUEST,
+            "sentinel without its companion path MUST be rejected at config-write time"
+        );
+        let v: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
+        let code = v
+            .as_map()
+            .unwrap()
+            .iter()
+            .find_map(|(k, v)| {
+                if k.as_text() == Some("code") {
+                    v.as_text().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default();
+        assert_eq!(code, "invalid_strategy");
+        let path = format!(
+            "/{}/system/revision/config/merge/path/nopath",
+            test_peer_id()
+        );
+        assert!(li.get(&path).is_none(), "rejected config MUST NOT be bound");
+    }
+
+    #[tokio::test]
+    async fn merge_config_accepts_handler_sentinel_with_companion_path() {
+        // The control for the row above: the same write with the companion
+        // field present MUST be accepted, so the rejection is attributable to
+        // the missing path and not to the sentinel itself.
+        let (store, li) = make_stores();
+        let handler = make_handler(store.clone(), li.clone());
+        let ctx = make_ctx(
+            "merge-config",
+            make_handler_config_params("withpath", Some("app/merge/text")),
+        );
+        let result = handler.handle(&ctx).await.unwrap();
+        assert_eq!(result.status, STATUS_OK);
+        let path = format!(
+            "/{}/system/revision/config/merge/path/withpath",
+            test_peer_id()
+        );
+        assert!(li.get(&path).is_some(), "valid sentinel config must land");
     }
 
     #[tokio::test]

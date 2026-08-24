@@ -540,6 +540,31 @@ pub struct RemoteState {
     /// by [`DialGuard`] when the last holder drops, so a hub dialing many peers
     /// does not leak gates (bounded memory).
     dialing: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// The **sequential** twin of `dialing`: per-peer consecutive-failure
+    /// bookkeeping for the §10.3 seam, so a caller that keeps re-dispatching to
+    /// an unreachable peer spaces its consultations out instead of running them
+    /// at whatever rate it happens to dispatch. See
+    /// [`crate::live_establish::ESTABLISH_FREE_CONSULTATIONS`] for the ruling
+    /// this implements and why it needs no new signal from the seam.
+    ///
+    /// Entries exist only for peers with a *current* failure streak: any pooled
+    /// connection clears one ([`RemoteState::note_establish_success`], called
+    /// from both pool-insert paths), and an entry nobody has retried for a whole
+    /// cap beyond its cooldown is pruned on the next failure — so this map is
+    /// bounded by the peers being retried right now, not by every peer ever
+    /// consulted.
+    establish_backoff: Mutex<HashMap<String, EstablishBackoff>>,
+}
+
+/// One peer's consecutive-failure streak at the §10.3 seam.
+#[derive(Debug, Clone, Copy)]
+struct EstablishBackoff {
+    /// Consultations that have failed in a row. Cleared by a pooled connection,
+    /// never by time — a peer that fails, gets skipped, then fails again keeps
+    /// climbing instead of oscillating back to full rate.
+    consecutive: u32,
+    /// Earliest instant at which the next consultation for this peer may run.
+    next_allowed: web_time::Instant,
 }
 
 impl Default for RemoteState {
@@ -548,6 +573,7 @@ impl Default for RemoteState {
             conns: Mutex::new(HashMap::new()),
             inbound: Mutex::new(HashMap::new()),
             dialing: Mutex::new(HashMap::new()),
+            establish_backoff: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -630,6 +656,81 @@ impl RemoteState {
         }
     }
 
+    /// How long until the §10.3 seam may be consulted again for `peer_id`, or
+    /// `None` if it may be consulted now.
+    ///
+    /// The sequential bound described on
+    /// [`crate::live_establish::ESTABLISH_FREE_CONSULTATIONS`]. Read at the call
+    /// site *after* the seam lookup, so a peer with no establisher registered
+    /// never accumulates a streak for a consultation that never happened.
+    pub fn establish_cooldown_remaining(&self, peer_id: &str) -> Option<std::time::Duration> {
+        let map = self.establish_backoff.lock().unwrap();
+        let entry = map.get(peer_id)?;
+        entry
+            .next_allowed
+            .checked_duration_since(web_time::Instant::now())
+            .filter(|d| !d.is_zero())
+    }
+
+    /// Record that a §10.3 consultation for `peer_id` is being *made*, and
+    /// compute when the next one may run.
+    ///
+    /// **The consultation is counted at its start, not at its outcome, and that
+    /// is load-bearing.** Recording on the `Err` return instead looks equivalent
+    /// and measured worse by a factor of ~1.7: a consultation whose future is
+    /// *dropped* — the caller's dispatch timed out, the surface moved on — never
+    /// returns anything to record, while the negotiation it started has already
+    /// deposited into someone else's carrier. Counting the ask rather than the
+    /// answer is also the simpler contract, and the honest one: this is a rate
+    /// limit on how often the caller may *consult*, which is the thing a carrier
+    /// feels.
+    ///
+    /// It follows that every outcome counts alike — `NoPath`, `Refused`,
+    /// `NotAttempted`, and cancellation. §10.3 already makes all three error
+    /// variants the same fall-through, and the call site cannot know what a
+    /// policy spent before producing one. (A per-variant schedule is a plausible
+    /// refinement; it needs a reason beyond symmetry.)
+    pub fn note_establish_attempt(&self, peer_id: &str) {
+        use crate::live_establish::{
+            ESTABLISH_BACKOFF_BASE, ESTABLISH_BACKOFF_CAP, ESTABLISH_FREE_CONSULTATIONS,
+        };
+        let now = web_time::Instant::now();
+        let mut map = self.establish_backoff.lock().unwrap();
+
+        // Prune streaks nobody is retrying any more. An entry whose cooldown
+        // elapsed a whole cap ago has had no consultation in that window, so the
+        // pressure this bound exists to relieve is gone and the streak carries
+        // no information worth the memory. Peers still being retried refresh
+        // `next_allowed` on every attempt and so are never pruned.
+        map.retain(|_, b| now <= b.next_allowed + ESTABLISH_BACKOFF_CAP);
+
+        let entry = map.entry(peer_id.to_string()).or_insert(EstablishBackoff {
+            consecutive: 0,
+            next_allowed: now,
+        });
+        entry.consecutive = entry.consecutive.saturating_add(1);
+        let delay = match entry.consecutive.checked_sub(ESTABLISH_FREE_CONSULTATIONS) {
+            // Still inside the grace window — full rate, no spacing at all.
+            None | Some(0) => std::time::Duration::ZERO,
+            Some(over) => ESTABLISH_BACKOFF_BASE
+                .saturating_mul(1u32.checked_shl(over - 1).unwrap_or(u32::MAX))
+                .min(ESTABLISH_BACKOFF_CAP),
+        };
+        entry.next_allowed = now + delay;
+    }
+
+    /// Clear any §10.3 failure streak for `peer_id` — called from both
+    /// pool-insert paths, so *any* connection that reaches the pool resets the
+    /// backoff whether it came from a dial or from the seam.
+    ///
+    /// Deliberately keyed on **pooling**, not on the seam returning `Ok`: a path
+    /// that opens and then fails its handshake never becomes a usable
+    /// connection, and clearing on `Ok` would let that case retry at full rate
+    /// forever — the exact shape this bound exists to stop.
+    pub fn note_establish_success(&self, peer_id: &str) {
+        self.establish_backoff.lock().unwrap().remove(peer_id);
+    }
+
     /// Insert a `RemoteConnection` (stream transport) into the pool.
     /// Returns the existing entry if another task connected in the
     /// meantime (race resolution).
@@ -645,6 +746,9 @@ impl RemoteState {
         peer_id: &str,
         endpoint: Arc<dyn RemoteEndpoint>,
     ) -> Arc<dyn RemoteEndpoint> {
+        // A connection reached the pool: whatever produced it, this peer is
+        // reachable right now, so any §10.3 failure streak is stale.
+        self.note_establish_success(peer_id);
         let mut conns = self.conns.lock().unwrap();
         if let Some(existing) = conns.get(peer_id) {
             return existing.clone();
@@ -664,6 +768,8 @@ impl RemoteState {
     /// error evicts it. A replaced binding's keepalive loop notices the
     /// swap on its next tick and exits.
     pub fn rebind_endpoint(&self, peer_id: &str, endpoint: Arc<dyn RemoteEndpoint>) {
+        // Same reasoning as `insert_endpoint`: a live binding clears the streak.
+        self.note_establish_success(peer_id);
         self.conns
             .lock()
             .unwrap()
@@ -902,7 +1008,7 @@ pub async fn get_or_connect(
             // Ordered BEFORE the §10.2 delivery fallback (MUST, §10.3) — which
             // this tree does not implement, so the ordering holds trivially and
             // is not evidence for the rule. See the punch scope checkpoint.
-            if let Some(path) = try_establish_live(peer_id, reentry.as_ref()).await {
+            if let Some(path) = try_establish_live(pool, peer_id, reentry.as_ref()).await {
                 let punched_addr = path.connection.remote_addr.clone();
                 return adopt_transport_connection(
                     pool,
@@ -1269,14 +1375,44 @@ pub const RECIPROCAL_GRANT_VECTOR_FLOOR_MS: u64 = 2000;
 /// *fall-through*, never an error. A platform without the §7.3 socket options
 /// lands here too.
 async fn try_establish_live(
+    pool: &RemoteState,
     peer_id: &str,
     reentry: Option<&Arc<crate::PeerShared>>,
 ) -> Option<crate::live_establish::LivePath> {
     let seam = reentry?.live_establish.as_ref()?;
+
+    // The sequential bound (see `live_establish::ESTABLISH_FREE_CONSULTATIONS`).
+    // Obligation 5 already bounds *concurrent* consultations per peer at the
+    // pool; this bounds *consecutive* ones, which is what an unreachable peer
+    // actually produces — the caller re-dispatches, each consultation is
+    // individually conformant, and the series is unbounded.
+    //
+    // Read AFTER the seam lookup on purpose: a peer with no establisher
+    // registered must not accumulate a streak for a consultation that never
+    // happened, or the additive no-regression property would acquire state.
+    if let Some(remaining) = pool.establish_cooldown_remaining(peer_id) {
+        tracing::debug!(
+            remote_peer = %peer_id,
+            cooldown_ms = remaining.as_millis() as u64,
+            "step 3b: skipping the §10.3 seam — consecutive failures for this peer \
+             are being spaced out; falling through as if no path came up"
+        );
+        return None;
+    }
+
     tracing::debug!(
         remote_peer = %peer_id,
         "step 3b: no durable profile; consulting the §10.3 live-establishment seam"
     );
+    // Charge the consultation BEFORE awaiting it, not on its result. A dropped
+    // future (dispatch timeout, abandoned surface) produces no result to charge,
+    // and the negotiation it started has already reached the carrier — so
+    // recording at the outcome silently exempts exactly the attempts a loaded or
+    // impatient caller makes most of. The streak is cleared when a connection
+    // reaches the pool (`note_establish_success` from the insert paths), never
+    // on `Ok` here: a path that opens and then fails its handshake is not a
+    // reachable peer.
+    pool.note_establish_attempt(peer_id);
     // §10.3: the seam MUST carry a deadline. This is the *dispatch* caller, so
     // the policy owns its own exchange budget (§7.2 — up to 3). The §4.1
     // reconnection path constructs `EstablishCtx::reconnect` instead, which

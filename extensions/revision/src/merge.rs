@@ -81,9 +81,19 @@ pub struct ConflictInfo {
     pub strategy: String,
 }
 
-/// Merge strategy (EXTENSION-REVISION §5.1).
+/// The custom-dispatch sentinel (§2.3, corrected v3.9). `strategy` names the
+/// sentinel; the companion `handler` field carries the target path. A bare
+/// path in `strategy` is the retracted encoding and is not accepted.
+pub const STRATEGY_HANDLER_SENTINEL: &str = "handler";
+
+/// Merge strategy (EXTENSION-REVISION §2.3 built-in table / §5.1 cascade).
 ///
-/// LWW is removed — no timestamps in structural version entries.
+/// Every value in §2.3's table has a named arm here. That is not a style
+/// preference: v3.10 pins that an accepted-but-unresolvable strategy MUST
+/// degrade to a conflict entity and MUST NOT be swept into a default arm —
+/// a strategy that falls into `default` is indistinguishable from one nobody
+/// has heard of, and whether a peer records a divergence or silently picks a
+/// side is cross-peer observable.
 #[derive(Debug, Clone, PartialEq)]
 pub enum MergeStrategy {
     ThreeWay,
@@ -91,27 +101,54 @@ pub enum MergeStrategy {
     TargetWins,
     Manual,
     KeepBoth,
+    /// §5.3 custom dispatch — the sentinel plus its companion handler path.
+    /// Delegation (`merge-request` → `merge-response`) is not built here, so
+    /// this degrades to a conflict entity; see the §5.3 note in `AGENTS.md`
+    /// terms: the disposition for a handler that cannot be reached is a
+    /// conflict entity for the one path, never a failed merge and never a
+    /// silent auto-resolve.
+    Handler(String),
+    /// Accepted vocabulary this peer cannot resolve. `lww` is the only member
+    /// today: v3.10 rules it a spec gap (the comparison basis is unspecified),
+    /// keeps it in the vocabulary, and pins that it MUST degrade to a conflict
+    /// entity rather than auto-resolve on a guessed basis.
+    Unresolvable(String),
 }
 
 impl MergeStrategy {
-    pub fn parse(s: &str) -> Option<MergeStrategy> {
-        match s {
+    /// Parse a `strategy` value together with its companion `handler` path
+    /// (§2.3). Returns `None` for a value outside the built-in table — the
+    /// caller treats that config as absent and continues the cascade.
+    pub fn parse(strategy: &str, handler: Option<&str>) -> Option<MergeStrategy> {
+        match strategy {
             "three-way" => Some(MergeStrategy::ThreeWay),
             "source-wins" => Some(MergeStrategy::SourceWins),
             "target-wins" => Some(MergeStrategy::TargetWins),
             "manual" => Some(MergeStrategy::Manual),
             "keep-both" => Some(MergeStrategy::KeepBoth),
+            "lww" => Some(MergeStrategy::Unresolvable("lww".to_string())),
+            STRATEGY_HANDLER_SENTINEL => match handler {
+                // The write path rejects the sentinel without a companion
+                // path (§2.3); a config persisted through some other route,
+                // or a bare `strategy` override, still must not resolve.
+                Some(p) if !p.trim().is_empty() => Some(MergeStrategy::Handler(p.to_string())),
+                _ => Some(MergeStrategy::Unresolvable(
+                    STRATEGY_HANDLER_SENTINEL.to_string(),
+                )),
+            },
             _ => None,
         }
     }
 
-    pub fn as_str(&self) -> &'static str {
+    pub fn as_str(&self) -> &str {
         match self {
             MergeStrategy::ThreeWay => "three-way",
             MergeStrategy::SourceWins => "source-wins",
             MergeStrategy::TargetWins => "target-wins",
             MergeStrategy::Manual => "manual",
             MergeStrategy::KeepBoth => "keep-both",
+            MergeStrategy::Handler(_) => STRATEGY_HANDLER_SENTINEL,
+            MergeStrategy::Unresolvable(name) => name.as_str(),
         }
     }
 }
@@ -330,7 +367,17 @@ pub fn merge_snapshots(
                             additional_bindings
                                 .push((format!("{}.keep-both-{}", path, hash_prefix), *r));
                         }
-                        MergeStrategy::Manual => {
+                        // `manual` always conflicts by definition. The other
+                        // two arms are the v3.10 [MUST]: a strategy this peer
+                        // accepts but cannot resolve records the divergence
+                        // instead of picking a side. `Handler` lands here
+                        // because §5.3 delegation is not built — the
+                        // disposition for an unreachable handler is a
+                        // conflict entity for the one path, not a failed
+                        // merge and not an invented resolution.
+                        MergeStrategy::Manual
+                        | MergeStrategy::Handler(_)
+                        | MergeStrategy::Unresolvable(_) => {
                             conflicts.push(ConflictInfo {
                                 path: path.clone(),
                                 base: base_hash.copied(),
@@ -505,35 +552,47 @@ pub fn find_merge_strategy(
     local_peer_id: &str,
 ) -> MergeStrategy {
     if let Some(s) = override_strategy {
-        if let Some(strategy) = MergeStrategy::parse(s) {
+        if let Some(strategy) = MergeStrategy::parse(s, None) {
             return strategy;
         }
     }
 
-    // Per-type config: look up entity type, then check config
-    let entity_hash = local_hash.or(remote_hash);
-    if let Some(h) = entity_hash {
+    // Step 1 — per-type config. §5.1: local type first (the existing
+    // entity), then the remote type when it differs (the incoming one);
+    // either side's config may understand the cross-type merge. The ordering
+    // is what makes two peers merging the same pair select the same config.
+    let mut types_to_check: Vec<String> = Vec::new();
+    for h in [local_hash, remote_hash].into_iter().flatten() {
         if let Some(entity) = store.get(h) {
-            let type_config_path = format!(
-                "/{}/system/revision/config/merge/type/{}",
-                local_peer_id, entity.entity_type
-            );
-            if let Some(config_hash) = location_index.get(&type_config_path) {
-                if let Some(config_entity) = store.get(&config_hash) {
-                    if let Some((_, strategy)) = decode_path_strategy_config(&config_entity.data) {
-                        return strategy;
-                    }
+            if !types_to_check.contains(&entity.entity_type) {
+                types_to_check.push(entity.entity_type);
+            }
+        }
+    }
+    for type_name in &types_to_check {
+        let type_config_path = format!(
+            "/{}/system/revision/config/merge/type/{}",
+            local_peer_id, type_name
+        );
+        if let Some(config_hash) = location_index.get(&type_config_path) {
+            if let Some(config_entity) = store.get(&config_hash) {
+                // A type-scoped config is keyed by the type name, so it
+                // carries no `pattern` — requiring one here silently skipped
+                // step 1 for every canonically-shaped per-type config.
+                if let Some(strategy) = decode_merge_config(&config_entity.data).strategy {
+                    return strategy;
                 }
             }
         }
     }
 
-    // Per-path config: global at system/revision/config/merge/path/
+    // Step 2 — per-path config: global at system/revision/config/merge/path/
     let path_config_prefix = format!("/{}/system/revision/config/merge/path/", local_peer_id,);
     let mut best_match: Option<(usize, MergeStrategy)> = None;
     for entry in location_index.list(&path_config_prefix) {
         if let Some(config_entity) = store.get(&entry.hash) {
-            if let Some((pattern, strategy)) = decode_path_strategy_config(&config_entity.data) {
+            let config = decode_merge_config(&config_entity.data);
+            if let (Some(pattern), Some(strategy)) = (config.pattern, config.strategy) {
                 if path_pattern_matches(&pattern, path) {
                     let specificity = pattern.len();
                     if best_match.as_ref().is_none_or(|(s, _)| specificity > *s) {
@@ -547,22 +606,42 @@ pub fn find_merge_strategy(
         return strategy;
     }
 
+    // Step 3 — default three-way (§5.2).
     MergeStrategy::ThreeWay
 }
 
-fn decode_path_strategy_config(data: &[u8]) -> Option<(String, MergeStrategy)> {
-    let val: ciborium::Value = ciborium::from_reader(data).ok()?;
-    let map = val.as_map()?;
+/// The fields of a `system/revision/merge-config` entity this module reads.
+/// `pattern` is absent on type-scoped configs (they are keyed by type name);
+/// `strategy` is `None` when the value is outside §2.3's built-in table, in
+/// which case the caller treats the config as absent and keeps descending
+/// the cascade.
+struct DecodedMergeConfig {
+    pattern: Option<String>,
+    strategy: Option<MergeStrategy>,
+}
+
+fn decode_merge_config(data: &[u8]) -> DecodedMergeConfig {
     let mut pattern = None;
-    let mut strategy = None;
-    for (k, v) in map {
-        match k.as_text() {
-            Some("pattern") => pattern = v.as_text().map(|s| s.to_string()),
-            Some("strategy") => strategy = v.as_text().and_then(MergeStrategy::parse),
-            _ => {}
+    let mut strategy_name = None;
+    let mut handler = None;
+
+    if let Ok(val) = ciborium::from_reader::<ciborium::Value, _>(data) {
+        if let Some(map) = val.as_map() {
+            for (k, v) in map {
+                match k.as_text() {
+                    Some("pattern") => pattern = v.as_text().map(|s| s.to_string()),
+                    Some("strategy") => strategy_name = v.as_text().map(|s| s.to_string()),
+                    Some("handler") => handler = v.as_text().map(|s| s.to_string()),
+                    _ => {}
+                }
+            }
         }
     }
-    Some((pattern?, strategy?))
+
+    let strategy = strategy_name
+        .as_deref()
+        .and_then(|s| MergeStrategy::parse(s, handler.as_deref()));
+    DecodedMergeConfig { pattern, strategy }
 }
 
 fn path_pattern_matches(pattern: &str, path: &str) -> bool {
@@ -1113,5 +1192,187 @@ mod tests {
             .0
             .starts_with("shared.keep-both-"));
         assert_eq!(result.additional_bindings[0].1, h2);
+    }
+
+    // -----------------------------------------------------------------
+    // §5.1 cascade — step 1 (per-type config) and the v3.10 vocabulary
+    // -----------------------------------------------------------------
+
+    /// Drive the same edit-vs-edit divergence every cascade test below uses:
+    /// one path, all three sides different, so the strategy arm is what
+    /// decides the outcome.
+    fn diverge(
+        store: &dyn ContentStore,
+        li: &dyn LocationIndex,
+        local_type: &str,
+        remote_type: &str,
+    ) -> (MergeResult, Hash, Hash) {
+        let h0 = put_test_entity(store, local_type, "base");
+        let h1 = put_test_entity(store, local_type, "local");
+        let h2 = put_test_entity(store, remote_type, "remote");
+
+        let mut base = BTreeMap::new();
+        base.insert("doc".to_string(), h0);
+        let mut local = BTreeMap::new();
+        local.insert("doc".to_string(), h1);
+        let mut remote = BTreeMap::new();
+        remote.insert("doc".to_string(), h2);
+
+        let result = merge_snapshots(
+            Some(&base),
+            &local,
+            &remote,
+            "data/",
+            None,
+            store,
+            li,
+            Hash::zero(),
+            Hash::zero(),
+            "test-peer",
+        );
+        (result, h1, h2)
+    }
+
+    fn install_config(
+        store: &dyn ContentStore,
+        li: &dyn LocationIndex,
+        tree_path: &str,
+        fields: Vec<(&str, &str)>,
+    ) {
+        let pairs: Vec<(entity_ecf::Value, entity_ecf::Value)> = fields
+            .into_iter()
+            .map(|(k, v)| (entity_ecf::text(k), entity_ecf::text(v)))
+            .collect();
+        let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(pairs));
+        let entity = Entity::new("system/revision/merge-config", data).unwrap();
+        let hash = store.put(entity).unwrap();
+        li.set(tree_path, hash);
+    }
+
+    /// CONTROL for the per-type rows: the identical divergence with NO config
+    /// conflicts. Without it a per-type PASS cannot be attributed to the
+    /// config.
+    #[test]
+    fn test_cascade_control_no_config_conflicts() {
+        let (store, li) = stores();
+        let (result, h1, _) = diverge(&store, &li, "test/typed-doc", "test/typed-doc");
+        assert_eq!(result.conflicts.len(), 1, "no config → three-way conflict");
+        assert_eq!(result.conflicts[0].strategy, "three-way");
+        assert_eq!(result.merged_bindings["doc"], h1);
+    }
+
+    /// §5.1 step 1. A type-scoped config is keyed by the type name and
+    /// carries no `pattern` — the shape every implementation writes. Requiring
+    /// `pattern` here skipped step 1 entirely for the canonical shape.
+    #[test]
+    fn test_per_type_config_without_pattern_is_consulted() {
+        let (store, li) = stores();
+        install_config(
+            &store,
+            &li,
+            "/test-peer/system/revision/config/merge/type/test/typed-doc",
+            vec![("strategy", "source-wins")],
+        );
+        let (result, _, h2) = diverge(&store, &li, "test/typed-doc", "test/typed-doc");
+        assert!(
+            result.conflicts.is_empty(),
+            "per-type source-wins must resolve the conflict"
+        );
+        assert_eq!(result.merged_bindings["doc"], h2);
+    }
+
+    /// §5.1 cascade order: step 1 (type) outranks step 2 (path).
+    #[test]
+    fn test_per_type_config_outranks_per_path_config() {
+        let (store, li) = stores();
+        install_config(
+            &store,
+            &li,
+            "/test-peer/system/revision/config/merge/type/test/typed-doc",
+            vec![("strategy", "source-wins")],
+        );
+        install_config(
+            &store,
+            &li,
+            "/test-peer/system/revision/config/merge/path/all",
+            vec![("pattern", "*"), ("strategy", "target-wins")],
+        );
+        let (result, _, h2) = diverge(&store, &li, "test/typed-doc", "test/typed-doc");
+        assert!(result.conflicts.is_empty());
+        assert_eq!(
+            result.merged_bindings["doc"], h2,
+            "type config (source-wins) must outrank the path config (target-wins)"
+        );
+    }
+
+    /// §5.1: when the types differ, the remote type's config gets its turn
+    /// after the local type's — either side's config may understand the merge.
+    #[test]
+    fn test_per_type_config_falls_through_to_remote_type() {
+        let (store, li) = stores();
+        install_config(
+            &store,
+            &li,
+            "/test-peer/system/revision/config/merge/type/test/incoming-doc",
+            vec![("strategy", "source-wins")],
+        );
+        let (result, _, h2) = diverge(&store, &li, "test/local-doc", "test/incoming-doc");
+        assert!(result.conflicts.is_empty());
+        assert_eq!(result.merged_bindings["doc"], h2);
+    }
+
+    /// v3.10 [MUST]: the `handler` sentinel this peer cannot dispatch degrades
+    /// to a conflict entity — not a silent fall-through to three-way, and not
+    /// an invented resolution. The conflict names the strategy that produced
+    /// it, which is what distinguishes this from the config being ignored.
+    #[test]
+    fn test_unreachable_handler_degrades_to_conflict() {
+        let (store, li) = stores();
+        install_config(
+            &store,
+            &li,
+            "/test-peer/system/revision/config/merge/type/test/typed-doc",
+            vec![
+                ("strategy", "handler"),
+                ("handler", "app/merge/not-installed"),
+            ],
+        );
+        let (result, h1, _) = diverge(&store, &li, "test/typed-doc", "test/typed-doc");
+        assert_eq!(result.conflicts.len(), 1);
+        assert_eq!(
+            result.conflicts[0].strategy, "handler",
+            "the conflict must name the configured strategy, not the default arm"
+        );
+        assert_eq!(result.merged_bindings["doc"], h1);
+    }
+
+    /// v3.10 [MUST]: `lww` stays in the vocabulary and MUST degrade to a
+    /// conflict entity — the comparison basis it needs is unspecified, so
+    /// resolving it on a guessed basis is a per-implementation convergence bug.
+    #[test]
+    fn test_lww_strategy_degrades_to_conflict() {
+        let (store, li) = stores();
+        install_config(
+            &store,
+            &li,
+            "/test-peer/system/revision/config/merge/path/all",
+            vec![("pattern", "*"), ("strategy", "lww")],
+        );
+        let (result, h1, _) = diverge(&store, &li, "test/typed-doc", "test/typed-doc");
+        assert_eq!(result.conflicts.len(), 1);
+        assert_eq!(result.conflicts[0].strategy, "lww");
+        assert_eq!(result.merged_bindings["doc"], h1);
+    }
+
+    /// §5.1 "Path argument scope": a `pattern: "*"` config matches ALL paths
+    /// within any merge, nested keys included — the peer-wide footgun v7.70
+    /// A1 names. (Single-segment `*` is what every implementation's stdlib
+    /// glob gives by default; this asserts the specified reading.)
+    #[test]
+    fn test_star_pattern_matches_nested_path() {
+        assert!(path_pattern_matches("*", "docs/deep/readme"));
+        assert!(path_pattern_matches("*", "top"));
+        assert!(path_pattern_matches("docs/**", "docs/deep/readme"));
+        assert!(!path_pattern_matches("docs/*", "other/readme"));
     }
 }

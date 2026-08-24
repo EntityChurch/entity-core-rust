@@ -52,6 +52,9 @@ pub mod remote;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod reuseport;
 pub mod runtime;
+/// The keystone-owned canonical §6.9a seed-policy file format — the cross-peer
+/// operator file that desugars to [`PeerBuilder::with_seed_policy`].
+pub mod seed_policy;
 pub mod server;
 pub mod session_entity;
 /// EXTENSION-NETWORK §6.7.1 srflx gathering — the client half that turns a
@@ -1242,9 +1245,9 @@ impl PeerBuilder {
     /// for naming operator / admin / reader identities.
     ///
     /// This is the **builder-first supply mechanism** (SDK-OPERATIONS §3.6).
-    /// CLI / config / file wrappers desugar to this method; a
-    /// `with_seed_policy_from_file` loader is deferred until the keystone
-    /// protocol-generator ratifies the cross-peer file format.
+    /// CLI / config / file wrappers desugar to this method — see
+    /// [`with_seed_policy_from_file`](Self::with_seed_policy_from_file) for the
+    /// keystone-ratified cross-peer file format.
     ///
     /// # A policy entry is read with two OPPOSITE meanings
     ///
@@ -1277,6 +1280,28 @@ impl PeerBuilder {
     pub fn with_seed_policy(mut self, entries: Vec<(String, Vec<GrantEntry>)>) -> Self {
         self.seed_policy.extend(entries);
         self
+    }
+
+    /// Declare §6.9a seed-policy entries from a **canonical seed-policy file**.
+    ///
+    /// The file wrapper the doc above defers to: keystone's protocol-generator
+    /// has since ratified the cross-peer format
+    /// (`shared/seed-policy/seed-policy.schema.json`), so an operator hands the
+    /// same file to a go, python or rust peer. Desugars to
+    /// [`with_seed_policy`](Self::with_seed_policy) — every caveat there (the
+    /// two opposite readings of a `default` entry above all) applies unchanged.
+    ///
+    /// Errors on a shape that is not the convention, on `version != 1`, and on
+    /// the authority-narrowing fields this seam cannot carry
+    /// (`bounds`/`constraints`/`allowances`); see
+    /// [`seed_policy::parse_seed_policy`](crate::seed_policy::parse_seed_policy).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_seed_policy_from_file(
+        self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<Self, PeerError> {
+        let entries = crate::seed_policy::load_seed_policy_file(path)?;
+        Ok(self.with_seed_policy(entries))
     }
 
     /// Provide custom query index storage (e.g., `SqliteQueryIndexes`).
@@ -4916,6 +4941,69 @@ mod tests {
         );
     }
 
+    /// F27 §6.9a: a canonical seed-policy **file** materializes the same
+    /// entries `with_seed_policy` does — the operator hands one keystone-format
+    /// file to any impl and gets one posture. Locks the whole path (file →
+    /// parse → L0 entry), not just the parser: go's `--seed-policy-file` and
+    /// python's `--seed-policy` read this exact document.
+    #[tokio::test]
+    async fn test_seed_policy_from_canonical_file_materializes_entries() {
+        let admin = entity_hash::Hash::compute("system/peer", b"admin-identity-entity").to_hex();
+        let doc = format!(
+            r#"{{"version":1,"entries":[
+                {{"_comment":"admin-seeded-restrictive posture",
+                  "grantee":"{}",
+                  "grants":[{{"handlers":{{"include":["*"]}},
+                              "resources":{{"include":["*"]}},
+                              "operations":{{"include":["*"]}},
+                              "peers":{{"include":["self"]}}}}]}}]}}"#,
+            admin
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seed-policy.json");
+        std::fs::write(&path, doc).unwrap();
+
+        let peer = PeerBuilder::new()
+            .keypair(test_keypair())
+            .with_seed_policy_from_file(&path)
+            .unwrap()
+            .build()
+            .unwrap();
+        let pid = peer.shared().keypair.peer_id().to_string();
+
+        let entry_path = format!("/{}/system/capability/policy/{}", pid, admin);
+        let h = peer
+            .shared()
+            .location_index
+            .get(&entry_path)
+            .expect("the file's admin entry is materialized at L0");
+        let entity = peer.shared().content_store.get(&h).expect("entry entity");
+        assert_eq!(entity.entity_type, entity_types::TYPE_CAP_POLICY_ENTRY);
+
+        let val: ciborium::Value = ciborium::de::from_reader(entity.data.as_slice()).unwrap();
+        let grants_v = val
+            .as_map()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("grants"))
+            .map(|(_, v)| v)
+            .expect("policy entry carries grants");
+        let arr = grants_v.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        let g = entity_capability::decode_grant_entry(&arr[0]).unwrap();
+        assert_eq!(g.handlers.include, vec!["*".to_string()]);
+        assert_eq!(g.operations.include, vec!["*".to_string()]);
+
+        // Unknown peers match no entry: no `default` entry is invented from a
+        // file that names only an admin — that absence IS the restrictive
+        // posture the gating checks measure against.
+        let default_path = format!("/{}/system/capability/policy/default", pid);
+        assert!(
+            peer.shared().location_index.get(&default_path).is_none(),
+            "an admin-only file must not seed a `default` fallback"
+        );
+    }
+
     /// spec-gap §S2(c): a `not_before` in the future makes the grant not yet
     /// valid. Mirror of the expired test, but with `not_before = u64::MAX`.
     #[cfg(feature = "handlers")]
@@ -7303,6 +7391,201 @@ mod tests {
         );
 
         server_handle.abort();
+    }
+
+    /// The **sequential** bound (`live_establish::ESTABLISH_FREE_CONSULTATIONS`)
+    /// — obligation 5's single-flight gate stops N *concurrent* consultations;
+    /// this stops an unbounded series of consecutive ones.
+    ///
+    /// The shape it defends against is the measured one: a caller re-dispatches
+    /// to a peer that can never be reached, every consultation is individually
+    /// conformant, and the series runs at the caller's dispatch rate forever
+    /// (5/s per open conversation, ~1.1 offer deposits each, into a third
+    /// party's rendezvous bucket). §11.5 cannot see it — that bound is per
+    /// establishment, and every one of these is inside it.
+    ///
+    /// **Mutation check:** delete the `establish_cooldown_remaining` guard in
+    /// `try_establish_live` and the consultation count becomes exactly
+    /// `DISPATCHES`, failing the ceiling below. A test that passes without the
+    /// mechanism would be worthless here, because the *pass* condition is a
+    /// number that a broken build also produces if the ceiling is loose.
+    #[tokio::test]
+    async fn repeated_dispatch_to_an_unreachable_peer_stops_re_consulting_the_seam() {
+        use transport::MemoryTransportRegistry;
+        let registry = MemoryTransportRegistry::new();
+
+        let mut client = PeerBuilder::new()
+            .keypair(Keypair::from_seed([43u8; 32]))
+            .build()
+            .unwrap();
+        client.local_only();
+        // Nobody is listening at this address, so every consultation fails with
+        // `NoPath` — a peer that can never be reached, which is the case the
+        // bound exists for.
+        let stub = std::sync::Arc::new(StubEstablisher::new(
+            registry.clone(),
+            "NobodyIsListeningAtThisAddress".to_string(),
+        ));
+        let calls = stub.calls.clone();
+        client.set_live_establish(stub);
+        let shared = client.shared();
+
+        const DISPATCHES: usize = 200;
+        for _ in 0..DISPATCHES {
+            let r = remote::get_or_connect(
+                &shared.remote,
+                "NobodyIsListeningAtThisAddress",
+                &shared.keypair,
+                shared.content_store.as_ref(),
+                shared.location_index.as_ref(),
+                &shared.peer_id.to_string(),
+                shared.connector.as_ref(),
+                shared.config.home_hash_format,
+                Some(shared.clone()),
+            )
+            .await;
+            assert!(
+                r.is_err(),
+                "the peer is unreachable — the ladder must still fail the dispatch. \
+                 A skipped consultation is a fall-through, NOT a new outcome"
+            );
+        }
+
+        let consulted = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            consulted >= live_establish::ESTABLISH_FREE_CONSULTATIONS as usize,
+            "the grace window must be spent at full rate — establishment normally \
+             takes several consultations, and backing off before that would slow \
+             the path that works to bound the path that does not (got {consulted})"
+        );
+        // The loop runs in microseconds, so every dispatch after the grace
+        // window lands inside the first few backoff steps (250ms, 500ms, ...).
+        // The ceiling is deliberately a handful above the grace window rather
+        // than exact: it must fail loudly at `DISPATCHES` while tolerating a
+        // loaded box that takes a whole backoff step to get round the loop.
+        assert!(
+            consulted <= live_establish::ESTABLISH_FREE_CONSULTATIONS as usize + 5,
+            "{DISPATCHES} dispatches to an unreachable peer must not produce \
+             {DISPATCHES} consultations — the series is what a carrier pays for \
+             (got {consulted})"
+        );
+    }
+
+    /// A **cancelled** consultation counts too — the property that decides
+    /// whether the bound holds under load, and the one the NAT rig caught.
+    ///
+    /// Charging the streak on the seam's `Err` return is the obvious factoring,
+    /// and it silently exempts every consultation whose future is *dropped*: the
+    /// caller's dispatch timed out, the surface moved on, nothing came back to
+    /// charge — while the negotiation it started has already deposited into
+    /// someone else's carrier. Those attempts are not an edge case; on the
+    /// measured rig they were most of the gap between the rate the schedule
+    /// predicts and the rate observed. So the charge happens before the await.
+    ///
+    /// **Mutation check:** move `note_establish_attempt` into the `Err` arm of
+    /// `try_establish_live` and this test sees `DISPATCHES` consultations — a
+    /// seam consulted 200 times because no consultation ever finished.
+    #[tokio::test]
+    async fn a_cancelled_consultation_still_counts_against_the_bound() {
+        /// An establisher that never returns — the shape of a traversal still
+        /// gathering candidates when the caller gives up on it.
+        struct PendingEstablisher {
+            calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl live_establish::LiveEstablish for PendingEstablisher {
+            async fn establish_live(
+                &self,
+                _ctx: live_establish::EstablishCtx,
+                _peer_id: &str,
+            ) -> Result<live_establish::LivePath, live_establish::LiveEstablishError> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::pending().await
+            }
+        }
+
+        let mut client = PeerBuilder::new()
+            .keypair(Keypair::from_seed([44u8; 32]))
+            .build()
+            .unwrap();
+        client.local_only();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        client.set_live_establish(std::sync::Arc::new(PendingEstablisher {
+            calls: calls.clone(),
+        }));
+        let shared = client.shared();
+
+        const DISPATCHES: usize = 200;
+        for _ in 0..DISPATCHES {
+            // Every dispatch abandons its consultation mid-negotiation.
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(2),
+                remote::get_or_connect(
+                    &shared.remote,
+                    "APeerThatNeverAnswers",
+                    &shared.keypair,
+                    shared.content_store.as_ref(),
+                    shared.location_index.as_ref(),
+                    &shared.peer_id.to_string(),
+                    shared.connector.as_ref(),
+                    shared.config.home_hash_format,
+                    Some(shared.clone()),
+                ),
+            )
+            .await;
+        }
+
+        let consulted = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            consulted <= live_establish::ESTABLISH_FREE_CONSULTATIONS as usize + 5,
+            "consultations abandoned by the caller must still be charged — they \
+             cost the carrier exactly as much as the ones that return (got \
+             {consulted} of {DISPATCHES})"
+        );
+    }
+
+    /// The bookkeeping itself, without the clock: the streak is cleared by a
+    /// *pooled connection*, not by the seam returning `Ok` and not by time.
+    ///
+    /// Worth pinning separately because the end-to-end test above can only
+    /// observe the cooldown engaging; the reset is what makes a peer that comes
+    /// back reachable get full-rate treatment again, and it has no natural
+    /// failure signal — a broken reset just makes reconnection quietly slow.
+    #[tokio::test]
+    async fn a_pooled_connection_clears_the_establish_backoff() {
+        let pool = remote::RemoteState::new();
+        let peer = "SomeUnreachablePeer";
+
+        for _ in 0..live_establish::ESTABLISH_FREE_CONSULTATIONS {
+            pool.note_establish_attempt(peer);
+        }
+        assert!(
+            pool.establish_cooldown_remaining(peer).is_none(),
+            "the grace window must run at full rate"
+        );
+
+        pool.note_establish_attempt(peer);
+        let cooling = pool
+            .establish_cooldown_remaining(peer)
+            .expect("past the grace window the next consultation must be spaced out");
+        assert!(cooling <= live_establish::ESTABLISH_BACKOFF_CAP);
+
+        // Any connection reaching the pool clears it — this is the path
+        // `insert_endpoint` / `rebind_endpoint` take.
+        pool.note_establish_success(peer);
+        assert!(
+            pool.establish_cooldown_remaining(peer).is_none(),
+            "a peer that just connected must not still be serving a cooldown"
+        );
+
+        // And the streak restarts from zero rather than resuming where it left
+        // off: a peer that connected, dropped, and is being re-established is
+        // not a peer that has been failing for a minute.
+        pool.note_establish_attempt(peer);
+        assert!(
+            pool.establish_cooldown_remaining(peer).is_none(),
+            "the streak must reset, not resume"
+        );
     }
 
     /// §10.3: *"`ctx` carries a deadline and is cancellable (MUST)... a seam

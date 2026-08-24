@@ -76,6 +76,16 @@ Manage and run peers. Global flags before the subcommand: `--verbose`,
   - `--history <pattern[:max_depth]>` — enable history recording.
   - `--publish-root` / `--publish-descriptors` — sign a published-root over the
     served namespace / publish content descriptors on `--files` roots.
+  - `--seed-policy <file>` — V7 §6.9a seed policy: the declared identity →
+    capability entries materialized at L0 and consulted at §4.6 authenticate,
+    in the **keystone-owned canonical file format** (`shared/seed-policy/
+    seed-policy.schema.json`), the same document go's `--seed-policy-file` and
+    python's `--seed-policy` read. Mutually exclusive with `--debug-grants`:
+    this is the operator posture *between* open access and the bare §4.4 floor
+    — name an admin by its identity-hash hex and unknown peers stay gated by
+    the initial-grant policy while the named one can stage its own setup.
+    Prefer a per-grantee hex/Base58 key over `default`, which is a floor on the
+    connection path and the attenuation **ceiling** on §6.2 `capability:request`.
   - `--debug-grants`, `--validate` — debug/conformance only; **not** for
     production (`--validate` exposes §7a test handlers).
 - `entity peer list` / `entity peer show <name>` — inspect configured peers.

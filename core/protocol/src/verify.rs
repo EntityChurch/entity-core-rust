@@ -496,17 +496,30 @@ fn explicitly_enumerates(resource_pattern: &str, target: &str) -> bool {
 /// be missing at B, failing B's `VerifyChain` (V7 §5.2).
 ///
 /// Returns, keyed by content hash: every capability from the leaf up to its
-/// root, plus — best-effort per link — each link's granter `system/peer`
-/// identity entity and the granter's signature over that link (resolved from
-/// the V7 invariant pointer path
+/// root, plus each link's **granter and grantee** `system/peer` identity
+/// entities, plus — best-effort — the granter's signature over that link
+/// (resolved from the V7 invariant pointer path
 /// `/{signer_peer_id}/system/signature/{target_hex}` that envelope ingest
 /// binds, so the bundle matches what B's signature resolver expects).
 ///
+/// **Identity entities are a `[MUST]`, not best-effort (v1.22, §4.3).** The
+/// bundle MUST carry a `system/peer` for *every* granter and *every* grantee
+/// in the transported chain, and a bundler that cannot resolve one MUST fail
+/// **at bundle time** with `chain_unreachable` rather than dispatch an
+/// incomplete bundle. This is what makes V7 §5.5 step 2a's per-link grantee
+/// resolution (→ `401 UnresolvableGrantee`) satisfiable: a MUST on the
+/// verifier over entities the bundler omitted best-effort is an interop bug
+/// by construction, and it is why a chain with a third-party installer
+/// (§4.2 case 3) authorized or failed depending on what the dispatcher's
+/// store happened to hold.
+///
 /// **Over-inclusion is intentional and free.** Content-addressing dedups any
 /// entity B already holds, eliminating the "B GC'd a parent → `VerifyChain`
-/// fails" failure mode at zero correctness cost (§4.2). **Best-effort per
-/// link** — a link whose identity or bound signature is not resolvable is
-/// simply omitted; B fails closed later if it actually needed it.
+/// fails" failure mode at zero correctness cost (§4.2).
+///
+/// **Signatures stay best-effort.** §4.3 pins identity entities; the bound
+/// signature is resolved through a tree pointer that a wire-only cap may
+/// legitimately not have locally, and B fails closed if it needed it.
 ///
 /// `resolve` is the content resolver (by convention the installer's content
 /// store — §3.2 step 5 persisted the full chain there at install). `locate`
@@ -515,8 +528,9 @@ fn explicitly_enumerates(resource_pattern: &str, target: &str) -> bool {
 /// the [`collect_authority_chain`] idiom — no store-trait dependency.
 ///
 /// Propagates [`ChainWalkError`] from the underlying walk (an unreachable or
-/// over-deep chain is a real failure, not a best-effort omission — the leaf
-/// chain itself must resolve).
+/// over-deep chain is a real failure — the leaf chain itself must resolve),
+/// and returns [`ChainWalkError::Unreachable`] for an identity the bundle
+/// requires and cannot resolve.
 pub fn collect_chain_bundle<R, L>(
     leaf_hash: &Hash,
     resolve: R,
@@ -541,23 +555,24 @@ where
             Granter::Multi(m) => m.signers.clone(),
         };
         for signer in signers {
+            // §4.3 [MUST]: an identity this bundle needs and cannot resolve
+            // fails the bundle here, rather than travelling incomplete and
+            // failing the far side's step 2a with a 401 the dispatcher could
+            // have prevented.
             let id_entity = match resolve(&signer) {
                 Some(e) if e.entity_type == TYPE_PEER => e,
-                // best-effort: identity not locally resolvable → omit
-                _ => continue,
+                _ => return Err(ChainWalkError::Unreachable),
             };
-            let peer_id = match PeerData::from_entity(&id_entity) {
-                // V7 §1.5 v7.65: derive canonical wire peer_id from
-                // (public_key, key_type). The entity no longer carries
-                // peer_id as a hashable field.
-                Ok(d) => match d.canonical_peer_id() {
-                    Some(p) => p,
-                    None => continue,
-                },
-                Err(_) => continue,
-            };
+            // V7 §1.5 v7.65: derive canonical wire peer_id from
+            // (public_key, key_type). The entity no longer carries
+            // peer_id as a hashable field.
+            let peer_id = PeerData::from_entity(&id_entity)
+                .ok()
+                .and_then(|d| d.canonical_peer_id())
+                .ok_or(ChainWalkError::Unreachable)?;
             bundle.insert(id_entity.content_hash, id_entity);
 
+            // Best-effort, and deliberately so — see the doc comment.
             let sig_path = invariant_signature_path(&peer_id, &cap_hash);
             if let Some(sig_hash) = locate(&sig_path) {
                 if let Some(sig_entity) = resolve(&sig_hash) {
@@ -566,6 +581,18 @@ where
                     }
                 }
             }
+        }
+
+        // Grantee identity for this link (v1.22, §4.3). Previously collected
+        // only where a grantee happened also to be a granter, which is why a
+        // self-rooted cap — granter and grantee collapsing onto peers both
+        // sides already hold — passed while a third-party installer chain did
+        // not.
+        match resolve(&fields.grantee) {
+            Some(e) if e.entity_type == TYPE_PEER => {
+                bundle.insert(e.content_hash, e);
+            }
+            _ => return Err(ChainWalkError::Unreachable),
         }
     }
     Ok(bundle)

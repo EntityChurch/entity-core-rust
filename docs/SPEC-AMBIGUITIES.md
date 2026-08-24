@@ -5136,11 +5136,28 @@ is what we would like added.
 
 ---
 
-## A verifier MUST that depends on entities the bundler only collects best-effort
+## ~~A verifier MUST that depends on entities the bundler only collects best-effort~~ RESOLVED
 
-**Status:** OPEN upstream — routed with `ROUTING-2026-08-13-m`'s reply. This is
-the seam behind `convergence.rexec_delivered` failing go(A) → rust(B) while
-go→go and go→python pass.
+**Status:** **CLOSED 2026-08-14** — arch ruled it in `EXTENSION-CONTINUATION`
+**v1.22 §4.3**, and the ruling is the first half of the ask: *"The bundle MUST
+carry a `system/peer` identity entity for **every `granter` and every
+`grantee`** appearing in the transported chain — not only for those that happen
+to also be a granter, and not on a best-effort basis. A bundler that cannot
+resolve one of them locally MUST fail **at bundle time** with
+`chain_unreachable` (§8.1) rather than dispatch an incomplete bundle."* The
+verifier's MUST stands; the bundler's best-effort omission is what was
+non-conformant.
+
+**Built here:** `collect_chain_bundle`
+(`core/protocol/src/verify.rs`) collects every link's granter **and grantee**
+identity and returns `ChainWalkError::Unreachable` when one cannot be resolved;
+the continuation dispatch site (`core/peer/src/connection.rs`) no longer sends
+the leaf alone with a warning — it refuses the dispatch with
+`chain_unreachable`. Signatures stay best-effort by design, which the doc
+comment states. Three tests, including a drop-the-grantee-identity mutation on
+the positive row.
+
+*Original entry, kept as the record:*
 
 **Spec:** V7 §5.5 + §3.6 per-link grantee resolution (as
 `PROPOSAL-ROLE-V2.0-PRODUCTION-READINESS` PR-3 lands it), against
@@ -5174,3 +5191,51 @@ granter *and* grantee in the chain. If it must, `collect_chain_bundle`'s
 best-effort omission becomes an error in all three impls and this is an
 implementation gap. If it must not, the verifier cannot require what the wire
 does not guarantee, and step 2a needs a different failure mode than 401.
+
+---
+
+## REVISION §4.4.4 — the oscillation pseudocode compares the root; the invariant beside it says the full identity
+
+**Status:** OPEN upstream — routed 2026-08-14 with the reply to go's §4 packet.
+**Not blocking us:** the normative MUST is unambiguous and we built it; the ask
+is that the pseudocode stop contradicting it.
+
+**Spec:** `EXTENSION-REVISION` §4.4.4, two passages in the same section.
+
+- **Version-transcription invariant (3)** (v3.2, A.3 — normative): *"When
+  evaluating whether a proposed merge result would re-create an existing
+  version … implementations MUST compare the candidate's **full identity** —
+  `{root, sorted_parents}` — against recent ancestors, **not just the root
+  hash**."* It then names the consequence exactly: same root with different
+  parents is a legitimate cross-link, and *"treating it as oscillation aborts
+  the merge and leaves heads stuck at divergent terminals — convergence becomes
+  impossible."*
+- **`detect_oscillation(proposed_root, local_head, depth_limit)`** — the
+  reference pseudocode in the same section, and the only *executable* statement
+  of the check — takes no parents, and returns true on
+  `version.data.root == proposed_root` alone. Its BFS starts at `local_head`,
+  so it examines the head's own root first.
+
+**The two readings diverge on a case that is not exotic — it is the ordinary
+conflicted merge.** When every conflicted path keeps its local side (which
+`three-way`, `target-wins` and `manual` all do), the merged trie root *equals
+the local head's root*. Root-only comparison then reports `oscillation_detected`
+on the first merge a peer ever performs against a diverging remote, on a freshly
+started peer, with none of §4.4.4's four stated cycling preconditions present
+(no subscription, no asymmetric strategy, default `merge_order: "deterministic"`).
+The merge that would have recorded the divergence is refused, and the two heads
+can never converge — the exact failure invariant (3) exists to prevent.
+
+**What we built:** the invariant. `detect_oscillation` takes the candidate's
+sorted parents and compares `{root, sorted_parents}`
+(`extensions/revision/src/dag.rs::detect_oscillation`). A merge whose root
+matches an ancestor's but whose parents are `{local, remote}` proceeds as the
+cross-link the invariant requires.
+
+**The ask:** amend §4.4.4's pseudocode signature to
+`detect_oscillation(proposed_root, proposed_parents, local_head, depth_limit)`
+and compare both fields, so the executable statement and the MUST agree. A
+reader implementing from the pseudocode alone — which is what an implementer
+does — gets the cross-impl-visible wrong answer today. Found by `entity-core-go`'s
+`merge_config_cascade_control_no_config_conflicts` control row against rust
+`cc6cb56`, and it was ours, not theirs.

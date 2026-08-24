@@ -286,19 +286,41 @@ pub fn check_relationship(store: &dyn ContentStore, local: Hash, remote: Hash) -
 // Oscillation detection (EXTENSION-REVISION §4.4.4)
 // ---------------------------------------------------------------------------
 
-/// Detect oscillation: check if `proposed_root` appeared in recent ancestry
-/// of `head`, up to `depth_limit` versions back. Returns true if oscillation detected.
+/// Detect oscillation: check whether the proposed version's **full identity**
+/// — `{root, sorted_parents}` — appeared in recent ancestry of `head`, up to
+/// `depth_limit` versions back. Returns true if oscillation detected.
+///
+/// The comparison is the full identity, not the root alone, per §4.4.4
+/// version-transcription invariant (3) (v3.2, A.3): *"implementations MUST
+/// compare the candidate's full identity — `{root, sorted_parents}` — against
+/// recent ancestors, not just the root hash."* Same root with different
+/// parents is a legitimate cross-link version — the two peers reached the
+/// same content state by different lineage — and treating it as oscillation
+/// aborts the merge and leaves both heads stuck at divergent terminals.
+///
+/// The root-only comparison in §4.4.4's `detect_oscillation` pseudocode is
+/// narrower than the invariant it sits beside; the normative MUST governs.
+/// Logged as SPEC-AMBIGUITIES R-OSC-1.
 pub fn detect_oscillation(
     store: &dyn ContentStore,
     proposed_root: Hash,
+    proposed_parents: &[Hash],
     head: Hash,
     depth_limit: usize,
 ) -> bool {
+    let mut proposed = proposed_parents.to_vec();
+    entity_tree::trie::sorted_parents(&mut proposed);
+
     let versions = walk_history(store, head, depth_limit, None);
     for version_hash in &versions {
         if let Some(entity) = store.get(version_hash) {
             if let Some(entry) = decode_revision_entry(&entity) {
-                if entry.root == proposed_root {
+                if entry.root != proposed_root {
+                    continue;
+                }
+                let mut ancestor_parents = entry.parents.clone();
+                entity_tree::trie::sorted_parents(&mut ancestor_parents);
+                if ancestor_parents == proposed {
                     return true;
                 }
             }
@@ -506,12 +528,47 @@ mod tests {
         let root_b = trie::build_trie(&store, &bindings2).unwrap();
         let v2 = make_revision_entry(&store, root_b, vec![v1]);
 
-        // Proposing root_a again should detect oscillation
-        assert!(detect_oscillation(&store, root_a, v2, 4));
+        // Re-proposing v1's full identity — same root AND same parents — is
+        // the cycle the check exists to stop.
+        assert!(detect_oscillation(&store, root_a, &[], v2, 4));
         // Proposing a novel root should not
         let mut bindings3 = BTreeMap::new();
         bindings3.insert("c".to_string(), Hash::zero());
         let root_c = trie::build_trie(&store, &bindings3).unwrap();
-        assert!(!detect_oscillation(&store, root_c, v2, 4));
+        assert!(!detect_oscillation(&store, root_c, &[], v2, 4));
+    }
+
+    /// §4.4.4 version-transcription invariant (3): same root, different
+    /// parents is a legitimate cross-link version and MUST NOT be treated as
+    /// oscillation. Root-only comparison fails this test — which is how a
+    /// conflict-only merge (every conflicted path keeps local, so the merged
+    /// root equals the local head's root) was aborted as a false cycle.
+    #[test]
+    fn test_cross_link_same_root_different_parents_is_not_oscillation() {
+        let store = make_store();
+        let mut bindings = BTreeMap::new();
+        bindings.insert("a".to_string(), Hash::zero());
+        let root_a = trie::build_trie(&store, &bindings).unwrap();
+
+        let base = make_revision_entry(&store, root_a, vec![]);
+        let local = make_revision_entry(&store, root_a, vec![base]);
+        let remote = make_revision_entry(&store, root_a, vec![base]);
+
+        // The merge candidate keeps the local content — same root as every
+        // version in ancestry — but its parents are {local, remote}, a
+        // lineage no ancestor has. Committing it is what converges the DAG.
+        let mut merge_parents = vec![local, remote];
+        trie::sorted_parents(&mut merge_parents);
+        assert!(!detect_oscillation(
+            &store,
+            root_a,
+            &merge_parents,
+            local,
+            8
+        ));
+
+        // The same root re-proposed under the local head's OWN parent set is
+        // still a cycle, and still caught.
+        assert!(detect_oscillation(&store, root_a, &[base], local, 8));
     }
 }

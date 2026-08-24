@@ -81,6 +81,8 @@ futures-util = { version = "0.3", optional = true }
 ciborium.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_bytes.workspace = true
+# §6.9a seed-policy files only (keystone's canonical schema is JSON). Never the wire.
+serde_json.workspace = true
 # Raw SHA-256 over SDP bytes for the control-plane `sdp_digest` — NOT an entity
 # content hash, so `entity_hash::Hash::compute` (which ECF-wraps {type, data})
 # is deliberately not used here.

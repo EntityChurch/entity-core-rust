@@ -60,6 +60,7 @@ enum IdentityAction {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // clap CLI enum: one value at a time, size is irrelevant
 enum PeerAction {
     /// Initialize a new peer
     Init {
@@ -143,6 +144,26 @@ enum PeerAction {
         /// Issue wide-open grants on connection (debug only)
         #[arg(long)]
         debug_grants: bool,
+        /// V7 §6.9a seed policy: a JSON file declaring the identity →
+        /// capability entries this peer materializes at L0 and consults at
+        /// §4.6 authenticate. Format is the keystone-owned cross-peer
+        /// canonical schema (`shared/seed-policy/seed-policy.schema.json`) —
+        /// `{"version":1,"entries":[{"grantee":"<self|default|hex|base58>",
+        /// "grants":[…]}]}` — the same file go's `--seed-policy-file` and
+        /// python's `--seed-policy` read.
+        ///
+        /// This is the operator posture *between* the two extremes: name an
+        /// admin identity by its identity-hash hex and unknown peers stay
+        /// gated by the initial-grant policy (EXTENSION-ROLE §4.7) while the
+        /// named one can stage its own setup. Mutually exclusive with
+        /// `--debug-grants`, which unions open grants onto every connection
+        /// and would hide the gate the policy exists to declare.
+        ///
+        /// A `default` entry is read with two OPPOSITE meanings — a floor on
+        /// the connection path, the attenuation CEILING on §6.2
+        /// `capability:request`. Prefer a per-grantee hex/Base58 key.
+        #[arg(long, conflicts_with = "debug_grants")]
+        seed_policy: Option<String>,
         /// Enable history recording (format: pattern[:max_depth], e.g. "*" or "*:1000" or "project/*")
         #[arg(long)]
         history: Option<String>,
@@ -357,6 +378,7 @@ async fn main() -> anyhow::Result<()> {
                     serve_closure_root,
                     storage,
                     debug_grants,
+                    seed_policy,
                     history,
                     files,
                     hash_type,
@@ -382,6 +404,7 @@ async fn main() -> anyhow::Result<()> {
                         serve_closure_root,
                         storage.as_deref(),
                         debug_grants,
+                        seed_policy.as_deref(),
                         history.as_deref(),
                         files.as_deref(),
                         &hash_type,

@@ -65,6 +65,70 @@ use crate::transport::Connection;
 /// otherwise.
 pub const DEFAULT_TRAVERSAL_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How many consecutive failed consultations for one peer the call site runs at
+/// full rate before it starts spacing them out.
+///
+/// # Why a *stop condition* lives at the call site (the obligation-5 argument)
+///
+/// §10.3 obligation 5 already put a bound on seam consultations at this call
+/// site: only one may be **in flight** per peer. That bound is on the
+/// *concurrency* axis, and it is why the pool holds a per-peer dial gate.
+/// Nothing bounded the **sequential** axis, so a caller that re-dispatches to an
+/// unreachable peer produces an unbounded series of individually-conformant
+/// negotiations — measured at **5/s per open conversation, indefinitely**, each
+/// depositing ~1.1 offers into a rendezvous bucket that belongs to a third
+/// party. §11.5 does not catch it, because §11.5 bounds deposits *per
+/// establishment* and every one of those establishments is inside the bound.
+///
+/// These constants are the time-axis twin of obligation 5: same call site, same
+/// per-peer key, same lifetime, same reason — the policy must not be asked to
+/// pay for how often the caller asks.
+///
+/// # Why this needs no new signal from the seam
+///
+/// The obvious objection is that [`LiveEstablishError::NoPath`] conflates *"this
+/// peer is unreachable"* with *"not reachable yet"*, so the caller cannot know
+/// when to stop. True — and it does not matter here, because **this never
+/// stops**. Telling those apart is required only to *abandon* a peer; a backoff
+/// merely spaces attempts out, so a counterpart that becomes reachable still
+/// connects, at most one cooldown late. The distinction stays unnecessary as
+/// long as the cap is short enough that "late" is a latency, not a failure —
+/// which is what [`ESTABLISH_BACKOFF_CAP`] is chosen for, and the reason it is
+/// far below the deadline in [`DEFAULT_TRAVERSAL_BUDGET`].
+///
+/// # Why the first consultations are free
+///
+/// Establishment is *expected* to take several consultations — a §6.5 rendezvous
+/// pair meets by depositing and collecting, so the first attempt routinely
+/// arrives before the counterpart has deposited anything. Measured on the
+/// shared-bridge gate, a healthy meet completes in ~4 offer deposits per side.
+/// A backoff that engaged immediately would slow down the path that works in
+/// order to bound the path that does not. The grace window is set at 2× the
+/// measured healthy figure so that a working establishment never reaches the
+/// ramp at all, and only a peer that has failed well past the point of plausible
+/// success starts paying.
+pub const ESTABLISH_FREE_CONSULTATIONS: u32 = 10;
+
+/// First backoff step once [`ESTABLISH_FREE_CONSULTATIONS`] is spent; doubles
+/// per subsequent consecutive failure up to [`ESTABLISH_BACKOFF_CAP`].
+///
+/// Matched to §7.2's own `d = max(rtt, 250 ms)` — one step is one exchange
+/// interval, so the first spacing costs a healthy-but-slow pair one extra beat
+/// rather than a visible stall.
+pub const ESTABLISH_BACKOFF_BASE: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Ceiling on the spacing between consultations for one peer.
+///
+/// **This is the number that buys the property, and the number that costs.** It
+/// bounds a peer's steady-state load on a third-party carrier at `1 / CAP` per
+/// conversation — 0.1/s here, against the 5/s measured without it — and it is
+/// simultaneously the worst-case extra latency before a counterpart that just
+/// became reachable is noticed. Ten seconds is chosen as the largest value that
+/// is still plainly a *latency* on a chat that is already failing to deliver;
+/// raising it trades user-visible reconnect time for carrier load, and the trade
+/// is a deployment's to make, not this constant's, once a knob exists.
+pub const ESTABLISH_BACKOFF_CAP: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// What the caller hands the seam: a deadline, and which retry authority owns
 /// this consultation.
 ///
