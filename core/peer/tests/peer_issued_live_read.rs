@@ -156,6 +156,19 @@ async fn serve(registry: Arc<RecordingRegistry>) -> (String, tokio::task::JoinHa
 /// by-name pointer, and the §5.2 invariant-pointer signature by `signer`.
 /// Mirrors the extension tests' `publish_binding`, but into the origin rather
 /// than into a local store — that difference is the whole subject here.
+/// A comfortably-live TTL. D3 makes a non-null `ttl` mandatory for
+/// `kind: "peer-issued"`, so fixtures testing something else (the pin,
+/// revocation, the precede path) must carry a real one — otherwise they would
+/// pass for the wrong reason, refused by D3 rather than by the thing under test.
+const LIVE_TTL_MS: u64 = 86_400_000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 fn publish_binding(
     reg: &RecordingRegistry,
     registry_id: &str,
@@ -164,12 +177,25 @@ fn publish_binding(
     target: &str,
     ttl: Option<u64>,
 ) -> Hash {
+    publish_binding_at(reg, registry_id, signer, name, target, now_ms(), ttl)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn publish_binding_at(
+    reg: &RecordingRegistry,
+    registry_id: &str,
+    signer: &Keypair,
+    name: &str,
+    target: &str,
+    issued_at: u64,
+    ttl: Option<u64>,
+) -> Hash {
     let binding = BindingData {
         name: name.into(),
         kind: "peer-issued".into(),
         target_peer_id: target.into(),
         transports: vec![entity_ecf::Value::Text("tcp://billslab.com:9000".into())],
-        issued_at: 1_000,
+        issued_at,
         ttl,
         supersedes: None,
         issuer_attestation: None,
@@ -293,7 +319,14 @@ async fn cold_resolve_goes_to_the_pinned_registry_and_verifies() {
     let registry_kp = Keypair::generate();
     let rid = registry_kp.peer_id().as_str().to_string();
     let target = Keypair::generate().peer_id().as_str().to_string();
-    publish_binding(&reg, &rid, &registry_kp, "billslab.com", &target, None);
+    publish_binding(
+        &reg,
+        &rid,
+        &registry_kp,
+        "billslab.com",
+        &target,
+        Some(LIVE_TTL_MS),
+    );
 
     let (endpoint, handle) = serve(reg.clone()).await;
     let consumer = Consumer::pinning(60, &rid, &endpoint);
@@ -331,7 +364,14 @@ async fn a_binding_signed_by_a_non_pinned_key_is_rejected_after_a_real_fetch() {
     let rid = registry_kp.peer_id().as_str().to_string();
     let target = Keypair::generate().peer_id().as_str().to_string();
     // Served by the pinned registry's namespace, but signed by someone else.
-    publish_binding(&reg, &rid, &attacker, "billslab.com", &target, None);
+    publish_binding(
+        &reg,
+        &rid,
+        &attacker,
+        "billslab.com",
+        &target,
+        Some(LIVE_TTL_MS),
+    );
 
     let (endpoint, handle) = serve(reg.clone()).await;
     let consumer = Consumer::pinning(61, &rid, &endpoint);
@@ -369,7 +409,14 @@ async fn a_revoked_binding_is_excluded_via_the_by_target_index() {
     let registry_kp = Keypair::generate();
     let rid = registry_kp.peer_id().as_str().to_string();
     let target = Keypair::generate().peer_id().as_str().to_string();
-    let binding_hash = publish_binding(&reg, &rid, &registry_kp, "billslab.com", &target, None);
+    let binding_hash = publish_binding(
+        &reg,
+        &rid,
+        &registry_kp,
+        "billslab.com",
+        &target,
+        Some(LIVE_TTL_MS),
+    );
 
     // A registry-signed revocation, reachable only through the by-target index.
     let revocation = entity_registry::data::RevocationData {
@@ -412,7 +459,15 @@ async fn an_expired_binding_is_excluded() {
     let rid = registry_kp.peer_id().as_str().to_string();
     let target = Keypair::generate().peer_id().as_str().to_string();
     // issued_at 1000 + ttl 1 is long past.
-    publish_binding(&reg, &rid, &registry_kp, "billslab.com", &target, Some(1));
+    publish_binding_at(
+        &reg,
+        &rid,
+        &registry_kp,
+        "billslab.com",
+        &target,
+        1_000,
+        Some(1),
+    );
 
     let (endpoint, handle) = serve(reg.clone()).await;
     let consumer = Consumer::pinning(63, &rid, &endpoint);
@@ -439,7 +494,14 @@ async fn a_preceded_binding_resolves_without_touching_the_wire() {
     let registry_kp = Keypair::generate();
     let rid = registry_kp.peer_id().as_str().to_string();
     let target = Keypair::generate().peer_id().as_str().to_string();
-    publish_binding(&reg, &rid, &registry_kp, "billslab.com", &target, None);
+    publish_binding(
+        &reg,
+        &rid,
+        &registry_kp,
+        "billslab.com",
+        &target,
+        Some(LIVE_TTL_MS),
+    );
 
     let (endpoint, handle) = serve(reg.clone()).await;
     let consumer = Consumer::pinning(64, &rid, &endpoint);
@@ -514,7 +576,14 @@ async fn a_chain_entry_without_an_endpoint_hint_does_not_dial() {
     let registry_kp = Keypair::generate();
     let rid = registry_kp.peer_id().as_str().to_string();
     let target = Keypair::generate().peer_id().as_str().to_string();
-    publish_binding(&reg, &rid, &registry_kp, "billslab.com", &target, None);
+    publish_binding(
+        &reg,
+        &rid,
+        &registry_kp,
+        "billslab.com",
+        &target,
+        Some(LIVE_TTL_MS),
+    );
 
     let (_endpoint, handle) = serve(reg.clone()).await;
 

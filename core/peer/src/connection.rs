@@ -1457,7 +1457,20 @@ pub(crate) async fn dispatch_request(
         Some(granter_peer_id) => entity_capability::check_permission_with_grant(
             &verified.operation,
             &resolved.pattern,
-            local_pid.as_str(),
+            // §5.2: `target_peer = extract_peer(execute.data.uri, local)` — NOT
+            // `local`. Passing `local` here made a grant scoped
+            // `peers: {include: [local]}` — or absent, which defaults to the
+            // same — authorize a dispatch into a FOREIGN namespace, since the
+            // dimension then compared local against local and always matched.
+            //
+            // This MUST read `verified.uri`, not `handler_path`: `handler_path`
+            // is `extract_handler_path` + `qualify_path`, and the first of those
+            // *strips* the authority from an `entity://{peer}/...` URI so the
+            // second re-qualifies it to the local peer. Deriving the target peer
+            // from it would reconstruct the very escalation this fixes, and
+            // would do it invisibly — the absolute-path form `/{peer}/...`
+            // survives that round-trip, so only the `entity://` form would leak.
+            &EntityUri::extract_peer(&verified.uri, local_pid.as_str()),
             resource_target.as_ref(),
             &verified.capability,
             local_pid.as_str(),
@@ -1493,22 +1506,16 @@ pub(crate) async fn dispatch_request(
         .iter()
         .map(|(h, e)| (*h, e.clone()))
         .collect();
-    let execute_fn = make_execute_fn(
-        shared.clone(),
-        Some(verified.author_hash),
-        included.clone(),
-        bounds.clone(),
-        // V7 §6.8 / proposal §6.2: original caller's verified capability is the
-        // attribution context for any sub-dispatches the handler performs.
-        Some(verified.capability.clone()),
-    );
-
     // Load + validate handler grant from tree (§6.8, §6.9, §S2/§S3). See
     // `load_local_handler_grant` for the full check ladder: granter equality,
     // signature verification, temporal validity. A failed check yields
     // `(None, None)`, which engages the §7.1 fail-closed path on entity-
     // native dispatch and drops any compiled-handler authority claim from a
     // transferred subtree.
+    //
+    // Loaded BEFORE `make_execute_fn` because it is also the §5.2 resource
+    // ceiling for any sub-dispatch this handler performs (D1) — the handler
+    // about to run is the deputy.
     let bare_pattern = entity_entity::EntityUri::strip_peer_prefix(&resolved.pattern);
     let (handler_grant, handler_grant_hash) = load_local_handler_grant(
         bare_pattern,
@@ -1518,6 +1525,17 @@ pub(crate) async fn dispatch_request(
         shared.identity_hash,
         shared.keypair.key_type(),
         &shared.keypair.public_key_bytes(),
+    );
+
+    let execute_fn = make_execute_fn(
+        shared.clone(),
+        Some(verified.author_hash),
+        included.clone(),
+        bounds.clone(),
+        // V7 §6.8 / proposal §6.2: original caller's verified capability is the
+        // attribution context for any sub-dispatches the handler performs.
+        Some(verified.capability.clone()),
+        DispatchCeiling::Handler(handler_grant.clone().map(Box::new)),
     );
 
     let mut builder = HandlerContext::builder(envelope.root.clone(), params)
@@ -2559,7 +2577,13 @@ fn lookup_operation_output_type(
 }
 
 /// Build a minimal error entity for entity-native dispatch fail-closed paths.
-#[cfg(feature = "compute")]
+///
+/// Deliberately NOT `#[cfg(feature = "compute")]`: §5.2's resource-dimension
+/// denial on the in-process path (D1) builds its 403 body with this, and that
+/// check is a security invariant of the dispatch core, not of the compute
+/// extension. Gating it would have made the guard compile away for any build
+/// without `compute` — the feature-gate hazard where a cfg'd symbol reads as an
+/// absent surface.
 fn make_error_response_entity(code: &str, message: &str) -> entity_entity::Entity {
     let data = entity_ecf::cbor_map! {
         "code" => entity_ecf::text(code),
@@ -2746,12 +2770,38 @@ fn load_local_handler_grant(
     (Some(token), Some(cap_hash))
 }
 
+/// Who is dispatching, and therefore what bounds §5.2's resource dimension on
+/// the in-process branch (PROPOSAL-DISPATCH-AUTHORIZATION-FRAME D1).
+///
+/// This is a three-state fact and collapsing it to `Option<CapabilityToken>`
+/// gets it wrong in one direction or the other: `None` has to mean *deny* for a
+/// grantless handler and *allow* for the peer's own SDK entry points, which are
+/// opposite answers to the same value.
+#[derive(Clone)]
+pub enum DispatchCeiling {
+    /// The peer itself is dispatching — `Peer::execute_with_options`, the
+    /// engine, the network link. The local peer is the root authority over its
+    /// own namespace and presents no capability to itself, exactly as the wire
+    /// path expects a *caller* to and an owner not to. There is no deputy to
+    /// attenuate against, so the dimension does not bind.
+    PeerRoot,
+    /// A handler is dispatching. Its own grant is the ceiling. `None` is a
+    /// handler holding no valid grant, which denies every resource-carrying
+    /// sub-dispatch — a dispatcher that can prove no authority over any
+    /// resource naming one is the escalation, not a special case.
+    Handler(Option<Box<entity_capability::CapabilityToken>>),
+}
+
+/// `ceiling` bounds §5.2's resource dimension for sub-dispatches made through
+/// the returned `execute_fn` — see [`DispatchCeiling`] and the check on the
+/// local branch below.
 pub fn make_execute_fn(
     shared: Arc<PeerShared>,
     author: Option<entity_hash::Hash>,
     included: HashMap<entity_hash::Hash, entity_entity::Entity>,
     parent_bounds: Option<entity_handler::Bounds>,
     parent_caller_capability: Option<entity_capability::CapabilityToken>,
+    ceiling: DispatchCeiling,
 ) -> ExecuteFn {
     Arc::new(
         move |handler_path: String,
@@ -2780,6 +2830,7 @@ pub fn make_execute_fn(
             // sub-dispatch chains so history transitions record the original external
             // caller, not the intermediate handler.
             let parent_caller_capability = parent_caller_capability.clone();
+            let ceiling = ceiling.clone();
             Box::pin(async move {
                 let local_pid = shared.keypair.peer_id();
                 let is_remote = crate::remote::is_remote_uri(&handler_path, local_pid.as_str());
@@ -3111,6 +3162,74 @@ pub fn make_execute_fn(
                     }
                     None => None,
                 };
+
+                // §5.2 resource dimension — D1 of PROPOSAL-DISPATCH-AUTHORIZATION-FRAME.
+                //
+                // The conditional in §5.2's pseudocode is `resource_target is not
+                // null`. It is a test on the FIELD, not on the door: there is no
+                // wire-entry predicate and no `is_sub_dispatch` flag anywhere in
+                // §5.2, so an in-process sub-dispatch carrying a resource is
+                // checked exactly like a wire dispatch carrying one. This branch
+                // previously ran NO capability check of any dimension.
+                //
+                // The ceiling is the DISPATCHING handler's grant — the deputy's
+                // own authority — not the child's install grant (that is
+                // `child_handler_grant` below, which authorizes the callee to
+                // exist, never the caller to reach a path). This is the
+                // confused-deputy shape: a handler granted `app/*` that
+                // sub-dispatches `system/handler:register` with a
+                // caller-influenced resource target must not install at `pwn`.
+                // §6.2 assigns `register`/`unregister`'s install-path
+                // authorization to this check and to nothing else, and `register`
+                // ALWAYS carries a resource (§3.2 path-as-resource) — so a path
+                // that skips it leaves handler installation authorized by nothing.
+                //
+                // Scoped to the local branch on purpose: the remote branch sends
+                // an EXECUTE that the receiving peer authorizes through its own
+                // `dispatch_request` check, so the dimension binds there already.
+                //
+                // Fail-closed when the deputy holds no grant at all: a dispatch
+                // that names a resource while its dispatcher can prove no
+                // authority over any resource is the escalation, not a special
+                // case. (§6.8 empty grants stay valid — an empty `grants` array
+                // is a present grant that covers nothing, and it correctly denies
+                // here rather than being absent.)
+                if let Some(ref rt) = resource_target {
+                    let target_peer = EntityUri::extract_peer(&qualified, local_pid.as_str());
+                    let allowed = match ceiling {
+                        // The peer dispatching in its own namespace as root.
+                        DispatchCeiling::PeerRoot => true,
+                        DispatchCeiling::Handler(Some(ref grant)) => {
+                            entity_capability::check_permission(
+                                &operation,
+                                &resolved.pattern,
+                                &target_peer,
+                                Some(rt),
+                                grant,
+                                local_pid.as_str(),
+                            )
+                        }
+                        DispatchCeiling::Handler(None) => false,
+                    };
+                    if !allowed {
+                        tracing::warn!(
+                            handler_path = %qualified,
+                            operation = %operation,
+                            targets = ?rt.targets,
+                            "sub-dispatch denied: §5.2 resource dimension"
+                        );
+                        return Ok(entity_handler::HandlerResult::error(
+                            STATUS_FORBIDDEN,
+                            make_error_response_entity(
+                                "capability_denied",
+                                &format!(
+                                    "capability does not grant {} on {} for the requested resource",
+                                    operation, qualified
+                                ),
+                            ),
+                        ));
+                    }
+                }
                 // Ruling 9 / F1: `{step_index}` is the originating request ID,
                 // and a CONSTANT SENTINEL IS NOT CONFORMANT. This default was
                 // the literal `"internal"`, so every handler-to-handler
@@ -3137,18 +3256,13 @@ pub fn make_execute_fn(
                     None
                 };
 
-                // Build child context — params entity passed directly (already parsed)
-                let child_execute_fn = make_execute_fn(
-                    shared.clone(),
-                    author,
-                    included.clone(),
-                    child_bounds.clone(),
-                    parent_caller_capability.clone(),
-                );
-
                 // Load + validate child handler's grant from tree (§6.8, §S2/§S3).
                 // Same check ladder as the wire dispatch path —
                 // see load_local_handler_grant.
+                //
+                // Loaded before `child_execute_fn` because the child is the
+                // deputy for anything IT sub-dispatches, so this is the §5.2
+                // resource ceiling one level down (D1).
                 let child_bare = entity_entity::EntityUri::strip_peer_prefix(&resolved.pattern);
                 let (child_handler_grant, child_grant_hash) = load_local_handler_grant(
                     child_bare,
@@ -3158,6 +3272,21 @@ pub fn make_execute_fn(
                     shared.identity_hash,
                     shared.keypair.key_type(),
                     &shared.keypair.public_key_bytes(),
+                );
+
+                // The child is the deputy for anything IT sub-dispatches, and for
+                // the spawned delivery re-dispatch further down — both need this
+                // after `child_handler_grant` is moved into the context builder.
+                let delivery_ceiling_grant = child_handler_grant.clone();
+
+                // Build child context — params entity passed directly (already parsed)
+                let child_execute_fn = make_execute_fn(
+                    shared.clone(),
+                    author,
+                    included.clone(),
+                    child_bounds.clone(),
+                    parent_caller_capability.clone(),
+                    DispatchCeiling::Handler(child_handler_grant.clone().map(Box::new)),
                 );
 
                 let log_name = resolved_handler_name(&resolved).to_string();
@@ -3234,6 +3363,8 @@ pub fn make_execute_fn(
                         included.clone(),
                         None, // bounds reset for the spawned re-dispatch
                         parent_caller_capability.clone(),
+                        // Same deputy, so the same §5.2 ceiling (D1).
+                        DispatchCeiling::Handler(delivery_ceiling_grant.map(Box::new)),
                     );
 
                     tracing::debug!(

@@ -309,6 +309,46 @@ impl EntityUri {
         segment.len() == 46 && segment.bytes().all(|b| BASE58.contains(&b))
     }
 
+    /// Extract the peer a URI addresses (V7 §5.2 `extract_peer`).
+    ///
+    /// ```text
+    /// extract_peer(uri, local_peer_id):
+    ///   first = first_segment(uri)
+    ///   if is_peer_id(first): return first
+    ///   return local_peer_id
+    /// ```
+    ///
+    /// This is the `target_peer` fed to the `peers` dimension of
+    /// [`check_permission`]. It is deliberately **not** `local_peer_id`: a
+    /// dispatch whose URI names a foreign peer must be tested against that
+    /// peer, or a grant scoped `peers: {include: [local]}` (or absent, which
+    /// defaults to the same) authorizes a *foreign* namespace. Passing `local`
+    /// here is a privilege escalation, not a conservative default.
+    ///
+    /// Short-form and non-peer-prefixed absolute paths (`system/tree`,
+    /// `/system/tree`) belong to the local peer.
+    ///
+    /// [`check_permission`]: ../entity_capability/fn.check_permission.html
+    pub fn extract_peer(uri: &str, local_peer_id: &str) -> String {
+        // `entity://{authority}/rest` — the authority IS the first segment.
+        // Note this cannot go through `normalize_path`, which *strips* the
+        // authority; routing it through there would read every `entity://`
+        // URI as local, which is the escalation this function exists to stop.
+        let rest = match uri.strip_prefix(URI_SCHEME) {
+            Some(rest) => rest,
+            None => uri.strip_prefix('/').unwrap_or(uri),
+        };
+        let first = match rest.find('/') {
+            Some(slash) => &rest[..slash],
+            None => rest,
+        };
+        if Self::is_peer_id(first) {
+            first.to_string()
+        } else {
+            local_peer_id.to_string()
+        }
+    }
+
     /// Qualify a path to absolute form. Idempotent.
     ///
     /// - `entity://peer/path` → `/peer/path`
@@ -876,6 +916,54 @@ mod tests {
         let pid = entity_crypto::Keypair::from_seed([42u8; 32]).peer_id();
         let result = EntityUri::qualify_path(pid.as_str(), pid.as_str());
         assert_eq!(result, format!("/{}", pid), "bare peer_id becomes absolute");
+    }
+
+    /// §5.2 `extract_peer` — the `target_peer` the `peers` dimension tests.
+    ///
+    /// The `entity://` case is the one with teeth: routing this through
+    /// `normalize_path`/`extract_handler_path` (which *strip* the authority)
+    /// reads every foreign `entity://` URI as local, which is precisely the
+    /// privilege escalation the peers dimension exists to stop. That mistake
+    /// turns the `entity_scheme_authority_is_the_target_peer` case red while
+    /// leaving the absolute-path case green — so both forms are asserted here.
+    #[test]
+    fn extract_peer_reads_the_uri_authority_not_the_local_peer() {
+        let local = entity_crypto::Keypair::from_seed([42u8; 32]).peer_id();
+        let foreign = entity_crypto::Keypair::from_seed([7u8; 32]).peer_id();
+        assert_ne!(local.as_str(), foreign.as_str());
+
+        // entity:// form — authority is the first segment after the scheme.
+        assert_eq!(
+            EntityUri::extract_peer(&format!("entity://{}/system/tree", foreign), local.as_str()),
+            foreign.to_string(),
+            "entity:// authority is the target peer"
+        );
+        // absolute-path form.
+        assert_eq!(
+            EntityUri::extract_peer(&format!("/{}/system/tree", foreign), local.as_str()),
+            foreign.to_string(),
+            "leading peer segment is the target peer"
+        );
+        // Bare peer-id with no trailing path.
+        assert_eq!(
+            EntityUri::extract_peer(&format!("/{}", foreign), local.as_str()),
+            foreign.to_string(),
+            "a bare peer-id is still a target peer"
+        );
+
+        // Short forms and non-peer-prefixed absolutes belong to the local peer.
+        for local_form in ["system/tree", "/system/tree", ""] {
+            assert_eq!(
+                EntityUri::extract_peer(local_form, local.as_str()),
+                local.to_string(),
+                "{local_form:?} has no authority, so it is local"
+            );
+        }
+        assert_eq!(
+            EntityUri::extract_peer(&format!("entity://{}/system/tree", local), local.as_str()),
+            local.to_string(),
+            "self-addressed entity:// is local"
+        );
     }
 
     #[test]

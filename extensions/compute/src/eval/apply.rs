@@ -17,7 +17,7 @@
 
 use ciborium::Value;
 use entity_ecf::ValueExt;
-use entity_entity::Entity;
+use entity_entity::{Entity, EntityUri};
 use entity_hash::Hash;
 
 use crate::types::*;
@@ -511,7 +511,12 @@ fn resolve_apply_capability(
     if !entity_capability::check_permission(
         target_op,
         &qualified_target,
-        ctx.local_peer_id,
+        // §5.2: the peers dimension tests `extract_peer(uri, local)`. `target_path`
+        // is expression-supplied and MAY name a foreign peer, so this is the same
+        // escalation the dispatch path carried: `local` here let a `peers:{local}`
+        // (or absent) handler grant satisfy the F2 dual-check for a foreign target,
+        // which is precisely the ceiling the dual-check exists to enforce.
+        &EntityUri::extract_peer(&qualified_target, ctx.local_peer_id),
         resource,
         ctx_cap,
         ctx.local_peer_id,

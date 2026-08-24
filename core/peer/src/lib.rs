@@ -653,6 +653,8 @@ impl Peer {
                         included,
                         None, // engine-initiated, no parent bounds
                         None, // engine-initiated, no external caller
+                        // The peer is dispatching as itself, not as a deputy.
+                        connection::DispatchCeiling::PeerRoot,
                     );
                     let opts = entity_handler::ExecuteOptions {
                         resource: req.resource,
@@ -750,6 +752,9 @@ impl Peer {
             std::collections::HashMap::new(),
             None,
             None,
+            // The peer is dispatching as itself, not as a deputy — the local
+            // peer is root over its own namespace (D1).
+            connection::DispatchCeiling::PeerRoot,
         );
         let result = execute_fn(handler.to_string(), operation.to_string(), params, options).await;
         match &result {
@@ -4391,6 +4396,104 @@ mod tests {
         assert_eq!(
             dispatch_result.result.entity_type, "app/echo/result",
             "expression returned its constructed entity"
+        );
+    }
+
+    /// AUTHZ-SUBDISPATCH-RESOURCE-1 (PROPOSAL-DISPATCH-AUTHORIZATION-FRAME D1)
+    /// — §5.2's resource dimension binds an in-process sub-dispatch exactly as
+    /// it binds a wire dispatch, because the pseudocode's conditional is
+    /// `resource_target is not null`: a test on the FIELD, not on the door.
+    ///
+    /// The confused-deputy shape, and the only shape that reaches this path: a
+    /// handler holding a grant scoped to `app/*` sub-dispatches
+    /// `system/handler:register` with a caller-influenced resource target
+    /// outside that scope. §6.2 assigns `register`'s install-path authorization
+    /// to this check and to nothing else, and `register` always carries a
+    /// resource (§3.2 path-as-resource) — so before D1 this installed at `pwn`
+    /// under a grant that covers only `app/*`.
+    ///
+    /// Teeth: this whole in-process path ran NO capability check of any
+    /// dimension before D1. Deleting the resource-dimension block in
+    /// `make_execute_fn` turns the first assertion red.
+    #[cfg(feature = "handlers")]
+    #[tokio::test]
+    async fn subdispatch_resource_dimension_binds_the_dispatching_handler() {
+        use entity_capability::{CapabilityToken, GrantEntry, Granter, IdScope, PathScope};
+
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
+        let shared = peer.shared();
+        let identity = shared.identity_hash;
+
+        // The deputy's grant: everything, but only over `app/*`.
+        let deputy_grant = CapabilityToken {
+            grants: vec![GrantEntry {
+                handlers: PathScope::new(vec!["*".into()]),
+                resources: PathScope::new(vec!["app/*".into()]),
+                operations: IdScope::new(vec!["*".into()]),
+                peers: None,
+                constraints: None,
+                allowances: None,
+            }],
+            granter: Granter::Single(identity),
+            grantee: identity,
+            parent: None,
+            created_at: 0,
+            expires_at: None,
+            not_before: None,
+            delegation_caveats: None,
+        };
+
+        let execute_fn = connection::make_execute_fn(
+            shared.clone(),
+            Some(identity),
+            std::collections::HashMap::new(),
+            None,
+            None,
+            connection::DispatchCeiling::Handler(Some(Box::new(deputy_grant.clone()))),
+        );
+
+        let params = entity_entity::Entity::new(
+            "primitive/null",
+            entity_ecf::to_ecf(&entity_ecf::Value::Null),
+        )
+        .unwrap();
+
+        // Outside the grant: `system/handler/pwn` is not under `app/*`.
+        let denied = execute_fn(
+            "system/handler".into(),
+            "register".into(),
+            params.clone(),
+            handler_resource_options("pwn"),
+        )
+        .await
+        .expect("dispatch returns a result, not a transport error");
+        assert_eq!(
+            denied.status, 403,
+            "a deputy granted only `app/*` must not reach `system/handler/pwn`"
+        );
+
+        // Control: the same dispatch with an in-scope resource is NOT denied by
+        // the resource dimension. It may fail later for unrelated reasons (the
+        // params are not a real register-request) — what must not happen is a
+        // 403 from this check, which would mean the guard denies everything and
+        // the assertion above proves nothing.
+        let allowed = execute_fn(
+            "system/handler".into(),
+            "register".into(),
+            params,
+            entity_handler::ExecuteOptions {
+                resource: Some(entity_capability::ResourceTarget {
+                    targets: vec!["app/mine".into()],
+                    exclude: vec![],
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("dispatch returns a result");
+        assert_ne!(
+            allowed.status, 403,
+            "an in-scope resource must pass the §5.2 resource dimension"
         );
     }
 

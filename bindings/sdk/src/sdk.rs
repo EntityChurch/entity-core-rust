@@ -767,6 +767,8 @@ async fn dispatch_execute(
         std::collections::HashMap::new(),
         None,
         None,
+        // The peer dispatching as itself, not as a deputy (§5.2 D1).
+        entity_peer::connection::DispatchCeiling::PeerRoot,
     );
     execute_fn(
         handler.into(),
@@ -3175,6 +3177,8 @@ impl PeerContext {
                 std::collections::HashMap::new(),
                 None,
                 Some(owner_cap),
+                // The owner's own SDK handle — the peer acting as itself (D1).
+                entity_peer::connection::DispatchCeiling::PeerRoot,
             );
             execute_fn(handler, operation, params, opts)
                 .await
@@ -3204,6 +3208,8 @@ impl PeerContext {
                 std::collections::HashMap::new(),
                 None,
                 Some(owner_cap),
+                // The owner's own SDK handle — the peer acting as itself (D1).
+                entity_peer::connection::DispatchCeiling::PeerRoot,
             );
             execute_fn(handler, operation, params, opts)
                 .await
@@ -3331,6 +3337,8 @@ impl PeerContext {
                 std::collections::HashMap::new(),
                 None,
                 None,
+                // The peer dispatching as itself, not as a deputy (§5.2 D1).
+                entity_peer::connection::DispatchCeiling::PeerRoot,
             );
             match execute_fn("system/tree".into(), "put".into(), params, opts).await {
                 Ok(result) if result.status == 200 => {
@@ -3611,6 +3619,8 @@ impl PeerContext {
                 std::collections::HashMap::new(),
                 None,
                 None,
+                // The peer dispatching as itself, not as a deputy (§5.2 D1).
+                entity_peer::connection::DispatchCeiling::PeerRoot,
             );
             match execute_fn("system/tree".into(), "put".into(), params, opts).await {
                 Ok(result) if result.status == 200 => {

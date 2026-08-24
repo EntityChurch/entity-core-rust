@@ -2028,6 +2028,103 @@ mod tests {
         }
     }
 
+    /// §5.2 peers dimension — the P-1/P-2/P-3 trio go's
+    /// `authz.authz_peers_target_from_uri` runs, as an in-process unit.
+    ///
+    /// The dimension is what stops a grant that names only the LOCAL peer from
+    /// authorizing a dispatch into a FOREIGN namespace. It is load-bearing only
+    /// if `target_peer` is `extract_peer(execute.data.uri, local)`; a caller
+    /// that passes `local_peer_id` makes P-2 and P-3 compare local against
+    /// local, always match, and allow the escalation. That is exactly what
+    /// `core/peer/src/connection.rs` did, and go measured it as
+    /// `P2 grant={L} uri=/R/: allow=true` / `P3 absent uri=/R/: allow=true`
+    /// while go and py both denied.
+    ///
+    /// Teeth: pass `LOCAL_PEER` instead of `FOREIGN_PEER` as the third argument
+    /// and P-2/P-3 flip to allow.
+    #[test]
+    fn peers_dimension_denies_a_foreign_target_from_a_local_or_absent_scope() {
+        const FOREIGN_PEER: &str = "2DFfrCdapVgjiNBPRUdNpwKLfLsmUaKHod4jmhakzBDs3X";
+        let foreign_uri_handler = format!("/{}/system/tree", FOREIGN_PEER);
+
+        // Cross-peer wildcards on handlers/resources (`/*/*`, not bare `*`) so
+        // the PEERS dimension is the only thing that can deny. A bare `*`
+        // canonicalizes into the local namespace and would fail P-1 on the
+        // handlers dimension instead, hiding what this test is about.
+        let with_peers = |peers: Option<IdScope>| {
+            let mut g = make_grant(&["/*/*"], &["/*/*"], &["get"]);
+            g.peers = peers;
+            make_token(vec![g])
+        };
+
+        // P-1 (control): a grant naming the foreign peer allows it.
+        assert!(
+            check_permission(
+                "get",
+                &foreign_uri_handler,
+                FOREIGN_PEER,
+                None,
+                &with_peers(Some(IdScope::new(vec![FOREIGN_PEER.into()]))),
+                LOCAL_PEER,
+            ),
+            "P-1: peers={{R}} must allow a dispatch to R"
+        );
+
+        // P-2: a grant naming only the LOCAL peer must NOT reach R.
+        assert!(
+            !check_permission(
+                "get",
+                &foreign_uri_handler,
+                FOREIGN_PEER,
+                None,
+                &with_peers(Some(IdScope::new(vec![LOCAL_PEER.into()]))),
+                LOCAL_PEER,
+            ),
+            "P-2: peers={{local}} must DENY a dispatch to a foreign peer — \
+             allowing it is foreign-namespace privilege escalation"
+        );
+
+        // P-3: an ABSENT peers field defaults to {include:[local]} and is still
+        // checked — absent is not "unscoped".
+        assert!(
+            !check_permission(
+                "get",
+                &foreign_uri_handler,
+                FOREIGN_PEER,
+                None,
+                &with_peers(None),
+                LOCAL_PEER,
+            ),
+            "P-3: absent peers defaults to {{include:[local]}} and MUST still deny R"
+        );
+
+        // The same trio through the dispatch-boundary entry point, which is the
+        // one `connection.rs` actually calls.
+        assert!(check_permission_with_grant(
+            "get",
+            &foreign_uri_handler,
+            FOREIGN_PEER,
+            None,
+            &with_peers(Some(IdScope::new(vec![FOREIGN_PEER.into()]))),
+            LOCAL_PEER,
+            LOCAL_PEER,
+        )
+        .is_some());
+        assert!(
+            check_permission_with_grant(
+                "get",
+                &foreign_uri_handler,
+                FOREIGN_PEER,
+                None,
+                &with_peers(None),
+                LOCAL_PEER,
+                LOCAL_PEER,
+            )
+            .is_none(),
+            "the dispatch boundary must deny the absent-peers escalation too"
+        );
+    }
+
     fn make_token(grants: Vec<GrantEntry>) -> CapabilityToken {
         CapabilityToken {
             grants,

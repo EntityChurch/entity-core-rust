@@ -174,6 +174,8 @@ impl PeerLink for PeerNetworkLink {
             HashMap::new(),
             None,
             None,
+            // The peer is dispatching as itself, not as a deputy (D1).
+            connection::DispatchCeiling::PeerRoot,
         );
         execute_fn(uri.to_string(), operation.to_string(), params, opts).await
     }

@@ -137,6 +137,8 @@ impl PeerContext {
                 std::collections::HashMap::new(),
                 None,
                 Some(owner_cap),
+                // The peer dispatching as itself, not as a deputy (§5.2 D1).
+                entity_peer::connection::DispatchCeiling::PeerRoot,
             );
             let merge_result = execute_fn(
                 "system/tree".into(),
@@ -205,6 +207,8 @@ impl PeerContext {
                 std::collections::HashMap::new(),
                 None,
                 Some(owner_cap),
+                // The peer dispatching as itself, not as a deputy (§5.2 D1).
+                entity_peer::connection::DispatchCeiling::PeerRoot,
             );
             let merge_result = execute_fn(
                 "system/tree".into(),

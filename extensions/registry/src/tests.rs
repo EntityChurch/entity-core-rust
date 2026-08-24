@@ -722,6 +722,13 @@ fn sign_into(
     li.set(&signature_pointer_path(registry_id, target), sig_hash);
 }
 
+/// A comfortably-live TTL for peer-issued fixtures. D3 makes a non-null `ttl`
+/// mandatory for `kind: "peer-issued"`, so fixtures that are testing something
+/// else (signature pinning, revocation, chain order) must carry a real one —
+/// otherwise they would pass for the wrong reason, refused by the D3 rule
+/// rather than by the thing under test.
+const LIVE_TTL_MS: u64 = 86_400_000;
+
 /// Publish a peer-issued binding into the local store (the precede path):
 /// body + by-name pointer + invariant-pointer signature (by `signer`).
 #[allow(clippy::too_many_arguments)]
@@ -769,8 +776,8 @@ fn peer_issued_resolve_happy_path() {
         &registry,
         "billslab.com",
         &target,
-        1000,
-        None,
+        crate::log::now_ms(),
+        Some(LIVE_TTL_MS),
     );
 
     let r = peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com")
@@ -803,8 +810,8 @@ fn peer_issued_verify_fail_rejected() {
         &attacker,
         "billslab.com",
         &target,
-        1000,
-        None,
+        crate::log::now_ms(),
+        Some(LIVE_TTL_MS),
     );
 
     let r = peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com");
@@ -830,8 +837,8 @@ fn peer_issued_revoked_excluded() {
         &registry,
         "billslab.com",
         &target,
-        1000,
-        None,
+        crate::log::now_ms(),
+        Some(LIVE_TTL_MS),
     );
 
     // Unsigned revocation present → still resolves (signature is required).
@@ -847,6 +854,10 @@ fn peer_issued_revoked_excluded() {
         &format!("{}{}", revocation_prefix(&rid), rev_hash.to_hex()),
         rev_hash,
     );
+    // §6a.6: the resolver finds a revocation through the by-target INDEX, not by
+    // scanning the revocation subtree. A fixture that files only the own-hash
+    // pointer is invisible to a conformant resolver.
+    li.set(&crate::revocation_by_target_path(&rid, &bh), rev_hash);
     assert!(
         peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com")
             .map(|r| r.is_resolved())
@@ -858,6 +869,201 @@ fn peer_issued_revoked_excluded() {
     sign_into(&cs, &li, &rid, &registry, &rev_hash);
     let r = peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com");
     assert!(r.is_none(), "verifying revocation must exclude, got {r:?}");
+}
+
+// D1 (REG-PEERISSUED-NAME-SUBSTITUTION-1) — a validly-signed binding for name X,
+// served at `by-name/{Y}`, MUST NOT answer a query for Y.
+//
+// This is the hostile-host substitution: the attacker never forges anything. It
+// repoints one pointer file at a binding the registry genuinely issued, so every
+// signature check passes. The `name` is inside the SIGNED body, so the
+// association is committed — we were discarding it. Nothing else on this path
+// can catch it, which is why the check is fail-closed and advances the chain.
+//
+// Teeth: delete the `binding.name != norm` comparison in `resolve_one` and this
+// resolves `evil.example` to the honest binding's target.
+#[test]
+fn peer_issued_name_substitution_refused() {
+    let (cs, li) = stores();
+    let registry = Keypair::generate();
+    let rid = registry.peer_id().as_str().to_string();
+    let target = Keypair::generate().peer_id().as_str().to_string();
+
+    // The registry legitimately issues + signs a binding for `honest.example`.
+    let bh = publish_binding(
+        &cs,
+        &li,
+        &rid,
+        &registry,
+        "honest.example",
+        &target,
+        crate::log::now_ms(),
+        Some(LIVE_TTL_MS),
+    );
+
+    // A hostile host serving the registry's tree repoints `evil.example` at it.
+    // No forgery: same entity, same registry signature, different pointer.
+    li.set(&by_name_pointer_path(&rid, "evil.example"), bh);
+
+    let r = peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "evil.example");
+    assert!(
+        r.is_none(),
+        "a binding whose signed name is `honest.example` MUST NOT answer a query \
+         for `evil.example` — got {r:?}"
+    );
+
+    // The honest name still resolves, so the check is a comparison and not a
+    // blanket refusal.
+    assert!(
+        peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "honest.example")
+            .map(|r| r.is_resolved())
+            .unwrap_or(false),
+        "the legitimately-bound name must still resolve"
+    );
+}
+
+// D3 (REG-PEERISSUED-NULL-TTL-1) — a `peer-issued` binding with a null `ttl` is
+// refused and the chain advances.
+//
+// Revocation is the only other check on this path that can retire a compromised
+// binding, and it asks the hostile host — which can withhold. `issued_at + ttl`
+// is computed locally from the signed body, so it is the one bound the attacker
+// cannot touch. Null ttl means permanently unrevokable.
+//
+// Teeth: restore `if let Some(ttl) = binding.ttl` (ttl-null = no expiry) and
+// this resolves.
+#[test]
+fn peer_issued_null_ttl_refused() {
+    let (cs, li) = stores();
+    let registry = Keypair::generate();
+    let rid = registry.peer_id().as_str().to_string();
+    let target = Keypair::generate().peer_id().as_str().to_string();
+    publish_binding(
+        &cs,
+        &li,
+        &rid,
+        &registry,
+        "billslab.com",
+        &target,
+        crate::log::now_ms(),
+        None, // null ttl — permanently unrevokable against a withholding origin
+    );
+
+    let r = peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com");
+    assert!(
+        r.is_none(),
+        "a peer-issued binding with null ttl MUST be refused (D3), got {r:?}"
+    );
+}
+
+// §6a.6 / P7 — revocation is found through the by-target INDEX, not a scan of the
+// revocation subtree.
+//
+// Teeth: restore the `location_index.list(revocation_prefix(..))` scan and the
+// second half of this test passes anyway (the scan finds the same revocation by
+// its `revokes` field) — which is exactly why the divergence stayed invisible.
+// The FIRST half is the part that bites: a revocation filed ONLY under the
+// own-hash pointer must not exclude, because a conformant resolver never looks
+// there.
+#[test]
+fn peer_issued_revocation_is_found_by_target_index_not_by_scan() {
+    let (cs, li) = stores();
+    let registry = Keypair::generate();
+    let rid = registry.peer_id().as_str().to_string();
+    let target = Keypair::generate().peer_id().as_str().to_string();
+    let bh = publish_binding(
+        &cs,
+        &li,
+        &rid,
+        &registry,
+        "billslab.com",
+        &target,
+        crate::log::now_ms(),
+        Some(LIVE_TTL_MS),
+    );
+
+    // A signed revocation that exists in the subtree but is NOT in the index.
+    let rev = RevocationData {
+        revokes: bh,
+        revoked_at: crate::log::now_ms(),
+        reason: None,
+    };
+    let rev_entity = rev.to_entity().unwrap();
+    let rev_hash = rev_entity.content_hash;
+    cs.put(rev_entity).unwrap();
+    li.set(
+        &format!("{}{}", revocation_prefix(&rid), rev_hash.to_hex()),
+        rev_hash,
+    );
+    sign_into(&cs, &li, &rid, &registry, &rev_hash);
+
+    assert!(
+        peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com")
+            .map(|r| r.is_resolved())
+            .unwrap_or(false),
+        "an unindexed revocation must not exclude — a §6a.6 resolver reads the \
+         by-target index, so finding this one would prove we are scanning"
+    );
+
+    // Filed in the index → excluded.
+    li.set(&crate::revocation_by_target_path(&rid, &bh), rev_hash);
+    assert!(
+        peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com").is_none(),
+        "an indexed, registry-signed revocation MUST exclude"
+    );
+}
+
+// §6a.6 — the index KEY is host-served and proves nothing. A genuine
+// registry-signed revocation for binding A, filed under `by-target/{B}`, must not
+// revoke B: the `revokes` field inside the signed body is what the registry
+// committed to.
+#[test]
+fn peer_issued_misfiled_revocation_does_not_revoke_the_wrong_binding() {
+    let (cs, li) = stores();
+    let registry = Keypair::generate();
+    let rid = registry.peer_id().as_str().to_string();
+    let target = Keypair::generate().peer_id().as_str().to_string();
+    let victim = publish_binding(
+        &cs,
+        &li,
+        &rid,
+        &registry,
+        "victim.example",
+        &target,
+        crate::log::now_ms(),
+        Some(LIVE_TTL_MS),
+    );
+    let other = publish_binding(
+        &cs,
+        &li,
+        &rid,
+        &registry,
+        "other.example",
+        &target,
+        crate::log::now_ms(),
+        Some(LIVE_TTL_MS),
+    );
+
+    // Genuine, registry-signed revocation — but it revokes `other`, not `victim`.
+    let rev = RevocationData {
+        revokes: other,
+        revoked_at: crate::log::now_ms(),
+        reason: None,
+    };
+    let rev_entity = rev.to_entity().unwrap();
+    let rev_hash = rev_entity.content_hash;
+    cs.put(rev_entity).unwrap();
+    sign_into(&cs, &li, &rid, &registry, &rev_hash);
+    // The hostile host misfiles it under the victim's index key.
+    li.set(&crate::revocation_by_target_path(&rid, &victim), rev_hash);
+
+    assert!(
+        peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "victim.example")
+            .map(|r| r.is_resolved())
+            .unwrap_or(false),
+        "a revocation whose signed `revokes` names another binding must not \
+         revoke this one — the index key is not evidence"
+    );
 }
 
 // REG-PEERISSUED-EXPIRED-1 — issued_at + ttl < now → excluded.
@@ -900,8 +1106,8 @@ fn peer_issued_precede_identical_to_live() {
         &registry,
         "billslab.com",
         &target,
-        1000,
-        None,
+        crate::log::now_ms(),
+        Some(LIVE_TTL_MS),
     );
 
     let r = peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com").unwrap();
@@ -943,8 +1149,8 @@ async fn peer_issued_via_meta_resolve() {
         &registry_kp,
         "billslab.com",
         &target,
-        1000,
-        None,
+        crate::log::now_ms(),
+        Some(LIVE_TTL_MS),
     );
 
     let cfg = ResolverConfigData {
@@ -987,8 +1193,8 @@ async fn peer_issued_verify_fail_via_meta_is_chain_exhausted() {
         &attacker,
         "billslab.com",
         &target,
-        1000,
-        None,
+        crate::log::now_ms(),
+        Some(LIVE_TTL_MS),
     );
 
     let cfg = ResolverConfigData {

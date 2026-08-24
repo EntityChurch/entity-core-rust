@@ -5239,3 +5239,62 @@ reader implementing from the pseudocode alone — which is what an implementer
 does — gets the cross-impl-visible wrong answer today. Found by `entity-core-go`'s
 `merge_config_cascade_control_no_config_conflicts` control row against rust
 `cc6cb56`, and it was ours, not theirs.
+
+---
+
+## EXTENSION-REVISION §6.1 — auto-version adopts an unfiltered root; `commit` builds a filtered one (SA-PY-8)
+
+**Spec:** `EXTENSION-REVISION` §2.4 (*"Exclude applies to trie building"*) and §6.1
+(`auto_version_on_write` Algorithm block) ⨯ §4.4 (`handle_commit`); cross-reference
+`EXTENSION-TREE` §3.4.1a (tracking-config / `system/tree/root/{P}`).
+
+**Status: reported, NOT implemented — deliberately.** Answers arch
+`ROUTING-2026-08-18-f` §4b, which asked us to *"read both paths and report before
+implementing."*
+
+### What our two paths do (measured, not inferred)
+
+| path | code | root |
+|---|---|---|
+| explicit `revision:commit` | `perform_commit` (`extensions/revision/src/lib.rs`) — "S2: apply exclude/exclude_types filters from config" | **exclude-filtered** |
+| auto-version | `auto_version_once` (`extensions/revision/src/engine.rs`) — `root: tracked_root`, read straight from `system/tree/root/{prefix}` | **unfiltered** |
+
+So we are **conformant on the `commit` half** (§2.4's existing MUST — this is the half
+`entity-core-py` is missing), and on the auto-version half we do exactly what §6.1's
+Algorithm block says: adopt `current_tracked_root(prefix)`. **`entity-core-go` is in the
+same position, and arch's ruling explicitly assigns it no fault.**
+
+### The ambiguity
+
+§6.1 contradicts itself, independent of any implementation. Its Amendment-2
+deletion-marker rule requires auto-version to **build** a trie ("the new version's trie
+MUST include explicit entries for every path bound in the parent version's trie"), which
+an algorithm that assigns `root = current_tracked_root(prefix)` cannot satisfy — it never
+constructs a trie. The v3.3 D3 refinement sharpens it further: marker-augmentation must
+run *before* the dedup-against-head check, and only the dedup step appears in the
+Algorithm block.
+
+Consequence if left as written: with a non-empty `exclude`, the same tree state yields two
+different roots depending on which path emitted the version — and a version entry is
+`{root, parents}`, content-addressed, so that is two version identities with no content
+difference. A DAG fork that entity exchange cannot converge.
+
+### Interim choice, and why it is to do nothing
+
+**We follow the landed text.** `PROPOSAL-REVISION-AUTO-VERSION-EXCLUDE-PARITY` is
+`Status: DRAFT` and its D1 explicitly *replaces* §6.1's Algorithm block — it is a spec
+revision reaching us, not a defect report against us. Implementing it now would diverge us
+from the landed spec and from `entity-core-go` simultaneously, to match text still under
+correction. That is the failure mode `AGENTS.md` names ("implement against the landed
+spec, not in-flight proposals") and the one the §2.1 Q23 ordering note was written for.
+
+**When D1 lands**, the change is confined to `auto_version_once`: compute the filtered
+trie instead of adopting `tracked_root`, keeping the documented fast path — with `exclude`
+and `exclude_types` both empty the filtered trie *is* the tracked root, so the O(1)
+adoption stays available for the common case. The emission gate
+(`if event.path matches exclude: return`) is a separate mechanism and stays.
+
+**Owed on landing:** `REV-AUTOVERSION-EXCLUDE-PARITY-1` (proposal D5) — write an excluded
+path, then a non-excluded one; the auto-version entry's `root` MUST equal the `root` an
+explicit `commit` produces over the same live state. No current vector reaches this, which
+is why three implementations disagreed silently.

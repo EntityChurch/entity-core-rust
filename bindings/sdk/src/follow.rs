@@ -176,6 +176,8 @@ impl Drop for FollowHandle {
                         HashMap::new(),
                         None,
                         None,
+                        // The peer dispatching as itself, not as a deputy (§5.2 D1).
+                        entity_peer::connection::DispatchCeiling::PeerRoot,
                     );
                     let _ = execute_fn(
                         "system/continuation".into(),
@@ -430,6 +432,8 @@ impl PeerContext {
                         HashMap::new(),
                         None,
                         Some(owner_cap),
+                        // The peer dispatching as itself, not as a deputy (§5.2 D1).
+                        entity_peer::connection::DispatchCeiling::PeerRoot,
                     );
                     if let Err(e) = execute_fn(
                         "system/tree".into(),
@@ -632,6 +636,8 @@ impl MirrorWriter {
             HashMap::new(),
             None,
             None,
+            // The peer dispatching as itself, not as a deputy (§5.2 D1).
+            entity_peer::connection::DispatchCeiling::PeerRoot,
         )
     }
 }

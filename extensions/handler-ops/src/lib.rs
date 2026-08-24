@@ -168,24 +168,30 @@ impl HandlersHandler {
             }
         }
 
-        // Build the grant scope. Prefer explicit `requested_scope`; fall back to
-        // manifest.internal_scope. A handler with no declared scope is a contract
-        // error — we do NOT fabricate a default (would silently grant wildcard).
+        // Build the grant scope, per §6.2's own pseudocode:
+        //   grant_scope = requested_scope or internal_scope or []
+        //
+        // The trailing `or []` is normative and is why an absent scope is NOT a
+        // 400 (CAP-1 / §S3). We used to reject it, reasoning that a handler with
+        // no declared scope is a contract error and that defaulting would
+        // "silently grant wildcard" — but the spec's default is the *empty*
+        // grant, which is the opposite of wildcard: it is the zero-authority
+        // ceiling under which every impure op fails its own per-op check. So the
+        // rejection bought no safety and refused the pure-functional handler
+        // §6.8 exists to bless.
+        //
+        // Absent and empty must land in the same place here, because on the wire
+        // they ARE the same fact: `requested_scope` is an optional array, so a
+        // peer sending `[]` omits the key (go encodes it `omitempty`). A register
+        // carrying an explicitly empty scope therefore arrives as *absent* — the
+        // old 400 fired on exactly the input the CAP-1 vector sends.
         let grant_scope = match decode_grant_entries(
             params_data
                 .get("requested_scope")
                 .or_else(|| manifest.get("internal_scope")),
         ) {
             Ok(Some(s)) => s,
-            Ok(None) => {
-                return Ok(HandlerResult::error(
-                    STATUS_BAD_REQUEST,
-                    error_entity(
-                        "missing_scope",
-                        "register-request must specify requested_scope or manifest.internal_scope (V7 §3.12)",
-                    ),
-                ))
-            }
+            Ok(None) => Vec::new(),
             Err(msg) => {
                 return Ok(HandlerResult::error(
                     STATUS_BAD_REQUEST,
@@ -811,16 +817,42 @@ mod tests {
         assert_eq!(data_str(&data, "code"), Some("forbidden_pattern".into()));
     }
 
+    /// CAP-1 / §6.2 step 3: `grant_scope = requested_scope or internal_scope or []`.
+    /// An absent scope is the **pure-functional** handler, not a contract error —
+    /// it registers 200 and installs a signed grant whose `grants` array is empty
+    /// (the zero-authority ceiling), never a wildcard.
+    ///
+    /// Teeth: this is the in-process half of go's `empty_handler_grant_dispatches`,
+    /// which failed here with `register returned status 400` while go and py both
+    /// passed. Restoring the old `Ok(None) => 400 missing_scope` arm turns the
+    /// status assertion red.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_register_rejects_missing_scope() {
+    async fn test_register_absent_scope_installs_empty_grant() {
         let handler = test_handler();
         let req = build_register_request("app/no-scope", false, None);
         let ctx = ctx_with_params(req, "register", "app/no-scope");
 
         let result = handler.handle(&ctx).await.unwrap();
-        assert_eq!(result.status, STATUS_BAD_REQUEST);
-        let data = decode_data(&result.result).unwrap();
-        assert_eq!(data_str(&data, "code"), Some("missing_scope".into()));
+        assert_eq!(
+            result.status, 200,
+            "an absent scope is §6.2's `or []`, not a 400"
+        );
+
+        // The grant must exist and must be empty — proving we defaulted to the
+        // zero-authority ceiling rather than fabricating any authority at all.
+        let pid = TEST_PID;
+        let grant_h = handler
+            .location_index
+            .get(&format!("/{}/system/capability/grants/app/no-scope", pid))
+            .expect("grant installed at /system/capability/grants/{pattern}");
+        let grant_ent = handler.content_store.get(&grant_h).unwrap();
+        let token = entity_capability::CapabilityToken::from_entity(&grant_ent)
+            .expect("grant decodes as a capability token");
+        assert!(
+            token.grants.is_empty(),
+            "absent scope must yield the empty (zero-authority) grant, got {:?}",
+            token.grants
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

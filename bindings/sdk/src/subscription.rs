@@ -80,6 +80,38 @@ pub struct SubscribeLimits {
     pub rate_limit: Option<u64>,
 }
 
+/// The EXTENSION-SUBSCRIPTION §2.2 event vocabulary. These are the only names a
+/// built-in tree change can produce.
+pub const SUBSCRIPTION_EVENTS: [&str; 3] = ["created", "updated", "deleted"];
+
+/// Reject an event name outside §2.2's vocabulary (SA-2).
+///
+/// The engine is correct and needs no change: it accepts an arbitrary name and
+/// filters deliveries against it. That is exactly why the wrapper must validate
+/// — an unknown name is not an error anywhere downstream, it is a filter that
+/// matches nothing. The caller gets a subscription that is created, returns an
+/// id, and never fires for its entire lifetime, with no error at any layer.
+///
+/// The reachable case is a caller following the pre-fix SDK-EXTENSION-OPERATIONS
+/// §3 vocabulary, which named events the extension never emitted.
+/// `entity-core-py` already rejects unknown names; this closes the same gap here.
+fn validate_event_vocabulary(events: &[String]) -> Result<(), SdkError> {
+    if let Some(bad) = events
+        .iter()
+        .find(|e| !SUBSCRIPTION_EVENTS.contains(&e.as_str()))
+    {
+        return Err(SdkError::BadRequest {
+            status: 400,
+            code: Some("invalid_event_type".into()),
+            message: format!(
+                "unknown subscription event {bad:?}; EXTENSION-SUBSCRIPTION §2.2                  defines only {}. An unknown name would be accepted by the engine                  and match nothing, so the subscription would never fire.",
+                SUBSCRIPTION_EVENTS.join(" / ")
+            ),
+        });
+    }
+    Ok(())
+}
+
 impl SubscribeOptions {
     /// Shorthand for `SubscribeOptions { include_payload: true, .. }`.
     /// Use this when the subscriber holds `tree:get` on the resource
@@ -94,9 +126,13 @@ impl SubscribeOptions {
 
     /// Builder-style helper: narrow the event types this subscription
     /// receives. Pass any subset of `"created"` / `"updated"` /
-    /// `"deleted"` (per EXTENSION-SUBSCRIPTION §2.2). Other event
-    /// names will be accepted by the engine but no built-in tree
-    /// event produces them.
+    /// `"deleted"` (per EXTENSION-SUBSCRIPTION §2.2).
+    ///
+    /// Unknown names are rejected at `subscribe` time — see
+    /// [`validate_event_vocabulary`]. They used to pass through, which is
+    /// SA-2: the engine accepts any name and filters against it, so an
+    /// unknown one produced a subscription that was created, returned an
+    /// id, and then never fired for its whole lifetime.
     pub fn with_events(mut self, events: Vec<String>) -> Self {
         self.events = Some(events);
         self
@@ -222,6 +258,8 @@ impl Drop for L1SubscriptionHandle {
                 std::collections::HashMap::new(),
                 None,
                 None,
+                // The peer dispatching as itself, not as a deputy (§5.2 D1).
+                entity_peer::connection::DispatchCeiling::PeerRoot,
             );
             let opts = ExecuteOptions::default();
             match execute_fn(unsub_target, "unsubscribe".into(), params, opts).await {
@@ -320,6 +358,8 @@ impl Drop for RawSubscriptionHandle {
                 std::collections::HashMap::new(),
                 None,
                 None,
+                // The peer dispatching as itself, not as a deputy (§5.2 D1).
+                entity_peer::connection::DispatchCeiling::PeerRoot,
             );
             let _ = execute_fn(
                 unsub_target,
@@ -745,6 +785,11 @@ impl PeerContext {
             // `events`: None → emit all three defaults (created /
             // updated / deleted) to preserve pre-v0.8 wire shape.
             // Some(vec) → emit verbatim (caller may narrow).
+            // §2.2 vocabulary — validated before the mint, so an unknown name
+            // fails loudly instead of yielding a never-firing subscription.
+            if let Some(ref es) = options.events {
+                validate_event_vocabulary(es)?;
+            }
             let events_values: Vec<ciborium::Value> = match &options.events {
                 None => vec![
                     entity_ecf::text("created"),
@@ -863,6 +908,8 @@ impl PeerContext {
                 included,
                 None,
                 caller_cap,
+                // The peer dispatching as itself, not as a deputy (§5.2 D1).
+                entity_peer::connection::DispatchCeiling::PeerRoot,
             );
             // Local: dispatch to bare `system/subscription` (local engine).
             // Cross-peer: dispatch to `entity://{remote}/system/subscription`
@@ -941,6 +988,10 @@ impl PeerContext {
         async move {
             let (token_entity, token_hash) = mint_result?;
 
+            // §2.2 vocabulary — the raw path takes the same names and owes the
+            // same check; validating only the typed entry point would leave the
+            // gap open for every caller that reaches for `subscribe_raw`.
+            validate_event_vocabulary(&events)?;
             let events_values: Vec<ciborium::Value> = if events.is_empty() {
                 vec![
                     entity_ecf::text("created"),
@@ -987,6 +1038,8 @@ impl PeerContext {
                 included,
                 None,
                 None,
+                // The peer dispatching as itself, not as a deputy (§5.2 D1).
+                entity_peer::connection::DispatchCeiling::PeerRoot,
             );
             let subscribe_target = match &remote_pid {
                 Some(pid) => format!("entity://{}/system/subscription", pid),
@@ -1230,6 +1283,8 @@ fn unsubscribe_dispatch(
             std::collections::HashMap::new(),
             None,
             None,
+            // The peer dispatching as itself, not as a deputy (§5.2 D1).
+            entity_peer::connection::DispatchCeiling::PeerRoot,
         );
         let result = execute_fn(
             "system/subscription".into(),
@@ -2019,6 +2074,55 @@ mod tests {
             }
             Err(other) => panic!("unexpected error variant: {:?}", other),
         }
+    }
+
+    /// SA-2 — an event name outside EXTENSION-SUBSCRIPTION §2.2's vocabulary is
+    /// rejected at `subscribe`, not passed through.
+    ///
+    /// The engine is correct and unchanged: it accepts any name and filters
+    /// deliveries against it. That is precisely what makes an unvalidated
+    /// wrapper dangerous — an unknown name is not an error anywhere downstream,
+    /// it is a filter matching nothing. Before this, the caller got a
+    /// subscription that was created, returned an id, and never fired for its
+    /// entire lifetime, with no error at any layer to explain the silence. The
+    /// reachable case is a caller following the pre-fix SDK-EXTENSION-OPERATIONS
+    /// §3 vocabulary.
+    ///
+    /// Teeth: delete the `validate_event_vocabulary` call in
+    /// `subscribe_internal` and this returns Ok with a live, silent handle.
+    #[tokio::test]
+    async fn subscribe_rejects_an_event_outside_the_ss_2_2_vocabulary() {
+        let ctx = make_peer_context();
+        let pid = ctx.peer_id().to_string();
+
+        let res = ctx
+            .subscribe_with_options(
+                format!("/{}/app/bad-vocab/*", pid),
+                SubscribeOptions::default().with_events(vec!["put".into()]),
+                |_ev| {},
+            )
+            .await;
+
+        match res {
+            Err(SdkError::BadRequest { code, .. }) => {
+                assert_eq!(code.as_deref(), Some("invalid_event_type"));
+            }
+            Err(other) => panic!("expected invalid_event_type, got {:?}", other),
+            Ok(_) => panic!(
+                "an unknown event name must be refused — the engine would accept \
+                 it and the subscription would never fire (SA-2)"
+            ),
+        }
+
+        // Control: the §2.2 vocabulary still subscribes.
+        let _handle = ctx
+            .subscribe_with_options(
+                format!("/{}/app/good-vocab/*", pid),
+                SubscribeOptions::default().with_events(vec!["created".into(), "deleted".into()]),
+                |_ev| {},
+            )
+            .await
+            .expect("the §2.2 vocabulary must still be accepted");
     }
 
     /// `SubscribeOptions::with_events` narrows the event filter.
