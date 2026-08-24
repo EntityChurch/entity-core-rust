@@ -222,6 +222,28 @@ Several handlers store `local_peer_id` but never use it (tree, inbox, continuati
 ### persist feature in entity-store
 `persist` feature and module are deprecated in favor of SQLite (`SqliteStore`). Module marked `#[deprecated(since = "0.2.0")]`. Remove when no external users remain.
 
+### `test_relay_source_route_three_hop` is load-sensitive (fixed-sleep flake)
+
+`core/peer/src/lib.rs::test_relay_source_route_three_hop` waits a **fixed
+`sleep(150ms)`** for an asynchronous B→C→D relay chain and then asserts the payload
+landed at D. Under a loaded machine that budget is not guaranteed, and the failure
+presents as a hard assert — *"payload should be present at D's tree after 3-hop relay
+delivery"* — not as a timeout, so it reads like a correctness break.
+
+Observed once on 2026-08-04 during a `cargo test --workspace` run that shared the box
+with a cross-impl punch matrix and a concurrent release build. Passed 3/3 in isolation
+immediately after, and the next full workspace run was **2415 / 0 / 12**, the exact
+baseline. Attribution rests on the mechanism rather than a bisect (an intermittent
+flake cannot be bisected by single runs): the only native change in flight was
+`punch_establisher::establish_live`'s `VerificationUnavailable` arm, which this test
+never constructs, and the other change is `#[cfg(target_arch = "wasm32")]` and was not
+compiled.
+
+**Fix shape when picked up:** poll for the delivery with a deadline instead of sleeping
+once — same pattern the other async-chain assertions here already need. Not fixed in
+place because the flip that surfaced it was a minimal-diff change and this is a
+different test's problem.
+
 ### entity-continuation fails `clippy -D warnings`
 `extensions/continuation/src/lib.rs`, the `DEFAULT_CHAIN_TTL > MAX_CHAIN_DEPTH` assertion in the
 depth-brake tests (was cited as `:5015`; the Python client's 2026-07-30 review found it now

@@ -36,7 +36,7 @@
 //!   **opaque**, fed verbatim to `setRemoteDescription`, so structuring it would
 //!   be wrong.
 //!
-//! # The §6.3 hole — why nothing here verifies a signature yet
+//! # §6.3 — the container this module deposits into and reads out of
 //!
 //! §6.5's security rests entirely on §6.3: *verify the entity's signature → feed
 //! **that** entity's SDP verbatim to `setRemoteDescription` → never
@@ -46,22 +46,26 @@
 //! is expected; the browser's own stack binds the DTLS cert to the SDP
 //! `a=fingerprint` (RFC 8827) automatically.
 //!
-//! **But the signature has nowhere to ride.** §6.3 specifies the two *checks*
-//! (derive `Base58(0x01 ‖ 0x01 ‖ SHA-256(pk))`, compare to the claimed peer-id;
-//! verify over the content hash) and no *container*: §6.2 pins the blob as the
-//! bare `{type, data, content_hash}` encoding, §12 registers no envelope type,
-//! and `system/signature` carries its signer as a **hash** — not self-contained
-//! for a stranger, which is the whole point of the §6.3 exception. Inventing one
-//! locally would be protocol design. `entity-core-go` reached the identical
-//! conclusion independently and routed it upstream
-//! (`ROUTING-2026-08-03-webrtc-coordination-in-go-and-the-6.3-hole`).
+//! The signature used to have **nowhere to ride**: §6.3 named two checks, §6.2
+//! framed the blob as the bare `{type, data, content_hash}` encoding, and §12
+//! registered no envelope. [`crate::envelope`] is the container that closed it —
+//! cross-verified with `entity-core-go` in both directions and **folded into the
+//! spec** on 2026-08-04 (arch `b99304d`: §6.2 repointed at the envelope, §6.3
+//! carrying the bucket-bound signing input and the four-disposition
+//! anti-downgrade rule, §12 registering `system/signaling/signed-blob`).
 //!
 //! Two consequences this module is built around, both worth stating plainly:
 //!
-//! 1. **The discharge is inoperative until the container lands.** Verification
-//!    that cannot happen cannot bind an identity, so §6.5's MUST is *buildable*
-//!    now and *dischargeable* only later. Nothing here should be read as the
-//!    browser leg being secure against a signaling MITM today.
+//! 1. **This module now deposits sealed and reads verified.** [`post`] seals
+//!    every §6.5 entity into a bucket-bound container and [`classify_collected`]
+//!    verifies what comes back, so a counterpart that has flipped arrives with a
+//!    [`VerifiedSigner`] and [`VerificationPolicy::Require`] succeeds against it.
+//!    What is still not true is that *every* counterpart has flipped —
+//!    `entity-core-go` flips in the same window — so the production call site
+//!    keeps the tolerant policy until it has. Read the security claim precisely:
+//!    the browser leg is MITM-safe only once the counterpart deposits sealed
+//!    **and** the policy is raised. The deposit half is done here; the policy
+//!    half is not.
 //! 2. **These entities carry no `peer_id` at all** — deliberately; a counterpart's
 //!    identity comes *only* from the §6.3 signature. So the offerer rule below
 //!    cannot even be *evaluated* in `tag` / `secret` / `lobby`, where the
@@ -70,7 +74,10 @@
 //!    band, which is exactly why §6.5 names it the natural default and why the
 //!    S5 gate uses it.
 
+use std::sync::Arc;
+
 use ciborium::Value;
+use entity_crypto::IdentityKeypair;
 use entity_ecf::{bytes, text, to_ecf};
 use entity_entity::Entity;
 
@@ -178,7 +185,9 @@ impl Offer {
     /// The remote SDP, **without** §6.3 verification — crate-private and named
     /// to be greppable. Reachable only through
     /// [`VerificationPolicy::AllowUnverifiedPreContainer`], which every caller
-    /// must name explicitly. Deletable the day the signature container lands.
+    /// must name explicitly. Deletable the day the deposit path flips and no
+    /// counterpart writes bare entities any more — the container itself has
+    /// landed, so this is now waiting on the migration, not on a missing shape.
     pub(crate) fn pre_container_sdp(&self) -> &str {
         &self.sdp
     }
@@ -246,7 +255,9 @@ impl Answer {
     /// The remote SDP, **without** §6.3 verification — crate-private and named
     /// to be greppable. Reachable only through
     /// [`VerificationPolicy::AllowUnverifiedPreContainer`], which every caller
-    /// must name explicitly. Deletable the day the signature container lands.
+    /// must name explicitly. Deletable the day the deposit path flips and no
+    /// counterpart writes bare entities any more — the container itself has
+    /// landed, so this is now waiting on the migration, not on a missing shape.
     pub(crate) fn pre_container_sdp(&self) -> &str {
         &self.sdp
     }
@@ -350,10 +361,64 @@ pub enum CollectedWebRtc {
 }
 
 /// Classify one collected blob as a §6.5 message.
+///
+/// **Container-blind.** Kept for the bare, pre-container framing and for the
+/// conformance harness, which classifies inner entities directly. The
+/// negotiation loop uses [`classify_collected`], which unwraps §6.3 containers
+/// and is the only path that can produce a [`VerifiedSigner`].
 pub fn classify_blob(blob: &[u8]) -> CollectedWebRtc {
     match entity_wire::decode_entity(blob) {
         Ok(e) => classify(&e.entity_type, &e.data),
         Err(_) => CollectedWebRtc::Unknown,
+    }
+}
+
+/// One collected blob, classified — plus the signer, when it arrived inside a
+/// §6.3 container.
+#[derive(Debug, Clone)]
+pub struct Collected {
+    pub msg: CollectedWebRtc,
+    /// `Some` **only** when the blob was a `signed-blob` whose signature
+    /// verified against the bucket it was collected from. There is no other way
+    /// to obtain one, which is what makes the sealed SDP accessors meaningful.
+    pub signer: Option<VerifiedSigner>,
+}
+
+/// Classify a collected blob, unwrapping a §6.3 container if that is what it is.
+///
+/// **Accepts both framings, deliberately, and only for as long as the migration
+/// needs it.** A bucket during the changeover holds bare entities from peers
+/// that have not flipped and containers from peers that have; refusing either
+/// would make the flag day a hard cutover instead of a rolling one. Which
+/// framing arrived is not lost, though — it is exactly the presence or absence
+/// of `signer`, and [`VerificationPolicy::Require`] is what turns that into a
+/// refusal.
+///
+/// A container whose signature does **not** verify is
+/// [`CollectedWebRtc::Unknown`] — §6.4's undecodable-blob skip, never an error
+/// and never a fallback to reading it as bare. Falling back would let an
+/// attacker downgrade a signed message to an unsigned one by corrupting the
+/// signature, which is the whole attack the container prevents.
+pub fn classify_collected(blob: &[u8], key: &RendezvousKey) -> Collected {
+    // Not a container at all → the legacy bare framing. During migration this
+    // is the common case, which is why `envelope::parse` failing is a normal
+    // outcome here rather than a diagnosis.
+    if crate::envelope::parse(blob).is_err() {
+        return Collected {
+            msg: classify_blob(blob),
+            signer: None,
+        };
+    }
+    match crate::envelope::open(blob, key) {
+        Ok((signer, inner)) => Collected {
+            msg: classify(&inner.entity_type, &inner.data),
+            signer: Some(signer),
+        },
+        // It claimed to be a container and failed to verify. Skip it.
+        Err(_) => Collected {
+            msg: CollectedWebRtc::Unknown,
+            signer: None,
+        },
     }
 }
 
@@ -391,6 +456,17 @@ pub struct VerifiedSigner {
 }
 
 impl VerifiedSigner {
+    /// Mint one — **crate-internal on purpose.**
+    ///
+    /// The SDP accessors below take a `&VerifiedSigner` precisely so that "I
+    /// checked the signature" is a value a caller cannot fabricate. Keeping the
+    /// constructor unexported preserves that; [`crate::envelope::open`] is the
+    /// only other place allowed to mint one, and it does so only after the full
+    /// §6.3 procedure.
+    pub(crate) fn new(peer_id: String) -> Self {
+        Self { peer_id }
+    }
+
     /// The derived-and-checked signer identity. §6.5's payloads carry **no**
     /// `peer_id` field, so this is the only place a counterpart's identity comes
     /// from — which is why the offerer rule cannot run without it.
@@ -451,10 +527,13 @@ pub fn verify_coordination_signature(
     key_type: u8,
     signature: &[u8],
 ) -> Result<VerifiedSigner, SignalingError> {
-    // An unallocated or sign-incapable key type is a *signer* fault, not a
-    // signature fault — the distinction the cross-impl vectors assert on.
+    // An unallocated or sign-incapable key type is a *key* fault, not a
+    // signature fault and not a false claim — the distinction the cross-impl
+    // vectors assert on. `unusable_key` is the settled cohort name for it, and
+    // the caller MUST skip it as an undecodable blob (§6.4 / ADR-0002) rather
+    // than treat it as a peer lying about who it is.
     let key_type =
-        entity_crypto::KeyType::from_byte(key_type).map_err(|_| SignalingError::SignerMismatch)?;
+        entity_crypto::KeyType::from_byte(key_type).map_err(|_| SignalingError::UnusableKey)?;
     // Check (b) first: a bad signature makes the claimed identity meaningless.
     entity_crypto::verify_for_key_type(
         key_type,
@@ -467,7 +546,7 @@ pub fn verify_coordination_signature(
         // as far as checking the signature; reporting `bad_signature` there
         // would send a diagnostician after the wrong half of the pair.
         entity_crypto::CryptoError::InvalidPublicKey
-        | entity_crypto::CryptoError::UnsupportedKeyType(_) => SignalingError::SignerMismatch,
+        | entity_crypto::CryptoError::UnsupportedKeyType(_) => SignalingError::UnusableKey,
         _ => SignalingError::BadSignature,
     })?;
     // Check (a): the peer-id IS a commitment to the public key, so deriving it
@@ -475,7 +554,7 @@ pub fn verify_coordination_signature(
     // canonical hash type per key type is selected inside the derivation
     // (Ed25519 → identity, Ed448 → SHA-256), not spelled here.
     let peer_id = entity_crypto::PeerId::from_public_key_with_key_type(public_key, key_type)
-        .map_err(|_| SignalingError::SignerMismatch)?;
+        .map_err(|_| SignalingError::UnusableKey)?;
     Ok(VerifiedSigner {
         peer_id: peer_id.to_string(),
     })
@@ -575,12 +654,18 @@ pub fn pair_should_suppress_offer(self_id: &str, other_id: &str) -> Result<bool,
 /// Correlates on `session_id` — the §6.5 analogue of the native nonce echo.
 /// A bucket in `lobby`/`tag` mode holds other pairings' answers, and they are
 /// not mine.
+/// The signer travels with the message because the two are only meaningful
+/// together: an SDP is admissible on the strength of who signed *that* blob, so
+/// re-pairing them after the fact would reintroduce exactly the substitution the
+/// container prevents.
 pub fn find_answer<'a>(
-    messages: impl IntoIterator<Item = &'a CollectedWebRtc>,
+    messages: impl IntoIterator<Item = &'a Collected>,
     my_session: &SessionId,
-) -> Option<Answer> {
-    messages.into_iter().find_map(|m| match m {
-        CollectedWebRtc::Answer(a) if &a.session_id == my_session => Some(a.clone()),
+) -> Option<(Answer, Option<VerifiedSigner>)> {
+    messages.into_iter().find_map(|c| match &c.msg {
+        CollectedWebRtc::Answer(a) if &a.session_id == my_session => {
+            Some((a.clone(), c.signer.clone()))
+        }
         _ => None,
     })
 }
@@ -595,29 +680,33 @@ pub fn find_answer<'a>(
 /// messages* MUST expressed in the only field this schema gives us to express it
 /// — the §6.5 entities carry no `peer_id`.
 ///
-/// **Pre-container caveat.** A counterpart reusing our `session_id` would slip
-/// past this. Honest bound: at ≥16 random bytes an accidental collision is not
-/// the concern, and a deliberate one is a spoof that §6.3's signature is what
-/// catches — unavailable until the container lands. Recorded, not papered over.
+/// **Caveat, now narrower.** A counterpart reusing our `session_id` would slip
+/// past this. At ≥16 random bytes an accidental collision is not the concern; a
+/// deliberate one is a spoof, and §6.3's signature is what catches it. That is
+/// available now — a spoofer would have to produce a container that verifies
+/// under the bucket key — but only against counterparts that deposit one, so
+/// the exposure closes with the migration rather than with this function.
 pub fn find_counterpart_offer<'a>(
-    messages: impl IntoIterator<Item = &'a CollectedWebRtc>,
+    messages: impl IntoIterator<Item = &'a Collected>,
     my_session: &SessionId,
-) -> Option<Offer> {
-    messages.into_iter().find_map(|m| match m {
-        CollectedWebRtc::Offer(o) if &o.session_id != my_session => Some(o.clone()),
+) -> Option<(Offer, Option<VerifiedSigner>)> {
+    messages.into_iter().find_map(|c| match &c.msg {
+        CollectedWebRtc::Offer(o) if &o.session_id != my_session => {
+            Some((o.clone(), c.signer.clone()))
+        }
         _ => None,
     })
 }
 
 /// Every trickled candidate belonging to one session, in bucket order.
 pub fn candidates_for<'a>(
-    messages: impl IntoIterator<Item = &'a CollectedWebRtc>,
+    messages: impl IntoIterator<Item = &'a Collected>,
     session: &SessionId,
 ) -> Vec<IceCandidate> {
     messages
         .into_iter()
-        .filter_map(|m| match m {
-            CollectedWebRtc::Candidate(c) if &c.session_id == session => Some(c.clone()),
+        .filter_map(|c| match &c.msg {
+            CollectedWebRtc::Candidate(ic) if &ic.session_id == session => Some(ic.clone()),
             _ => None,
         })
         .collect()
@@ -688,40 +777,87 @@ pub trait WebRtcIo {
 /// Whether this negotiation demands §6.3 verification before it will feed a
 /// counterpart's SDP to `setRemoteDescription`.
 ///
-/// **There is no `Default`, on purpose.** §6.3 specifies the checks but no
-/// container to carry a signature (module doc), so [`Require`](Self::Require)
-/// cannot currently succeed and the pre-container path is the only one that
-/// runs. Making that a named argument at every call site — rather than a
-/// silently-permissive default — is what keeps "we shipped the browser leg with
-/// no identity binding" from being something a reader has to infer.
+/// **Defined in [`crate::coordination`] and shared with §6.1**, because both
+/// substrates read the same envelope out of the same buckets under the same
+/// MUST. Re-exported here because this is where it was born, where every §6.5
+/// call site names it, and where `core/peer` imports it from.
+///
+/// [`VerificationPolicy::Require`] **works now** on this path: [`crate::envelope`]
+/// is the §6.3 container it was waiting for, [`post`] seals every deposit into
+/// one, and [`classify_collected`] mints the [`VerifiedSigner`] it demands — two
+/// peers running this crate negotiate under `Require` end to end, which is what
+/// the worker host now passes. There is no second §6.5 implementation to wait
+/// for: `entity-core-go` builds the §6.5 *shapes* (and crosses them as vectors)
+/// but runs no negotiation, so a counterpart here is always another peer running
+/// this crate.
 ///
 /// The sealed SDP accessors are what force this decision into the open: without
-/// them the missing container would simply be an absent check nobody wrote.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VerificationPolicy {
-    /// Conformant: refuse SDP that did not pass §6.3. **Fails until the
-    /// container lands** — which is the correct behaviour for a peer that would
-    /// rather not connect than connect to an unverified counterpart.
-    Require,
-    /// Pre-container interop: accept a counterpart's SDP without verification.
-    /// Bounded exactly as the native punch is bounded — *the key introduces, it
-    /// never authorizes* — **except** that §6.5 discharges §7.4 for this
-    /// substrate, so on the browser leg nothing downstream re-checks identity.
-    /// Grep for this variant to find every place that matters.
-    AllowUnverifiedPreContainer,
-}
+/// them the missing container would simply have been an absent check nobody
+/// wrote.
+pub use crate::coordination::VerificationPolicy;
 
 /// What went wrong in a §6.5 negotiation.
 #[derive(Debug, thiserror::Error)]
 pub enum WebRtcError {
     #[error("carrier refused or failed: {0}")]
     Carrier(String),
-    #[error("no counterpart answered within the negotiation window")]
-    Timeout,
+    /// The window closed without an open data channel.
+    ///
+    /// **Carries the terminal state, because the bare variant told a story that
+    /// turned out to be false.** "No counterpart answered" and "the counterpart
+    /// answered and the channel never opened" are the same observation from
+    /// inside this loop, and they have opposite diagnoses — the first points at
+    /// rendezvous, the second at ICE. `entity-browser-rust`'s rung-1 re-run hit
+    /// the second and read the message for the first, with the node's own log
+    /// disproving both horns of the dichotomy the old text offered.
+    ///
+    /// `channel_wait` is the load-bearing field: a per-tick `wait_open` failure
+    /// is the *normal* not-yet-open outcome, so it cannot be logged as it
+    /// happens without emitting one line per tick for the whole window. Kept as
+    /// the last reason instead, it is the one fact this error could never carry
+    /// and the only one that says why an agreed SDP pair never opened.
+    #[error(
+        "§6.5 negotiation window closed with no open data channel \
+         (role={}, sdp_exchange={}, last counterpart bucket={counterpart_msgs} msg(s), \
+         channel wait: {})",
+        if *offered { "offerer" } else { "answerer" },
+        if *answered { "complete" } else { "INCOMPLETE" },
+        channel_wait.as_deref().unwrap_or("never reached")
+    )]
+    Timeout {
+        /// Did we offer (`lo`) or suppress and wait (`hi`)? The offerer rule is
+        /// pre-assigned in `pair` mode, so this pins which half of the exchange
+        /// this peer was running without correlating two logs.
+        offered: bool,
+        /// Did the SDP exchange complete on our side — answer accepted (offerer)
+        /// or answer posted (answerer)? `false` with a non-empty bucket is a
+        /// correlation failure; `true` is an ICE/channel failure.
+        answered: bool,
+        /// Size of the last collected bucket **after** §6.4 skip-own — i.e. how
+        /// many messages the counterpart actually contributed. Zero here is the
+        /// genuine "nobody came" case.
+        counterpart_msgs: usize,
+        /// Last reason the data channel wait failed, if it was ever reached.
+        channel_wait: Option<String>,
+    },
     #[error("the browser's WebRTC stack refused: {0}")]
     Substrate(String),
-    #[error("§6.3 verification is required but no signature container exists yet")]
+    /// `Require` was set and the counterpart's blob arrived **without** a §6.3
+    /// container — a peer that has not flipped its deposit path yet. Not
+    /// "verification is unimplemented" any more; it is a refusal to speak to an
+    /// unsigned counterpart, which is what `Require` is for.
+    #[error("§6.3 verification is required but this blob carried no signature container")]
     VerificationUnavailable,
+    /// The party sorts as one identity and signs as another.
+    ///
+    /// Refused before a single deposit, because every §6.5 decision —
+    /// [`crate::key::pair_key`], the offerer rule, §6.4's skip-own — is a
+    /// comparison over `self_id`, while a counterpart learns who we are *only*
+    /// from the container's verified `signer`. Disagreement there is the
+    /// mixed-encoding failure wearing a different hat: a bucket nobody shares,
+    /// reported as success at every visible step.
+    #[error("§6.5 identity skew: negotiating as `{self_id}` but signing as `{signing_id}`")]
+    IdentitySkew { self_id: String, signing_id: String },
     #[error(transparent)]
     Coding(#[from] SignalingError),
 }
@@ -738,11 +874,16 @@ impl From<crate::punch::PunchError> for WebRtcError {
 /// One peer's side of a `pair`-mode §6.5 negotiation.
 ///
 /// **`pair` only, deliberately.** The counterpart's `peer_id` is required, and
-/// in `tag` / `secret` / `lobby` it is *unknowable* before the first collected
-/// entity — those payloads carry no `peer_id` and the §6.3 signature that would
-/// supply one has no container yet. So the offerer rule cannot be evaluated at
-/// all in the matchmaking modes, which is independently why §6.5 names `pair`
-/// the natural default and why the S5 gate uses it.
+/// in `tag` / `secret` / `lobby` it is not known before the first collected
+/// entity — those payloads carry no `peer_id`, so a counterpart's identity can
+/// come only from a §6.3 container's verified `signer`.
+///
+/// That container exists now, which changes the *kind* of limit this is: a
+/// matchmaking mode became buildable (learn the counterpart from the first
+/// verified deposit, then evaluate the offerer rule) rather than impossible. It
+/// is still not built here — `pair` is what S3 → S5 gates on and §6.5 names it
+/// the natural default — but the next reader should not re-derive a blocker
+/// that has been removed.
 pub struct WebRtcParty {
     /// The rendezvous key both peers derived — `pair` mode, so
     /// [`crate::key::pair_key`] over the two ids.
@@ -757,28 +898,66 @@ pub struct WebRtcParty {
     /// handshake, which is why trickle exists at all.
     pub deadline_ms: u64,
     pub trust: VerificationPolicy,
+    /// The identity every deposit is sealed under (§6.3).
+    ///
+    /// **MUST be the keypair `self_id` names** — [`negotiate`] refuses the pair
+    /// otherwise, because a peer that sorts as one id and signs as another
+    /// derives its bucket from the first and proves the second, and nothing in
+    /// between reports an error.
+    ///
+    /// `Arc` because [`IdentityKeypair`] is not `Clone`: it is a private key,
+    /// held once per peer and shared by handle rather than copied into every
+    /// negotiation that needs to sign.
+    pub signer: Arc<IdentityKeypair>,
 }
 
-/// Release a collected SDP under `policy`.
+/// Release a collected offer's SDP under the caller's policy.
 ///
-/// The seal (`accept_remote_description`) needs a [`VerifiedSigner`], and
-/// pre-container there is no way to mint one — so this is the single place the
-/// gap is bridged, and it is bridged explicitly rather than by widening the
-/// seal. When the container lands, the `Require` arm starts working and this
-/// function is where verification plugs in; nothing else moves.
-fn release_offer_sdp(offer: &Offer, policy: VerificationPolicy) -> Result<String, WebRtcError> {
-    match policy {
-        VerificationPolicy::Require => Err(WebRtcError::VerificationUnavailable),
-        VerificationPolicy::AllowUnverifiedPreContainer => {
+/// The seal (`accept_remote_description`) needs a [`VerifiedSigner`], and this
+/// is the single place the policy decides whether one is required — bridged
+/// explicitly rather than by widening the seal.
+///
+/// **`Require` works now.** It used to be unconditionally impossible — §6.3
+/// named the checks and no container carried a signature. The container exists
+/// and both this peer's deposits and a flipped counterpart's arrive in one, so
+/// this is the ordinary path again: a blob that arrived sealed and verified
+/// carries a [`VerifiedSigner`], and `Require` demands one.
+///
+/// Under `AllowUnverifiedPreContainer` a signer is *used when present* rather
+/// than ignored — so a peer that has flipped gets the §6.4 skip-own check
+/// against a real identity even while its counterpart has not, and the tolerant
+/// variant converges on the strict one as the migration completes instead of
+/// staying permanently weaker.
+fn release_offer_sdp(
+    offer: &Offer,
+    signer: Option<&VerifiedSigner>,
+    my_peer_id: &str,
+    policy: VerificationPolicy,
+) -> Result<String, WebRtcError> {
+    match (policy, signer) {
+        (_, Some(signer)) => Ok(offer
+            .accept_remote_description(signer, my_peer_id)?
+            .to_string()),
+        (VerificationPolicy::Require, None) => Err(WebRtcError::VerificationUnavailable),
+        (VerificationPolicy::AllowUnverifiedPreContainer, None) => {
             Ok(offer.pre_container_sdp().to_string())
         }
     }
 }
 
-fn release_answer_sdp(answer: &Answer, policy: VerificationPolicy) -> Result<String, WebRtcError> {
-    match policy {
-        VerificationPolicy::Require => Err(WebRtcError::VerificationUnavailable),
-        VerificationPolicy::AllowUnverifiedPreContainer => {
+/// See [`release_offer_sdp`].
+fn release_answer_sdp(
+    answer: &Answer,
+    signer: Option<&VerifiedSigner>,
+    my_peer_id: &str,
+    policy: VerificationPolicy,
+) -> Result<String, WebRtcError> {
+    match (policy, signer) {
+        (_, Some(signer)) => Ok(answer
+            .accept_remote_description(signer, my_peer_id)?
+            .to_string()),
+        (VerificationPolicy::Require, None) => Err(WebRtcError::VerificationUnavailable),
+        (VerificationPolicy::AllowUnverifiedPreContainer, None) => {
             Ok(answer.pre_container_sdp().to_string())
         }
     }
@@ -811,6 +990,17 @@ pub async fn negotiate<C: Carrier, I: WebRtcIo>(
     let mut session = party.session_id.clone();
     let mut fed_candidates: Vec<IceCandidate> = Vec::new();
 
+    // Sign as the identity we sort as, or refuse. Checked once, before the
+    // first deposit — see [`WebRtcError::IdentitySkew`] for why this is a
+    // refusal rather than a warning.
+    let signing_id = party.signer.peer_id().to_string();
+    if signing_id != party.self_id {
+        return Err(WebRtcError::IdentitySkew {
+            self_id: party.self_id.clone(),
+            signing_id,
+        });
+    }
+
     // `hi` waits for `lo`'s offer (the pair optimization); `lo` offers now.
     let suppress = pair_should_suppress_offer(&party.self_id, &party.peer_id)?;
     let mut offered = false;
@@ -819,6 +1009,7 @@ pub async fn negotiate<C: Carrier, I: WebRtcIo>(
         let blob = post(
             carrier,
             &party.key,
+            &party.signer,
             &Offer::new(session.clone(), sdp),
             &mut posted,
         )
@@ -828,24 +1019,59 @@ pub async fn negotiate<C: Carrier, I: WebRtcIo>(
     }
 
     let mut answered = false;
+    // The two facts the terminal `Timeout` could never carry. Neither is a
+    // control input — nothing below branches on them — they exist so that the
+    // window closing says *which* half failed instead of guessing at rendezvous.
+    let mut counterpart_msgs = 0usize;
+    let mut channel_wait: Option<String> = None;
+    let mut tick = 0u64;
     loop {
+        tick += 1;
         if io.now_ms().saturating_sub(started) >= party.deadline_ms {
-            return Err(WebRtcError::Timeout);
+            return Err(WebRtcError::Timeout {
+                offered,
+                answered,
+                counterpart_msgs,
+                channel_wait,
+            });
         }
 
         let bucket = carrier
             .collect(&party.key)
             .await
             .map_err(|e| WebRtcError::Carrier(e.to_string()))?;
-        let mine: Vec<CollectedWebRtc> = bucket
+        let mine: Vec<Collected> = bucket
             .iter()
             .filter(|b| !posted.iter().any(|p| p == *b)) // §6.4 skip-own
-            .map(|b| classify_blob(b))
+            .map(|b| classify_collected(b, &party.key))
             .collect();
+        counterpart_msgs = mine.len();
+
+        // One line per tick — the only thing that can pin WHERE a peer stopped.
+        //
+        // `entity-browser-rust`'s peer A emitted the derived-key line and then
+        // nothing at all: no error, no completion, and no further collects at
+        // the node. From outside, "still polling", "blocked in a main-thread
+        // round trip", and "the carrier stalled" are the same observation —
+        // silence — and they have three different fixes. The last tick a peer
+        // logs, with the state it held, separates them.
+        //
+        // `trace!`, not `debug!`: this fires every poll interval for the whole
+        // window. The browser rig already opts in with `?log=trace`, and the
+        // node vantage is `entity_signaling=debug`, so this stays off in the
+        // logs anyone reads by default.
+        tracing::trace!(
+            tick,
+            offered,
+            answered,
+            counterpart_msgs,
+            "§6.5: negotiation tick"
+        );
 
         if offered && !answered {
-            if let Some(answer) = find_answer(&mine, &session) {
-                let sdp = release_answer_sdp(&answer, party.trust)?;
+            if let Some((answer, signer)) = find_answer(&mine, &session) {
+                let sdp =
+                    release_answer_sdp(&answer, signer.as_ref(), &party.self_id, party.trust)?;
                 io.accept_answer(&sdp)
                     .await
                     .map_err(WebRtcError::Substrate)?;
@@ -854,10 +1080,11 @@ pub async fn negotiate<C: Carrier, I: WebRtcIo>(
         }
 
         if !offered && !answered {
-            if let Some(offer) = find_counterpart_offer(&mine, &session) {
+            if let Some((offer, signer)) = find_counterpart_offer(&mine, &session) {
                 // The offerer's session governs the pairing from here.
                 session = offer.session_id.clone();
-                let remote = release_offer_sdp(&offer, party.trust)?;
+                let remote =
+                    release_offer_sdp(&offer, signer.as_ref(), &party.self_id, party.trust)?;
                 let sdp = io
                     .create_answer(&remote)
                     .await
@@ -865,6 +1092,7 @@ pub async fn negotiate<C: Carrier, I: WebRtcIo>(
                 post(
                     carrier,
                     &party.key,
+                    &party.signer,
                     &Answer::new(session.clone(), sdp),
                     &mut posted,
                 )
@@ -908,7 +1136,7 @@ pub async fn negotiate<C: Carrier, I: WebRtcIo>(
                 sdp_mline_index: local.sdp_mline_index,
                 username_fragment: local.username_fragment,
             };
-            post(carrier, &party.key, &c, &mut posted).await?;
+            post(carrier, &party.key, &party.signer, &c, &mut posted).await?;
         }
         for remote in candidates_for(&mine, &session) {
             if fed_candidates.contains(&remote) {
@@ -924,8 +1152,19 @@ pub async fn negotiate<C: Carrier, I: WebRtcIo>(
             let remaining = party
                 .deadline_ms
                 .saturating_sub(io.now_ms().saturating_sub(started));
-            if let Ok(channel) = io.wait_open(remaining.min(party.poll_interval_ms)).await {
-                return Ok(channel);
+            match io.wait_open(remaining.min(party.poll_interval_ms)).await {
+                Ok(channel) => return Ok(channel),
+                // Deliberately not logged here. This is a *poll* — the timeout
+                // handed down is one tick, so "not open yet" is the expected
+                // answer on every tick but the last, and a `warn!` in this arm
+                // would emit one line per tick for the whole window. It was
+                // previously `if let Ok(..)`, which discarded the reason
+                // entirely; the main thread's own
+                // "data channel did not open within {N}ms" was produced, handed
+                // back as a value, and dropped on this line — which is why
+                // grepping the main-thread band for it came up empty and the
+                // stall looked worker-side.
+                Err(e) => channel_wait = Some(e),
             }
         }
 
@@ -933,14 +1172,20 @@ pub async fn negotiate<C: Carrier, I: WebRtcIo>(
     }
 }
 
-/// Frame, post, and remember — the remembering is §6.4's skip-own.
+/// Seal, post, and remember — the sealing is §6.3, the remembering is §6.4's
+/// skip-own.
+///
+/// What reaches the carrier is the `signed-blob` container, never the bare
+/// entity: the signature is bound to `key`, so this deposit verifies in this
+/// bucket and in no other one it could be lifted into.
 async fn post<C: Carrier, E: ToBlob>(
     carrier: &C,
     key: &RendezvousKey,
+    signer: &IdentityKeypair,
     msg: &E,
     posted: &mut Vec<Vec<u8>>,
 ) -> Result<Vec<u8>, WebRtcError> {
-    let blob = crate::coordination::to_blob(&msg.to_entity()?);
+    let blob = crate::envelope::seal(&msg.to_entity()?, key, signer)?;
     carrier
         .offer(key, blob.clone())
         .await
@@ -1171,16 +1416,50 @@ mod tests {
         }
     }
 
-    fn party(self_id: &str, peer_id: &str, trust: VerificationPolicy) -> WebRtcParty {
+    fn signer_for(seed: u8) -> Arc<IdentityKeypair> {
+        Arc::new(IdentityKeypair::Ed25519(entity_crypto::Keypair::from_seed(
+            [seed; 32],
+        )))
+    }
+
+    fn party(
+        signer: Arc<IdentityKeypair>,
+        peer_id: &str,
+        trust: VerificationPolicy,
+    ) -> WebRtcParty {
+        let self_id = signer.peer_id().to_string();
         WebRtcParty {
-            key: crate::key::pair_key(self_id, peer_id),
-            self_id: self_id.into(),
+            key: crate::key::pair_key(&self_id, peer_id),
+            self_id,
             peer_id: peer_id.into(),
             session_id: SessionId::generate(),
             poll_interval_ms: 5,
             deadline_ms: 500,
             trust,
+            signer,
         }
+    }
+
+    /// Two parties on one bucket, **`lo` first**.
+    ///
+    /// The ids are no longer arbitrary labels post-flip: they are what every
+    /// deposit is signed as, so they are derived from real keypairs and sorted
+    /// here — `lo` is the lower-sorting id, which is the one
+    /// [`pair_should_suppress_offer`] makes the offerer. Returning them in that
+    /// order is what lets the assertions keep saying "lo offered, hi answered"
+    /// without depending on which seed happens to sort first.
+    fn two_parties(
+        trust_lo: VerificationPolicy,
+        trust_hi: VerificationPolicy,
+    ) -> (WebRtcParty, WebRtcParty) {
+        let (a, b) = (signer_for(1), signer_for(2));
+        let (a_id, b_id) = (a.peer_id().to_string(), b.peer_id().to_string());
+        let (lo, lo_id, hi, hi_id) = if a_id.as_bytes() < b_id.as_bytes() {
+            (a, a_id, b, b_id)
+        } else {
+            (b, b_id, a, a_id)
+        };
+        (party(lo, &hi_id, trust_lo), party(hi, &lo_id, trust_hi))
     }
 
     /// Both peers on one bucket, stepped by polling — the real shape, minus the
@@ -1189,17 +1468,9 @@ mod tests {
     async fn two_peers_negotiate_to_an_open_channel() {
         let bucket = SharedBucket::default();
         let (lo_io, hi_io) = (StubBrowser::new("lo", true), StubBrowser::new("hi", true));
-        let (lo_p, hi_p) = (
-            party(
-                "peer-a",
-                "peer-b",
-                VerificationPolicy::AllowUnverifiedPreContainer,
-            ),
-            party(
-                "peer-b",
-                "peer-a",
-                VerificationPolicy::AllowUnverifiedPreContainer,
-            ),
+        let (lo_p, hi_p) = two_parties(
+            VerificationPolicy::AllowUnverifiedPreContainer,
+            VerificationPolicy::AllowUnverifiedPreContainer,
         );
         assert_eq!(lo_p.key, hi_p.key, "pair mode: both derive one key");
 
@@ -1236,17 +1507,9 @@ mod tests {
     async fn a_peer_never_feeds_its_own_candidates_back_to_itself() {
         let bucket = SharedBucket::default();
         let (lo_io, hi_io) = (StubBrowser::new("lo", true), StubBrowser::new("hi", true));
-        let (lo_p, hi_p) = (
-            party(
-                "peer-a",
-                "peer-b",
-                VerificationPolicy::AllowUnverifiedPreContainer,
-            ),
-            party(
-                "peer-b",
-                "peer-a",
-                VerificationPolicy::AllowUnverifiedPreContainer,
-            ),
+        let (lo_p, hi_p) = two_parties(
+            VerificationPolicy::AllowUnverifiedPreContainer,
+            VerificationPolicy::AllowUnverifiedPreContainer,
         );
         let (lo_c, hi_c) = (BucketView(&bucket), BucketView(&bucket));
         let _ = tokio::join!(
@@ -1273,27 +1536,114 @@ mod tests {
         }
     }
 
-    /// A conformant peer refuses rather than connecting blind. Until the §6.3
-    /// container exists this is the whole of `Require` — and it failing loudly
-    /// is the point: the alternative is a browser leg that looks connected and
-    /// has verified nothing.
+    /// The flag day, asserted from the outside: `Require` **completes** against
+    /// a counterpart that deposits sealed.
+    ///
+    /// This is the test that inverted at the flip. It used to assert that
+    /// `Require` could only ever fail, because no container existed to satisfy
+    /// it; both peers now seal, so the strict policy is an ordinary working
+    /// configuration and the negotiation runs to an open channel with every SDP
+    /// admitted on a verified signer.
     #[tokio::test]
-    async fn requiring_verification_refuses_while_no_container_exists() {
+    async fn requiring_verification_succeeds_against_a_sealed_counterpart() {
         let bucket = SharedBucket::default();
         let (lo_io, hi_io) = (StubBrowser::new("lo", true), StubBrowser::new("hi", true));
-        let lo_p = party(
-            "peer-a",
-            "peer-b",
-            VerificationPolicy::AllowUnverifiedPreContainer,
-        );
-        let hi_p = party("peer-b", "peer-a", VerificationPolicy::Require);
+        let (lo_p, hi_p) = two_parties(VerificationPolicy::Require, VerificationPolicy::Require);
 
         let (lo_c, hi_c) = (BucketView(&bucket), BucketView(&bucket));
-        let (_, hi_res) = tokio::join!(
+        let (lo_res, hi_res) = tokio::join!(
             negotiate(&lo_p, &lo_c, &lo_io),
             negotiate(&hi_p, &hi_c, &hi_io),
         );
-        assert!(matches!(hi_res, Err(WebRtcError::VerificationUnavailable)));
+        assert_eq!(lo_res.unwrap(), "channel-lo");
+        assert_eq!(hi_res.unwrap(), "channel-hi");
+    }
+
+    /// And it still refuses the peer that has **not** flipped.
+    ///
+    /// The other half of the same claim, and the one that keeps `Require` from
+    /// quietly becoming decorative: a bare deposit carries no signer, so a
+    /// `Require` peer refuses it rather than feeding unverified SDP to
+    /// `setRemoteDescription`. This is exactly what `entity-core-go`'s peers
+    /// look like until they flip, which is why the production call site is not
+    /// on `Require` yet.
+    #[tokio::test]
+    async fn requiring_verification_still_refuses_a_bare_depositor() {
+        let bucket = SharedBucket::default();
+        let (_, hi_p) = two_parties(
+            VerificationPolicy::AllowUnverifiedPreContainer,
+            VerificationPolicy::Require,
+        );
+        // A pre-flip counterpart's offer: the §6.2 bare framing, no container.
+        bucket.blobs.lock().unwrap().push(to_blob(
+            &Offer::new(sid(), "v=0\r\na=fingerprint:sha-256 unsigned\r\n")
+                .to_entity()
+                .unwrap(),
+        ));
+
+        let res = negotiate(&hi_p, &BucketView(&bucket), &StubBrowser::new("hi", true)).await;
+        assert!(matches!(res, Err(WebRtcError::VerificationUnavailable)));
+    }
+
+    /// What actually reaches the carrier is a container, and it is bound to the
+    /// bucket it was posted in.
+    ///
+    /// Asserted on the bucket rather than on `seal`'s own unit tests, because
+    /// the claim under test is that the **negotiation** deposits sealed — the
+    /// one thing a same-side round trip through `post` could never tell us
+    /// apart from the bare framing it replaced.
+    #[tokio::test]
+    async fn every_deposit_is_a_container_bound_to_its_bucket() {
+        let bucket = SharedBucket::default();
+        let (lo_io, hi_io) = (StubBrowser::new("lo", true), StubBrowser::new("hi", true));
+        let (lo_p, hi_p) = two_parties(
+            VerificationPolicy::AllowUnverifiedPreContainer,
+            VerificationPolicy::AllowUnverifiedPreContainer,
+        );
+        let key = lo_p.key;
+        let (lo_c, hi_c) = (BucketView(&bucket), BucketView(&bucket));
+        let _ = tokio::join!(
+            negotiate(&lo_p, &lo_c, &lo_io),
+            negotiate(&hi_p, &hi_c, &hi_io),
+        );
+
+        let blobs = bucket.blobs.lock().unwrap().clone();
+        assert!(
+            blobs.len() >= 3,
+            "offer, answer, and at least one candidate"
+        );
+        let elsewhere = crate::key::pair_key("some-other", "bucket-entirely");
+        for blob in &blobs {
+            let (signer, _) = crate::envelope::open(blob, &key)
+                .expect("every deposit verifies in the bucket it was posted to");
+            assert!(
+                signer.peer_id() == lo_p.self_id || signer.peer_id() == hi_p.self_id,
+                "a deposit signed by neither party"
+            );
+            assert!(
+                crate::envelope::open(blob, &elsewhere).is_err(),
+                "the same blob must not verify in a bucket it was not signed for"
+            );
+        }
+    }
+
+    /// Sorting as one identity and signing as another is refused before a
+    /// single deposit — the mixed-encoding failure class, caught at the seam
+    /// that can still see both halves.
+    #[tokio::test]
+    async fn a_party_that_signs_as_someone_else_is_refused() {
+        let bucket = SharedBucket::default();
+        let mut p = party(
+            signer_for(1),
+            "peer-b",
+            VerificationPolicy::AllowUnverifiedPreContainer,
+        );
+        p.signer = signer_for(9);
+
+        assert!(matches!(
+            negotiate(&p, &BucketView(&bucket), &StubBrowser::new("lo", true)).await,
+            Err(WebRtcError::IdentitySkew { .. })
+        ));
     }
 
     /// No counterpart ever arrives. The exchange is seconds-bounded (§6.5), so
@@ -1302,15 +1652,31 @@ mod tests {
     async fn an_unanswered_offer_times_out_rather_than_polling_forever() {
         let bucket = SharedBucket::default();
         let io = StubBrowser::new("lo", true);
-        let p = party(
-            "peer-a",
-            "peer-b",
+        let (p, _) = two_parties(
+            VerificationPolicy::AllowUnverifiedPreContainer,
             VerificationPolicy::AllowUnverifiedPreContainer,
         );
-        assert!(matches!(
-            negotiate(&p, &BucketView(&bucket), &io).await,
-            Err(WebRtcError::Timeout)
-        ));
+        // Pinned field-by-field, not just by variant. This is the *genuine*
+        // "nobody came" timeout, and it is the one shape that should send a
+        // reader to the node's rendezvous log — an empty bucket, no SDP
+        // exchange, the channel wait never reached. `entity-browser-rust`'s
+        // rung-1 wall reports the same variant with the opposite values, so
+        // asserting the variant alone would let the two cases collapse back
+        // into one indistinguishable outcome.
+        match negotiate(&p, &BucketView(&bucket), &io).await {
+            Err(WebRtcError::Timeout {
+                offered,
+                answered,
+                counterpart_msgs,
+                channel_wait,
+            }) => {
+                assert!(offered, "`lo` offers in pair mode");
+                assert!(!answered, "no counterpart, so no SDP exchange");
+                assert_eq!(counterpart_msgs, 0, "nobody deposited but us");
+                assert_eq!(channel_wait, None, "never answered, so never waited");
+            }
+            other => panic!("expected a §6.5 timeout, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1565,12 +1931,19 @@ mod tests {
     }
 
     #[test]
-    fn a_mismatched_key_type_is_a_signer_fault_not_a_signature_fault() {
+    fn a_mismatched_key_type_is_an_unusable_key_not_a_signature_fault() {
         // The widening is bounded: dispatching on `key_type` must not become
         // "try until something verifies." Each of these stops before the
         // signature is ever checked, and reports the half that is actually
         // wrong — `bad_signature` here would send a diagnostician after the
         // key material instead of the key type.
+        //
+        // All three are `unusable_key` in the settled cohort taxonomy, not
+        // `signer_mismatch`: nobody has claimed to be anybody yet. That name is
+        // reserved for the §6.1 claim comparison, where a peer really does
+        // assert an identity the signature does not support. Keeping them
+        // distinct is what lets an unsupported key type be *skipped* per
+        // ADR-0002 rather than treated as a peer lying.
         let kp = entity_crypto::Ed448Keypair::from_seed(&[0x42; 57]).unwrap();
         let entity = Offer::new(sid(), "v=0\r\n").to_entity().unwrap();
         let sig = kp.sign(&entity.content_hash.to_bytes());
@@ -1583,7 +1956,7 @@ mod tests {
                 entity_crypto::KEY_TYPE_ED25519,
                 &sig
             ),
-            Err(SignalingError::SignerMismatch)
+            Err(SignalingError::UnusableKey)
         ));
 
         // A key type with no sign/verify semantics (V7 §4.7).
@@ -1594,13 +1967,13 @@ mod tests {
                 entity_crypto::KEY_TYPE_EXPERIMENTAL_TEST,
                 &sig
             ),
-            Err(SignalingError::SignerMismatch)
+            Err(SignalingError::UnusableKey)
         ));
 
         // An unallocated code — including v7.67 §5's reserved `0xFF`.
         assert!(matches!(
             verify_coordination_signature(&entity, &kp.public_key_bytes(), 0xFF, &sig),
-            Err(SignalingError::SignerMismatch)
+            Err(SignalingError::UnusableKey)
         ));
     }
 
@@ -1625,11 +1998,147 @@ mod tests {
         ));
     }
 
+    /// The read side of the flag day: a bucket holds both framings at once, and
+    /// which one a blob arrived in is exactly what decides whether its SDP may
+    /// be released.
+    mod collected_framings {
+        use super::*;
+        use crate::envelope;
+        use crate::key::pair_key;
+
+        fn kp(seed: u8) -> entity_crypto::IdentityKeypair {
+            entity_crypto::IdentityKeypair::Ed25519(entity_crypto::Keypair::from_seed([seed; 32]))
+        }
+
+        fn bucket_key(a: u8, b: u8) -> crate::core::RendezvousKey {
+            pair_key(&kp(a).peer_id().to_string(), &kp(b).peer_id().to_string())
+        }
+
+        #[test]
+        fn a_sealed_offer_yields_a_signer_and_satisfies_require() {
+            let signer_kp = kp(0x11);
+            let key = bucket_key(0x11, 0x22);
+            let offer = Offer::new(sid(), "v=0\r\nSEALED\r\n");
+            let blob = envelope::seal(&offer.to_entity().unwrap(), &key, &signer_kp).unwrap();
+
+            let c = classify_collected(&blob, &key);
+            assert!(matches!(c.msg, CollectedWebRtc::Offer(_)));
+            let signer = c.signer.expect("a verified container yields a signer");
+            assert_eq!(signer.peer_id(), signer_kp.peer_id().to_string());
+
+            // `Require` was unreachable before the container existed. It works now.
+            let released = release_offer_sdp(
+                &offer,
+                Some(&signer),
+                &kp(0x22).peer_id().to_string(),
+                VerificationPolicy::Require,
+            )
+            .expect("a verified offer is releasable under Require");
+            assert!(released.contains("SEALED"));
+        }
+
+        #[test]
+        fn a_bare_offer_still_correlates_but_require_refuses_it() {
+            let key = bucket_key(0x11, 0x22);
+            let offer = Offer::new(sid(), "v=0\r\nBARE\r\n");
+            let blob = entity_wire::encode_entity(&offer.to_entity().unwrap());
+
+            let c = classify_collected(&blob, &key);
+            assert!(matches!(c.msg, CollectedWebRtc::Offer(_)));
+            assert!(c.signer.is_none(), "nothing signed it");
+
+            let me = kp(0x22).peer_id().to_string();
+            assert!(matches!(
+                release_offer_sdp(&offer, None, &me, VerificationPolicy::Require),
+                Err(WebRtcError::VerificationUnavailable)
+            ));
+            // ...and the migration variant still interoperates with it.
+            assert!(release_offer_sdp(
+                &offer,
+                None,
+                &me,
+                VerificationPolicy::AllowUnverifiedPreContainer
+            )
+            .unwrap()
+            .contains("BARE"));
+        }
+
+        /// **The downgrade.** A container that fails verification MUST NOT fall
+        /// back to being read as a bare message: an attacker who corrupts a
+        /// signature would otherwise turn a signed offer into an accepted
+        /// unsigned one, which is the whole attack the container exists to stop.
+        #[test]
+        fn a_container_that_fails_to_verify_is_skipped_not_read_as_bare() {
+            let key = bucket_key(0x11, 0x22);
+            let offer = Offer::new(sid(), "v=0\r\nSEALED\r\n");
+            let blob = envelope::seal(&offer.to_entity().unwrap(), &key, &kp(0x11)).unwrap();
+
+            let mut broken = envelope::parse(&blob).unwrap();
+            broken.signature[0] ^= 0xFF;
+
+            let c = classify_collected(&broken.to_blob().unwrap(), &key);
+            assert!(
+                matches!(c.msg, CollectedWebRtc::Unknown),
+                "a corrupted signature must not degrade into an unsigned message"
+            );
+            assert!(c.signer.is_none());
+        }
+
+        /// The bucket binding, at the read seam rather than in the vectors: a
+        /// blob replayed out of its bucket is skipped here too.
+        #[test]
+        fn a_container_sealed_for_another_bucket_is_skipped() {
+            let signed_under = bucket_key(0x11, 0x22);
+            let collected_from = bucket_key(0x11, 0x33);
+            let offer = Offer::new(sid(), "v=0\r\n");
+            let blob =
+                envelope::seal(&offer.to_entity().unwrap(), &signed_under, &kp(0x11)).unwrap();
+
+            assert!(classify_collected(&blob, &signed_under).signer.is_some());
+            assert!(matches!(
+                classify_collected(&blob, &collected_from).msg,
+                CollectedWebRtc::Unknown
+            ));
+        }
+
+        /// Under the tolerant variant a signer is *used* when present, not
+        /// ignored — so a peer that has flipped gets §6.4's skip-own check
+        /// against a real identity even before its counterpart flips.
+        #[test]
+        fn the_tolerant_variant_still_refuses_a_blob_signed_by_myself() {
+            let me = kp(0x11);
+            let key = bucket_key(0x11, 0x22);
+            let offer = Offer::new(sid(), "v=0\r\n");
+            let blob = envelope::seal(&offer.to_entity().unwrap(), &key, &me).unwrap();
+            let signer = classify_collected(&blob, &key).signer.unwrap();
+
+            assert!(matches!(
+                release_offer_sdp(
+                    &offer,
+                    Some(&signer),
+                    &me.peer_id().to_string(),
+                    VerificationPolicy::AllowUnverifiedPreContainer
+                ),
+                Err(WebRtcError::Coding(SignalingError::SelfNegotiation))
+            ));
+        }
+    }
+
+    /// A collected message in the **bare** pre-container framing — no signer.
+    /// The correlation helpers must behave identically either way: which
+    /// framing a blob arrived in decides whether SDP may be *released*, never
+    /// whether the message *correlates*.
+    fn bare(msg: CollectedWebRtc) -> Collected {
+        Collected { msg, signer: None }
+    }
+
     #[test]
     fn an_answer_for_another_session_is_not_mine() {
         let mine = sid();
         let theirs = SessionId::parse(vec![9u8; 16]).unwrap();
-        let bucket = vec![CollectedWebRtc::Answer(Answer::new(theirs, "v=0\r\n"))];
+        let bucket = vec![bare(CollectedWebRtc::Answer(Answer::new(
+            theirs, "v=0\r\n",
+        )))];
         assert!(find_answer(&bucket, &mine).is_none());
     }
 
@@ -1638,13 +2147,13 @@ mod tests {
         let mine = sid();
         let theirs = SessionId::parse(vec![9u8; 16]).unwrap();
         let mk = |s: &SessionId, line: &str| {
-            CollectedWebRtc::Candidate(IceCandidate {
+            bare(CollectedWebRtc::Candidate(IceCandidate {
                 session_id: s.clone(),
                 candidate: line.into(),
                 sdp_mid: "0".into(),
                 sdp_mline_index: 0,
                 username_fragment: None,
-            })
+            }))
         };
         let bucket = vec![mk(&mine, "a"), mk(&theirs, "b"), mk(&mine, "c")];
         let got = candidates_for(&bucket, &mine);

@@ -44,13 +44,13 @@ use std::rc::Rc;
 
 use entity_signaling::key::pair_key;
 use entity_signaling::webrtc::{
-    negotiate, IceCandidate, LocalCandidate, SessionId, WebRtcIo, WebRtcParty,
+    negotiate, IceCandidate, LocalCandidate, SessionId, WebRtcError, WebRtcIo, WebRtcParty,
 };
 
 /// Re-exported because it is a **required** argument to
 /// [`BrowserWebRtcEstablisher::new`], and a caller that must name it should not
 /// need a direct dependency on the signaling extension to do so. Grep for the
-/// variants to find every place the pre-container posture is chosen.
+/// variants to find every place the migration posture is still chosen.
 pub use entity_signaling::webrtc::VerificationPolicy;
 use web_sys::MessagePort;
 
@@ -329,11 +329,21 @@ impl BrowserWebRtcEstablisher {
     /// Wire the §6.5 negotiation behind the seam.
     ///
     /// `trust` is a required argument and has no default, because
-    /// [`VerificationPolicy`] deliberately has none: §6.3 specifies the checks
-    /// but no container to carry a signature, so
-    /// [`VerificationPolicy::Require`] cannot currently succeed. Naming the
-    /// choice at the call site is what keeps "we shipped the browser leg with
-    /// no identity binding" from being something a reader has to infer.
+    /// [`VerificationPolicy`] deliberately has none. Naming the choice at the
+    /// call site is what keeps "we shipped the browser leg with no identity
+    /// binding" from being something a reader has to infer.
+    ///
+    /// [`VerificationPolicy::Require`] **is what the worker host now passes** —
+    /// the §6.3 container landed, this establisher deposits sealed into it, and
+    /// `entity_signaling`'s collect path mints the verified signer `Require`
+    /// needs. Nothing gates it: a §6.5 counterpart is always another peer
+    /// running this crate (`entity-core-go` implements no §6.5 negotiation), so
+    /// the only thing `Require` refuses is a build of this crate older than the
+    /// deposit flip.
+    ///
+    /// The argument is still worth having at *your* call site, which is why this
+    /// stays a required parameter: a peer that must interoperate with a known-old
+    /// build is the one case for the tolerant variant.
     ///
     /// `ice_servers` is likewise required and likewise has no default. An
     /// empty vector is the LAN-only deployment and says so on the wire; the
@@ -421,11 +431,15 @@ impl LiveEstablish for BrowserWebRtcEstablisher {
         let remaining_ms = ctx.remaining().as_millis().min(u64::MAX as u128) as u64;
         let deadline_ms = remaining_ms.min(self.max_deadline_ms);
         if deadline_ms == 0 {
+            tracing::debug!(
+                remote_peer = %peer_id,
+                "§10.3: deadline already passed; not starting a §6.5 negotiation"
+            );
             return None;
         }
 
         let session_id = SessionId::generate();
-        let io = WorkerWebRtcIo::open(
+        let io = match WorkerWebRtcIo::open(
             self.control.0.clone(),
             &self.self_peer_id,
             peer_id,
@@ -433,7 +447,18 @@ impl LiveEstablish for BrowserWebRtcEstablisher {
             self.ice_servers.clone(),
         )
         .await
-        .ok()?;
+        {
+            Ok(io) => io,
+            Err(e) => {
+                tracing::warn!(
+                    remote_peer = %peer_id,
+                    error = %e,
+                    "§6.5: the main thread would not open an RTCPeerConnection; \
+                     no negotiation was attempted"
+                );
+                return None;
+            }
+        };
 
         let party = WebRtcParty {
             key,
@@ -443,6 +468,12 @@ impl LiveEstablish for BrowserWebRtcEstablisher {
             poll_interval_ms: self.poll_interval_ms,
             deadline_ms,
             trust: self.trust,
+            // §6.3: every deposit is sealed under the identity the carrier
+            // authenticates to the node as. Taken from the carrier rather than
+            // injected separately so "the peer the node sees" and "the peer the
+            // signature proves" cannot drift apart — `negotiate` refuses the
+            // pair outright if this disagrees with `self_id`.
+            signer: self.carrier.identity(),
         };
 
         // ONE negotiation, never retried — which is how §7.2.1's
@@ -457,7 +488,90 @@ impl LiveEstablish for BrowserWebRtcEstablisher {
         // the stricter behaviour is correct in both cases, and a policy that
         // retried only when the flag was clear would multiply budgets onto
         // someone else's node exactly as §7.2.1 warns.
-        let port = negotiate(&party, &self.carrier, &io).await.ok()?;
+        let port = match negotiate(&party, &self.carrier, &io).await {
+            Ok(port) => port,
+            // Every §6.5 failure is still "no live path" to the §10.3 seam —
+            // same contract the native punch keeps, where relay is the outcome
+            // of a failed traversal. What changed is that it is no longer
+            // *silent*: this used to be `.ok()?`, which dropped the error on
+            // the floor in the one establisher whose failures happen inside a
+            // worker, where nobody can attach a debugger. Three separate hunts
+            // in this arc ended at "`included_count=0`, no error anywhere";
+            // two of the variants below are that condition, named.
+            Err(e) => {
+                match &e {
+                    // The mixed-build case. Worth a `warn!` and worth spelling
+                    // out, because `Require` refuses *only* a build of this
+                    // crate older than the sealed-deposit flip — and a refusal
+                    // on the browser leg reads as a NAT problem to everyone who
+                    // has not been told otherwise. That mis-read is the
+                    // recurring cost in this cohort; the line should pre-empt
+                    // it rather than a routing doc having to.
+                    WebRtcError::VerificationUnavailable => tracing::warn!(
+                        remote_peer = %peer_id,
+                        rendezvous_key = ?party.key,
+                        "§6.5: counterpart's SDP carried no §6.3 container under `Require` \
+                         — this is a MIXED BUILD (a peer older than the sealed-deposit \
+                         flip), not a NAT or connectivity failure"
+                    ),
+                    // Our own two ids disagreed: bucket derived from one,
+                    // identity proved by another. Refused before any deposit
+                    // precisely because it is invisible at every later step.
+                    WebRtcError::IdentitySkew { .. } => tracing::warn!(
+                        remote_peer = %peer_id,
+                        error = %e,
+                        "§6.5: refusing to negotiate — the id we sort by and the key we \
+                         sign with are not the same identity"
+                    ),
+                    // Was the one failure a peer structurally could not diagnose
+                    // alone — so the line offered a dichotomy ("unshared bucket
+                    // vs absent peer") and sent the reader to the node's log.
+                    //
+                    // `entity-browser-rust`'s rung-1 re-run then hit a case that
+                    // is NEITHER: bucket shared, counterpart present and
+                    // answering (the node logged all 8 messages under one key),
+                    // and still no channel. The old text mis-described the very
+                    // case that reached it, so the reader spent the run
+                    // re-litigating rendezvous, which was already working.
+                    //
+                    // The error now carries the terminal state, so this says
+                    // which half failed instead of offering a guess:
+                    // `sdp_exchange=INCOMPLETE` with a non-empty bucket is a
+                    // correlation failure, `complete` with a `channel wait`
+                    // reason is ICE/DTLS. Only the genuinely empty bucket sends
+                    // anyone back to the node's log.
+                    WebRtcError::Timeout {
+                        counterpart_msgs, ..
+                    } => tracing::warn!(
+                        remote_peer = %peer_id,
+                        self_peer_id = %self.self_peer_id,
+                        rendezvous_key = ?party.key,
+                        deadline_ms,
+                        error = %e,
+                        hint = if *counterpart_msgs == 0 {
+                            "bucket was EMPTY — rendezvous side: match this rendezvous_key \
+                             against the node's offer/collect log \
+                             (`RUST_LOG=entity_signaling=debug`) to tell an unshared bucket \
+                             from an absent peer"
+                        } else {
+                            "bucket was NON-EMPTY — the counterpart was present, so this is \
+                             NOT a rendezvous failure; read `sdp_exchange` and `channel wait` \
+                             in the error above"
+                        },
+                        "§6.5: the negotiation window closed without an open data channel"
+                    ),
+                    WebRtcError::Carrier(_)
+                    | WebRtcError::Substrate(_)
+                    | WebRtcError::Coding(_) => tracing::warn!(
+                        remote_peer = %peer_id,
+                        rendezvous_key = ?party.key,
+                        error = %e,
+                        "§6.5: negotiation failed; no live path"
+                    ),
+                }
+                return None;
+            }
+        };
 
         // The worker side of the handoff is unchanged code: the broker keeps
         // the far end and pumps the RTCDataChannel against it, so what arrives

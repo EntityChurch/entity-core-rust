@@ -538,10 +538,17 @@ async fn candidate_exchange_completes_over_tcp() {
         .collect(k)
         .await
         .iter()
-        .map(|b| coordination::classify_blob(b))
+        .map(|b| coordination::classify_collected(b, &k))
         .collect();
-    let seen = coordination::find_request(&bob_bucket, &b_pid).expect("bob finds alice's request");
+    let (seen, signer) =
+        coordination::find_request(&bob_bucket, &b_pid).expect("bob finds alice's request");
     assert_eq!(seen.initiator, a_pid);
+    assert!(
+        signer.is_none(),
+        "this test deposits bare on purpose (it drives the client verbs directly, \
+         not `punch::initiate`), so it also pins that the bare framing still reads \
+         through the node — the migration case a peer on an older build presents"
+    );
     assert_eq!(
         seen.candidates, alice_candidates,
         "candidates survive the carrier byte-for-byte"
@@ -563,9 +570,9 @@ async fn candidate_exchange_completes_over_tcp() {
         .collect(k)
         .await
         .iter()
-        .map(|b| coordination::classify_blob(b))
+        .map(|b| coordination::classify_collected(b, &k))
         .collect();
-    let answer =
+    let (answer, _) =
         coordination::find_response(&alice_bucket, &nonce, &a_pid).expect("alice finds the answer");
     assert_eq!(answer.responder, b_pid);
     assert_eq!(answer.candidates, bob_candidates);

@@ -660,14 +660,31 @@ fn build_webrtc_establisher(
                 .unwrap_or(DEFAULT_WEBRTC_POLL_INTERVAL_MS),
             cfg.max_deadline_ms
                 .unwrap_or(DEFAULT_WEBRTC_MAX_DEADLINE_MS),
-            // §6.3 specifies the identity checks but no container to carry a
-            // signature, so `Require` cannot currently succeed. Naming the
-            // pre-container variant here rather than defaulting to it is what
-            // keeps "the browser leg ships with no identity binding" a stated
-            // fact instead of something a reader has to infer. **This is the
-            // call site the §6.3 container lands on** — the first and, today,
-            // only production choice of this policy.
-            entity_peer::worker_webrtc::VerificationPolicy::AllowUnverifiedPreContainer,
+            // **Require.** The browser leg verifies §6.3 before any SDP reaches
+            // `setRemoteDescription`, which is the whole of §7.4's discharge for
+            // this substrate.
+            //
+            // This waited on a premise that was never true. The comment here
+            // used to say it flips "when Go's deposit side lands" — but
+            // `entity-core-go` has **no §6.5 deposit path at all** (their
+            // correction, 2026-08-04, verified in their tree: every §6.5 payload
+            // they construct is in `cmd/webrtc-vectors`, and every carrier
+            // deposit they make is §6.1). There was no second implementation
+            // coming. A §6.5 counterpart is always another peer running *this*
+            // crate, and this crate has sealed its deposits since `d70f245`.
+            //
+            // So the tolerant variant was protecting nothing here and costing
+            // the actual guarantee. What `Require` refuses is a build of this
+            // crate older than the flip — which is exactly the mixed-build case
+            // worth refusing **loudly**, since the alternative is silently
+            // feeding unverified SDP to a browser's ICE stack.
+            //
+            // For `entity-browser-rust`: a `VerificationUnavailable` on this
+            // path means the two ends are on different builds of this crate, not
+            // a NAT problem. Reverting this one line to
+            // `AllowUnverifiedPreContainer` restores the old behaviour if a rig
+            // needs it mid-debug.
+            entity_peer::worker_webrtc::VerificationPolicy::Require,
             ice_servers,
         ),
     ))

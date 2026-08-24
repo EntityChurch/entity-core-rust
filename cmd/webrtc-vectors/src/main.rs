@@ -36,19 +36,26 @@
 use std::collections::BTreeMap;
 
 use anyhow::{bail, Context, Result};
+use entity_crypto::IdentityKeypair;
 use entity_ecf::{bytes as ecf_bytes, text, to_ecf, Value};
 use entity_signaling::webrtc::{
     classify_blob, glare_role, pair_should_suppress_offer, verify_claimed_signer,
     verify_coordination_signature, Answer, CollectedWebRtc, GlareRole, IceCandidate, Offer,
     SessionId, SCHEMA_VERSION,
 };
-use entity_signaling::SignalingError;
+use entity_signaling::{envelope, RendezvousKey, SignalingError, RENDEZVOUS_KEY_LEN};
 
 const EMITTER: &str = "core-rust";
 
 const EXPECT_OK: &str = "ok";
 const EXPECT_BAD_SIGNATURE: &str = "bad_signature";
 const EXPECT_SIGNER_MISMATCH: &str = "signer_mismatch";
+/// The third settled taxonomy name — a key that cannot be *used* to answer the
+/// question, as distinct from a peer claiming an identity it cannot support.
+const EXPECT_UNUSABLE_KEY: &str = "unusable_key";
+/// Not one of the three: the blob never parsed as a container at all, which
+/// §6.4 makes a normal bucket occurrence rather than a verification verdict.
+const EXPECT_DECODE_SKIP: &str = "decode_skip";
 const ERR_SELF_NEGOTIATION: &str = "self_negotiation";
 
 fn main() {
@@ -156,6 +163,56 @@ struct SignatureVector {
     expect: String,
 }
 
+/// Surface 0 — the signing input, **as data, checked before anything else**.
+///
+/// Go's contribution, and the reason for it is the divergence that produced it:
+/// Rust and Go independently reached "cover the rendezvous key, don't carry it"
+/// and still disagreed on the bytes — Go had
+/// `content_hash ‖ rendezvous_key`, Rust `domain ‖ SEP ‖ rendezvous_key ‖
+/// content_hash`. A disagreement on this field makes **every** signature row
+/// fail identically, which is indistinguishable from total breakage; the whole
+/// container reads as broken when one 84-byte layout is off.
+///
+/// So it is checked first and separately, and it is `[K]`-free: a declarative
+/// component list would still let two impls agree on names and lengths while
+/// ordering them differently, so `sample` carries a worked example whose exact
+/// bytes pin the order operationally.
+#[cfg_attr(test, derive(Debug))]
+struct SigningInputVector {
+    /// `(name, len)` in wire order.
+    components: Vec<(String, u64)>,
+    total_len: u64,
+    /// A worked example: these two inputs produce exactly these bytes.
+    sample_key: Vec<u8>,
+    sample_content_hash: Vec<u8>,
+    sample_bytes: Vec<u8>,
+}
+
+/// Surface 5 — the §6.3 **container**, not the verification primitive.
+///
+/// Surface 4 crosses `verify_coordination_signature` on a scaffolded triple:
+/// entity, key, signature handed over separately, as no wire format carried
+/// them. This row is the thing a bucket actually holds.
+#[cfg_attr(test, derive(Debug))]
+struct SignedBlobVector {
+    name: String,
+    /// The whole `system/signaling/signed-blob` container.
+    blob: Vec<u8>,
+    /// The 33-byte bucket key the signature is bound to. Carried explicitly so
+    /// the crossing is decidable regardless of which binding mechanism the
+    /// cohort settles on — a verifier reproduces these exact bytes or it does
+    /// not, and no prose is needed to adjudicate.
+    rendezvous_key: Vec<u8>,
+    /// Present only on §6.1-shaped rows that name their own signer.
+    claimed_peer_id: String,
+    expect_signer: String,
+    /// The inner entity, verbatim — pins the byte-preservation MUST *through*
+    /// the container, which is where a decode+re-encode would silently
+    /// invalidate the signature.
+    expect_inner_blob: Vec<u8>,
+    expect: String,
+}
+
 #[cfg_attr(test, derive(Debug))]
 struct VectorFile {
     schema: String,
@@ -165,6 +222,29 @@ struct VectorFile {
     roles: Vec<RoleVector>,
     session_ids: Vec<SessionIdVector>,
     signatures: Vec<SignatureVector>,
+    /// **Optional on read, always emitted.** `signed_blobs` postdates the
+    /// four original surfaces, and `SCHEMA_VERSION` cannot be bumped to
+    /// announce it: the same string is pinned into every
+    /// `system/peer/transport/webrtc` profile's `negotiation.signaling_schema`
+    /// (`EXTENSION-NETWORK.md` §6.5.2d), so bumping it would be a wire-visible
+    /// change to advertise a *test-harness* addition, and `verify_file` hard-
+    /// refuses a schema it does not recognize — the two impls could never land
+    /// it without a flag day.
+    ///
+    /// So the surface is added the way ADR-0002 says unknowns are handled, with
+    /// the harness holding itself to the rule it tests: a sibling file without
+    /// the array still verifies clean on the four crossed surfaces, and ours
+    /// carries the array for them to pick up. [`verify_signed_blobs`] says
+    /// **loudly** when the array was absent, so "0 fail" can never be misread
+    /// as "the container crossed."
+    signed_blobs: Vec<SignedBlobVector>,
+    /// Whether the file carried the array at all — absent is not the same fact
+    /// as present-and-empty.
+    has_signed_blobs: bool,
+    /// Optional for the same MUST-ignore reason as `signed_blobs`: Go offered
+    /// this block rather than emitting it unilaterally, so either side may land
+    /// it first without breaking the other.
+    signing_input: Option<SigningInputVector>,
 }
 
 // ---------------------------------------------------------------------------
@@ -302,6 +382,53 @@ fn parse_file(raw: &[u8]) -> Result<VectorFile> {
         });
     }
 
+    // Optional by design — see `VectorFile::signed_blobs`. Note this reads
+    // `m.get`, not `get()`: an explicit null is a malformed array here, not an
+    // absence, and it should surface as a parse failure rather than pass as
+    // "the emitter has not landed the surface yet."
+    let has_signed_blobs = m.contains_key("signed_blobs");
+    let mut signed_blobs = Vec::new();
+    if has_signed_blobs {
+        for row in req_array(&m, "signed_blobs").context(
+            "signed_blobs is present but not an array — an emitter that writes null here \
+             would be claiming the surface while carrying nothing",
+        )? {
+            let r = as_map(row)?;
+            signed_blobs.push(SignedBlobVector {
+                name: req_text(&r, "name")?,
+                blob: req_bytes(&r, "blob")?,
+                rendezvous_key: req_bytes(&r, "rendezvous_key")?,
+                claimed_peer_id: opt_text(&r, "claimed_peer_id"),
+                expect_signer: opt_text(&r, "expect_signer"),
+                expect_inner_blob: get(&r, "expect_inner_blob")
+                    .and_then(|v| v.as_bytes())
+                    .cloned()
+                    .unwrap_or_default(),
+                expect: req_text(&r, "expect")?,
+            });
+        }
+    }
+
+    let signing_input = match get(&m, "signing_input") {
+        None => None,
+        Some(v) => {
+            let r = as_map(v)?;
+            let mut components = Vec::new();
+            for c in req_array(&r, "components")? {
+                let c = as_map(c)?;
+                components.push((req_text(&c, "name")?, opt_u64(&c, "len")));
+            }
+            let sample = as_map(get(&r, "sample").context("signing_input needs a `sample`")?)?;
+            Some(SigningInputVector {
+                components,
+                total_len: opt_u64(&r, "total_len"),
+                sample_key: req_bytes(&sample, "rendezvous_key")?,
+                sample_content_hash: req_bytes(&sample, "content_hash")?,
+                sample_bytes: req_bytes(&sample, "bytes")?,
+            })
+        }
+    };
+
     Ok(VectorFile {
         schema: req_text(&m, "schema")?,
         emitter: req_text(&m, "emitter")?,
@@ -310,6 +437,9 @@ fn parse_file(raw: &[u8]) -> Result<VectorFile> {
         roles,
         session_ids,
         signatures,
+        signed_blobs,
+        has_signed_blobs,
+        signing_input,
     })
 }
 
@@ -367,10 +497,13 @@ fn verify_file(path: &str) -> Result<bool> {
     println!();
 
     let reports = [
+        // First, and separately — see `verify_signing_input`.
+        verify_signing_input(f.signing_input.as_ref()),
         verify_entities(&f.entities),
         verify_roles(&f.roles),
         verify_session_ids(&f.session_ids),
         verify_signatures(&f.signatures),
+        verify_signed_blobs(&f.signed_blobs, f.has_signed_blobs),
     ];
 
     let (mut total, mut failed) = (0usize, 0usize);
@@ -391,6 +524,17 @@ fn verify_file(path: &str) -> Result<bool> {
         println!(
             "  Coordination layer only. NOT evidence that WebRTC transport works (§11.5.1: S5 is)."
         );
+        // The §6.3 fold trigger is defined as *this* surface crossing. A pass
+        // on the other four while the container is absent is exactly the
+        // "eight green crossings on an unimplemented security MUST" state the
+        // envelope proposal was written to end — so it is named, not implied.
+        if !f.has_signed_blobs {
+            println!(
+                "  §6.3 container NOT crossed: {} emitted no `signed_blobs`. The fold trigger \
+                 is unmet.",
+                f.emitter
+            );
+        }
         return Ok(true);
     }
     println!(
@@ -736,6 +880,215 @@ fn verify_signatures(rows: &[SignatureVector]) -> Report {
     r
 }
 
+/// Surface 0 — the signing input, checked before any signature is verified.
+///
+/// Reports `ABSENT` rather than passing when the block is missing, for the same
+/// reason surface 5 does: a 0/0 that reads as agreement is the failure mode
+/// these guards exist to prevent.
+fn verify_signing_input(v: Option<&SigningInputVector>) -> Report {
+    let mut r = Report::new("0. signing input");
+    let Some(v) = v else {
+        r.lines.push(
+            "      ABSENT  no `signing_input` block — a signing-input divergence will \
+             surface as every signature row failing at once"
+                .to_string(),
+        );
+        return r;
+    };
+
+    // Ours, for the same sample inputs. Recomputing is correct here (unlike the
+    // convergence check, which must read the file): the point is precisely to
+    // compare their stated bytes against what this build would produce.
+    let key = match RendezvousKey::from_slice(&v.sample_key) {
+        Ok(k) => k,
+        Err(e) => {
+            r.bad("sample/key-length", &format!("{e}"));
+            return r;
+        }
+    };
+    let ours = envelope::signing_input(&key, &v.sample_content_hash);
+
+    if ours != v.sample_bytes {
+        r.bad(
+            "sample/bytes",
+            &format!(
+                "signing input differs — ours {}, theirs {}. Everything downstream of this \
+                 is meaningless until it agrees; do NOT read the signature rows as a crypto \
+                 fault.",
+                hex(&ours),
+                hex(&v.sample_bytes)
+            ),
+        );
+        return r;
+    }
+    r.ok("sample/bytes");
+
+    let expected: Vec<(String, u64)> = vec![
+        ("domain".into(), envelope::SIGNING_DOMAIN.len() as u64),
+        ("sep".into(), 1),
+        ("rendezvous_key".into(), RENDEZVOUS_KEY_LEN as u64),
+        ("content_hash".into(), 33),
+    ];
+    if v.components != expected {
+        r.bad(
+            "components",
+            &format!("stated {:?}, ours {:?}", v.components, expected),
+        );
+    } else {
+        r.ok("components");
+    }
+
+    if v.total_len != ours.len() as u64 {
+        r.bad(
+            "total_len",
+            &format!("stated {}, ours {}", v.total_len, ours.len()),
+        );
+    } else {
+        r.ok("total_len");
+    }
+    r
+}
+
+/// Surface 5 — the §6.3 container end to end.
+///
+/// Every row is fed to the **real** [`entity_signaling::envelope::open`], the
+/// same function the negotiation loop uses. Nothing here reconstructs the
+/// expected answer locally: a row states the bucket key and the verdict, and
+/// this build either reproduces it from the sibling's bytes or does not.
+fn verify_signed_blobs(rows: &[SignedBlobVector], present: bool) -> Report {
+    let mut r = Report::new("5. §6.3 signed-blob");
+    if !present {
+        // Deliberately loud. A surface that silently reports 0/0 reads as
+        // "crossed" in a summary line, and this is the one surface the fold
+        // trigger is defined against.
+        r.lines.push(
+            "      ABSENT  this file carries no `signed_blobs` array — the container \
+             crossing has NOT happened"
+                .to_string(),
+        );
+        return r;
+    }
+    for v in rows {
+        let key = match RendezvousKey::from_slice(&v.rendezvous_key) {
+            Ok(k) => k,
+            Err(e) => {
+                r.bad(
+                    &v.name,
+                    &format!(
+                        "rendezvous_key is {} bytes, not {RENDEZVOUS_KEY_LEN}: {e}",
+                        v.rendezvous_key.len()
+                    ),
+                );
+                continue;
+            }
+        };
+
+        let outcome = if v.claimed_peer_id.is_empty() {
+            envelope::open(&v.blob, &key)
+        } else {
+            envelope::open_claimed(&v.blob, &key, &v.claimed_peer_id)
+        };
+
+        match v.expect.as_str() {
+            EXPECT_OK => match outcome {
+                Err(e) => {
+                    r.bad(&v.name, &format!("expected ok, got {e}"));
+                    continue;
+                }
+                Ok((signer, inner)) => {
+                    if !v.expect_signer.is_empty() && signer.peer_id() != v.expect_signer {
+                        r.bad(
+                            &v.name,
+                            &format!(
+                                "derived signer {}, want {} — the id is derived canonically \
+                                 from (public_key, key_type), never decoded from the wire",
+                                signer.peer_id(),
+                                v.expect_signer
+                            ),
+                        );
+                        continue;
+                    }
+                    // The byte-preservation MUST, checked through the container.
+                    if !v.expect_inner_blob.is_empty() {
+                        let got = entity_wire::encode_entity(&inner);
+                        if got != v.expect_inner_blob {
+                            r.bad(
+                                &v.name,
+                                &format!(
+                                    "inner entity came back as {} bytes, want {} — a container \
+                                     that decodes and re-encodes its payload silently \
+                                     invalidates the signature it carries (§6.2)",
+                                    hex(&got),
+                                    hex(&v.expect_inner_blob)
+                                ),
+                            );
+                            continue;
+                        }
+                    }
+                }
+            },
+            EXPECT_BAD_SIGNATURE => {
+                if !matches!(outcome, Err(SignalingError::BadSignature)) {
+                    r.bad(
+                        &v.name,
+                        &format!(
+                            "expected BadSignature, got {:?}",
+                            outcome.map(|(s, _)| s.peer_id().to_string())
+                        ),
+                    );
+                    continue;
+                }
+            }
+            EXPECT_SIGNER_MISMATCH => {
+                if !matches!(outcome, Err(SignalingError::SignerMismatch)) {
+                    r.bad(
+                        &v.name,
+                        &format!(
+                            "expected SignerMismatch, got {:?} — this name is reserved for a \
+                             valid signature under a FALSE claim; collapsing it into \
+                             unusable_key loses the distinction",
+                            outcome.map(|(s, _)| s.peer_id().to_string())
+                        ),
+                    );
+                    continue;
+                }
+            }
+            EXPECT_UNUSABLE_KEY => {
+                if !matches!(outcome, Err(SignalingError::UnusableKey)) {
+                    r.bad(
+                        &v.name,
+                        &format!(
+                            "expected UnusableKey, got {:?} — an unsupported key_type MUST be \
+                             skipped (ADR-0002), not rejected as a false claim",
+                            outcome.map(|(s, _)| s.peer_id().to_string())
+                        ),
+                    );
+                    continue;
+                }
+            }
+            EXPECT_DECODE_SKIP => {
+                if !matches!(outcome, Err(SignalingError::Decode(_))) {
+                    r.bad(
+                        &v.name,
+                        &format!(
+                            "expected a decode skip, got {:?} — a bucket is a mixed set and a \
+                             foreign blob is normal traffic, not a verdict",
+                            outcome.map(|(s, _)| s.peer_id().to_string())
+                        ),
+                    );
+                    continue;
+                }
+            }
+            other => {
+                r.bad(&v.name, &format!("unknown expect {other}"));
+                continue;
+            }
+        }
+        r.ok(&v.name);
+    }
+    r
+}
+
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
@@ -825,6 +1178,7 @@ fn emit_file(path: &str) -> Result<()> {
     let roles = emit_roles();
     let session_ids = emit_session_ids();
     let signatures = emit_signatures()?;
+    let signed_blobs = emit_signed_blobs()?;
     let commit = head_commit();
 
     let root = Value::Map(vec![
@@ -835,6 +1189,8 @@ fn emit_file(path: &str) -> Result<()> {
         (text("roles"), Value::Array(roles.clone())),
         (text("session_ids"), Value::Array(session_ids.clone())),
         (text("signatures"), Value::Array(signatures.clone())),
+        (text("signed_blobs"), Value::Array(signed_blobs.clone())),
+        (text("signing_input"), emit_signing_input()),
     ]);
     let raw = to_ecf(&root);
     std::fs::write(path, &raw).with_context(|| format!("write {path}"))?;
@@ -842,13 +1198,347 @@ fn emit_file(path: &str) -> Result<()> {
     println!("wrote {path} ({} bytes)", raw.len());
     println!("  schema={SCHEMA_VERSION} emitter={EMITTER} commit={commit}");
     println!(
-        "  entities={} roles={} session_ids={} signatures={}",
+        "  entities={} roles={} session_ids={} signatures={} signed_blobs={}",
         entities.len(),
         roles.len(),
         session_ids.len(),
-        signatures.len()
+        signatures.len(),
+        signed_blobs.len()
     );
     Ok(())
+}
+
+/// Surface 5 rows — the §6.3 container.
+///
+/// **These rows also carry the open bucket-binding call.** Every signature here
+/// is bound to the `rendezvous_key` the row states, and
+/// `ed25519/replayed-into-another-bucket` is the row that decides it: it is the
+/// same valid blob, verified under a different key, and it MUST fail. An
+/// implementation that does not bind fails exactly that row and passes the
+/// rest, which localizes the disagreement to the mechanism instead of
+/// reporting a diff.
+fn emit_signed_blobs() -> Result<Vec<Value>> {
+    let kp_a = IdentityKeypair::Ed25519(entity_crypto::Keypair::from_seed(SEED_A));
+    let kp_b = IdentityKeypair::Ed25519(entity_crypto::Keypair::from_seed(SEED_B));
+    let kp_448 = IdentityKeypair::Ed448(entity_crypto::Ed448Keypair::from_seed(&ed448_seed(0x42))?);
+
+    // Two fixed buckets. `pair_key` sorts its arguments, so these are exactly
+    // what the two peers would derive — not synthetic byte strings.
+    let a_id = kp_a.peer_id().to_string();
+    let b_id = kp_b.peer_id().to_string();
+    let c_id = kp_448.peer_id().to_string();
+    let bucket = entity_signaling::pair_key(&a_id, &b_id);
+    let other_bucket = entity_signaling::pair_key(&a_id, &c_id);
+
+    let sess = sid_bytes(0x40, 16);
+    let inner = Offer::new(
+        SessionId::parse(sess.clone())?,
+        "v=0\r\no=- 5 5 IN IP4 0.0.0.0\r\na=fingerprint:sha-256 12:34\r\n",
+    )
+    .to_entity()?;
+    let inner_blob = entity_wire::encode_entity(&inner);
+
+    let valid_a = envelope::seal(&inner, &bucket, &kp_a)?;
+    let valid_448 = envelope::seal(&inner, &bucket, &kp_448)?;
+
+    // Adopted from core-go's file. A signature over the **bare** 33-byte
+    // content_hash — the unbound shape, and the one both impls would have built
+    // without §5's binding. It is the direct negative for the binding: an impl
+    // that omitted it entirely passes the replay row (both keys "work") and
+    // fails only this one.
+    let mut bare_hash = envelope::parse(&valid_a)?;
+    bare_hash.signature = entity_crypto::Keypair::from_seed(SEED_A)
+        .sign(&inner.content_hash.to_bytes())
+        .to_vec();
+    let bare_hash_blob = bare_hash.to_blob()?;
+
+    // Also from Go. A valid signature over the correct input, made by a key
+    // that is not the one named — derivation binds `signer` to A's key, so this
+    // reaches step 4 and fails there. Distinct from `forged-signer`, which
+    // fails at step 2 and never reaches the signature at all.
+    let mut other_key = envelope::parse(&valid_a)?;
+    other_key.signature = kp_b.sign(&envelope::signing_input(
+        &bucket,
+        &inner.content_hash.to_bytes(),
+    ));
+    let other_key_blob = other_key.to_blob()?;
+
+    // A forged `signer`: A's key and signature, B's id in the field.
+    let mut forged = envelope::parse(&valid_a)?;
+    forged.signer = b_id.clone();
+    let forged_blob = forged.to_blob()?;
+
+    // A well-formed but NON-CANONICAL id for the very same key — the legacy
+    // SHA-256 form. Admitting it gives one key two valid ids, and every §6.5
+    // decision is a sort over that id.
+    let mut relabelled = envelope::parse(&valid_a)?;
+    relabelled.signer = entity_crypto::legacy_sha256_peer_id_fixture(
+        &entity_crypto::Keypair::from_seed(SEED_A).public_key_bytes(),
+    )
+    .to_string();
+    let relabelled_blob = relabelled.to_blob()?;
+
+    // Substituted SDP under a real signature — what binds the DTLS fingerprint.
+    let other_inner = Offer::new(
+        SessionId::parse(sess.clone())?,
+        "v=0\r\no=- 5 5 IN IP4 0.0.0.0\r\na=fingerprint:sha-256 DE:AD\r\n",
+    )
+    .to_entity()?;
+    let mut tampered = envelope::parse(&valid_a)?;
+    tampered.entity = entity_wire::encode_entity(&other_inner);
+    let tampered_blob = tampered.to_blob()?;
+
+    // A well-formed key_type this build cannot verify (`0xFE`, 64-byte key).
+    // MUST be skipped, never hardcode-rejected — the Ed448 defect, generalized.
+    let exotic_pk = vec![0x07u8; 64];
+    let exotic = envelope::SignedBlob {
+        entity: inner_blob.clone(),
+        signer: entity_crypto::PeerId::from_public_key_with_key_type(
+            &exotic_pk,
+            entity_crypto::KeyType::ExperimentalTest,
+        )?
+        .to_string(),
+        public_key: exotic_pk,
+        signature: vec![0x00; 64],
+    }
+    .to_blob()?;
+
+    // ---------------------------------------------------------------------
+    // §6.1 inners — the shape §6.5 cannot reach
+    // ---------------------------------------------------------------------
+    //
+    // Every row above wraps a §6.5 payload, which names nobody: the derived
+    // signer simply *is* the identity. §6.1's `connect-request` /
+    // `connect-response` carry `initiator` / `responder` AS WIRE FIELDS, so a
+    // signature that is entirely valid under a **false** claim passes steps 2
+    // and 4 and is caught only by step 3. That is a distinct failure surface,
+    // and it survived a 38·0F crossing in both impls because no row exercised
+    // it. Adopted from core-go's four rows (`204e1d9`) so the check crosses in
+    // both directions rather than one.
+    //
+    // Nonces are fixed, not generated: a vector file must re-emit byte-identical
+    // at the same commit or its provenance means nothing.
+    let native_candidates = vec![entity_signaling::coordination::Candidate::new(
+        entity_signaling::coordination::CANDIDATE_HOST,
+        entity_signaling::coordination::SUBSTRATE_TCP,
+        "192.0.2.7:9000",
+    )];
+    let request = entity_signaling::coordination::ConnectRequest {
+        initiator: a_id.clone(),
+        candidates: native_candidates.clone(),
+        nonce: entity_signaling::coordination::Nonce(vec![0x51; 16]),
+    }
+    .to_entity()?;
+    // The same shape with the lie moved INSIDE the signature: `initiator` names
+    // B, and A signs it anyway. Sealed by `kp_a` exactly like the truthful one,
+    // so steps 2 and 4 pass and only step 3 — "the payload's author must be the
+    // verified signer" — can catch it.
+    //
+    // The first cut of the false-claim row reused the truthful blob and lied
+    // only in the row's own `claimed_peer_id`. `entity-core-go` ran their
+    // verifier against our file and reported it as a `W`: a real §6.1 collector
+    // reads `initiator` out of the signed entity, so it saw a truthful message
+    // and correctly returned ok — the row could not catch the regression it is
+    // named for. Their `OpenBlobClaimed` was in exactly that state (tested
+    // directly, no caller in the read path) and would have passed it.
+    let request_lying = entity_signaling::coordination::ConnectRequest {
+        initiator: b_id.clone(),
+        candidates: native_candidates.clone(),
+        nonce: entity_signaling::coordination::Nonce(vec![0x51; 16]),
+    }
+    .to_entity()?;
+    let response = entity_signaling::coordination::ConnectResponse {
+        responder: a_id.clone(),
+        candidates: native_candidates,
+        nonce: entity_signaling::coordination::Nonce(vec![0x51; 16]),
+    }
+    .to_entity()?;
+    let sync = entity_signaling::coordination::PunchSync {
+        nonce: entity_signaling::coordination::Nonce(vec![0x51; 16]),
+        fire_at: 40,
+    }
+    .to_entity()?;
+
+    let request_blob = envelope::seal(&request, &bucket, &kp_a)?;
+    let request_blob_lying = envelope::seal(&request_lying, &bucket, &kp_a)?;
+    let response_blob = envelope::seal(&response, &bucket, &kp_a)?;
+    let sync_blob = envelope::seal(&sync, &bucket, &kp_a)?;
+
+    Ok(vec![
+        signed_blob_row(
+            "ed25519/valid",
+            valid_a.clone(),
+            &bucket,
+            EXPECT_OK,
+            vec![
+                (text("expect_signer"), text(&a_id)),
+                (text("expect_inner_blob"), ecf_bytes(inner_blob.clone())),
+            ],
+        ),
+        // Parametric key_type: the floor is Ed25519, not the ceiling.
+        signed_blob_row(
+            "ed448/valid",
+            valid_448,
+            &bucket,
+            EXPECT_OK,
+            vec![
+                (text("expect_signer"), text(&c_id)),
+                (text("expect_inner_blob"), ecf_bytes(inner_blob.clone())),
+            ],
+        ),
+        // THE bucket-binding row. Same bytes, different bucket.
+        signed_blob_row(
+            "ed25519/replayed-into-another-bucket",
+            valid_a.clone(),
+            &other_bucket,
+            EXPECT_BAD_SIGNATURE,
+            vec![],
+        ),
+        signed_blob_row(
+            "ed25519/forged-signer",
+            forged_blob,
+            &bucket,
+            EXPECT_UNUSABLE_KEY,
+            vec![],
+        ),
+        signed_blob_row(
+            "ed25519/non-canonical-hash-type",
+            relabelled_blob,
+            &bucket,
+            EXPECT_UNUSABLE_KEY,
+            vec![],
+        ),
+        signed_blob_row(
+            "ed25519/tampered-inner-entity",
+            tampered_blob,
+            &bucket,
+            EXPECT_BAD_SIGNATURE,
+            vec![],
+        ),
+        signed_blob_row(
+            "unsupported-key-type/0xfe",
+            exotic,
+            &bucket,
+            EXPECT_UNUSABLE_KEY,
+            vec![],
+        ),
+        signed_blob_row(
+            "ed25519/bare-content-hash-signature",
+            bare_hash_blob,
+            &bucket,
+            EXPECT_BAD_SIGNATURE,
+            vec![],
+        ),
+        signed_blob_row(
+            "ed25519/signed-by-another-key",
+            other_key_blob,
+            &bucket,
+            EXPECT_BAD_SIGNATURE,
+            vec![],
+        ),
+        // §6.1's step 3 — only the claim comparison catches a valid signature
+        // under a false claim.
+        signed_blob_row(
+            "ed25519/false-claim",
+            valid_a.clone(),
+            &bucket,
+            EXPECT_SIGNER_MISMATCH,
+            vec![(text("claimed_peer_id"), text(&b_id))],
+        ),
+        // The same claim told truthfully, so the row above cannot pass by a
+        // verifier that rejects every claimed-signer row.
+        signed_blob_row(
+            "ed25519/true-claim",
+            valid_a,
+            &bucket,
+            EXPECT_OK,
+            vec![
+                (text("claimed_peer_id"), text(&a_id)),
+                (text("expect_signer"), text(&a_id)),
+            ],
+        ),
+        // A bare coordination entity — legacy unsigned traffic, or another
+        // impl's blob. Normal bucket contents, so a skip and not a verdict.
+        signed_blob_row(
+            "not-a-container",
+            inner_blob,
+            &bucket,
+            EXPECT_DECODE_SKIP,
+            vec![],
+        ),
+    ]
+    .into_iter()
+    .chain(signed_blob_rows_6_1(
+        request_blob,
+        request_blob_lying,
+        response_blob,
+        sync_blob,
+        &bucket,
+        &a_id,
+        &b_id,
+    ))
+    .collect())
+}
+
+/// Surface 0 — emit the signing input as data.
+fn emit_signing_input() -> Value {
+    // Fixed, recognizable inputs: neither is a real key or a real hash, which
+    // is the point — the block describes a layout, not a signature.
+    let key = entity_signaling::RendezvousKey::from_slice(&[0x5Au8; RENDEZVOUS_KEY_LEN])
+        .expect("33 bytes is the key length");
+    let content_hash = vec![0xC7u8; 33];
+    let bytes = envelope::signing_input(&key, &content_hash);
+
+    let component = |name: &str, len: usize| {
+        Value::Map(vec![
+            (text("name"), text(name)),
+            (
+                text("len"),
+                Value::Integer(ciborium::value::Integer::from(len as u64)),
+            ),
+        ])
+    };
+
+    Value::Map(vec![
+        (
+            text("components"),
+            Value::Array(vec![
+                component("domain", envelope::SIGNING_DOMAIN.len()),
+                component("sep", 1),
+                component("rendezvous_key", RENDEZVOUS_KEY_LEN),
+                component("content_hash", 33),
+            ]),
+        ),
+        (
+            text("sample"),
+            Value::Map(vec![
+                (text("bytes"), ecf_bytes(bytes.clone())),
+                (text("content_hash"), ecf_bytes(content_hash)),
+                (text("rendezvous_key"), ecf_bytes(key.as_bytes().to_vec())),
+            ]),
+        ),
+        (
+            text("total_len"),
+            Value::Integer(ciborium::value::Integer::from(bytes.len() as u64)),
+        ),
+    ])
+}
+
+fn signed_blob_row(
+    name: &str,
+    blob: Vec<u8>,
+    key: &RendezvousKey,
+    expect: &str,
+    extra: Vec<(Value, Value)>,
+) -> Value {
+    let mut entries = vec![
+        (text("name"), text(name)),
+        (text("blob"), ecf_bytes(blob)),
+        (text("rendezvous_key"), ecf_bytes(key.as_bytes().to_vec())),
+        (text("expect"), text(expect)),
+    ];
+    entries.extend(extra);
+    Value::Map(entries)
 }
 
 fn entity_row(
@@ -1143,6 +1833,78 @@ fn emit_signatures() -> Result<Vec<Value>> {
             ],
         ),
     ])
+}
+
+/// Append the §6.1-inner rows to the signed-blob set.
+fn signed_blob_rows_6_1(
+    request_blob: Vec<u8>,
+    request_blob_lying: Vec<u8>,
+    response_blob: Vec<u8>,
+    sync_blob: Vec<u8>,
+    bucket: &RendezvousKey,
+    a_id: &str,
+    b_id: &str,
+) -> Vec<Value> {
+    vec![
+        // The claim, told truthfully. Present so the row below cannot pass in a
+        // verifier that simply rejects every §6.1 container it meets.
+        signed_blob_row(
+            "ed25519/connect-request/true-initiator",
+            request_blob.clone(),
+            bucket,
+            EXPECT_OK,
+            vec![
+                (text("claimed_peer_id"), text(a_id)),
+                (text("expect_signer"), text(a_id)),
+            ],
+        ),
+        // THE §6.1 row: a signature that verifies perfectly, over a payload
+        // whose `initiator` names someone else. Steps 2 and 4 pass; only step 3
+        // fails. An impl that skipped step 3 passes every other row in this
+        // file and fails exactly this one.
+        //
+        // **The lie lives in the payload, not in this row's `claimed_peer_id`.**
+        // `claimed_peer_id` here EQUALS the `initiator` inside the signed
+        // entity, so a payload-driven collector — which is what every real §6.1
+        // read path is — reads B, verifies A, and must reject. When the row
+        // instead carried the truthful blob and lied only in this field, a
+        // payload-driven verifier saw a consistent message and returned ok:
+        // the row tested the row, not the read path. `entity-core-go` caught
+        // that by running their verifier against our file; the pin it argues
+        // for is that on a §6.1 row `claimed_peer_id` MUST equal the author
+        // field inside the signed payload, because that is the only
+        // construction under which the row tests what a live collector does.
+        signed_blob_row(
+            "ed25519/connect-request/initiator-names-another-peer",
+            request_blob_lying,
+            bucket,
+            EXPECT_SIGNER_MISMATCH,
+            vec![(text("claimed_peer_id"), text(b_id))],
+        ),
+        // `responder` is the same hazard under a different field name — worth
+        // its own row because a verifier that hardcoded `initiator` would pass
+        // the two above and let every answer through unchecked.
+        signed_blob_row(
+            "ed25519/connect-response/true-responder",
+            response_blob,
+            bucket,
+            EXPECT_OK,
+            vec![
+                (text("claimed_peer_id"), text(a_id)),
+                (text("expect_signer"), text(a_id)),
+            ],
+        ),
+        // `punch-sync` names nobody, so step 3 has nothing to compare and step
+        // 2 is the whole check — the position all of §6.5's payloads are in.
+        // It still governs when both peers fire, so it is sealed like the rest.
+        signed_blob_row(
+            "ed25519/punch-sync/names-nobody",
+            sync_blob,
+            bucket,
+            EXPECT_OK,
+            vec![(text("expect_signer"), text(a_id))],
+        ),
+    ]
 }
 
 #[cfg(test)]

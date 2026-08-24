@@ -1,6 +1,6 @@
 # entity-core-rust — status
 
-_Updated: 2026-07-31 · public: v0.8.0 (master)_
+_Updated: 2026-08-04 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -34,6 +34,127 @@ and tree semantics are interop-validated against the Go and Python peers, not
 just self-tested.
 
 ## Where we left off
+
+_2026-08-04 (late) — **the live cross-impl sealed §6.1 punch ran; `PUNCH_TRUST` is `Require`.**_
+(`docs/status/ROUTING-2026-08-04-the-live-sealed-punch-ran-and-require-is-on-to-go.md`.)
+
+The last hold in the §6.1 flag day is discharged. Both seats are `cmd/signaling-punch` over the
+CLI/JSON contract agreed with `entity-core-go`, their binary built to a scratch directory from
+`6a3f1b6` (**their tree never written to, their git never run**), one Rust `--open` node, loopback,
+`--mode tag`. Rust↔Go **both directions** and Rust↔Rust are `verified:true` under tolerance *and*
+under `Require`, with byte-identical keys and `dialed_outbound:true` on both seats throughout.
+
+**The tolerant pass alone would not have licensed the raise**, and that is the reasoning worth
+keeping: a tolerant collector admits an *unsealed* counterpart, so a green tolerant run is
+consistent with Go never having sealed anything. `Require` is the **assay**, not merely the goal —
+it refuses any blob without a §6.3 container, so a green cross-impl run under it is positive proof
+that Go's deposits are sealed and verify in this collector, bound to the rendezvous key. That
+inverts the usual ordering: we had to flip to learn whether flipping was safe.
+
+**And the negative control is the load-bearing half.** A Rust `signaling-punch` built from our own
+pre-flip `b1eb4b5` deposits bare; Rust-on-`Require` refuses it 2/2 (`punched:false`, exit 1,
+`VerificationUnavailable`, before any socket work). Without that, "green under `Require`" would not
+have been distinguishable from "the policy never reached the party."
+
+The control also found a defect **the flip itself created**: the refusal was invisible where an
+operator looks — `debug!` alongside every other traversal failure, and the driver's JSON reporting
+`detail: "no direct path within the deadline"`, i.e. a mixed build presenting as a NAT problem.
+`punch_establisher.rs` now gives `VerificationUnavailable` its own arm and a `warn!` naming the
+reading. **The outcome is unchanged** — still `None`, still relay per §7.1 step 6; only legibility
+moved. The JSON contract was deliberately **not** touched: enriching `detail` would require the
+§10.3 seam to return `Result` rather than `Option`, which is a joint call, and it is routed as one.
+
+**Two asks are open and both are Go's:** their `-verify` against our vector file (`40·0F @
+007e078`) — ours passes theirs at `42·0F @ 204e1d9`, so the shape is crossed in one direction only —
+and a `Require`-side punch from their seat, since `cmd/signaling-punch/main.go:430` hardcodes
+`VerifyTolerant` with no flag. Everything measured proves their *deposits* seal; nothing yet proves
+their *collector* enforces.
+
+**Still loopback.** Four green runs on one box say the sealed exchange completes and that `Require`
+discriminates. The racing-socket tie-break remains unexercised by any substrate either impl has run,
+and the cohort has still never crossed two real networks.
+
+_2026-08-04 (late) — **the browser establisher was swallowing every error; §3.2 is closed.**_
+(`docs/status/ROUTING-2026-08-04-the-establisher-was-swallowing-its-errors-to-browser-rust.md`.)
+
+`BrowserWebRtcEstablisher::establish_live` ended in `negotiate(...).await.ok()?`, which discarded the
+`WebRtcError` outright — so `VerificationUnavailable`, `IdentitySkew`, `Timeout`, and every carrier
+or substrate failure collapsed into an indistinguishable `None`, in the **one** `LiveEstablish` impl
+whose failures happen inside a worker where nobody can attach a debugger (`PeerPunchEstablisher` has
+logged its failures all along). That gap arrived with the `Require` flip itself: the routing doc told
+`entity-browser-rust` they would "see `VerificationUnavailable`" on a mixed build, and they would
+not have — they built a preflight banner for a string nothing emitted. Every failure path now logs
+before returning `None`; the `None` contract is unchanged (§7.3.1 pin 1 / §7.1 step 6 keep a failed
+traversal as "no live path", never a dispatch error). Diagnostics only — no wire shape, no policy
+change. It pairs with `entity-browser-rust`'s new worker→main `BroadcastChannel` log forwarding,
+which is what makes worker-realm `tracing` lines visible at all.
+
+**§3.2 "canonicalize the counterpart id at the §10.3 seam" is closed as not-applicable**, pinned to
+symbols rather than asserted: `self_peer_id` has exactly three construction sites (all
+`build_webrtc_establisher` callers in `bindings/wasm-worker-host/src/lib.rs` — Init/primary,
+Init/additional, `CreatePeer`), each passing `keypair.peer_id().to_string()`, so that operand cannot
+be a hash; and the target operand is refused by `EntityUri::is_peer_id` in `establish_live` **before**
+`pair_key`. Landing a canonicalization there would widen a working guard from refuse to accept.
+`entity-browser-rust` is right that nothing landed since `8c4a8cd` fixes their `included_count=0` —
+the incorrect step is that a §3.2 seam fix would. Both sides had been holding for the other; neither
+was blocked, and the rung-1 acceptance re-run is unblocked now.
+
+_2026-08-04 — **the §6.3 container is folded into the spec, and Rust's deposit side is flipped.**_
+(`docs/status/ROUTING-2026-08-04-deposit-flipped-and-the-6.1-path-is-still-bare-to-cohort.md`.)
+
+The browser leg's missing piece landed. §6.3 named a self-contained signature and §6.2 framed the
+blob with nowhere to put one, so every coordination message either impl shipped was **unsigned**.
+`system/signaling/signed-blob` (`extensions/signaling/src/envelope.rs`) closes it, cross-verified
+with `entity-core-go` **in both directions at both heads** — Rust `38·0F` on Go's `7384c7c`, Go
+`36·0F` on Rust's `6077229`, each direction checked by the *other* implementation, which is the
+§11.5.1 bar. Arch folded it at `b99304d` (their repo), carrying both of this repo's corrections as
+validated behavior: the signature binds the **rendezvous key** without carrying it (a blob replayed
+into another bucket fails), and a container that fails to verify is a **fourth** disposition that
+MUST NOT fall back to its bare inner entity — collapsing it into "undecodable" would let one
+flipped signature byte downgrade a signed offer into an accepted unsigned one.
+
+`d70f245` flips Rust's deposit path: §6.5 now posts sealed containers, signed under the identity
+the carrier authenticates to the node as, and refuses outright if the id it sorts by and the key it
+signs with disagree. **The wire shapes did not move** — re-emitting the vector file differs only in
+`emitter_commit` — so the crossing stands without a re-run. The one line left in the flag day is the
+production policy (`AllowUnverifiedPreContainer` → `Require`), correctly still tolerant until Go's
+deposit lands: `Require` refuses a bare depositor, and Go is one until it flips.
+
+**Read the security claim precisely.** Verification is operative, not in force: half the cohort
+deposits sealed, so the browser leg is not yet MITM-safe, and the reason is the migration rather
+than a missing shape.
+
+The same day turned up a second gap and closed it. The **§6.1 native punch** had no §6.3
+verification code at all — it deposited bare, read bare, and could not tell a signed message from an
+unsigned one, while carrying `initiator`/`responder` as forgeable wire fields. Both impls were in
+that state; `entity-core-go` flipped first (`d56a690`). `b1eb4b5` landed the read side here — all
+four dispositions plus §6.3 step 3, the claim comparison the browser leg has no use for — and
+`007e078` seals every §6.1 deposit and derives `PunchParty`'s id **from its signing key** (Go's
+shape: our §6.5 party has to refuse an id/key skew at runtime precisely because it takes two
+sources, and the native establisher was the live instance of that hazard). Skip-own and the
+expected-peer filter now run on the verified signer, not the claimed field.
+
+**§6.5 is on `Require`** as of `007e078`: no SDP reaches `setRemoteDescription` on the browser leg
+without a signature bound to its rendezvous bucket. It had been held off pending "Go's deposit side"
+— a premise that was never true, since Go implements no §6.5 negotiation at all (their correction,
+verified in their tree). A §6.5 counterpart is always another peer running this crate, and this
+crate has sealed since `d70f245`, so the tolerant variant was protecting nothing and costing the
+guarantee. `PUNCH_TRUST` (§6.1's policy) stays tolerant until one live cross-impl sealed punch runs:
+vectors prove bytes, not that a Go peer and a Rust peer complete an exchange through a real node.
+
+Vectors: `40·0F @ 007e078` self-verify with four §6.1 rows added, and our verifier passes Go's file
+at **42·0F @ 204e1d9** including all four of theirs — the §6.1 shape crossed in one direction, with
+Go's `-verify` against ours the number that would make it both.
+
+Also settled: `BrowserWebRtcConnector` is **not** on the S5 path and will not be built — a browser
+publishes no profile and has nothing to dial, so `LiveEstablish` / `BrowserWebRtcEstablisher` is the
+S5 seam. S3 continues there → S4 (browser-rust) → **S5**, which is the only real evidence that the
+browser leg works. rung-1 is still red for a cause upstream of the container: the node-side
+rendezvous key log landed at `6a98a7f` and `entity-browser-rust` owns the re-run.
+
+Gate: `cargo test --workspace` **2405 passed / 0 failed / 12 ignored** (`make test`, which is
+`cargo test --release` over default members, **1946 / 0 / 9**), fmt clean, clippy clean, `make
+features` clean, `make wasm` clean including the three worker crates.
 
 _2026-07-31 — **the owed cross-impl backlog is clear, and Rust joined the signaling meet.**_
 (`docs/validation/reports/2026-07-31-seven-categories-cleared-and-rust-joins-the-meet.md`.)
@@ -589,13 +710,27 @@ up only if a future profile shows `verify_request` back on the hot path.
 
 ## Next
 
+> **This list was swept 2026-08-04.** Three items below had gone stale and one of
+> them cost a session: 5b named §6.7.1 as unvalidated when it had been closed
+> four ways on 2026-08-02, and it was picked up and recommended as "next" on that
+> basis. A cold-start reference that is wrong about what is *done* is worse than
+> one that is merely incomplete. The punch/WebRTC arc (2026-08-01 → 04) now leads
+> the list, because that is where the work actually is.
+
+0. **The browser leg — S5, and it is the only real evidence.** S3 is built here
+   (`worker_webrtc`, the §6.3 container, §6.5 `Require`); S4 is
+   `entity-browser-rust`'s and built; **S5 has never run** and rung-1 is red. The
+   next fact is their acceptance re-run, which is unblocked — nothing is owed to
+   them from this tree
+   (`ROUTING-2026-08-04-the-establisher-was-swallowing-its-errors-to-browser-rust.md`).
+   Coordination-green is not transport-works.
 1. **Two questions routed to architecture — waiting on the model answer, not on
    Rust.** (a) Retention: is a self-collection MUST warranted, or does §5 stay a
-   MAY? (`ROUTING-2026-07-17-marker-feasibility-and-retention-rust.md`). (b)
-   `chain_depth` in `system/bounds`: Rust confirmed the shape + O1 signal and
-   held the wire build pending fold / a second wired seat
-   (`ROUTING-2026-07-17-bounds-propagation-rust-position.md`). The ruled list
-   itself is otherwise **closed** (#18 landed, feasibility answered, #14 N/A).
+   MAY? (`ROUTING-2026-07-17-marker-feasibility-and-retention-rust.md`).
+   ~~(b) `chain_depth` — held pending fold / a second wired seat.~~ **STALE —
+   built 2026-07-18** and cleared cross-impl 2026-07-31; see item 2, which
+   contradicted this on the same list. The ruled list is **closed** (#18 landed,
+   feasibility answered, #14 N/A).
 2. **Cross-peer chain bound build — DONE (2026-07-18).** The wired `chain_depth`
    brake is built (field + CBOR, cross-peer bounds propagation, step-6
    inherit/increment, O1 signal, §3.9 suspend + §3.7 resume) plus the standing-model
@@ -616,13 +751,28 @@ up only if a future profile shows `verify_request` back on the hot path.
    halves of the stale-image trap are closed. **Owed:** confirm the stamp on a real
    `make build`; the label mechanism was proven on a minimal equivalent image, not
    the full one.
-5a. **Re-diff signaling against the arch corpus when it lands.** The highest-value
-   outstanding item and the one that upgrades every green result in the signaling
-   arc from cohort-consistent to independent convergence. Not ours to schedule.
-5b. **Validate `EXTENSION-NETWORK` §6.7.1** (`observed_address` on HELLO,
-   Amendment 13) — buildable in all three impls **now**, never validated by anyone,
-   and the source of the v1 punch's `srflx`. The cheapest real progress toward
-   Stage 2, and unlike Stage 2 itself it is not blocked on arch.
+5a. ~~**Re-diff signaling against the arch corpus when it lands.**~~ **DONE
+   2026-07-31** — arch `4241b96` folded the connectivity family and the re-diff ran
+   against the committed text, six findings, two logged as ambiguities
+   (`docs/validation/reports/2026-07-31-signaling-rediff-against-committed-v1.md`).
+5b. ~~**Validate `EXTENSION-NETWORK` §6.7.1**~~ **DONE 2026-08-01/02 — the matrix is
+   closed four ways.** The client half is `core/peer/src/srflx.rs`; Rust also built a
+   **responder** (`NetworkHandler::handle_observe_address` + the §6.7.4 rate limit),
+   and standing it up immediately found a real grant bug — Go's client got `403`
+   from our responder because reflection was reachable only to a caller already
+   holding a `system/network` grant, fixed in `default_connection_grants`
+   (`observe-address` only; §6.7.2 `check-reachability` stays restricted, since a
+   broad grant there makes every peer a DDoS reflector). Go↔Go, Go→Rust, Rust→Rust,
+   Rust→Go all exercised, plus the two-NAT topology on Go's harness
+   (`ROUTING-2026-08-02-rust-reflects-too-and-the-403-you-would-have-hit.md`).
+5c. **The punch ladder — G0–G3 green, G4 is operator infra.** Rust and Go punch
+   cross-impl through a real node; the §6.1 exchange is now **sealed on both sides
+   and `Require` on ours** (2026-08-04, four live runs plus a firing negative
+   control). Two things are genuinely open and both are Go's to run: their `-verify`
+   against our vector file (`40·0F @ 007e078`), and a `Require`-side punch from their
+   seat — their `cmd/signaling-punch` hardcodes `VerifyTolerant` with no flag.
+   **Still unexercised by anybody:** the racing-socket tie-break, and everything is
+   still one box — the cohort has never crossed two real networks.
 6. **Cross-peer subscription delivery to a Rust subscriber** — unblocked at the
    core by ruling 24; land the SDK-side grantee/signature/handler-scope fixes.
 7. Keep the green gate (`make check` = lint + test) and `make wasm` passing on

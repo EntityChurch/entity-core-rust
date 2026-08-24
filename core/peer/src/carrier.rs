@@ -45,7 +45,7 @@ use crate::transport::Connector;
 pub struct PeerCarrier {
     node_peer_id: String,
     node_addr: String,
-    keypair: IdentityKeypair,
+    keypair: Arc<IdentityKeypair>,
     connector: Arc<dyn Connector>,
     home_format: u8,
     conn: tokio::sync::Mutex<Option<Arc<remote::RemoteConnection>>>,
@@ -67,11 +67,27 @@ impl PeerCarrier {
         Self {
             node_peer_id: node_peer_id.into(),
             node_addr: node_addr.into(),
-            keypair,
+            keypair: Arc::new(keypair),
             connector,
             home_format,
             conn: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// The identity this carrier authenticates to the node as.
+    ///
+    /// Exposed for **one** reason: §6.3 deposits are signed, and the signature
+    /// must be made by the same identity the node's session authenticated. Two
+    /// sources of identity here would be two things that can skew — a peer that
+    /// signs its offers as one id while the node logs `caller=` another, which
+    /// is unfalsifiable from either side alone. Taking it from the carrier makes
+    /// the skew unrepresentable rather than merely tested for.
+    ///
+    /// A handle, not the key material: `Arc` shares the one keypair the peer
+    /// already holds. Nothing here serializes, exports, or logs it — the
+    /// keystore remains its only durable home.
+    pub fn identity(&self) -> Arc<IdentityKeypair> {
+        self.keypair.clone()
     }
 
     async fn connection(&self) -> Result<Arc<remote::RemoteConnection>, PunchError> {
@@ -287,7 +303,13 @@ mod rendezvous_over_a_real_node {
         }
     }
 
-    fn party(key: RendezvousKey, me: &str, them: &str, io_deadline: u64) -> WebRtcParty {
+    fn party(
+        key: RendezvousKey,
+        me: &str,
+        them: &str,
+        signer: Arc<entity_crypto::IdentityKeypair>,
+        io_deadline: u64,
+    ) -> WebRtcParty {
         WebRtcParty {
             key,
             self_id: me.to_string(),
@@ -296,6 +318,10 @@ mod rendezvous_over_a_real_node {
             poll_interval_ms: 25,
             deadline_ms: io_deadline,
             trust: VerificationPolicy::AllowUnverifiedPreContainer,
+            // The carrier's own identity — the same one the node authenticated
+            // this session as, which is what makes the deposits it logs and the
+            // signatures they carry the same peer by construction.
+            signer,
         }
     }
 
@@ -308,6 +334,12 @@ mod rendezvous_over_a_real_node {
     /// offer), which is only reachable if the collect that carried it was
     /// non-empty. `included_count=0` on both sides — the reported symptom —
     /// fails this test.
+    ///
+    /// Post-flag-day it proves a second thing for free. Every deposit is now a
+    /// §6.3 container, and a candidate only reaches `add_remote_candidate` if
+    /// `classify_collected` opened it — so "each peer saw the other's deposit"
+    /// now means each peer **verified** a signature bound to this bucket, over
+    /// a real node, over real TCP.
     #[tokio::test]
     async fn two_peers_share_one_bucket_and_see_each_other() {
         let (node_id, node_port, node_handle) = start_node(0x61).await;
@@ -334,8 +366,8 @@ mod rendezvous_over_a_real_node {
         let a_io = StubIo::new("A");
         let b_io = StubIo::new("B");
 
-        let a_party = party(a_key, &a_id, &b_id, 4_000);
-        let b_party = party(b_key, &b_id, &a_id, 4_000);
+        let a_party = party(a_key, &a_id, &b_id, a_carrier.identity(), 4_000);
+        let b_party = party(b_key, &b_id, &a_id, b_carrier.identity(), 4_000);
         let (a_res, b_res) = tokio::join!(
             negotiate(&a_party, &a_carrier, &a_io),
             negotiate(&b_party, &b_carrier, &b_io),

@@ -155,7 +155,15 @@ impl Meet<'_> {
         Ok(self.execute("offer", &params).await?.0)
     }
 
-    async fn collect_messages(&self, k: &RendezvousKey) -> anyhow::Result<Vec<CollectedMessage>> {
+    /// Container-aware (§6.3): a counterpart that has flipped its deposit path
+    /// is read through the envelope, one that has not is read bare, and a
+    /// container that fails to verify is skipped rather than downgraded. The
+    /// driver's JSON contract is unchanged — this only widens what it can read,
+    /// which is what a cross-impl meet needs during the changeover.
+    async fn collect_messages(
+        &self,
+        k: &RendezvousKey,
+    ) -> anyhow::Result<Vec<coordination::CollectedCoordination>> {
         let params = CollectRequest { rendezvous_key: *k }.to_entity()?;
         let (status, result) = self.execute("collect", &params).await?;
         if status != 200 {
@@ -164,7 +172,7 @@ impl Meet<'_> {
         Ok(CollectResult::from_params(&result.data)?
             .messages
             .iter()
-            .map(|blob| coordination::classify_blob(blob))
+            .map(|blob| coordination::classify_collected(blob, k))
             .collect())
     }
 
@@ -224,7 +232,7 @@ async fn run_initiator(
 
     while Instant::now() < deadline {
         if let Ok(messages) = meet.collect_messages(&k).await {
-            if let Some(resp) = coordination::find_response(&messages, &nonce, peer_id) {
+            if let Some((resp, _signer)) = coordination::find_response(&messages, &nonce, peer_id) {
                 return vec![
                     ("ok".into(), Json::Bool(true)),
                     ("nonce".into(), Json::Str(nonce_hex)),
@@ -269,7 +277,7 @@ async fn run_responder(
     while Instant::now() < deadline {
         if let Ok(messages) = meet.collect_messages(&k).await {
             for m in &messages {
-                let CollectedMessage::Request(req) = m else {
+                let CollectedMessage::Request(req) = &m.msg else {
                     continue;
                 };
                 // §3.2: skip your own messages — `collect` is non-destructive,

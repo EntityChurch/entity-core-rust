@@ -1467,12 +1467,168 @@ fn unknown_candidate_class_sorts_last_and_survives() {
 /// the bucket is shared and `collect` is non-destructive, so a poll returns:
 /// your own offer, the answer you want, and strangers' traffic. Both filters —
 /// nonce echo and not-my-peer-id — are load-bearing.
+/// A collected message in the **bare** pre-flip framing — no container, so no
+/// signer. What every §6.1 depositor still writes until that window opens.
+fn bare(msg: CollectedMessage) -> coordination::CollectedCoordination {
+    coordination::CollectedCoordination { msg, signer: None }
+}
+
+// ---------------------------------------------------------------------------
+// §6.3 read side, §6.1 half — the four dispositions
+// ---------------------------------------------------------------------------
+//
+// Every negative here is **silent** in production (§6.4 skips rather than
+// reports), so these assertions are the only place the distinctions are ever
+// visible. The §6.5 half of the same rule lives in `webrtc::tests`.
+
+mod collected_framings_6_1 {
+    use super::*;
+    use crate::coordination::{classify_collected, CollectedMessage};
+    use crate::envelope;
+    use entity_crypto::IdentityKeypair;
+
+    fn kp(seed: u8) -> IdentityKeypair {
+        IdentityKeypair::Ed25519(entity_crypto::Keypair::from_seed([seed; 32]))
+    }
+
+    fn bucket_of(a: &IdentityKeypair, b: &IdentityKeypair) -> RendezvousKey {
+        key::pair_key(&a.peer_id().to_string(), &b.peer_id().to_string())
+    }
+
+    /// A `connect-request` naming `initiator` — the §6.1 shape that carries a
+    /// claim, and therefore the one step 3 exists for.
+    fn request_from(who: &IdentityKeypair) -> Entity {
+        coordination::ConnectRequest {
+            initiator: who.peer_id().to_string(),
+            candidates: vec![coordination::Candidate::new(
+                coordination::CANDIDATE_HOST,
+                coordination::SUBSTRATE_TCP,
+                "10.0.0.1:900",
+            )],
+            nonce: coordination::Nonce::generate(),
+        }
+        .to_entity()
+        .expect("request encodes")
+    }
+
+    /// Disposition 1 — **never was a container.** Every §6.1 depositor still
+    /// writes this, so it must keep reading.
+    #[test]
+    fn a_bare_deposit_reads_as_the_6_2_framing_and_carries_no_signer() {
+        let (alice, bob) = (kp(1), kp(2));
+        let blob = coordination::to_blob(&request_from(&alice));
+
+        let got = classify_collected(&blob, &bucket_of(&alice, &bob));
+        assert!(matches!(got.msg, CollectedMessage::Request(_)));
+        assert!(got.signer.is_none());
+    }
+
+    /// Disposition 2 — verified. The signer is derived, not read, and it is the
+    /// only identity a §6.1 reader can trust.
+    #[test]
+    fn a_sealed_request_verifies_and_names_its_signer() {
+        let (alice, bob) = (kp(1), kp(2));
+        let bucket = bucket_of(&alice, &bob);
+        let blob = envelope::seal(&request_from(&alice), &bucket, &alice).unwrap();
+
+        let got = classify_collected(&blob, &bucket);
+        assert!(matches!(got.msg, CollectedMessage::Request(_)));
+        assert_eq!(
+            got.signer.expect("verified").peer_id(),
+            alice.peer_id().to_string()
+        );
+    }
+
+    /// Disposition 3 — **a container that did not verify.** The anti-downgrade
+    /// rule: it must NOT fall back to being read as its bare inner entity, or
+    /// flipping one signature byte turns a signed request into an accepted
+    /// unsigned one.
+    #[test]
+    fn a_container_that_fails_to_verify_is_skipped_not_read_as_bare() {
+        let (alice, bob) = (kp(1), kp(2));
+        let bucket = bucket_of(&alice, &bob);
+        let blob = envelope::seal(&request_from(&alice), &bucket, &alice).unwrap();
+
+        let mut broken = envelope::parse(&blob).unwrap();
+        broken.signature[0] ^= 0x01;
+        let got = classify_collected(&broken.to_blob().unwrap(), &bucket);
+
+        assert!(
+            matches!(got.msg, CollectedMessage::Unknown),
+            "a corrupted signature must not downgrade to the bare inner entity"
+        );
+        assert!(got.signer.is_none());
+    }
+
+    /// §6.3 step 3 — `signer_mismatch`, the check §6.5 has no use for.
+    ///
+    /// The signature is **valid**: these bytes really were signed by the key
+    /// presented, and steps 2 and 4 both pass. What fails is the claim — the
+    /// payload says `initiator: alice` and bob signed it. Without this
+    /// comparison a peer forges anyone's candidate list, which is why §6.1
+    /// carrying its author on the wire is the more exposed shape.
+    #[test]
+    fn a_signature_valid_under_a_false_initiator_claim_is_skipped() {
+        let (alice, bob) = (kp(1), kp(2));
+        let bucket = bucket_of(&alice, &bob);
+        // Claims alice; signed by bob.
+        let blob = envelope::seal(&request_from(&alice), &bucket, &bob).unwrap();
+
+        assert!(
+            envelope::open(&blob, &bucket).is_ok(),
+            "the signature itself is sound — only the claim is a lie"
+        );
+        let got = classify_collected(&blob, &bucket);
+        assert!(matches!(got.msg, CollectedMessage::Unknown));
+        assert!(got.signer.is_none());
+    }
+
+    /// Bucket binding on the §6.1 path: a valid container lifted into another
+    /// rendezvous fails, because the key it was signed under is the one the
+    /// verifier supplies from the bucket it collected.
+    #[test]
+    fn a_container_sealed_for_another_bucket_is_skipped() {
+        let (alice, bob, carol) = (kp(1), kp(2), kp(3));
+        let signed_under = bucket_of(&alice, &bob);
+        let blob = envelope::seal(&request_from(&alice), &signed_under, &alice).unwrap();
+
+        let elsewhere = bucket_of(&alice, &carol);
+        assert!(classify_collected(&blob, &signed_under).signer.is_some());
+        assert!(matches!(
+            classify_collected(&blob, &elsewhere).msg,
+            CollectedMessage::Unknown
+        ));
+    }
+
+    /// `punch-sync` names nobody, so step 3 has nothing to compare and step 2
+    /// is the whole check — the position all of §6.5's payloads are in.
+    #[test]
+    fn a_sealed_sync_verifies_without_a_claim_to_compare() {
+        let (alice, bob) = (kp(1), kp(2));
+        let bucket = bucket_of(&alice, &bob);
+        let sync = coordination::PunchSync {
+            nonce: coordination::Nonce::generate(),
+            fire_at: 40,
+        }
+        .to_entity()
+        .unwrap();
+        let blob = envelope::seal(&sync, &bucket, &alice).unwrap();
+
+        let got = classify_collected(&blob, &bucket);
+        assert!(matches!(got.msg, CollectedMessage::Sync(_)));
+        assert_eq!(
+            got.signer.expect("verified").peer_id(),
+            alice.peer_id().to_string()
+        );
+    }
+}
+
 #[test]
 fn find_response_ignores_own_offers_and_strangers() {
     let mine = Nonce(vec![1u8; 16]);
     let theirs = Nonce(vec![2u8; 16]);
 
-    let bucket = vec![
+    let bucket: Vec<_> = vec![
         // My own request, which I re-read every poll.
         CollectedMessage::Request(ConnectRequest {
             initiator: "alice".into(),
@@ -1493,17 +1649,22 @@ fn find_response_ignores_own_offers_and_strangers() {
             candidates: candidates_for("bob"),
             nonce: mine.clone(),
         }),
-    ];
+    ]
+    .into_iter()
+    .map(bare)
+    .collect();
 
-    let found = coordination::find_response(&bucket, &mine, "alice").expect("bob's answer");
+    let (found, signer) =
+        coordination::find_response(&bucket, &mine, "alice").expect("bob's answer");
     assert_eq!(found.responder, "bob");
+    assert!(signer.is_none(), "a bare deposit carries no signer");
 }
 
 /// A peer must not answer its own request — it would "succeed" at meeting
 /// itself, which is confusing to debug and trivially preventable.
 #[test]
 fn find_request_skips_my_own() {
-    let bucket = vec![
+    let bucket: Vec<_> = vec![
         CollectedMessage::Request(ConnectRequest {
             initiator: "alice".into(),
             candidates: vec![],
@@ -1514,10 +1675,14 @@ fn find_request_skips_my_own() {
             candidates: candidates_for("bob"),
             nonce: Nonce(vec![2u8; 16]),
         }),
-    ];
+    ]
+    .into_iter()
+    .map(bare)
+    .collect();
     assert_eq!(
         coordination::find_request(&bucket, "alice")
             .unwrap()
+            .0
             .initiator,
         "bob"
     );
@@ -1528,11 +1693,11 @@ fn find_request_skips_my_own() {
 /// peer — two concurrent exchanges between the same pair must not cross.
 #[test]
 fn find_response_requires_the_nonce_echo() {
-    let bucket = vec![CollectedMessage::Response(ConnectResponse {
+    let bucket = vec![bare(CollectedMessage::Response(ConnectResponse {
         responder: "bob".into(),
         candidates: vec![],
         nonce: Nonce(vec![9u8; 16]),
-    })];
+    }))];
     assert!(coordination::find_response(&bucket, &Nonce(vec![1u8; 16]), "alice").is_none());
 }
 
@@ -1553,14 +1718,15 @@ async fn candidate_exchange_completes_through_the_carrier() {
         .unwrap();
 
     let bob_sees = bob.collect_messages(&k).await.unwrap();
-    let request = coordination::find_request(&bob_sees, "bob").expect("bob finds alice's request");
+    let (request, _) =
+        coordination::find_request(&bob_sees, "bob").expect("bob finds alice's request");
     assert_eq!(request.initiator, "alice");
     bob.respond(k, "bob", &request, candidates_for("bob"))
         .await
         .unwrap();
 
     let alice_sees = alice.collect_messages(&k).await.unwrap();
-    let response = coordination::find_response(&alice_sees, &nonce, "alice")
+    let (response, _) = coordination::find_response(&alice_sees, &nonce, "alice")
         .expect("alice finds bob's answer");
     assert_eq!(response.responder, "bob");
     assert_eq!(response.candidates, candidates_for("bob"));

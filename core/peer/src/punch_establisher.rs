@@ -56,13 +56,60 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use entity_crypto::IdentityKeypair;
-use entity_signaling::coordination::{Candidate, CANDIDATE_HOST, SUBSTRATE_TCP};
+use entity_signaling::coordination::{
+    Candidate, VerificationPolicy, CANDIDATE_HOST, SUBSTRATE_TCP,
+};
 use entity_signaling::punch::{self, PunchIo, PunchParty};
 use entity_signaling::{key, RendezvousKey};
 
 use crate::carrier::PeerCarrier;
 use crate::live_establish::{EstablishCtx, LiveEstablish};
 use crate::transport::{Connection, Connector};
+
+/// The §6.3 posture of the **native** punch, named once here rather than
+/// defaulted inside the party.
+///
+/// **Both impls now seal their §6.1 deposits** — `entity-core-go` at `d56a690`,
+/// this one alongside this constant — so `Require` is satisfied by any
+/// counterpart running current Go or current Rust, and the vectors cross the
+/// shape both ways (`42·0F`, four §6.1 rows each side).
+///
+/// **The live cross-impl punch has now run, and this is the line it released.**
+/// The hold was narrow and explicit — vectors prove the bytes, not that a Go
+/// peer and a Rust peer complete a *sealed* exchange through a real node — so
+/// it needed exactly one run to discharge, and raising it first would have
+/// converted a first live failure from "they disagree about X" into "one of them
+/// refuses to speak".
+///
+/// What ran (2026-08-04, loopback, one Rust `--open` node, `cmd/signaling-punch`
+/// on both seats over the CLI/JSON contract agreed with `entity-core-go`):
+///
+/// | Initiator | Responder | Tolerant | Under `Require` here |
+/// |---|---|---|---|
+/// | Rust | Go   | `verified:true` | `verified:true` |
+/// | Go   | Rust | `verified:true` | `verified:true` |
+///
+/// **The tolerant pass alone would not have licensed this**, and that is the
+/// trap worth naming: a tolerant collector admits an *unsealed* counterpart too,
+/// so a green tolerant run is consistent with Go never having sealed anything.
+/// `Require` is the assay rather than merely the goal — it refuses any blob
+/// without a §6.3 container, so a green cross-impl run **under** it is positive
+/// proof that Go's deposits are sealed and that they verify in this collector,
+/// bound to the rendezvous key. That is the observation the hold was waiting
+/// for, and it is only available from the strict side.
+///
+/// Still true, and the reason the tolerant variant was never a security hole:
+/// *the key introduces, it never authorizes* — a punched connection runs the
+/// full handshake and capability flow regardless, so the worst case under
+/// tolerance was a wasted dial rather than an authorized stranger. `Require`
+/// buys the §6.4 filters: skip-own and expected-peer now run on a proven signer
+/// with no unsigned fallback, so a forged `initiator`/`responder` field cannot
+/// steer a crossing.
+///
+/// What this refuses is a peer older than either impl's deposit flip
+/// (`entity-core-go` `d56a690`, this crate `007e078`) — the mixed-build case,
+/// and the one worth refusing loudly.
+const PUNCH_TRUST: VerificationPolicy = VerificationPolicy::Require;
 
 // ---------------------------------------------------------------------------
 // The substrate — SO_REUSEPORT dial and accept
@@ -361,7 +408,7 @@ impl PeerPunchEstablisher {
             return None;
         }
         let key = self.rendezvous_key_for(peer_id);
-        let party = PunchParty::new(key, &self.self_peer_id, SUBSTRATE_TCP)
+        let party = PunchParty::new(key, self.carrier.identity(), SUBSTRATE_TCP, PUNCH_TRUST)
             .with_candidates(self.local_candidates(peer_id).await?);
         let mut io = PeerPunchIo::counted(self.local_addr, self.outbound.clone());
         io.suppress_dial = self.suppress_dial;
@@ -392,7 +439,7 @@ impl LiveEstablish for PeerPunchEstablisher {
         // needs no out-of-band agreement, unlike `tag` / `secret`.
         let key = self.rendezvous_key_for(peer_id);
 
-        let mut party = PunchParty::new(key, &self.self_peer_id, SUBSTRATE_TCP)
+        let mut party = PunchParty::new(key, self.carrier.identity(), SUBSTRATE_TCP, PUNCH_TRUST)
             .with_candidates(self.local_candidates(peer_id).await?);
         // §10.3 obligation 4 / §7.2.1: when §4.1's reconnect backoff owns the
         // retry, this punch gets exactly ONE carrier exchange. The crossing
@@ -411,9 +458,31 @@ impl LiveEstablish for PeerPunchEstablisher {
                 tracing::debug!(remote_peer = %peer_id, addr = %conn.remote_addr, "§7 punch established a direct path");
                 Some(conn)
             }
-            // Every failure is "no live path", never an error: §7.3.1 pin 1
-            // makes a substrate mismatch explicitly not a dispatch error, and
-            // §7.1 step 6 makes relay the outcome of every failed punch.
+            // A §6.3 refusal is not "no live path" in the sense the rest of this
+            // arm means — it is a **policy** decision this peer made about a
+            // counterpart it could otherwise have reached, and under
+            // `PUNCH_TRUST = Require` the only thing it refuses is a peer older
+            // than the deposit flip. Left at `debug!` it presents to an operator
+            // as an ordinary failed traversal, i.e. as a NAT problem; that
+            // mis-read is the recurring cost in this cohort and the flip that
+            // raised the policy is what makes it reachable here. Same treatment
+            // as the browser leg's establisher, for the same reason.
+            //
+            // The **outcome** is unchanged and deliberately so: still `None`,
+            // still falls through to relay per §7.1 step 6.
+            Ok(Err(e @ punch::PunchError::VerificationUnavailable)) => {
+                tracing::warn!(
+                    remote_peer = %peer_id,
+                    error = %e,
+                    "§6.3: refusing the punch — the counterpart deposited no signature \
+                     container under `Require`. This is a MIXED BUILD (a peer older than \
+                     the §6.1 deposit flip), not a NAT or connectivity failure"
+                );
+                None
+            }
+            // Every other failure is "no live path", never an error: §7.3.1
+            // pin 1 makes a substrate mismatch explicitly not a dispatch error,
+            // and §7.1 step 6 makes relay the outcome of every failed punch.
             Ok(Err(e)) => {
                 tracing::debug!(remote_peer = %peer_id, error = %e, "§7 punch found no live path; falling through");
                 None

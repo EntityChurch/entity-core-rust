@@ -20,9 +20,7 @@ use entity_handler::{
     Dispatcher, ExecuteOptions, HandlerError, STATUS_NOT_SUPPORTED, STATUS_OK, STATUS_RATE_LIMITED,
 };
 
-use crate::coordination::{
-    self, Candidate, CollectedMessage, ConnectRequest, ConnectResponse, Nonce,
-};
+use crate::coordination::{self, Candidate, ConnectRequest, ConnectResponse, Nonce};
 use crate::core::{Advertisement, RendezvousKey};
 use crate::data::{advertisement_from_params, CollectRequest, CollectResult, OfferRequest};
 use crate::{SignalingError, OP_ADVERTISE, OP_COLLECT, OP_OFFER, PATTERN};
@@ -134,12 +132,19 @@ impl<'a> SignalingClient<'a> {
         self.offer(key, &coordination::to_blob(entity)).await
     }
 
-    /// Collect a bucket and classify every blob in it.
+    /// Collect a bucket and classify every blob in it, unwrapping §6.3
+    /// containers against the key it was collected from.
     ///
-    /// Returns [`CollectedMessage::Unknown`] entries rather than dropping them:
+    /// Returns [`coordination::CollectedMessage::Unknown`] entries rather than dropping them:
     /// a shared `lobby` bucket may hold other pairs' traffic and message types
     /// this build has never seen, and a caller that wants to know how much it
-    /// skipped should be able to count.
+    /// skipped should be able to count. A container that failed to verify lands
+    /// in the same bucket of outcomes — deliberately indistinguishable *on the
+    /// wire* (§6.4 skips silently), and deliberately **not** read as its bare
+    /// inner entity.
+    ///
+    /// Each entry carries its `signer` when one was proven, which is the only
+    /// place a counterpart's identity comes from before a connection exists.
     ///
     /// **Includes your own offers.** `collect` is non-destructive (§1.1 pin 1),
     /// so you always re-read what you wrote — which is why
@@ -148,12 +153,12 @@ impl<'a> SignalingClient<'a> {
     pub async fn collect_messages(
         &self,
         key: &RendezvousKey,
-    ) -> Result<Vec<CollectedMessage>, ClientError> {
+    ) -> Result<Vec<coordination::CollectedCoordination>, ClientError> {
         Ok(self
             .collect(key)
             .await?
             .iter()
-            .map(|blob| coordination::classify_blob(blob))
+            .map(|blob| coordination::classify_collected(blob, key))
             .collect())
     }
 

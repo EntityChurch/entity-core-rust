@@ -4251,7 +4251,26 @@ convention if it stands — and state whether listening on the shared port is co
 4's "each side sends", since the answer determines whether the dual-hole sequencing is a §7.5
 hardening detail or a correction to step 4 itself.
 
-## §6.3's peer-id derivation is the legacy form both implementations refuse to mint
+## ~~§6.3's peer-id derivation is the legacy form both implementations refuse to mint~~ RESOLVED
+
+> **RULED 2026-08-04 — arch `PROPOSAL-EXTENSION-SIGNALING-COORDINATION-ENVELOPE` §2, cohort-reviewed
+> (Go blocking 1 absorbed). The interim choice below was RIGHT and is now normative — with one
+> addition it did not anticipate.** Check (a) is restated as a derivation rather than a spelled-out
+> byte string: derive the id canonically from `(public_key, key_type)` and require the envelope's
+> `signer` to equal it **in full**. The addition is *verified-then-used*: `signer` is a wire field
+> and therefore forgeable, so it is never trusted as given, and a well-formed but **non-canonical**
+> `hash_type` is `unusable_key` rather than an accepted alternate form. Admitting it would give one
+> key two valid ids, and every §6.5 decision is a sort over that id — a chosen id is a chosen glare
+> role and a split rendezvous bucket.
+>
+> **Built in Rust 2026-08-04.** `extensions/signaling/src/envelope.rs::open` steps 1–2; fenced by
+> `a_non_canonical_hash_type_is_unusable_even_though_it_names_the_right_key` and by the
+> `ed25519/non-canonical-hash-type` cross-impl row (`cmd/webrtc-vectors`, surface 5).
+> The stale form is also corrected in `coordination.rs`'s module doc; arch is routing the same
+> correction through `ENTITY-SYSTEM-REFERENCE.md:75/601` (#67).
+
+<details><summary>Original entry</summary>
+
 
 **Passage.** `EXTENSION-SIGNALING.md` §6.3 *The signature* `[security — MUST]`:
 
@@ -4285,7 +4304,29 @@ rather than a spelled-out byte string, so it cannot drift from the core spec's c
 mandate again. If the spelled-out form is retained for clarity, it needs to be the identity-multihash
 form and to carry a pointer to V7 §1.5 v7.65 Amendment 3.
 
-## §6.3's `key_type = 0x01` — is a coordination signer restricted to Ed25519, or is that a simplification?
+</details>
+
+## ~~§6.3's `key_type = 0x01` — is a coordination signer restricted to Ed25519, or is that a simplification?~~ RESOLVED
+
+> **RULED 2026-08-04 — same proposal, §4. Illustrative, not a constraint — the interim choice below
+> was right, and one sentence of it is now WRONG and retracted.** `key_type` is parametric; Ed25519
+> (`0x01`) is the **MUST-implement floor, not the ceiling**. A well-formed but *unsupported*
+> `key_type` MUST be treated as an undecodable blob and **skipped** (MUST-ignore, ADR-0002) —
+> never hardcode-rejected.
+>
+> **Retracted:** the last line of the interim choice below — *"An unallocated or sign-incapable
+> `key_type` is refused as `SignerMismatch` (a signer fault)"*. That name codes the case as *"this
+> peer is lying,"* which is the reading that justifies a hardcoded reject — and a hardcoded reject
+> is exactly what locked out an Ed448 identity this codebase mints. It is now **`unusable_key`**,
+> the third of the cohort's three settled names; `signer_mismatch` is reserved for the §6.1 claim
+> comparison, where a peer really did assert an identity its signature does not support.
+>
+> **Built in Rust 2026-08-04.** `SignalingError::UnusableKey`; `verify_coordination_signature` and
+> `envelope::open` remapped. Fenced by `a_well_formed_unsupported_key_type_is_unusable_not_a_false_claim`
+> and the `unsupported-key-type/0xfe` cross-impl row. No already-crossed vector row changed outcome.
+
+<details><summary>Original entry</summary>
+
 
 **Passage.** `EXTENSION-SIGNALING.md` §6.3 *The signature* `[security — MUST]` — the same sentence as
 the entry above:
@@ -4329,3 +4370,5 @@ Carried by core-go as the third of three pins on their §6.3 spec issue.
 
 **Question for arch.** State explicitly whether §6.3's `0x01` constrains the signer's key type or is
 illustrative. If illustrative, spell check (a) parametrically over `key_type` as the rest of V7 does.
+
+</details>

@@ -46,8 +46,8 @@
 use async_trait::async_trait;
 
 use crate::coordination::{
-    self, punch_delay, Candidate, CollectedMessage, ConnectRequest, ConnectResponse, Nonce,
-    PunchSync, CANDIDATE_SRFLX,
+    self, punch_delay, Candidate, CollectedCoordination, CollectedMessage, ConnectRequest,
+    ConnectResponse, Nonce, PunchSync, VerificationPolicy, CANDIDATE_SRFLX,
 };
 use crate::core::RendezvousKey;
 use crate::SignalingError;
@@ -100,6 +100,15 @@ pub enum PunchError {
     CrossingFailed { attempts: u32 },
     #[error("deadline passed before the punch could start")]
     DeadlineExceeded,
+    /// `Require` was set and the counterpart's message arrived **without** a
+    /// §6.3 container — a peer that has not flipped its deposit path yet.
+    ///
+    /// Raised only for a message that was otherwise ours (nonce echo matched,
+    /// or a request we would have answered): an unverified stranger's blob in a
+    /// shared `lobby` bucket is skipped under §6.4 like any other, and must not
+    /// be able to end someone else's exchange.
+    #[error("§6.3 verification is required but the counterpart's message carried no container")]
+    VerificationUnavailable,
     #[error(transparent)]
     Coding(#[from] SignalingError),
 }
@@ -122,8 +131,12 @@ impl PunchError {
             PunchError::ExchangeTimeout
             | PunchError::CrossingFailed { .. }
             | PunchError::Carrier(_) => true,
+            // A counterpart that deposits bare will still deposit bare on the
+            // next attempt. Retrying spends a fresh nonce at someone else's
+            // node for a guaranteed second refusal — §7.2.1's own rationale.
             PunchError::NoSharedSubstrate
             | PunchError::DeadlineExceeded
+            | PunchError::VerificationUnavailable
             | PunchError::Coding(_) => false,
         }
     }
@@ -261,9 +274,18 @@ fn dial_target(candidates: &[Candidate], substrate: &str) -> Option<String> {
 pub struct PunchParty {
     /// The rendezvous key both peers derived (§3).
     pub key: RendezvousKey,
-    /// This peer's own id — used to skip our own bucket entries (§6.4) and to
-    /// resolve the crossing tiebreak.
-    pub self_id: String,
+    /// The identity every deposit is sealed under (§6.3) — and the **only**
+    /// source of this peer's own id.
+    ///
+    /// `entity-core-go` reached this shape first and the argument is theirs:
+    /// a party that took an id *and* a signing key has two sources that can
+    /// disagree, and the disagreement is invisible from either side alone —
+    /// our own §6.5 party has to refuse the skew at runtime because it takes
+    /// both. Deleting the second source makes it unrepresentable instead.
+    signer: std::sync::Arc<entity_crypto::IdentityKeypair>,
+    /// Derived from [`Self::signer`] once, at construction — used to skip our
+    /// own bucket entries (§6.4) and to resolve the crossing tiebreak.
+    self_id: String,
     /// This peer's gathered candidates (§7.1 step 1), bound to the shared local
     /// endpoint [`PunchIo`] dials from.
     pub local_candidates: Vec<Candidate>,
@@ -278,19 +300,33 @@ pub struct PunchParty {
     pub poll_ms: u64,
     pub dial_timeout_ms: u64,
     pub exchange_timeout_ms: u64,
+    /// Whether a collected message must have passed §6.3 before this peer acts
+    /// on it.
+    ///
+    /// Named at every call site rather than defaulted — see
+    /// [`VerificationPolicy`]. Today this path deposits **bare**, so a peer that
+    /// set `Require` on both sides of a Rust-to-Rust punch would refuse itself;
+    /// the deposit flip for §6.1 is a cohort window that has not opened.
+    pub trust: VerificationPolicy,
 }
 
 impl PunchParty {
     /// A party with the §7.2 defaults — a **standalone** consultation, which
     /// owns its own exchange budget.
+    ///
+    /// `trust` is a required argument and has no default, for the reason
+    /// [`VerificationPolicy`] has none: a permissive posture chosen by omission
+    /// is one nobody reviews.
     pub fn new(
         key: RendezvousKey,
-        self_id: impl Into<String>,
+        signer: std::sync::Arc<entity_crypto::IdentityKeypair>,
         substrate: impl Into<String>,
+        trust: VerificationPolicy,
     ) -> Self {
         Self {
+            self_id: signer.peer_id().to_string(),
             key,
-            self_id: self_id.into(),
+            signer,
             local_candidates: Vec::new(),
             substrate: substrate.into(),
             crossing_retries: DEFAULT_CROSSING_RETRIES,
@@ -298,12 +334,20 @@ impl PunchParty {
             poll_ms: DEFAULT_POLL_MS,
             dial_timeout_ms: DEFAULT_DIAL_TIMEOUT_MS,
             exchange_timeout_ms: DEFAULT_EXCHANGE_TIMEOUT_MS,
+            trust,
         }
     }
 
     pub fn with_candidates(mut self, candidates: Vec<Candidate>) -> Self {
         self.local_candidates = candidates;
         self
+    }
+
+    /// This peer's canonical id — **derived from the signing key**, never
+    /// supplied. What a counterpart reads out of our containers and what we
+    /// sort by are the same string by construction.
+    pub fn self_id(&self) -> &str {
+        &self.self_id
     }
 
     /// Cap this punch at **one** carrier exchange — §10.3 obligation 4 / §7.2.1.
@@ -354,6 +398,28 @@ pub async fn initiate<C: Carrier, I: PunchIo>(
     Err(last)
 }
 
+/// Seal and deposit one §6.1 coordination entity — **every deposit, no
+/// exceptions**.
+///
+/// §6.1 needs the container more than §6.5 did, for a reason §6.5 does not
+/// have: `connect-request` and `connect-response` carry `initiator` /
+/// `responder` as wire fields, so an unverified deposit lets anyone assert
+/// either id — and then `await_response`'s expected-peer filter is comparing
+/// against a string the attacker wrote. §6.5's payloads name nobody, so there
+/// was nothing there to forge. (`entity-core-go`'s framing, and it is the right
+/// one.)
+///
+/// The signature binds `party.key`, so this deposit verifies in this bucket and
+/// in no other one it could be lifted into.
+async fn deposit<C: Carrier>(
+    party: &PunchParty,
+    carrier: &C,
+    entity: &entity_entity::Entity,
+) -> Result<(), PunchError> {
+    let blob = crate::envelope::seal(entity, &party.key, &party.signer)?;
+    carrier.offer(&party.key, blob).await
+}
+
 async fn initiate_once<C: Carrier, I: PunchIo>(
     party: &PunchParty,
     carrier: &C,
@@ -373,9 +439,7 @@ async fn initiate_once<C: Carrier, I: PunchIo>(
     // the response — §7.2: "the only latency estimate either peer has, since by
     // construction neither can yet reach the other directly."
     let sent_at = io.now_ms();
-    carrier
-        .offer(&party.key, coordination::to_blob(&request.to_entity()?))
-        .await?;
+    deposit(party, carrier, &request.to_entity()?).await?;
 
     let response = await_response(party, carrier, io, &nonce, expected_peer_id).await?;
     let rtt_ms = io.now_ms().saturating_sub(sent_at);
@@ -388,9 +452,7 @@ async fn initiate_once<C: Carrier, I: PunchIo>(
         nonce: nonce.clone(),
         fire_at: d,
     };
-    carrier
-        .offer(&party.key, coordination::to_blob(&sync.to_entity()?))
-        .await?;
+    deposit(party, carrier, &sync.to_entity()?).await?;
 
     let target =
         dial_target(&response.candidates, &party.substrate).ok_or(PunchError::NoSharedSubstrate)?;
@@ -415,9 +477,7 @@ pub async fn respond<C: Carrier, I: PunchIo>(
         candidates: party.local_candidates.clone(),
         nonce: request.nonce.clone(),
     };
-    carrier
-        .offer(&party.key, coordination::to_blob(&response.to_entity()?))
-        .await?;
+    deposit(party, carrier, &response.to_entity()?).await?;
 
     // The responder fires `d` after RECEIVING the sync (§7.2) — so the sleep
     // starts here, at the moment the poll returned it, not at any shared instant.
@@ -563,14 +623,18 @@ async fn poll_bucket<C: Carrier, I: PunchIo>(
     party: &PunchParty,
     carrier: &C,
     io: &I,
-    mut pick: impl FnMut(&[CollectedMessage]) -> Option<PolledMessage>,
+    mut pick: impl FnMut(&[CollectedCoordination]) -> Option<PolledMessage>,
 ) -> Result<PolledMessage, PunchError> {
     let deadline = io.now_ms() + party.exchange_timeout_ms;
     loop {
         let blobs = carrier.collect(&party.key).await?;
-        let messages: Vec<CollectedMessage> = blobs
+        // §6.3-aware: a sealed deposit is unwrapped and verified against the
+        // bucket it came from, a bare one is read as the §6.2 framing it is,
+        // and a container that failed to verify is skipped **without** falling
+        // back to its inner entity. See `coordination::classify_collected`.
+        let messages: Vec<CollectedCoordination> = blobs
             .iter()
-            .map(|b| coordination::classify_blob(b))
+            .map(|b| coordination::classify_collected(b, &party.key))
             .collect();
         if let Some(found) = pick(&messages) {
             return Ok(found);
@@ -586,6 +650,15 @@ enum PolledMessage {
     Response(Box<ConnectResponse>),
     Request(Box<ConnectRequest>),
     Sync(Box<PunchSync>),
+    /// The message we were waiting for arrived, and it was **not** sealed while
+    /// this party demands §6.3.
+    ///
+    /// Carried out of the poll rather than refused inside the `pick` closure so
+    /// the refusal is loud and immediate: silently skipping it would leave the
+    /// caller polling a bucket that already holds its answer, and reporting the
+    /// eventual `ExchangeTimeout` as "nobody replied" — a diagnosis one word
+    /// away from the truth and days away from the cause.
+    Unverified,
 }
 
 async fn await_response<C: Carrier, I: PunchIo>(
@@ -597,16 +670,31 @@ async fn await_response<C: Carrier, I: PunchIo>(
 ) -> Result<ConnectResponse, PunchError> {
     let self_id = party.self_id.clone();
     let expected = expected_peer_id.to_string();
+    let trust = party.trust;
     let found = poll_bucket(party, carrier, io, move |msgs| {
         coordination::find_response(msgs, nonce, &self_id)
             // A different peer answering our shared-bucket request is not our
             // answer — keep waiting for the one we intend to reach (§6.4).
-            .filter(|r| expected.is_empty() || r.responder == expected)
-            .map(|r| PolledMessage::Response(Box::new(r)))
+            //
+            // Against the **verified** signer when the message was sealed: the
+            // whole point of this filter is that we reach the peer we meant to,
+            // and pre-container it was comparing `responder` — a string the
+            // answering peer chose for itself.
+            .filter(|(r, signer)| {
+                let who = signer.as_ref().map(|s| s.peer_id()).unwrap_or(&r.responder);
+                expected.is_empty() || who == expected
+            })
+            // Policy applies **after** the filters, so only a message that was
+            // ours to act on can raise it.
+            .map(|(r, signer)| match (trust, signer) {
+                (VerificationPolicy::Require, None) => PolledMessage::Unverified,
+                _ => PolledMessage::Response(Box::new(r)),
+            })
     })
     .await?;
     match found {
         PolledMessage::Response(r) => Ok(*r),
+        PolledMessage::Unverified => Err(PunchError::VerificationUnavailable),
         _ => Err(PunchError::ExchangeTimeout),
     }
 }
@@ -617,12 +705,17 @@ async fn await_request<C: Carrier, I: PunchIo>(
     io: &I,
 ) -> Result<ConnectRequest, PunchError> {
     let self_id = party.self_id.clone();
+    let trust = party.trust;
     let found = poll_bucket(party, carrier, io, move |msgs| {
-        coordination::find_request(msgs, &self_id).map(|r| PolledMessage::Request(Box::new(r)))
+        coordination::find_request(msgs, &self_id).map(|(r, signer)| match (trust, signer) {
+            (VerificationPolicy::Require, None) => PolledMessage::Unverified,
+            _ => PolledMessage::Request(Box::new(r)),
+        })
     })
     .await?;
     match found {
         PolledMessage::Request(r) => Ok(*r),
+        PolledMessage::Unverified => Err(PunchError::VerificationUnavailable),
         _ => Err(PunchError::ExchangeTimeout),
     }
 }
@@ -634,17 +727,27 @@ async fn await_sync<C: Carrier, I: PunchIo>(
     nonce: &Nonce,
 ) -> Result<PunchSync, PunchError> {
     let want = nonce.clone();
+    let trust = party.trust;
     let found = poll_bucket(party, carrier, io, move |msgs| {
         msgs.iter()
-            .find_map(|m| match m {
-                CollectedMessage::Sync(s) if s.nonce == want => Some(s.clone()),
+            .find_map(|c| match &c.msg {
+                // `punch-sync` names no author, so the nonce echo is the whole
+                // of the correlation and the signer — when there is one — is
+                // the only identity in play (§6.3 step 3 has nothing to
+                // compare). It still governs *when we fire*, so an unverified
+                // one is refused under `Require` exactly like the others.
+                CollectedMessage::Sync(s) if s.nonce == want => Some((s.clone(), c.signer.clone())),
                 _ => None,
             })
-            .map(|s| PolledMessage::Sync(Box::new(s)))
+            .map(|(s, signer)| match (trust, signer) {
+                (VerificationPolicy::Require, None) => PolledMessage::Unverified,
+                _ => PolledMessage::Sync(Box::new(s)),
+            })
     })
     .await?;
     match found {
         PolledMessage::Sync(s) => Ok(*s),
+        PolledMessage::Unverified => Err(PunchError::VerificationUnavailable),
         _ => Err(PunchError::ExchangeTimeout),
     }
 }
@@ -771,12 +874,54 @@ mod tests {
         RendezvousKey::from_slice(&[7u8; 33]).unwrap()
     }
 
-    fn party(id: &str, addr: &str) -> PunchParty {
-        PunchParty::new(key(), id, SUBSTRATE_TCP).with_candidates(vec![Candidate::new(
-            CANDIDATE_HOST,
+    fn seeded(seed: u8) -> std::sync::Arc<entity_crypto::IdentityKeypair> {
+        std::sync::Arc::new(entity_crypto::IdentityKeypair::Ed25519(
+            entity_crypto::Keypair::from_seed([seed; 32]),
+        ))
+    }
+
+    /// A deterministic identity per label.
+    ///
+    /// The party derives its own id from the signing key now — there is no id
+    /// to hand it — so these tests need real keypairs while keeping "alice" and
+    /// "bob" as their vocabulary. **"alice" is always assigned the
+    /// lower-sorting id**, because several tests assert on the crossing
+    /// tiebreak and its direction is a sort over exactly these strings.
+    fn kp_named(label: &str) -> std::sync::Arc<entity_crypto::IdentityKeypair> {
+        let (one, two) = (seeded(1), seeded(2));
+        let (lo, hi) = if one.peer_id().to_string() < two.peer_id().to_string() {
+            (one, two)
+        } else {
+            (two, one)
+        };
+        match label {
+            "alice" => lo,
+            "bob" => hi,
+            other => seeded(other.bytes().fold(3u8, |acc, b| acc.wrapping_add(b))),
+        }
+    }
+
+    /// The canonical id behind a label — what a counterpart actually sees.
+    ///
+    /// Leaked deliberately: these ids are passed as `&str` into `join!`ed
+    /// futures, and a per-call `String` would be a temporary dropped while
+    /// borrowed. The label set is tiny and fixed, and this is `cfg(test)`.
+    fn id_of(label: &str) -> &'static str {
+        Box::leak(kp_named(label).peer_id().to_string().into_boxed_str())
+    }
+
+    /// The tolerant posture, which is what most of these exercise. Both impls
+    /// now seal their §6.1 deposits, so `Require` also works between two of
+    /// these parties — `require_admits_a_sealed_counterpart` is that half, and
+    /// `require_refuses_a_bare_counterpart_loudly` is the other.
+    fn party(label: &str, addr: &str) -> PunchParty {
+        PunchParty::new(
+            key(),
+            kp_named(label),
             SUBSTRATE_TCP,
-            addr,
-        )])
+            VerificationPolicy::AllowUnverifiedPreContainer,
+        )
+        .with_candidates(vec![Candidate::new(CANDIDATE_HOST, SUBSTRATE_TCP, addr)])
     }
 
     /// **The choreography, end to end.** Two peers meet through one carrier:
@@ -799,14 +944,15 @@ mod tests {
         let (a_io, b_io) = (StubIo::new(), StubIo::new());
 
         let (a_res, b_res) = tokio::join!(
-            initiate(&a, carrier.as_ref(), &a_io, "bob"),
+            initiate(&a, carrier.as_ref(), &a_io, id_of("bob")),
             respond(&b, carrier.as_ref(), &b_io),
         );
 
         let a_conn = a_res.expect("initiator");
         let (b_conn, initiator_id) = b_res.expect("responder");
         assert_eq!(
-            initiator_id, "alice",
+            initiator_id,
+            id_of("alice"),
             "the responder learns who it met — the id the caller serves the handshake for (§7.4.1)"
         );
 
@@ -855,7 +1001,7 @@ mod tests {
         let b_io = StubIo::new();
 
         let (a_res, _) = tokio::join!(
-            initiate(&a, carrier.as_ref(), &a_io, "bob"),
+            initiate(&a, carrier.as_ref(), &a_io, id_of("bob")),
             respond(&b, carrier.as_ref(), &b_io),
         );
         assert_eq!(
@@ -878,7 +1024,7 @@ mod tests {
         let (a_io, b_io) = (StubIo::new(), StubIo::new());
 
         let (a_res, b_res) = tokio::join!(
-            initiate(&a, carrier.as_ref(), &a_io, "bob"),
+            initiate(&a, carrier.as_ref(), &a_io, id_of("bob")),
             respond(&b, carrier.as_ref(), &b_io),
         );
         a_res.expect("initiator");
@@ -962,7 +1108,7 @@ mod tests {
         let b_io = StubIo::new();
 
         let (a_res, _) = tokio::join!(
-            initiate(&a, carrier.as_ref(), &a_io, "bob"),
+            initiate(&a, carrier.as_ref(), &a_io, id_of("bob")),
             respond(&b, carrier.as_ref(), &b_io),
         );
         assert!(
@@ -994,7 +1140,7 @@ mod tests {
         let b_io = StubIo::new();
 
         let (a_res, _) = tokio::join!(
-            initiate(&a, carrier.as_ref(), &a_io, "bob"),
+            initiate(&a, carrier.as_ref(), &a_io, id_of("bob")),
             respond(&b, carrier.as_ref(), &b_io),
         );
         assert!(matches!(
@@ -1008,6 +1154,157 @@ mod tests {
         );
     }
 
+    /// The whole exchange under `Require`, both sides — which **works now**,
+    /// because both deposits are sealed.
+    ///
+    /// This test inverted at the flip: it used to assert that `Require` could
+    /// only ever refuse, since nothing deposited a container. Two peers running
+    /// this module now complete a punch with every message verified and the
+    /// crossing tiebreak resolved on identities each side *proved* rather than
+    /// claimed.
+    #[tokio::test]
+    async fn require_admits_a_sealed_counterpart_end_to_end() {
+        let carrier = Arc::new(MemCarrier::default());
+        let requiring = |label, addr| PunchParty {
+            trust: VerificationPolicy::Require,
+            ..party(label, addr)
+        };
+        let (a, b) = (
+            requiring("alice", "10.0.0.1:900"),
+            requiring("bob", "10.0.0.2:900"),
+        );
+        let (a_io, b_io) = (StubIo::new(), StubIo::new());
+
+        let (a_res, b_res) = tokio::join!(
+            initiate(&a, carrier.as_ref(), &a_io, id_of("bob")),
+            respond(&b, carrier.as_ref(), &b_io),
+        );
+
+        assert_eq!(a_res.expect("initiator"), "dialed:10.0.0.2:900");
+        let (b_conn, initiator_id) = b_res.expect("responder");
+        assert_eq!(b_conn, "accepted");
+        assert_eq!(
+            initiator_id,
+            id_of("alice"),
+            "under Require the id handed back is a verified signer, not a claim"
+        );
+    }
+
+    /// A counterpart that answers **bare** is refused loudly, when the answer
+    /// arrives — not by timing out.
+    ///
+    /// The adversary is the honest one to model post-flip: a peer that reads
+    /// our sealed `connect-request`, echoes its nonce, and answers unsigned.
+    /// That is precisely the downgrade `Require` exists to stop, and the
+    /// distinction being asserted is *how* it stops: a silent skip would leave
+    /// the initiator polling a bucket that already holds its answer and then
+    /// reporting "nobody replied", which reads as a NAT problem and gets
+    /// diagnosed days later. It must also cost no socket work — there is
+    /// nothing here worth dialing at.
+    #[tokio::test]
+    async fn require_refuses_a_bare_answerer_loudly() {
+        /// Unwraps the initiator's sealed request and answers it **bare**.
+        struct BareAnswerer {
+            key: RendezvousKey,
+            blobs: Mutex<Vec<Vec<u8>>>,
+        }
+
+        #[async_trait]
+        impl Carrier for BareAnswerer {
+            async fn offer(&self, _key: &RendezvousKey, blob: Vec<u8>) -> Result<(), PunchError> {
+                self.blobs.lock().unwrap().push(blob);
+                Ok(())
+            }
+            async fn collect(&self, _key: &RendezvousKey) -> Result<Vec<Vec<u8>>, PunchError> {
+                let mut out = self.blobs.lock().unwrap().clone();
+                for blob in &out.clone() {
+                    if let CollectedMessage::Request(req) =
+                        coordination::classify_collected(blob, &self.key).msg
+                    {
+                        let answer = ConnectResponse {
+                            responder: id_of("bob").to_string(),
+                            candidates: vec![Candidate::new(
+                                CANDIDATE_HOST,
+                                SUBSTRATE_TCP,
+                                "10.0.0.2:900",
+                            )],
+                            nonce: req.nonce.clone(),
+                        };
+                        out.push(coordination::to_blob(&answer.to_entity().unwrap()));
+                    }
+                }
+                Ok(out)
+            }
+        }
+
+        let carrier = BareAnswerer {
+            key: key(),
+            blobs: Mutex::new(Vec::new()),
+        };
+        let a = PunchParty {
+            trust: VerificationPolicy::Require,
+            ..party("alice", "10.0.0.1:900")
+        };
+        let a_io = StubIo::new();
+
+        let res = initiate(&a, &carrier, &a_io, id_of("bob")).await;
+        assert!(
+            matches!(res.unwrap_err(), PunchError::VerificationUnavailable),
+            "an unsealed answer must be refused by name, not reported as a timeout"
+        );
+        assert_eq!(
+            a_io.dials(),
+            0,
+            "the refusal lands before any socket work — there is nothing here to dial at"
+        );
+    }
+
+    /// The responder half of the same rule: a `Require` peer does not answer a
+    /// bare `connect-request` either.
+    ///
+    /// Asserted separately because `await_request` carries its own policy
+    /// branch, and a rule enforced on one side of an exchange is a rule an
+    /// attacker takes the other side of.
+    #[tokio::test]
+    async fn require_refuses_a_bare_request_on_the_responder_side() {
+        let carrier = Arc::new(MemCarrier::default());
+        // A pre-flip initiator's request: the §6.2 bare framing, no container.
+        let stale = ConnectRequest {
+            initiator: id_of("alice").to_string(),
+            candidates: vec![Candidate::new(
+                CANDIDATE_HOST,
+                SUBSTRATE_TCP,
+                "10.0.0.1:900",
+            )],
+            nonce: Nonce(vec![0x33; 16]),
+        };
+        carrier
+            .offer(&key(), coordination::to_blob(&stale.to_entity().unwrap()))
+            .await
+            .unwrap();
+
+        let b = PunchParty {
+            trust: VerificationPolicy::Require,
+            ..party("bob", "10.0.0.2:900")
+        };
+        let b_io = StubIo::new();
+
+        let b_res = respond(&b, carrier.as_ref(), &b_io).await;
+        assert!(matches!(
+            b_res.unwrap_err(),
+            PunchError::VerificationUnavailable
+        ));
+        assert_eq!(b_io.dials(), 0);
+    }
+
+    /// A refusal is **not** worth a fresh exchange: the counterpart will still
+    /// be bare next time, and the retry spends a nonce at someone else's node
+    /// for a guaranteed second failure (§7.2.1).
+    #[test]
+    fn a_verification_refusal_is_not_transient() {
+        assert!(!PunchError::VerificationUnavailable.is_transient());
+    }
+
     /// §7.3.1: a counterpart reachable only on a substrate we do not share is
     /// **not a dispatch error** — it is "no live path", which the §10.3 seam
     /// maps to the relay fallback.
@@ -1016,7 +1313,13 @@ mod tests {
         let carrier = Arc::new(MemCarrier::default());
         let a = party("alice", "10.0.0.1:900");
         // bob advertises only webrtc; alice punches tcp.
-        let b = PunchParty::new(key(), "bob", "webrtc").with_candidates(vec![Candidate::new(
+        let b = PunchParty::new(
+            key(),
+            kp_named("bob"),
+            "webrtc",
+            VerificationPolicy::AllowUnverifiedPreContainer,
+        )
+        .with_candidates(vec![Candidate::new(
             CANDIDATE_HOST,
             "webrtc",
             "webrtc-endpoint",
@@ -1024,7 +1327,7 @@ mod tests {
         let (a_io, b_io) = (StubIo::new(), StubIo::new());
 
         let (a_res, _) = tokio::join!(
-            initiate(&a, carrier.as_ref(), &a_io, "bob"),
+            initiate(&a, carrier.as_ref(), &a_io, id_of("bob")),
             respond(&b, carrier.as_ref(), &b_io),
         );
         assert!(matches!(a_res.unwrap_err(), PunchError::NoSharedSubstrate));
@@ -1049,7 +1352,7 @@ mod tests {
         };
 
         let (a_res, _) = tokio::join!(
-            initiate(&a, carrier.as_ref(), &a_io, "bob"),
+            initiate(&a, carrier.as_ref(), &a_io, id_of("bob")),
             respond(&m, carrier.as_ref(), &m_io),
         );
         assert!(

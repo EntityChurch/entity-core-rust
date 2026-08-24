@@ -35,21 +35,42 @@
 //! §2.2 derivation ships in Stage 1 because getting it wrong is a silent
 //! never-meet, even though only Stage 2 dials.
 //!
-//! # The Stage-1 gap, stated: these messages are not signed
+//! # Signing: this module reads the container, and does not yet write it
 //!
 //! §3.3 pins that a coordination blob is **self-contained** — the entity plus a
 //! detached signature carrying the signer's `public_key`, which a stranger
-//! verifies with no key lookup by recomputing
-//! `Base58(0x01 ‖ 0x01 ‖ SHA-256(pk))` and checking it against the claimed
-//! peer-id. That is a deliberate exception to the ecosystem's
-//! `/{signer}/system/signature/{hash}` convention, which is *structurally
-//! unavailable* here: the whole point of the carrier is that no connection
-//! exists yet, so there is no session to sync over and no tree to bind into.
+//! verifies with no key lookup. That is a deliberate exception to the
+//! ecosystem's `/{signer}/system/signature/{hash}` convention, which is
+//! *structurally unavailable* here: the whole point of the carrier is that no
+//! connection exists yet, so there is no session to sync over and no tree to
+//! bind into.
 //!
-//! **None of it is implemented, and that is correct for Stage 1** — §3.3 stages
-//! signing and the probe budget together, before any punch is attempted from a
-//! `tag`/`lobby` bucket. Stage 1 does not punch. Two things to carry forward
-//! when it lands, because both are easy to over-read: the signature
+//! The container is [`crate::envelope`] (`system/signaling/signed-blob`), folded
+//! into the spec on 2026-08-04. **The read side is here**
+//! ([`classify_collected`]): a sealed §6.1 deposit is unwrapped, verified
+//! against its bucket, and checked against the `initiator` / `responder` the
+//! payload claims (§6.3 step 3), while a bare one still reads as the §6.2
+//! framing and a container that fails to verify is skipped without falling back
+//! to it.
+//!
+//! **[`to_blob`] still emits the bare, unsigned encoding**, and that is the
+//! remaining half. Switching what a bucket holds is a wire-visible flag day: a
+//! signed depositor and an unsigned collector do not interoperate, so Rust and
+//! Go turn it on together. §6.5 flipped first (`d70f245`) because its container
+//! had crossed; §6.1's window has not opened, and reading first is exactly what
+//! makes it safe to open — a collector that already understands both framings
+//! turns the cutover into a rolling changeover.
+//!
+//! **The derivation is the canonical one, not §3.3's spelled-out byte string.**
+//! §3.3 writes `Base58(0x01 ‖ 0x01 ‖ SHA-256(pk))` — the legacy SHA-256 form
+//! that V7 §1.5 v7.65 Amendment 3 made decode-only and that neither reference
+//! implementation mints. Following it literally derives a peer-id that compares
+//! unequal against every canonical one, and a failed §3.3 check is skipped
+//! *silently*, so every message would simply vanish. Logged as
+//! `docs/SPEC-AMBIGUITIES.md` #67; arch is routing the same correction through
+//! `ENTITY-SYSTEM-REFERENCE.md:75/601`, which still carries the stale form.
+//!
+//! Two things that are easy to over-read once signing is on: the signature
 //! authenticates the **author, not the address** (an attacker signs its own
 //! candidate list containing a victim's address perfectly well), so the
 //! anti-amplification probe budget is needed *independently* rather than as
@@ -71,6 +92,8 @@
 use entity_ecf::{array, bytes, text, to_ecf, Value};
 use entity_entity::Entity;
 
+use crate::core::RendezvousKey;
+use crate::webrtc::VerifiedSigner;
 use crate::SignalingError;
 
 // ---------------------------------------------------------------------------
@@ -446,6 +469,112 @@ pub fn classify(entity_type: &str, data: &[u8]) -> CollectedMessage {
     }
 }
 
+// ---------------------------------------------------------------------------
+// §6.3 — the container, read side
+// ---------------------------------------------------------------------------
+
+/// Whether a party demands §6.3 verification before it acts on a collected
+/// message.
+///
+/// **Substrate-neutral, and deliberately one type.** §6.1 (native punch) and
+/// §6.5 (the browser leg) read the same envelope out of the same buckets under
+/// the same MUST; two policy enums would be two things to keep in step at a
+/// security seam, and the one that drifted would be the one nobody was looking
+/// at. Re-exported as `webrtc::VerificationPolicy`, which is where it was born
+/// and where `core/peer` names it.
+///
+/// **There is no `Default`, on purpose.** Making this a named argument at every
+/// call site — rather than a silently-permissive default — is what keeps "we
+/// shipped it with no identity binding" from being something a reader has to
+/// infer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationPolicy {
+    /// Conformant: refuse to act on a message that did not pass §6.3. Satisfied
+    /// by any counterpart that deposits sealed, and a refusal for any that does
+    /// not — the correct posture for a peer that would rather not connect than
+    /// connect to an unverified counterpart.
+    Require,
+    /// Migration interop: act on a counterpart's message without verification.
+    /// Grep for this variant to find every place that matters.
+    AllowUnverifiedPreContainer,
+}
+
+/// One collected blob, classified — plus the signer, when it arrived inside a
+/// §6.3 container.
+#[derive(Debug, Clone)]
+pub struct CollectedCoordination {
+    pub msg: CollectedMessage,
+    /// `Some` **only** when the blob was a `signed-blob` that verified against
+    /// the bucket it was collected from *and* whose signer matched whatever
+    /// identity the payload claimed. There is no other way to obtain one.
+    pub signer: Option<VerifiedSigner>,
+}
+
+/// The identity a §6.1 payload claims for its own author, if it claims one.
+///
+/// `connect-request` and `connect-response` name their author on the wire, so a
+/// signature valid under a **false claim** passes every other step — the bytes
+/// really were signed by the key presented, just not by the peer the message
+/// says wrote it. `punch-sync` names nobody: it is correlated by the nonce echo
+/// and carries only a delay, which puts it in the same position as all of
+/// §6.5's payloads, where the derived signer simply *is* the identity.
+fn claimed_signer(msg: &CollectedMessage) -> Option<&str> {
+    match msg {
+        CollectedMessage::Request(r) => Some(&r.initiator),
+        CollectedMessage::Response(r) => Some(&r.responder),
+        CollectedMessage::Sync(_) | CollectedMessage::Unknown => None,
+    }
+}
+
+/// Classify a collected blob, unwrapping a §6.3 container if that is what it is
+/// — the §6.1 counterpart of [`crate::webrtc::classify_collected`].
+///
+/// **Four dispositions, not three** (spec §6.3, folded 2026-08-04). The three
+/// verify failures — `unusable_key` / `signer_mismatch` / `bad_signature` — are
+/// one outcome here (skip), and "it never was a container" is a *different*
+/// one (read it as the bare §6.2 framing). Collapsing them is a downgrade: if a
+/// verify failure could fall back to the bare inner entity, flipping one
+/// signature byte turns a signed message into an accepted unsigned one, which
+/// is the whole attack the container prevents.
+///
+/// Both bare and sealed are accepted **only for as long as the migration needs
+/// it**. Which framing arrived is not lost — it is exactly the presence or
+/// absence of `signer`, and [`VerificationPolicy::Require`] is what turns that
+/// into a refusal.
+pub fn classify_collected(blob: &[u8], key: &RendezvousKey) -> CollectedCoordination {
+    // Not a container at all → the bare framing every §6.1 depositor still
+    // writes. `envelope::parse` failing is the normal outcome here, not a
+    // diagnosis.
+    if crate::envelope::parse(blob).is_err() {
+        return CollectedCoordination {
+            msg: classify_blob(blob),
+            signer: None,
+        };
+    }
+    match crate::envelope::open(blob, key) {
+        Ok((signer, inner)) => {
+            let msg = classify(&inner.entity_type, &inner.data);
+            match claimed_signer(&msg) {
+                // §6.3 step 3 — `signer_mismatch`. Skipped, and skipped as a
+                // container: never re-read as its bare inner entity.
+                Some(claim) if claim != signer.peer_id() => CollectedCoordination {
+                    msg: CollectedMessage::Unknown,
+                    signer: None,
+                },
+                _ => CollectedCoordination {
+                    msg,
+                    signer: Some(signer),
+                },
+            }
+        }
+        // It claimed to be a container and failed to verify. Skip it.
+        Err(_) => CollectedCoordination {
+            msg: CollectedMessage::Unknown,
+            signer: None,
+        },
+    }
+}
+
 /// Find the response to *my* exchange in a collected bucket.
 ///
 /// Two §3.2 MUSTs, both necessary:
@@ -456,17 +585,36 @@ pub fn classify(entity_type: &str, data: &[u8]) -> CollectedMessage {
 /// - **not my own peer-id** — a peer that answered its own request would
 ///   "succeed" at meeting itself, and that failure is miserable to diagnose
 ///   because every individual step reports success.
+///
+/// The signer travels with the message because the two are only meaningful
+/// together: a candidate list is worth dialing on the strength of who signed
+/// *that* blob, so re-pairing them after the fact would reintroduce exactly the
+/// substitution the container prevents.
 pub fn find_response<'a>(
-    messages: impl IntoIterator<Item = &'a CollectedMessage>,
+    messages: impl IntoIterator<Item = &'a CollectedCoordination>,
     my_nonce: &Nonce,
     my_peer_id: &str,
-) -> Option<ConnectResponse> {
-    messages.into_iter().find_map(|m| match m {
-        CollectedMessage::Response(r) if &r.nonce == my_nonce && r.responder != my_peer_id => {
-            Some(r.clone())
+) -> Option<(ConnectResponse, Option<VerifiedSigner>)> {
+    messages.into_iter().find_map(|c| match &c.msg {
+        CollectedMessage::Response(r)
+            if &r.nonce == my_nonce && author_of(c, &r.responder) != my_peer_id =>
+        {
+            Some((r.clone(), c.signer.clone()))
         }
         _ => None,
     })
+}
+
+/// Who a collected message is **from**, for the §6.4 filters.
+///
+/// The verified signer when there is one; the wire claim otherwise. For a
+/// sealed message step 3 has already proven the two equal, so this changes no
+/// outcome — it changes which value the code is *written against*, and that is
+/// the difference between a filter that keeps working when the claim becomes
+/// hostile and one that only looked correct. For a bare message the claim is
+/// all there is, and it is exactly as trustworthy as whoever wrote it.
+fn author_of<'a>(c: &'a CollectedCoordination, claimed: &'a str) -> &'a str {
+    c.signer.as_ref().map(|s| s.peer_id()).unwrap_or(claimed)
 }
 
 /// Find a request addressed at this rendezvous that I should answer — anyone's
@@ -485,11 +633,13 @@ pub fn find_response<'a>(
 /// the nonces you have already answered and skip them; the bucket is a set with
 /// history, not a queue.
 pub fn find_request<'a>(
-    messages: impl IntoIterator<Item = &'a CollectedMessage>,
+    messages: impl IntoIterator<Item = &'a CollectedCoordination>,
     my_peer_id: &str,
-) -> Option<ConnectRequest> {
-    messages.into_iter().find_map(|m| match m {
-        CollectedMessage::Request(r) if r.initiator != my_peer_id => Some(r.clone()),
+) -> Option<(ConnectRequest, Option<VerifiedSigner>)> {
+    messages.into_iter().find_map(|c| match &c.msg {
+        CollectedMessage::Request(r) if author_of(c, &r.initiator) != my_peer_id => {
+            Some((r.clone(), c.signer.clone()))
+        }
         _ => None,
     })
 }

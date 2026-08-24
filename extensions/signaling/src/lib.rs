@@ -94,6 +94,9 @@
 pub mod coordination;
 pub mod core;
 pub mod data;
+/// `EXTENSION-SIGNALING.md` §6.3 — the self-contained signed container every
+/// coordination blob rides in. The §6.2/§6.3 contradiction, closed.
+pub mod envelope;
 pub mod handler;
 pub mod key;
 pub mod pool;
@@ -119,6 +122,7 @@ pub use core::{
     RENDEZVOUS_KEY_LEN,
 };
 pub use data::{CollectRequest, CollectResult, OfferRequest};
+pub use envelope::{open, open_claimed, parse, seal, SignedBlob, TYPE_SIGNED_BLOB};
 pub use handler::SignalingHandler;
 pub use key::{lobby_key, pair_key, secret_key, tag_key};
 pub use pool::{PoolMember, SKEW_FANOUT};
@@ -261,8 +265,27 @@ pub enum SignalingError {
     SelfNegotiation,
     /// §6.3 check (a) failed: the `public_key` does not derive the claimed
     /// peer-id, so the message does not belong to who it says it does.
+    ///
+    /// **Reserved for a claim comparison** — the §6.1 payloads that name their
+    /// own `initiator`/`responder` (envelope step 3). A key that cannot be
+    /// bound to its `signer` at all is [`Self::UnusableKey`], not this: the
+    /// cohort taxonomy separates *"this is not who it says it is"* from
+    /// *"this key cannot be used to answer the question."*
     #[error("public_key does not derive the claimed peer_id (§6.3)")]
     SignerMismatch,
+    /// The signer's key cannot be used: an unallocated or sign-incapable
+    /// `key_type`, a `public_key` whose length does not match it, or a `signer`
+    /// that is not the **canonical** id for `(public_key, key_type)` — the
+    /// last including a well-formed but non-canonical `hash_type`.
+    ///
+    /// **A well-formed unsupported `key_type` lands here and is skipped**, not
+    /// rejected: ADR-0002 MUST-ignore. Hardcode-rejecting it is the exact Ed448
+    /// defect a cross-impl vector caught in this crate — a fail-closed path
+    /// that silently locked out an identity this codebase mints. The label is
+    /// for diagnostics and conformance vectors only; on the wire every failure
+    /// here is an undecodable blob (§6.4) and nothing more.
+    #[error("signer key unusable — bad key_type, key length, or non-canonical signer (§6.3)")]
+    UnusableKey,
     /// §6.3 check (b) failed: the signature does not verify over the entity's
     /// content hash.
     #[error("signature does not verify over the entity content hash (§6.3)")]
