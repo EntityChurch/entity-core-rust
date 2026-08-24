@@ -32,6 +32,13 @@ pub async fn handle_connection(
     conn: TransportConnection,
     shared: Arc<PeerShared>,
 ) -> Result<(), PeerError> {
+    // §6.7.1's accept-side path starts here: the transport source of this
+    // connection, captured before the halves are split out. It is scoped around
+    // each dispatch below and is visible ONLY to `system/network`'s
+    // observe-address — see `entity_network::accept_source` for why it is not a
+    // HandlerContext field.
+    #[cfg(feature = "network")]
+    let accept_source_addr = conn.remote_addr.clone();
     let (mut reader, mut writer) = (conn.reader, conn.writer);
 
     let mut conn = Connection::new(shared.keypair.peer_id());
@@ -294,17 +301,28 @@ pub async fn handle_connection(
         let resp_tx_task = resp_tx.clone();
         let sem_task = dispatch_sem.clone();
         let remote_peer_id_task = remote_peer_id.clone();
+        // Only the network feature reads it; without that feature there is no
+        // observe-address responder to reflect anything.
+        #[cfg(feature = "network")]
+        let accept_source_task = accept_source_addr.clone();
         crate::runtime::spawn(async move {
             let _permit = match sem_task.acquire_owned().await {
                 Ok(p) => p,
                 Err(_) => return, // semaphore closed → shutting down
             };
-            let response_envelope = dispatch_request(
+            let dispatch = dispatch_request(
                 &envelope,
                 shared_task.clone(),
                 Some(remote_peer_id_task.as_str()),
-            )
-            .await;
+            );
+            // Scoped per request, not per connection: the source belongs to the
+            // connection the request arrived on, which is exactly the fact
+            // §6.7.1 reflects.
+            #[cfg(feature = "network")]
+            let response_envelope =
+                entity_network::accept_source::scope(accept_source_task.clone(), dispatch).await;
+            #[cfg(not(feature = "network"))]
+            let response_envelope = dispatch.await;
             let response_frame = encode_envelope(&response_envelope);
             // §2.1 #5 wire-send hook. Fires before pushing the frame onto
             // the writer channel — the envelope is in scope so request_id

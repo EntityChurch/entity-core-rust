@@ -74,14 +74,19 @@ use entity_entity::Entity;
 use crate::SignalingError;
 
 // ---------------------------------------------------------------------------
-// Entity types (§3). Naming note: `system/nat/*` is what §3 uses; §10 lists
-// `system/nat/*` vs `system/signaling/*` vs `system/connectivity/*` as an open
-// item, and we match the DRAFT rather than pre-empt the ruling.
+// Entity types (§3.1). §10 listed `system/nat/*` vs `system/signaling/*` vs
+// `system/connectivity/*` as §13 Open Item #1; arch resolved it to
+// `system/signaling/*` and the cohort renamed together (S0, 2026-08-02).
+//
+// This was a flag day, not a cleanup: the type strings feed the content hash,
+// so a peer on the old names derives a different rendezvous key and silently
+// never meets one on the new names — nothing errors, nothing logs. Measured
+// rather than predicted; see `key.rs` for why the derivation is that brittle.
 // ---------------------------------------------------------------------------
 
-pub const TYPE_CONNECT_REQUEST: &str = "system/nat/connect-request";
-pub const TYPE_CONNECT_RESPONSE: &str = "system/nat/connect-response";
-pub const TYPE_PUNCH_SYNC: &str = "system/nat/punch-sync";
+pub const TYPE_CONNECT_REQUEST: &str = "system/signaling/connect-request";
+pub const TYPE_CONNECT_RESPONSE: &str = "system/signaling/connect-response";
+pub const TYPE_PUNCH_SYNC: &str = "system/signaling/punch-sync";
 
 // ---------------------------------------------------------------------------
 // Candidates (`PROPOSAL-NETWORK-REACHABILITY-FACTS` §4)

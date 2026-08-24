@@ -5,16 +5,19 @@
 //! source it saw. That observation, typed as a `srflx` candidate (§6.7.3), is the
 //! address a counterpart punches at.
 //!
-//! # This is the client half only, and that is deliberate
+//! # This is the client half; the responder is `extensions/network`
 //!
-//! The §6.7.1 **responder** — reflecting the transport source of an accepted
-//! connection — is not here. `entity-core-go` ships it
-//! (`ext/network/reachability.go`), live-validated under its `reachability`
-//! validator category, and one reflector serves both peers in a two-peer
-//! traversal test. Building a second responder here would add a component to the
-//! cross-NAT gate without adding anything the gate tests. If Rust later needs to
-//! *be* a reflector, that is a `system/network` handler operation and belongs in
-//! `extensions/network`, not in this module.
+//! The §6.7.1 **responder** is built — `NetworkHandler::handle_observe_address`
+//! — it is simply not *here*, because reflecting the transport source of an
+//! accepted connection is a `system/network` handler operation, not a gatherer
+//! concern.
+//!
+//! An earlier revision of this comment said Rust would not build a responder at
+//! all. **That was wrong and is retracted.** The cohort scoped Go as the
+//! reflector *for G3*, so the traversal gate would not block on standing two of
+//! them up — a sound call about that gate, and not a decision about what this
+//! implementation offers. Rust reflects too; a peer that can only ask other
+//! peers where it is has a hole where a protocol operation should be.
 //!
 //! # The socket binding is the whole point `[§6.7.3 — MUST]`
 //!
@@ -52,17 +55,22 @@
 //! disagreement being itself the signal, since a mapping that differs per
 //! destination is a symmetric NAT where the punch will fail and relay is correct.
 //!
-//! **This gathers from one reflector**, matching Go's shape, and therefore does
-//! **not** implement NAT-type detection. That is a real limit, not an oversight:
-//! it is the difference between "here is my mapping" and "my mapping is stable
-//! enough to be worth your crossing budget." Nothing here may be used as a
-//! security input, and a multi-reflector gatherer is the natural next shape.
+//! [`SrflxGatherer`] gathers from **one** reflector, which is the right shape
+//! for producing a candidate: "here is my mapping." It deliberately does not
+//! conclude a NAT type, because that is the different claim — "my mapping is
+//! stable enough to be worth your crossing budget" — and §6.7.1 forbids resting
+//! it on one observation.
+//!
+//! [`detect_mapping`] is the multi-reflector half that may make that second
+//! claim. It is a separate entry point rather than a flag on the gatherer
+//! precisely so the two claims cannot be confused at a call site.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use entity_crypto::IdentityKeypair;
+use entity_network::nat_type::{classify_mapping, MappingAssessment, MappingClass, Observation};
 use entity_network::{
     observe_address_params, ObserveAddressResult, HANDLER_PATTERN, OP_OBSERVE_ADDRESS,
     TYPE_OBSERVE_ADDRESS_RESULT,
@@ -124,63 +132,85 @@ impl SrflxGatherer {
     /// instead of an advertising difference. [`Self::gather`] remains the
     /// §6.7.3-correct thing for an ordinary peer.
     pub async fn observe(&self) -> Result<String, String> {
-        let remote_addr: SocketAddr = self
-            .reflector_addr
-            .strip_prefix("tcp://")
-            .unwrap_or(&self.reflector_addr)
-            .parse()
-            .map_err(|_| format!("srflx: bad reflector address {}", self.reflector_addr))?;
-
-        // §6.7.3: bound to the punch's own endpoint, not an ephemeral one.
-        let stream = crate::reuseport::dial_reuseport(self.local_addr, remote_addr, || {})
-            .await
-            .map_err(|e| format!("srflx: dial reflector {}: {}", self.reflector_addr, e))?;
-
-        // The reflector connection must not outlive the observation: the punch
-        // re-binds `local_addr`, and although SO_REUSEPORT permits the concurrent
-        // bind, leaving a live peer session on the punch's own port invites a
-        // stray frame onto a socket the crossing is about to reason about.
-        // `RemoteConnection` aborts its reader task on drop, which closes it.
-        let conn =
-            remote::perform_connect(PeerPunchIo::wrap(stream), &self.keypair, self.home_format)
-                .await
-                .map_err(|e| format!("srflx: handshake with reflector: {}", e))?;
-
-        let uri = format!("/{}/{}", conn.remote_peer_id, HANDLER_PATTERN);
-        let params = observe_address_params()?;
-        // `resource: None` — same rule the signaling carrier follows: the
-        // operation addresses no tree resource, and attaching one reads as
-        // "not granted" (403) rather than as the mistake it is.
-        let resp = remote::send_execute(
-            &conn,
+        observe_at(
+            &self.reflector_addr,
+            self.local_addr,
             &self.keypair,
-            &uri,
-            OP_OBSERVE_ADDRESS,
-            &params,
-            None,
-            None,
-            None,
-            &std::collections::HashMap::new(),
-            None,
+            self.home_format,
         )
         .await
-        .map_err(|e| format!("srflx: observe-address: {}", e))?;
-
-        if resp.status != 200 {
-            return Err(format!(
-                "srflx: reflector returned status {} (want 200; §6.7.4 makes network-reflect a \
-                 broad default grant, so a 403 here means the reflector narrowed it)",
-                resp.status
-            ));
-        }
-        if resp.result.entity_type != TYPE_OBSERVE_ADDRESS_RESULT {
-            return Err(format!(
-                "srflx: result type {:?}, want {:?} (§6.7.1)",
-                resp.result.entity_type, TYPE_OBSERVE_ADDRESS_RESULT
-            ));
-        }
-        Ok(ObserveAddressResult::from_result_data(&resp.result.data)?.observed_address)
     }
+}
+
+/// One `observe-address` exchange, pinned to `local_addr`.
+///
+/// Free-standing rather than a method because [`detect_mapping`] consults
+/// several reflectors on **one** keypair, and `IdentityKeypair` is deliberately
+/// not `Clone` — a private key is not a thing to hand out copies of. Taking it by
+/// reference is what lets the multi-reflector probe exist without weakening that.
+async fn observe_at(
+    reflector_addr: &str,
+    local_addr: SocketAddr,
+    keypair: &IdentityKeypair,
+    home_format: u8,
+) -> Result<String, String> {
+    let remote_addr: SocketAddr = reflector_addr
+        .strip_prefix("tcp://")
+        .unwrap_or(reflector_addr)
+        .parse()
+        .map_err(|_| format!("srflx: bad reflector address {}", reflector_addr))?;
+
+    // §6.7.3: bound to the punch's own endpoint, not an ephemeral one.
+    let stream = crate::reuseport::dial_reuseport(local_addr, remote_addr, || {})
+        .await
+        .map_err(|e| format!("srflx: dial reflector {}: {}", reflector_addr, e))?;
+
+    // The reflector connection must not outlive the observation: the punch
+    // re-binds `local_addr`, and although SO_REUSEPORT permits the concurrent
+    // bind, leaving a live peer session on the punch's own port invites a
+    // stray frame onto a socket the crossing is about to reason about.
+    // `RemoteConnection` aborts its reader task on drop, which closes it.
+    let conn = remote::perform_connect(PeerPunchIo::wrap(stream), keypair, home_format)
+        .await
+        .map_err(|e| format!("srflx: handshake with reflector: {}", e))?;
+
+    let uri = format!("/{}/{}", conn.remote_peer_id, HANDLER_PATTERN);
+    let params = observe_address_params()?;
+    // `resource: None` — same rule the signaling carrier follows: the
+    // operation addresses no tree resource, and attaching one reads as
+    // "not granted" (403) rather than as the mistake it is.
+    let resp = remote::send_execute(
+        &conn,
+        keypair,
+        &uri,
+        OP_OBSERVE_ADDRESS,
+        &params,
+        None,
+        None,
+        None,
+        &std::collections::HashMap::new(),
+        None,
+    )
+    .await
+    .map_err(|e| format!("srflx: observe-address: {}", e))?;
+
+    if resp.status != 200 {
+        return Err(format!(
+            "srflx: reflector returned status {} (want 200; §6.7.4 makes network-reflect a \
+             broad default grant, so a 403 here means the reflector narrowed it)",
+            resp.status
+        ));
+    }
+    if resp.result.entity_type != TYPE_OBSERVE_ADDRESS_RESULT {
+        return Err(format!(
+            "srflx: result type {:?}, want {:?} (§6.7.1)",
+            resp.result.entity_type, TYPE_OBSERVE_ADDRESS_RESULT
+        ));
+    }
+    Ok(ObserveAddressResult::from_result_data(&resp.result.data)?.observed_address)
+}
+
+impl SrflxGatherer {
 
     /// The §6.7.3 candidate set for a peer with no reflector: `host` only
     /// (plus a configured `relay`, if any).
@@ -227,6 +257,115 @@ impl CandidateGatherer for SrflxGatherer {
 /// Convenience: a gatherer as the `Arc<dyn CandidateGatherer>` the establisher takes.
 pub fn arc(gatherer: SrflxGatherer) -> Arc<dyn CandidateGatherer> {
     Arc::new(gatherer)
+}
+
+/// The outcome of a multi-reflector probe: the verdict plus what it cost to get.
+#[derive(Debug, Clone)]
+pub struct MappingDetection {
+    /// The §6.7.1 verdict over whatever observations came back.
+    pub assessment: MappingAssessment,
+    /// The single socket every reflector was consulted from (§6.7.3).
+    pub local_addr: SocketAddr,
+    /// Reflectors that answered.
+    pub reflector_ok: usize,
+    /// Distinct reflectors asked. Duplicates are **not** counted here — see
+    /// [`detect_mapping`].
+    pub reflector_all: usize,
+    /// One line per reflector that failed, and one per rejected duplicate.
+    pub errors: Vec<String>,
+}
+
+impl MappingDetection {
+    /// Whether a **conclusion was reachable** — i.e. two or more reflectors
+    /// answered. This is emphatically *not* whether the verdict was favourable:
+    /// a symmetric NAT correctly detected is a successful probe reporting a
+    /// relay-only peer, and reports `true`.
+    pub fn conclusive(&self) -> bool {
+        self.reflector_ok >= 2 && self.assessment.class != MappingClass::Unknown
+    }
+}
+
+/// `EXTENSION-NETWORK.md` §6.7.1 / `EXTENSION-SIGNALING.md` §9.3 — consult
+/// several reflectors from one pinned socket and classify the mapping.
+///
+/// # The trap this signature exists to close `[§6.7.3]`
+///
+/// **A mapping belongs to a socket.** Consult two reflectors from two sockets
+/// and a perfectly punchable cone NAT reports two different ports — the exact
+/// signature of the symmetric NAT the probe is looking for. The observations are
+/// well-formed, the classifier is correct, and the verdict is confidently wrong;
+/// nothing downstream can catch it, because there is nothing wrong with the data.
+///
+/// So `local_addr` is a **parameter of the detection**, not something each dial
+/// picks. Every reflector below is consulted through a [`SrflxGatherer`] built on
+/// that one address. An implementation that let the OS choose per dial would look
+/// simpler and be silently broken on exactly the NAT type this exists to find.
+///
+/// # A reflector listed twice is not agreement
+///
+/// Self-corroboration would satisfy the several-reflectors MUST on paper while
+/// proving nothing, so duplicates are rejected rather than counted — recorded in
+/// [`MappingDetection::errors`] so a report can say it happened.
+///
+/// Reflectors are consulted **sequentially**: they share one local port, and
+/// serializing keeps each observation attributable to a completed exchange.
+pub async fn detect_mapping(
+    local_addr: SocketAddr,
+    reflectors: &[String],
+    keypair: &IdentityKeypair,
+    home_format: u8,
+    per_reflector_timeout: std::time::Duration,
+) -> MappingDetection {
+    let mut errors: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    let mut distinct: Vec<String> = Vec::new();
+
+    for r in reflectors {
+        let raw = r.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        // Normalize before the duplicate check so `tcp://h:p` and `h:p` are the
+        // same reflector — otherwise the spelling would buy a fake second vote.
+        let key = raw.strip_prefix("tcp://").unwrap_or(raw).to_string();
+        if seen.contains(&key) {
+            errors.push(format!(
+                "reflector {} listed more than once — a reflector cannot corroborate itself \
+                 (§6.7.1 requires several reflectors)",
+                key
+            ));
+            continue;
+        }
+        seen.push(key);
+        distinct.push(raw.to_string());
+    }
+
+    let mut observations: Vec<Observation> = Vec::new();
+    for reflector in &distinct {
+        // `local_addr` is the pin — identical for every reflector, by
+        // construction rather than by convention.
+        let exchange = observe_at(reflector, local_addr, keypair, home_format);
+        match tokio::time::timeout(per_reflector_timeout, exchange).await {
+            Ok(Ok(observed)) => observations.push(Observation {
+                reflector: reflector.clone(),
+                observed,
+            }),
+            Ok(Err(e)) => errors.push(e),
+            Err(_) => errors.push(format!(
+                "srflx: reflector {} timed out after {:?}",
+                reflector, per_reflector_timeout
+            )),
+        }
+    }
+
+    let reflector_ok = observations.len();
+    MappingDetection {
+        assessment: classify_mapping(&local_addr.to_string(), &observations),
+        local_addr,
+        reflector_ok,
+        reflector_all: distinct.len(),
+        errors,
+    }
 }
 
 #[cfg(test)]
@@ -332,5 +471,58 @@ mod tests {
         );
         let err = g.gather().await.expect_err("no reflector is listening");
         assert!(err.starts_with("srflx: dial reflector"), "got: {}", err);
+    }
+
+    fn probe_keypair() -> IdentityKeypair {
+        IdentityKeypair::Ed25519(entity_crypto::Keypair::from_seed([0x62; 32]))
+    }
+
+    /// A reflector listed twice must not count as two. Self-corroboration would
+    /// satisfy the several-reflectors MUST on paper while proving nothing, so
+    /// the duplicate is rejected and *said out loud* rather than silently
+    /// deduplicated — a report that quietly dropped it would read as though the
+    /// operator had supplied two.
+    #[tokio::test]
+    async fn a_reflector_listed_twice_is_rejected_not_counted() {
+        let d = detect_mapping(
+            "127.0.0.1:0".parse().unwrap(),
+            &[
+                "127.0.0.1:1".to_string(),
+                // Same reflector, different spelling: normalizing before the
+                // duplicate check is what stops the spelling buying a fake vote.
+                "tcp://127.0.0.1:1".to_string(),
+            ],
+            &probe_keypair(),
+            entity_hash::HASH_ALGORITHM_SHA256,
+            std::time::Duration::from_millis(500),
+        )
+        .await;
+
+        assert_eq!(d.reflector_all, 1, "the duplicate must not inflate the count");
+        assert!(
+            d.errors.iter().any(|e| e.contains("listed more than once")),
+            "the rejection must be reported: {:?}",
+            d.errors
+        );
+    }
+
+    /// Nothing answered, so nothing may be concluded — and `conclusive()` must
+    /// report that regardless of how many reflectors were *asked*.
+    #[tokio::test]
+    async fn unreachable_reflectors_reach_no_conclusion() {
+        let d = detect_mapping(
+            "127.0.0.1:0".parse().unwrap(),
+            &["127.0.0.1:1".to_string(), "127.0.0.1:2".to_string()],
+            &probe_keypair(),
+            entity_hash::HASH_ALGORITHM_SHA256,
+            std::time::Duration::from_millis(500),
+        )
+        .await;
+
+        assert_eq!(d.reflector_all, 2);
+        assert_eq!(d.reflector_ok, 0);
+        assert!(!d.conclusive(), "no observations cannot be a conclusion");
+        assert_eq!(d.assessment.class, MappingClass::Unknown);
+        assert_eq!(d.errors.len(), 2, "each failure is reported: {:?}", d.errors);
     }
 }

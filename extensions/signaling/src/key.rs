@@ -3,7 +3,7 @@
 //!
 //! ```text
 //! payload        = "entity:rdv:v1" ‖ SEP ‖ mode ‖ SEP ‖ canonical(mode_input)
-//! rendezvous_key = varint(0x00) ‖ SHA-256( ecf_for_hash( "system/nat/rendezvous-key",
+//! rendezvous_key = varint(0x00) ‖ SHA-256( ecf_for_hash( "system/signaling/rendezvous-key",
 //!                                                        cbor_bstr(payload) ) )
 //! ```
 //!
@@ -45,7 +45,7 @@ use crate::core::{CoreError, RendezvousKey};
 
 /// The `type` half of the hash input — pinned by §2.2, since the substrate
 /// content-hash primitive hashes ECF `{data, type}` and has no bare-byte form.
-pub const RENDEZVOUS_KEY_TYPE: &str = "system/nat/rendezvous-key";
+pub const RENDEZVOUS_KEY_TYPE: &str = "system/signaling/rendezvous-key";
 
 /// The domain-separation prefix. Versioned so a future derivation change is a
 /// new domain rather than a silent reinterpretation of the same bytes.

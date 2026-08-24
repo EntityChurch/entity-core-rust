@@ -92,6 +92,53 @@ pub fn observe_address_params() -> Result<Entity, String> {
     Entity::new("primitive/any", vec![0xa0]).map_err(|e| e.to_string())
 }
 
+/// The §6.7.1 accept-side channel: the transport source of the connection the
+/// request arrived on.
+///
+/// # Why this is a task-local and not a `HandlerContext` field
+///
+/// §6.7.1 is unusually specific about the shape, and it is worth quoting because
+/// the obvious implementation is the one it forbids:
+///
+/// > *"The handler answering `observe-address` needs the source address of the
+/// > connection the request arrived on. A dispatch seam that extracts only the
+/// > remote peer identity does not carry it, and this spec deliberately does
+/// > **not** widen the general handler context to fix that — a narrow,
+/// > NETWORK-scoped accept-side path from the connection to this operation is
+/// > the intended shape."*
+///
+/// A `source_addr` on `HandlerContext` would be exactly that widening: every
+/// handler in the system would gain a transport fact that only this one
+/// operation may use, and the next handler to reach for it would be writing a
+/// responder-side address somewhere dialer-side (MUST 2's failure).
+///
+/// So the path is literally this module's: `core/peer` scopes it around the
+/// accept-side dispatch, nothing else can see it, and it is unset for an
+/// in-process dispatch — which is why `observe-address` correctly refuses one
+/// rather than inventing an address.
+pub mod nat_type;
+
+pub mod accept_source {
+    tokio::task_local! {
+        static ACCEPT_SOURCE: String;
+    }
+
+    /// Run `fut` with `source` visible to [`current`]. Called by the accept-side
+    /// dispatch in `core/peer`, and nowhere else.
+    pub async fn scope<F: std::future::Future>(source: String, fut: F) -> F::Output {
+        ACCEPT_SOURCE.scope(source, fut).await
+    }
+
+    /// The transport source of the connection this request arrived on, if it
+    /// arrived on one at all.
+    ///
+    /// `None` for an in-process dispatch — there is no observable transport
+    /// source, and §6.7.1's answer to that is a refusal, not a guess.
+    pub fn current() -> Option<String> {
+        ACCEPT_SOURCE.try_with(|s| s.clone()).ok()
+    }
+}
+
 /// The §6.7.1 result: this peer's public mapping, as **one** reflector saw it.
 ///
 /// # This is advisory, and it is not an address to keep
@@ -502,6 +549,45 @@ pub struct NetworkHandler {
     /// Weak self-handle for timer tasks (set by [`bind`](Self::bind)).
     self_weak: RwLock<Weak<NetworkHandler>>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
+    /// §6.7.4 per-requester budget for `observe-address`.
+    reflect_limiter: ReflectLimiter,
+}
+
+/// A per-requester token budget over a fixed window (§6.7.4).
+///
+/// Deliberately crude: reflection is a mirror, so the limit exists to bound
+/// amplification rather than to meter a resource. The numbers are local and
+/// interoperate with nothing — §6.7.4 makes `network-reflect` a broad default
+/// grant precisely because the operation is cheap and leaks nothing the caller
+/// did not already tell us by connecting.
+struct ReflectLimiter {
+    window_ms: u64,
+    max_per_window: u32,
+    seen: Mutex<HashMap<String, (u64, u32)>>,
+}
+
+impl ReflectLimiter {
+    fn new() -> Self {
+        Self {
+            window_ms: 1_000,
+            max_per_window: 20,
+            seen: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn allow(&self, requester: &str) -> bool {
+        let now = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let mut seen = self.seen.lock().unwrap();
+        let entry = seen.entry(requester.to_string()).or_insert((now, 0));
+        if now.saturating_sub(entry.0) >= self.window_ms {
+            *entry = (now, 0);
+        }
+        entry.1 += 1;
+        entry.1 <= self.max_per_window
+    }
 }
 
 impl NetworkHandler {
@@ -516,6 +602,7 @@ impl NetworkHandler {
             location_index,
             local_peer_id,
             qualified_pattern,
+            reflect_limiter: ReflectLimiter::new(),
             link: RwLock::new(None),
             self_weak: RwLock::new(Weak::new()),
             sessions: Mutex::new(HashMap::new()),
@@ -720,6 +807,7 @@ impl Handler for NetworkHandler {
             "close" => self.handle_close(ctx).await,
             "reconnect" => self.handle_reconnect(ctx).await,
             "restore-subscriptions" => self.handle_restore_subscriptions(ctx).await,
+            OP_OBSERVE_ADDRESS => self.handle_observe_address(ctx).await,
             other => Ok(error_result(
                 STATUS_BAD_REQUEST,
                 "unknown_operation",
@@ -807,6 +895,7 @@ impl Handler for NetworkHandler {
                     "close",
                     "reconnect",
                     "restore-subscriptions",
+                    OP_OBSERVE_ADDRESS,
                 ]),
                 peers: None,
                 constraints: None,
@@ -1764,6 +1853,74 @@ impl NetworkHandler {
     /// entities plus session bookkeeping. `pending_count` is bare zero
     /// throughout — Rust ships no §8 outbox (Amendment 11: the bare-error
     /// terminal is conformant; rung 4 stays optional).
+    /// §6.7.1 `observe-address` — tell the caller the source address we see it at.
+    ///
+    /// The entire mechanism is: when A connects to R, R can see the source
+    /// `IP:port` its transport reported, and that observed source **is** A's
+    /// public NAT mapping. R telling A what it saw is the whole thing.
+    ///
+    /// # The three MUSTs, and where each one lives
+    ///
+    /// 1. **The transport source, never a body echo.** The address comes from
+    ///    [`accept_source::current`] and the request body is never read — the
+    ///    operation declares no input type at all. A body-supplied address would
+    ///    make this peer a laundering service that will attest to an attacker's
+    ///    chosen address, and it is the same amplification seam §6.7.2 closes on
+    ///    the dial-back side. *A body carrying a plausible `observed_address` is
+    ///    therefore ignored, not honored — the test asserts exactly that.*
+    /// 2. **Never persisted.** Nothing here writes. The observed source is read
+    ///    from the live connection, encoded into the result, and dropped. It is
+    ///    a *responder-side* fact, and every durable address in this protocol is
+    ///    *dialer-side dialable-endpoint* state; writing an ephemeral source port
+    ///    into `system/connection.address` or a transport profile produces a
+    ///    routable-looking value that routes nowhere, which §10 dispatch and
+    ///    `system/peer/status` then consume as dialable.
+    /// 3. **Per socket.** Not enforceable here — it binds the *caller*, which
+    ///    must punch from the socket it gathered on (§6.7.3). This peer simply
+    ///    reports what it saw, which is what makes the caller's violation
+    ///    detectable at all.
+    ///
+    /// # No live connection is a refusal, not a guess
+    ///
+    /// An in-process dispatch has no observable transport source. Returning the
+    /// loopback address, or the caller's advertised one, would be inventing the
+    /// single fact this operation exists to report — so it is a 400.
+    async fn handle_observe_address(
+        &self,
+        ctx: &HandlerContext,
+    ) -> Result<HandlerResult, HandlerError> {
+        // §6.7.4: rate-limited per requester. Reflection is cheap to serve and
+        // cheap to abuse as an amplifier, and the grant is deliberately broad.
+        let requester = ctx
+            .session_peer_id
+            .clone()
+            .unwrap_or_else(|| "<local>".to_string());
+        if !self.reflect_limiter.allow(&requester) {
+            return Ok(error_result(
+                429,
+                "rate_limited",
+                "observe-address is rate-limited per requester (§6.7.4)",
+            ));
+        }
+
+        let Some(observed) = accept_source::current() else {
+            return Ok(error_result(
+                STATUS_BAD_REQUEST,
+                "no_transport_source",
+                "observe-address requires a live accepted connection; there is no observable \
+                 transport source for an in-process dispatch",
+            ));
+        };
+
+        let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+            entity_ecf::text("observed_address"),
+            entity_ecf::text(&observed),
+        )]));
+        let result = Entity::new(TYPE_OBSERVE_ADDRESS_RESULT, data)
+            .map_err(|e| HandlerError::Internal(e.to_string()))?;
+        Ok(HandlerResult::ok(result))
+    }
+
     async fn handle_status(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let _ = ctx;
         // Subscription counts per delivery peer, one scan (§2.8: active
@@ -2096,6 +2253,158 @@ fn now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // §6.7.1 observe-address — the responder half.
+    //
+    // The operation reflects a TRANSPORT fact, so what has to be pinned
+    // is not the encoding but where the address is allowed to come from.
+    // Both failures these guard against are silent: a body echo returns a
+    // perfectly well-formed result carrying an attacker's address, and an
+    // in-process guess returns a well-formed result carrying a fiction.
+    // -----------------------------------------------------------------
+
+    fn reflect_handler() -> NetworkHandler {
+        let store = Arc::new(entity_store::MemoryContentStore::new());
+        let index = Arc::new(entity_store::MemoryLocationIndex::new());
+        NetworkHandler::new(store, index, "TestPeer".to_string())
+    }
+
+    fn observe_ctx(params: Entity) -> HandlerContext {
+        let execute = Entity::new("system/protocol/execute", vec![0xa0]).unwrap();
+        entity_handler::HandlerContext::builder(execute, params)
+            .pattern(HANDLER_PATTERN)
+            .operation(OP_OBSERVE_ADDRESS)
+            .session_peer_id("CallerPeer")
+            .build()
+    }
+
+    fn observed_of(result: &HandlerResult) -> Option<String> {
+        decode_text_field(&result.result.data, "observed_address")
+    }
+
+    /// The happy path: the address reported is the one the accept-side
+    /// channel carries, and the result is the §6.7.1 type.
+    #[tokio::test]
+    async fn reflects_the_transport_source_of_this_connection() {
+        let h = reflect_handler();
+        let out = accept_source::scope("203.0.113.7:51820".to_string(), async {
+            h.handle(&observe_ctx(observe_address_params().unwrap()))
+                .await
+                .unwrap()
+        })
+        .await;
+        assert_eq!(out.status, STATUS_OK);
+        assert_eq!(out.result.entity_type, TYPE_OBSERVE_ADDRESS_RESULT);
+        assert_eq!(observed_of(&out).as_deref(), Some("203.0.113.7:51820"));
+    }
+
+    /// **MUST 1 — the body is never echoed.** A request carrying a
+    /// plausible `observed_address` must be ignored, not honored.
+    ///
+    /// Honoring it turns this peer into a laundering service: an attacker
+    /// asks it to attest to an address of their choosing and hands the
+    /// signed-looking answer to a third party. It is the same
+    /// amplification seam §6.7.2 closes on the dial-back side, and the
+    /// give-away is that a body echo passes every same-impl round-trip
+    /// test — encoder and decoder agree, and the value is simply wrong.
+    #[tokio::test]
+    async fn a_body_supplied_address_is_ignored_not_reflected() {
+        let h = reflect_handler();
+        let attacker = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+            entity_ecf::text("observed_address"),
+            entity_ecf::text("198.51.100.66:31337"),
+        )]));
+        let params = Entity::new("system/network/observe-address-request", attacker).unwrap();
+
+        let out = accept_source::scope("203.0.113.7:51820".to_string(), async {
+            h.handle(&observe_ctx(params)).await.unwrap()
+        })
+        .await;
+        assert_eq!(out.status, STATUS_OK);
+        assert_eq!(
+            observed_of(&out).as_deref(),
+            Some("203.0.113.7:51820"),
+            "the reflected address MUST be the transport source, never the body's claim \
+             (§6.7.1 MUST 1) — a peer that echoes this attests to any address it is handed"
+        );
+    }
+
+    /// An in-process dispatch has no observable transport source, and
+    /// §6.7.1's answer to that is a refusal.
+    ///
+    /// The tempting alternatives — loopback, or the caller's advertised
+    /// address — both invent the one fact this operation exists to
+    /// report, and a caller cannot tell an invented mapping from a real
+    /// one until its punch silently fails.
+    #[tokio::test]
+    async fn no_live_connection_is_a_refusal_not_a_guess() {
+        let h = reflect_handler();
+        let out = h
+            .handle(&observe_ctx(observe_address_params().unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(out.status, STATUS_BAD_REQUEST);
+        assert_eq!(
+            decode_text_field(&out.result.data, "code").as_deref(),
+            Some("no_transport_source")
+        );
+    }
+
+    /// **MUST 2 — never persisted.** The observation is returned and
+    /// dropped; nothing durable is written.
+    ///
+    /// An observed source is a *responder-side* fact, while every durable
+    /// address in this protocol is *dialer-side dialable-endpoint* state.
+    /// The cheap fix — writing it to `system/connection.address` — stores
+    /// an ephemeral source port where §10 dispatch and
+    /// `system/peer/status` both read a dialable address, so it corrupts
+    /// routing for every other reader.
+    #[tokio::test]
+    async fn the_observation_is_never_written_to_the_tree() {
+        let store = Arc::new(entity_store::MemoryContentStore::new());
+        let index = Arc::new(entity_store::MemoryLocationIndex::new());
+        let h = NetworkHandler::new(store.clone(), index.clone(), "TestPeer".to_string());
+        let before = index.list("/").len();
+
+        let out = accept_source::scope("203.0.113.7:51820".to_string(), async {
+            h.handle(&observe_ctx(observe_address_params().unwrap()))
+                .await
+                .unwrap()
+        })
+        .await;
+        assert_eq!(out.status, STATUS_OK);
+        assert_eq!(
+            index.list("/").len(),
+            before,
+            "observe-address MUST NOT persist the observed address anywhere (§6.7.1 MUST 2)"
+        );
+    }
+
+    /// §6.7.4: reflection is rate-limited per requester. Cheap to serve,
+    /// cheap to abuse as an amplifier, and the grant is deliberately broad.
+    #[tokio::test]
+    async fn reflection_is_rate_limited_per_requester() {
+        let h = reflect_handler();
+        let statuses = accept_source::scope("203.0.113.7:51820".to_string(), async {
+            let mut out = Vec::new();
+            for _ in 0..40 {
+                out.push(
+                    h.handle(&observe_ctx(observe_address_params().unwrap()))
+                        .await
+                        .unwrap()
+                        .status,
+                );
+            }
+            out
+        })
+        .await;
+        assert!(statuses.contains(&STATUS_OK));
+        assert!(
+            statuses.contains(&429),
+            "a requester past the §6.7.4 budget must be refused, not served"
+        );
+    }
 
     fn cfg(min_ms: u64, max_ms: u64, strategy: &str) -> BackoffCfg {
         BackoffCfg {

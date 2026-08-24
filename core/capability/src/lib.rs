@@ -112,9 +112,24 @@ pub struct GrantEntry {
 
 /// Default connection grants per §4.4.
 ///
-/// Two grants:
+/// Three grants:
 /// 1. Tree handler: read type definitions and handler manifests.
 /// 2. Capability handler: request capabilities (V7 §6.2).
+/// 3. Network handler: `observe-address` only — `EXTENSION-NETWORK` §6.7.4's
+///    `system/capability/network-reflect`, which that section makes a **broad
+///    default grant** on the reasoning that reflection is a mirror: it returns
+///    the caller's own transport source and leaks nothing the caller did not
+///    reveal by connecting. Deliberately *only* `observe-address` — §6.7.2's
+///    `check-reachability` is the restricted one (`network-dialback`), because
+///    it causes this peer to **emit traffic at an address**, and a broad grant
+///    there would make every peer a DDoS reflector.
+///
+/// > **Found by the cross-impl matrix, not by review.** Rust shipped the
+/// > §6.7.1 responder reachable only to a caller that already held a
+/// > `system/network` grant, so Go's client got a 403 where the spec says it
+/// > should get a mapping. Neither impl's own suite could see it: Go's client
+/// > only ever met Go's responder, whose defaults already covered it, and
+/// > Rust had a client and a responder that never spoke to each other.
 ///
 /// Both targets are registered as bootstrap handlers when the matching
 /// feature flag is on (default). Per RULING-CAPABILITY-HANDLER-
@@ -135,6 +150,17 @@ pub fn default_connection_grants() -> Vec<GrantEntry> {
             handlers: PathScope::new(vec!["system/capability".into()]),
             resources: PathScope::new(vec![]),
             operations: IdScope::new(vec!["request".into()]),
+            peers: None,
+            constraints: None,
+            allowances: None,
+        },
+        GrantEntry {
+            handlers: PathScope::new(vec!["system/network".into()]),
+            // No resource scope: reflection addresses no tree resource, and
+            // attaching one reads as "not granted" rather than as the mistake
+            // it is.
+            resources: PathScope::new(vec![]),
+            operations: IdScope::new(vec!["observe-address".into()]),
             peers: None,
             constraints: None,
             allowances: None,

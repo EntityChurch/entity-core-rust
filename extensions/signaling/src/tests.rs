@@ -1374,7 +1374,7 @@ fn unrecognized_blobs_classify_as_unknown_not_an_error() {
     );
 
     let alien = Entity::new(
-        "system/nat/some-future-message",
+        "system/signaling/some-future-message",
         entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![])),
     )
     .unwrap();

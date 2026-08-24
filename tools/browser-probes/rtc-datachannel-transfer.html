@@ -1,0 +1,40 @@
+<!doctype html><meta charset=utf-8><title>rtc-transfer-probe</title>
+<body><pre id=out>running…</pre><script>
+function report(lines){
+  dump("\n===PROBE2-BEGIN===\n" + lines.join("\n") + "\n===PROBE2-END===\n");
+  setTimeout(function(){ window.close(); }, 150);
+}
+var results = [];
+var workerSrc = [
+  "onmessage = function(ev){",
+  "  var r = [];",
+  "  var dc = ev.data && ev.data.channel;",
+  "  r.push('worker.received_type=' + (dc === undefined ? 'undefined' : Object.prototype.toString.call(dc)));",
+  "  r.push('worker.is_RTCDataChannel=' + (typeof RTCDataChannel === 'function' && dc instanceof RTCDataChannel));",
+  "  if (dc) { try { r.push('worker.label=' + dc.label); r.push('worker.readyState=' + dc.readyState); }",
+  "            catch(e){ r.push('worker.access_THREW:' + e.name); } }",
+  "  postMessage(r);",
+  "};"
+].join("\n");
+
+var w = new Worker(URL.createObjectURL(new Blob([workerSrc], {type:'text/javascript'})));
+var timeout = setTimeout(function(){ results.push("worker=TIMEOUT"); report(results); }, 8000);
+w.onmessage = function(ev){ clearTimeout(timeout); report(results.concat(ev.data)); };
+w.onerror = function(e){ clearTimeout(timeout); report(results.concat(["worker=ERROR:" + e.message])); };
+
+try {
+  var pc = new RTCPeerConnection();
+  var dc = pc.createDataChannel("entity-probe");
+  results.push("main.created_channel=OK label=" + dc.label + " state=" + dc.readyState);
+  try {
+    w.postMessage({channel: dc}, [dc]);
+    results.push("main.transfer=ACCEPTED");
+  } catch(e) {
+    results.push("main.transfer=THREW:" + e.name + ":" + e.message);
+    w.postMessage({channel: null});
+  }
+} catch(e) {
+  results.push("main.setup=THREW:" + e.name + ":" + e.message);
+  clearTimeout(timeout); report(results);
+}
+</script></body>

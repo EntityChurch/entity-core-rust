@@ -17,7 +17,7 @@ async-trait.workspace = true
 ciborium.workspace = true
 tracing.workspace = true
 rand.workspace = true
-tokio = { version = "1", features = ["sync"] }
+tokio = { version = "1", features = ["sync", "rt"] }
 web-time = "1.1"
 
 [dev-dependencies]

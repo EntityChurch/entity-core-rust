@@ -1,0 +1,39 @@
+<!doctype html><meta charset=utf-8><title>rtc-worker-probe</title>
+<body><pre id=out>running…</pre><script>
+function report(lines){
+  dump("\n===PROBE-BEGIN===\n" + lines.join("\n") + "\n===PROBE-END===\n");
+  document.getElementById('out').textContent = lines.join("\n");
+  setTimeout(function(){ window.close(); }, 150);
+}
+var results = [];
+results.push("main_thread.typeof_RTCPeerConnection=" + (typeof RTCPeerConnection));
+try { var pc = new RTCPeerConnection(); results.push("main_thread.construct=OK"); pc.close(); }
+catch(e){ results.push("main_thread.construct=THREW:" + e.name + ":" + e.message); }
+
+var workerSrc = [
+  "var r = [];",
+  "r.push('worker.globalScope=' + self.constructor.name);",
+  "r.push('worker.typeof_RTCPeerConnection=' + (typeof RTCPeerConnection));",
+  "r.push('worker.in_self=' + ('RTCPeerConnection' in self));",
+  "try { var p = new RTCPeerConnection(); r.push('worker.construct=OK'); p.close(); }",
+  "catch(e){ r.push('worker.construct=THREW:' + e.name + ':' + e.message); }",
+  "r.push('worker.typeof_RTCDataChannel=' + (typeof RTCDataChannel));",
+  "r.push('worker.typeof_MessagePort=' + (typeof MessagePort));",
+  "postMessage(r);"
+].join("\n");
+
+var timeout = setTimeout(function(){
+  results.push("worker=TIMEOUT_NO_REPLY");
+  report(results);
+}, 8000);
+
+try {
+  var w = new Worker(URL.createObjectURL(new Blob([workerSrc], {type:'text/javascript'})));
+  w.onmessage = function(ev){ clearTimeout(timeout); results = results.concat(ev.data); report(results); };
+  w.onerror = function(e){ clearTimeout(timeout); results.push("worker=ERROR:" + e.message); report(results); };
+} catch(e) {
+  clearTimeout(timeout);
+  results.push("worker=SPAWN_THREW:" + e.name + ":" + e.message);
+  report(results);
+}
+</script></body>

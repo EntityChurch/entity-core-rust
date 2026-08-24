@@ -125,6 +125,13 @@ clean:
 # Builds the `entity-peer` crate (core/peer), which carries these features.
 # NOTE: the feature list lives in a variable so its commas are not parsed as
 # $(call) argument separators (which would silently truncate it at the first comma).
-WASM_FEATURES := inbox,continuation,subscription,clock,revision,query,history,compute,handlers,identity,role,registry,discovery,type-system,content
+# `signaling` and `network` are in the wasm lane as of S1 (2026-08-02): both
+# extension crates are socket-free by construction, so the carrier half — key
+# derivation, the §6.1 coordination messages, candidate selection — is portable
+# and CI now holds it that way. What is NOT in this build is the TCP wiring in
+# core/peer (`punch_establisher`, `srflx`, `reuseport`), each already gated
+# `not(target_arch = "wasm32")` with its reason in place. That gap is the
+# browser leg's actual remaining work, not a portability defect.
+WASM_FEATURES := inbox,continuation,subscription,clock,revision,query,history,compute,handlers,identity,role,registry,discovery,type-system,content,signaling,network
 wasm: toolchain
 	$(call RUN_TOOLCHAIN,cargo build --target wasm32-unknown-unknown -p entity-peer --no-default-features --features $(WASM_FEATURES))

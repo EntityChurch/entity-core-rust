@@ -93,17 +93,17 @@ use entity_signaling::{key, RendezvousKey};
 )]
 struct Args {
     /// `host:port` of the connection node carrying the coordination exchange.
-    #[arg(long)]
+    #[arg(long, default_value = "")]
     node: String,
     /// `initiator` | `responder`.
-    #[arg(long)]
+    #[arg(long, default_value = "")]
     role: String,
     /// `tag` | `secret` | `lobby` | `pair`.
-    #[arg(long)]
+    #[arg(long, default_value = "")]
     mode: String,
     /// The mode's input. `pair` takes `peer-a,peer-b`; the literal `SELF` is
     /// substituted with this peer's id once the handshake reveals it.
-    #[arg(long)]
+    #[arg(long, default_value = "")]
     input: String,
     /// The shared local endpoint the punch binds with `SO_REUSEPORT` (§7.3).
     ///
@@ -145,6 +145,28 @@ struct Args {
     /// behind SNAT is the lie §6.7.3 exists to forbid.
     #[arg(long, default_value = "")]
     reflector: String,
+    /// **Probe mode** (`EXTENSION-SIGNALING` §11.2 SHOULD / §9.3 MUST): classify
+    /// this socket's NAT mapping from several reflectors and exit. Punches
+    /// nothing; needs no `--node`, `--role`, `--mode` or `--input`.
+    ///
+    /// This is the G4 pre-drive screen. Without it, a symmetric NAT presents as a
+    /// punch failing late at the crossing — indistinguishable from a counterpart
+    /// that never showed up, which is the same silent shape as the S0 rendezvous
+    /// mismatch. With it, the screen is one command per side.
+    #[arg(long, default_value_t = false)]
+    nat_type: bool,
+    /// Comma-separated `host:port` reflectors for `--nat-type`.
+    ///
+    /// **All of them are consulted from `--local-addr`**, because a mapping
+    /// belongs to a socket (§6.7.3): two reflectors reached from two sockets make
+    /// a punchable cone NAT report two ports — the exact signature of the
+    /// symmetric NAT the probe looks for, with well-formed observations and a
+    /// confidently wrong verdict nothing downstream can catch.
+    ///
+    /// §6.7.1 forbids concluding from one, so a single reachable reflector is a
+    /// refusal (`ok:false`), not a verdict — even when its observation is right.
+    #[arg(long, default_value = "")]
+    reflectors: String,
     /// **Negative control:** never dial, listen only — the pre-G1 one-dials
     /// shape.
     ///
@@ -286,6 +308,11 @@ async fn verify_as_client(conn: Connection, keypair: &IdentityKeypair) -> anyhow
 enum Json {
     Bool(bool),
     Str(String),
+    /// Counts (`reflector_ok` / `reflector_all`) — the NAT-type contract's only
+    /// numbers, and they are cardinalities, so `usize` is the whole domain.
+    Num(usize),
+    Arr(Vec<Json>),
+    Obj(Vec<(String, Json)>),
 }
 
 fn escape(s: &str) -> String {
@@ -306,16 +333,23 @@ fn escape(s: &str) -> String {
     out
 }
 
+fn render_value(v: &Json) -> String {
+    match v {
+        Json::Bool(b) => b.to_string(),
+        Json::Str(s) => format!("\"{}\"", escape(s)),
+        Json::Num(n) => n.to_string(),
+        Json::Arr(items) => format!(
+            "[{}]",
+            items.iter().map(render_value).collect::<Vec<_>>().join(",")
+        ),
+        Json::Obj(fields) => render(fields),
+    }
+}
+
 fn render(fields: &[(String, Json)]) -> String {
     let body: Vec<String> = fields
         .iter()
-        .map(|(k, v)| {
-            let rendered = match v {
-                Json::Bool(b) => b.to_string(),
-                Json::Str(s) => format!("\"{}\"", escape(s)),
-            };
-            format!("\"{}\":{}", escape(k), rendered)
-        })
+        .map(|(k, v)| format!("\"{}\":{}", escape(k), render_value(v)))
         .collect();
     format!("{{{}}}", body.join(","))
 }
@@ -353,8 +387,24 @@ async fn main() {
             .init();
     }
 
+    // Probe mode is a different program sharing a binary: it punches nothing, so
+    // none of the punch's required flags apply and none are validated.
+    if args.nat_type {
+        match run_nat_type(&args).await {
+            Ok(fields) => emit_and_exit(fields),
+            Err(e) => emit_and_exit(vec![
+                ("probe".into(), Json::Str("nat-type".into())),
+                ("ok".into(), Json::Bool(false)),
+                ("error".into(), Json::Str(e.to_string())),
+            ]),
+        }
+    }
+
     if args.role != "initiator" && args.role != "responder" {
         fail(&args.role, "--role must be initiator|responder".into());
+    }
+    if args.node.is_empty() {
+        fail(&args.role, "--node is required".into());
     }
     if !matches!(args.mode.as_str(), "tag" | "secret" | "lobby" | "pair") {
         fail(&args.role, "--mode must be tag|secret|lobby|pair".into());
@@ -367,6 +417,87 @@ async fn main() {
         Ok(fields) => emit_and_exit(fields),
         Err(e) => fail(&args.role, e.to_string()),
     }
+}
+
+/// `--nat-type` — the §6.7.1 multi-reflector probe.
+///
+/// The output contract is Go's (`ROUTING-2026-08-02-nat-type-precheck-and-the-
+/// same-socket-trap.md` §1), matched field for field so a harness runs either
+/// binary unchanged.
+///
+/// **`ok` means a conclusion was reachable, not that the verdict was favourable.**
+/// `endpoint-dependent` with `ok:true` is a *successful* probe reporting a
+/// relay-only peer — the run did its job. One reachable reflector is `ok:false`,
+/// because §6.7.1 forbids concluding from one.
+async fn run_nat_type(args: &Args) -> anyhow::Result<Vec<(String, Json)>> {
+    let local_addr: SocketAddr = args.local_addr.parse().map_err(|_| {
+        anyhow::anyhow!("--local-addr must be host:port, got {:?}", args.local_addr)
+    })?;
+
+    let reflectors: Vec<String> = args
+        .reflectors
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if reflectors.is_empty() {
+        anyhow::bail!("--reflectors is required for --nat-type (comma-separated host:port)");
+    }
+
+    // Ephemeral identity, same as the punch path: a reflector answers strangers
+    // (§6.7.4 makes network-reflect a broad default grant).
+    let keypair = IdentityKeypair::Ed25519(Keypair::generate());
+
+    let detection = entity_peer::srflx::detect_mapping(
+        local_addr,
+        &reflectors,
+        &keypair,
+        entity_hash::HASH_ALGORITHM_SHA256,
+        Duration::from_secs_f64(args.timeout),
+    )
+    .await;
+
+    let a = &detection.assessment;
+    let conclusive = detection.conclusive();
+
+    Ok(vec![
+        ("probe".into(), Json::Str("nat-type".into())),
+        ("ok".into(), Json::Bool(conclusive)),
+        ("class".into(), Json::Str(a.class.as_str().to_string())),
+        ("punchable".into(), Json::Bool(a.punchable())),
+        (
+            "mapping".into(),
+            Json::Str(a.mapping.clone().unwrap_or_default()),
+        ),
+        ("local_addr".into(), Json::Str(local_addr.to_string())),
+        (
+            "observations".into(),
+            Json::Arr(
+                a.observations
+                    .iter()
+                    .map(|o| {
+                        Json::Obj(vec![
+                            ("reflector".into(), Json::Str(o.reflector.clone())),
+                            ("observed".into(), Json::Str(o.observed.clone())),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ),
+        ("reflector_ok".into(), Json::Num(detection.reflector_ok)),
+        ("reflector_all".into(), Json::Num(detection.reflector_all)),
+        (
+            "errors".into(),
+            Json::Arr(
+                detection
+                    .errors
+                    .iter()
+                    .map(|e| Json::Str(e.clone()))
+                    .collect(),
+            ),
+        ),
+        ("reason".into(), Json::Str(a.reason.clone())),
+    ])
 }
 
 async fn run(args: &Args) -> anyhow::Result<Vec<(String, Json)>> {

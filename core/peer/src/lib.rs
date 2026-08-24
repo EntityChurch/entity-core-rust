@@ -2050,6 +2050,12 @@ impl PeerBuilder {
                     "close",
                     "reconnect",
                     "restore-subscriptions",
+                    // §6.7.1 (Amendment 13). Advertised so a caller can see
+                    // the peer offers reflection before spending a round trip
+                    // on it; §6.7.4 makes network-reflect a broad default
+                    // grant, since the operation is a mirror and leaks nothing
+                    // the caller did not reveal by connecting.
+                    entity_network::OP_OBSERVE_ADDRESS,
                 ],
             )?;
             handler
