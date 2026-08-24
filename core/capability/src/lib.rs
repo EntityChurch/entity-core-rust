@@ -255,13 +255,66 @@ pub fn owner_self_grant(peer_id: &str) -> Vec<GrantEntry> {
     }]
 }
 
-/// Wildcard handler grant scope: all handlers, all resources, all operations, all peers.
+/// Wildcard handler grant scope: all handlers, all operations, all peers, and
+/// all resources **in the local peer's own namespace** — the bare `*` resource
+/// canonicalizes to `/{local}/*` (see [`check_resource_scope`] / `canonicalize`).
 ///
-/// Default scope for handlers that do not declare `internal_scope` (§6.9).
+/// **This is the own-namespace form.** For the §6.9 per-handler self-grant the
+/// peer seeds at init, use [`default_handler_self_grant`] instead: that one is
+/// the ceiling for a handler's in-process sub-dispatches (§5.2 D1), and a peer's
+/// own store legitimately holds foreign-namespace subtrees (V7 §1.4 Category A),
+/// so confining it to `/{local}/*` forbids the peer's own engine from writing
+/// its own mirrors. Kept as-is for the call sites that *want* own-namespace
+/// confinement (the SDK owner self-cap builds on it and adds an explicit
+/// cross-namespace read grant on top).
 pub fn wildcard_handler_grant() -> Vec<GrantEntry> {
     vec![GrantEntry {
         handlers: PathScope::all(),
         resources: PathScope::all(),
+        operations: IdScope::all(),
+        peers: Some(IdScope::all()),
+        constraints: None,
+        allowances: None,
+    }]
+}
+
+/// Default scope for handlers that do not declare `internal_scope` (§6.9):
+/// all handlers, **all resources**, all operations, all peers.
+///
+/// Identical to [`wildcard_handler_grant`] except that "all resources" is
+/// written in the R-5 cross-namespace peer-wildcard form `/*/*` rather than the
+/// bare `*` — the same distinction, and for the same reason, as
+/// [`debug_open_grants`].
+///
+/// **Why the form matters here and did not before.** §6.9 describes this default
+/// as unrestricted, and until D1 (PROPOSAL-DISPATCH-AUTHORIZATION-FRAME, §5.2
+/// resource dimension) nothing read its `resources` field at all on the
+/// in-process path — `make_execute_fn` ran no capability check of any dimension.
+/// D1 made this grant the **ceiling** for every sub-dispatch a handler performs,
+/// at which point the bare `*` silently narrowed "all resources" to
+/// `/{local}/*`. A peer's own store legitimately holds OTHER peers' subtrees at
+/// their natural universal paths (V7 §1.4 Category A — a cached foreign content
+/// site, a `follow` mirror at `/{them}/app/...`), and those writes are dispatched
+/// by the peer's own engine handlers. Under the bare-`*` ceiling the engine could
+/// not write them: `follow(Continuation)`'s standing leg 403'd at its
+/// `system/tree:merge` step, which is what
+/// `follow_continuation_standing_leg_fires_cross_peer` measures.
+///
+/// This does not blunt D1. D1's teeth are handlers that declare a **narrow**
+/// `internal_scope` (the confused-deputy shape: a deputy granted `app/*` that
+/// sub-dispatches `system/handler:register` at `system/handler/pwn`); those are
+/// unaffected. A handler on the default scope was already omnipotent inside
+/// `/{local}/*`, so restoring the cross-namespace half returns exactly the
+/// authority §6.9 says it has and nothing more — and it is still bounded by the
+/// **local** store: a write into `/{them}/...` here touches this peer's tree, not
+/// theirs (a foreign peer authorizes its own writes through `dispatch_request`).
+pub fn default_handler_self_grant() -> Vec<GrantEntry> {
+    vec![GrantEntry {
+        handlers: PathScope::all(),
+        // R-5 form — see `debug_open_grants`. Bare `*` would canonicalize to
+        // `/{local}/*` and exclude the foreign-namespace paths this peer's own
+        // store holds.
+        resources: PathScope::new(vec!["/*/*".into()]),
         operations: IdScope::all(),
         peers: Some(IdScope::all()),
         constraints: None,

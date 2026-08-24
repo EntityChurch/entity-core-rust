@@ -200,6 +200,30 @@ gates by making the TCP path compile on wasm32.
   the enum the moment you catch yourself writing "`None` here means…" twice with different
   answers** — the compiler then finds the call sites for you, which is how the sweep stayed
   honest across 14 of them.
+- **A check added to a path that ran none starts READING fields that were written when
+  nothing read them — audit the values it will now consult, not just the call sites the
+  compiler makes you touch.** *(Candidate: bit us once, `7c21d04` → found 2026-08-23.)*
+  D1 gave `make_execute_fn` a §5.2 resource ceiling. The type change forced 14 call sites
+  and every one got a considered answer; what nobody looked at was the **`resources` field
+  of the grants the ceiling would now consult**, because until that commit no code path
+  read it. §6.9's default per-handler self-grant is described as *"all resources"* and was
+  written `PathScope::all()` — bare `*`, which `canonicalize` resolves to `/{local}/*`.
+  Harmless as an unread field; as a ceiling it means **own namespace only**, so the peer's
+  own engine could no longer write the foreign-namespace subtrees its store legitimately
+  holds (V7 §1.4 Category A — a cached foreign site, a `follow` mirror at `/{them}/app/…`).
+  `follow(Continuation)`'s standing leg 403'd at its `system/tree:merge` step and stayed
+  red for five days. The same trap was already documented one function over: `debug_open_grants`
+  carries an R-5 note saying bare `*` excludes `/{X}/…` and uses `/*/*` for exactly this
+  reason — a *written* precedent that the new reader did not inherit. Fix is
+  `default_handler_self_grant()` (`/*/*`), kept distinct from `wildcard_handler_grant()` so
+  the own-namespace call sites that want confinement still say so.
+  **Enforcement:** when a commit turns an inert field into an authorization input, grep every
+  constructor of that field (`grep -rn 'resources:' --include=*.rs`) and ask what each one
+  **means** versus what it **encodes** — the two are only the same once something checks. And
+  pin the answer at *both* ends: `default_handler_grant_ceiling_reaches_a_foreign_namespace_path`
+  (core/peer) fails against the pre-fix `wildcard_handler_grant()`, and its narrow-deputy
+  control fails if the new check is neutered — verified by running both mutations, because
+  "widening the default" and "putting a hole in D1" are one edit apart.
 - **Prove an absence by construction, not by grep, before you report it.** *(Ratified: bit
   us twice, and the second time the region was the build graph, not the file.)* The
   `substitute` category skipped against our peer and core-go's report read that as *"a 1-skip

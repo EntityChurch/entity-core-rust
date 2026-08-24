@@ -2533,14 +2533,27 @@ impl PeerBuilder {
             h
         };
 
-        // §6.9 step 6: Create handler grants for all registered handlers
+        // §6.9 step 6: Create handler grants for all registered handlers.
+        //
+        // The default (no `internal_scope`) is `default_handler_self_grant`, NOT
+        // `wildcard_handler_grant`: since D1 (§5.2 resource dimension on the
+        // in-process path) this grant is the ceiling for everything the handler
+        // sub-dispatches, and the bare-`*` resource form canonicalizes to
+        // `/{local}/*` — which would forbid the peer's own engine from writing
+        // the foreign-namespace subtrees its store legitimately holds (V7 §1.4
+        // Category A). See `default_handler_self_grant` for the full argument.
+        //
+        // Note `create_handler_grant` is install-once (Class I): a peer whose
+        // tree already binds `system/capability/grants/{pattern}` keeps the grant
+        // it was seeded with. That is deliberate (GUIDE-RESTART-AND-PERSISTENCE
+        // §2.2) — the shape change reaches new peers, not stores minted earlier.
         let registered_patterns = handler_registry.patterns();
         for pattern in &registered_patterns {
             let bare = entity_entity::EntityUri::strip_peer_prefix(pattern).to_string();
             let scope = handler_registry
                 .get(pattern)
                 .and_then(|h| h.internal_scope())
-                .unwrap_or_else(entity_capability::wildcard_handler_grant);
+                .unwrap_or_else(entity_capability::default_handler_self_grant);
             create_handler_grant(
                 &bare,
                 scope,
@@ -4503,6 +4516,143 @@ mod tests {
         assert_ne!(
             allowed.status, 403,
             "an in-scope resource must pass the §5.2 resource dimension"
+        );
+    }
+
+    /// The other half of D1: its ceiling must not forbid the peer's own engine
+    /// from writing the **foreign-namespace** subtrees its store legitimately
+    /// holds (V7 §1.4 Category A — a cached foreign content site, a `follow`
+    /// mirror at `/{them}/app/...`).
+    ///
+    /// §6.9 calls the default per-handler self-grant "all resources", but the
+    /// bare `*` resource form canonicalizes to `/{local}/*` — so written that
+    /// way it silently means *own namespace only*, and every engine-dispatched
+    /// mirror write 403s at the §5.2 resource dimension. Nothing read the field
+    /// before D1, so the mis-encoding was invisible until D1 made this grant a
+    /// ceiling; the first thing it broke was `follow(Continuation)`'s standing
+    /// leg (`entity-sdk`'s `follow_continuation_standing_leg_fires_cross_peer`),
+    /// which merges into `/{remote}/...` in the LOCAL tree. `/*/*` is the same
+    /// R-5 form `debug_open_grants` already uses for the same reason.
+    ///
+    /// Teeth: build the ceiling from `wildcard_handler_grant()` — the pre-fix
+    /// value — and the first assertion goes 403. The control below is the
+    /// narrow-deputy case, which must stay denied: this is a fix to what "all
+    /// resources" encodes, not a hole in D1.
+    #[tokio::test]
+    async fn default_handler_grant_ceiling_reaches_a_foreign_namespace_path() {
+        use entity_capability::{CapabilityToken, GrantEntry, Granter, IdScope, PathScope};
+
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
+        let shared = peer.shared();
+        let identity = shared.identity_hash;
+        // A real, well-formed foreign peer-id — the mirror path lives under its
+        // namespace but the write lands in OUR tree.
+        let foreign = Keypair::from_seed([7u8; 32]).peer_id().to_string();
+
+        let token = |grants: Vec<GrantEntry>| CapabilityToken {
+            grants,
+            granter: Granter::Single(identity),
+            grantee: identity,
+            parent: None,
+            created_at: 0,
+            expires_at: None,
+            not_before: None,
+            delegation_caveats: None,
+        };
+
+        let foreign_resource = |path: String| entity_handler::ExecuteOptions {
+            resource: Some(entity_capability::ResourceTarget {
+                targets: vec![path],
+                exclude: vec![],
+            }),
+            ..Default::default()
+        };
+
+        // `system/tree put` params: `{entity: {type, data}}` (§3.2 path-as-
+        // resource, so the mirror path IS the resource target).
+        let body = entity_entity::Entity::new(
+            "primitive/text",
+            entity_ecf::to_ecf(&entity_ecf::text("mirrored-from-them")),
+        )
+        .unwrap();
+        let params = entity_entity::Entity::new(
+            "system/tree/put/params",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+                entity_ecf::text("entity"),
+                entity_ecf::Value::Map(vec![
+                    (
+                        entity_ecf::text("type"),
+                        entity_ecf::text(&body.entity_type),
+                    ),
+                    (
+                        entity_ecf::text("data"),
+                        entity_ecf::text("mirrored-from-them"),
+                    ),
+                ]),
+            )])),
+        )
+        .unwrap();
+        let mirror_path = format!("/{foreign}/app/mirror/x");
+
+        // The §6.9 default scope: "all resources" must mean all resources.
+        let default_scope = connection::make_execute_fn(
+            shared.clone(),
+            Some(identity),
+            std::collections::HashMap::new(),
+            None,
+            None,
+            connection::DispatchCeiling::Handler(Some(Box::new(token(
+                entity_capability::default_handler_self_grant(),
+            )))),
+        );
+        let mirrored = default_scope(
+            "system/tree".into(),
+            "put".into(),
+            params.clone(),
+            foreign_resource(mirror_path.clone()),
+        )
+        .await
+        .expect("dispatch returns a result, not a transport error");
+        assert_ne!(
+            mirrored.status, 403,
+            "the §6.9 default handler grant is `all resources`; a mirror write \
+             under another peer's namespace in OUR OWN tree must not be denied \
+             by the §5.2 resource dimension"
+        );
+        assert!(
+            peer.tree().get(&mirror_path).is_some(),
+            "and the write must actually land in the local tree"
+        );
+
+        // Control: a deputy that declared a narrow `internal_scope` is still
+        // confined by it. D1's teeth are unchanged.
+        let narrow = connection::make_execute_fn(
+            shared.clone(),
+            Some(identity),
+            std::collections::HashMap::new(),
+            None,
+            None,
+            connection::DispatchCeiling::Handler(Some(Box::new(token(vec![GrantEntry {
+                handlers: PathScope::all(),
+                resources: PathScope::new(vec!["app/*".into()]),
+                operations: IdScope::all(),
+                peers: Some(IdScope::all()),
+                constraints: None,
+                allowances: None,
+            }])))),
+        );
+        let denied = narrow(
+            "system/tree".into(),
+            "put".into(),
+            params,
+            foreign_resource(format!("/{foreign}/app/mirror/y")),
+        )
+        .await
+        .expect("dispatch returns a result");
+        assert_eq!(
+            denied.status, 403,
+            "a deputy scoped to its own `app/*` must not reach a foreign \
+             namespace — widening the DEFAULT scope is not widening D1"
         );
     }
 
