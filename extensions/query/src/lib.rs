@@ -724,6 +724,7 @@ mod tests {
             handler_grant_hash: None,
             bounds: None,
             is_external: false,
+            reactive_trigger: false,
             session_peer_id: None,
         }
     }
@@ -1391,6 +1392,7 @@ mod sqlite_handler_tests {
             handler_grant_hash: None,
             bounds: None,
             is_external: false,
+            reactive_trigger: false,
             session_peer_id: None,
         }
     }

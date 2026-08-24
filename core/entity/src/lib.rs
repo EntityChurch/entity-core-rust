@@ -514,37 +514,62 @@ pub fn is_safe_path_segment(s: &str) -> bool {
     !s.bytes().any(|b| b < 0x20 || b == 0x7F)
 }
 
-/// Returns `s` when it is safe as one path segment, else a deterministic
-/// synthetic segment `invalid-<first 8 bytes of sha256(s), hex>`.
+/// Sentinel for a non-path-safe `{reason}` coordinate — EXTENSION-
+/// CONTINUATION §3.10.5, landed (not ours to choose).
+pub const SENTINEL_UNSPECIFIED_ERROR: &str = "unspecified_error";
+/// Sentinel for a non-path-safe `{chain_id}` coordinate (arch round-2
+/// ruling 3; converged with Go's `types.ChainIDUnspecified`).
+pub const SENTINEL_UNSPECIFIED_CHAIN_ID: &str = "unspecified_chain_id";
+/// Sentinel for a non-path-safe `{step_index}` coordinate (arch round-2
+/// ruling 3; converged with Go's `types.StepIndexUnspecified`).
+pub const SENTINEL_UNSPECIFIED_STEP_INDEX: &str = "unspecified_step_index";
+
+/// Returns `s` when it is safe as one path segment, else the caller's fixed
+/// `sentinel`.
 ///
 /// For any value that arrives from the wire — `request_id`, `bounds.chain_id`,
 /// a remote handler's `result.data.code` — this is the boundary between "a
 /// caller names its own coordinate" and "a caller chooses where our entity
 /// lands". Callers MUST run every untrusted value through this BEFORE
-/// concatenating it into a path.
+/// concatenating it into a path, and MUST preserve the original in the
+/// record's body — collapsing is only lossless because the body recovers it
+/// (§3.10.6's pinned schema).
 ///
 /// The §3.10.3 `rejected` marker is the sharp case: it is bound precisely
 /// BECAUSE the sender's cap check failed, so an unauthorized caller reaches
 /// the binding site by construction and no capability is required to choose
 /// where that entity lands.
 ///
-/// Unsafe values are **hashed, not dropped or collapsed**: markers are
-/// observational, so dropping one loses the event, and collapsing them all to
-/// a constant merges distinct failures onto one coordinate. Hashing keeps
-/// distinct hostile values distinct while making them inert.
+/// **Collapse, not hash** (arch round-2 ruling 1, amending round-1 ruling 13;
+/// the shape §3.10.5 already lands for `{reason}`). This function first hashed
+/// unsafe values to keep distinct values on distinct coordinates. That was
+/// wrong three ways:
+///
+/// - **Distinctness was already carried elsewhere.** §3.10.1's terminal
+///   `{marker_hash}` segment puts every occurrence at its own path regardless
+///   of what the intermediate segments do, so collapsing loses no occurrence.
+/// - **Hashing is a ONE-WAY loss wherever the body does not carry the
+///   original** — exactly `chain_id`, the one coordinate a remote fully
+///   controls. An operator reading the marker that exists to observe a hostile
+///   failure could not answer what the attacker sent.
+/// - **It re-opened the vector the sanitizing closed, one layer up:** each
+///   distinct hostile value hashed to a distinct node, so an attacker could
+///   mint unbounded path nodes, bounded only by GC. A sentinel bounds it to
+///   one quarantine node — pinned by
+///   `sanitize_path_segment_does_not_let_an_attacker_mint_nodes`.
+///
+/// One sentinel per coordinate rather than one shared, so a quarantined marker
+/// still says WHICH coordinate was hostile without putting the value on the
+/// path.
 ///
 /// Safe values pass through byte-identical, so this changes no conformant
 /// coordinate and cannot de-converge a seat. Matches Go's
-/// `store.SanitizePathSegment` (`core/store/store.go`) byte-for-byte, so the
-/// synthetic segment converges cross-impl.
-pub fn sanitize_path_segment(s: &str) -> std::borrow::Cow<'_, str> {
-    use sha2::{Digest, Sha256};
+/// `store.SanitizePathSegment(s, sentinel)` (`core/store/store.go`).
+pub fn sanitize_path_segment<'a>(s: &'a str, sentinel: &'a str) -> &'a str {
     if is_safe_path_segment(s) {
-        return std::borrow::Cow::Borrowed(s);
+        return s;
     }
-    let digest = Sha256::digest(s.as_bytes());
-    let hex: String = digest[..8].iter().map(|b| format!("{:02x}", b)).collect();
-    std::borrow::Cow::Owned(format!("invalid-{}", hex))
+    sentinel
 }
 
 impl std::fmt::Display for EntityUri {
@@ -1098,7 +1123,7 @@ mod tests {
             "é-unicode-is-fine",
         ] {
             assert_eq!(
-                sanitize_path_segment(seg),
+                sanitize_path_segment(seg, SENTINEL_UNSPECIFIED_CHAIN_ID),
                 seg,
                 "a safe value MUST pass through unchanged"
             );
@@ -1122,18 +1147,17 @@ mod tests {
             "with\nnewline",
             "with\x7fdel",
         ] {
-            let got = sanitize_path_segment(seg);
+            let got = sanitize_path_segment(seg, SENTINEL_UNSPECIFIED_CHAIN_ID);
             assert!(
-                is_safe_path_segment(&got),
+                is_safe_path_segment(got),
                 "sanitize_path_segment({:?}) = {:?}, still not a safe segment",
                 seg,
                 got
             );
-            assert!(
-                got.starts_with("invalid-"),
-                "sanitize_path_segment({:?}) = {:?}, want a visibly synthetic segment",
-                seg,
-                got
+            assert_eq!(
+                got, SENTINEL_UNSPECIFIED_CHAIN_ID,
+                "sanitize_path_segment({:?}) = {:?}, want the caller's sentinel",
+                seg, got
             );
             // The property that actually matters: assert on the CLEANED
             // path, not the literal one. `sink/{X}/..` is inside the sink by
@@ -1147,36 +1171,66 @@ mod tests {
         }
     }
 
-    /// Distinct hostile values MUST NOT merge onto one coordinate — markers
-    /// are observational, so collapsing them to a constant would lose the
-    /// distinction between two different failures.
+    /// The invariant that decided arch round-2 ruling 1, and the reason the
+    /// previous hashing rule was reversed: hostile input MUST NOT be able to
+    /// mint path nodes.
+    ///
+    /// Hashing put every distinct hostile value on its own node, which
+    /// re-opened the tree-pollution vector the injection fix had just closed —
+    /// one layer up, bounded only by GC. Neither implementing seat found that
+    /// argument; it is pinned here as an invariant rather than left as a
+    /// comment, because it is the whole reason this function collapses.
+    ///
+    /// History: this test replaces `..._keeps_distinct_values_distinct`, which
+    /// asserted the opposite. Distinctness was never at risk from collapsing —
+    /// §3.10.1's terminal `{marker_hash}` segment already gives every
+    /// occurrence its own path (distinct bodies → distinct hashes), so the
+    /// property that test protected was being carried elsewhere all along.
     #[test]
-    fn sanitize_path_segment_keeps_distinct_values_distinct() {
-        assert_ne!(sanitize_path_segment(".."), sanitize_path_segment("."));
-        assert_ne!(
-            sanitize_path_segment("../../authority/keys"),
-            sanitize_path_segment("../../authority/other")
+    fn sanitize_path_segment_does_not_let_an_attacker_mint_nodes() {
+        let nodes: std::collections::BTreeSet<&str> = (0..1000)
+            .map(|i| {
+                let hostile = format!("../../../../authority/keys/{i}");
+                // The sanitizer is a pure function of (value, sentinel), so a
+                // borrowed result would not outlive `hostile`. Collapse means
+                // the result is the sentinel itself — a 'static constant —
+                // which is exactly what this asserts.
+                let got = sanitize_path_segment(&hostile, SENTINEL_UNSPECIFIED_CHAIN_ID);
+                assert_eq!(got, SENTINEL_UNSPECIFIED_CHAIN_ID);
+                SENTINEL_UNSPECIFIED_CHAIN_ID
+            })
+            .collect();
+        assert_eq!(
+            nodes.len(),
+            1,
+            "1000 distinct hostile values must collapse to exactly 1 quarantine node"
         );
-        // Deterministic: the same hostile value always lands in the same
-        // place, so re-binding the same observation still dedupes.
-        assert_eq!(sanitize_path_segment(".."), sanitize_path_segment(".."));
     }
 
-    /// Convergence with Go's `store.SanitizePathSegment` (`core/store/store.go`
-    /// @ `24d618c`) — same algorithm (`invalid-` + first 8 bytes of sha256,
-    /// hex), so a hostile coordinate lands at the same synthetic segment on
-    /// both seats rather than forking the tree two ways.
-    ///
-    /// These literals were read off a live Go run, not derived from its
-    /// source — the cheap version of this test asserts a shape and would pass
-    /// against a differing algorithm.
+    /// One sentinel per coordinate: a quarantined marker still says WHICH
+    /// coordinate was hostile, without putting the hostile value on the path.
     #[test]
-    fn sanitize_path_segment_converges_with_go() {
-        assert_eq!(sanitize_path_segment(".."), "invalid-5ec1f7e700f37c3d");
-        assert_eq!(sanitize_path_segment("."), "invalid-cdb4ee2aea69cc6a");
+    fn sanitize_path_segment_uses_the_callers_sentinel_per_coordinate() {
         assert_eq!(
-            sanitize_path_segment("../../../../authority/keys"),
-            "invalid-c492f5b66018643e"
+            sanitize_path_segment("..", SENTINEL_UNSPECIFIED_CHAIN_ID),
+            "unspecified_chain_id"
         );
+        assert_eq!(
+            sanitize_path_segment("..", SENTINEL_UNSPECIFIED_STEP_INDEX),
+            "unspecified_step_index"
+        );
+        assert_eq!(
+            sanitize_path_segment("..", SENTINEL_UNSPECIFIED_ERROR),
+            "unspecified_error"
+        );
+        // Every sentinel must itself be a safe segment, or the quarantine
+        // node is the next injection.
+        for s in [
+            SENTINEL_UNSPECIFIED_ERROR,
+            SENTINEL_UNSPECIFIED_CHAIN_ID,
+            SENTINEL_UNSPECIFIED_STEP_INDEX,
+        ] {
+            assert!(is_safe_path_segment(s), "sentinel {s:?} is not path-safe");
+        }
     }
 }

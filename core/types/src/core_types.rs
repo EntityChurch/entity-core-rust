@@ -440,6 +440,7 @@ fn system_peer_status() -> TypeDefinition {
         .field("connection", opt("system/tree/path"))
         .field("reason", opt("primitive/string"))
         .field("last_error", opt("primitive/string"))
+        .field("failing_since", opt("primitive/uint"))
         .build()
 }
 
@@ -483,6 +484,8 @@ fn system_network_backoff_config() -> TypeDefinition {
         .field("min_ms", opt("primitive/uint"))
         .field("max_ms", opt("primitive/uint"))
         .field("strategy", opt("primitive/string"))
+        .field("max_attempts", opt("primitive/uint"))
+        .field("max_elapsed_ms", opt("primitive/uint"))
         .build()
 }
 
@@ -650,6 +653,7 @@ fn system_bounds() -> TypeDefinition {
     TypeDefBuilder::new("system/bounds")
         .field("budget", opt("primitive/uint"))
         .field("cascade_depth", opt("primitive/uint"))
+        .field("chain_depth", opt("primitive/uint"))
         .field("chain_id", opt("primitive/string"))
         .field("parent_chain_id", opt("primitive/string"))
         .field("ttl", opt("primitive/uint"))

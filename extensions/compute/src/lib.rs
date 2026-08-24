@@ -1186,6 +1186,7 @@ mod entity_native_tests {
             handler_grant_hash: Some(Hash::compute("test", b"hgrant")),
             bounds: None,
             is_external: false,
+            reactive_trigger: false,
         }
     }
 
@@ -1609,6 +1610,7 @@ mod entity_native_tests {
             handler_grant_hash: None,
             bounds: None,
             is_external: false,
+            reactive_trigger: false,
         };
 
         let dispatch =

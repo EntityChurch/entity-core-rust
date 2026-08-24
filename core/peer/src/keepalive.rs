@@ -45,7 +45,9 @@ use std::sync::{Arc, Weak};
 use entity_crypto::IdentityKeypair;
 use entity_store::{ContentStore, LocationIndex};
 
-use crate::liveness::{demote_peer_on_keepalive_miss, now_ms, write_peer_status};
+use crate::liveness::{
+    demote_peer_on_keepalive_miss, episode_failing_since, now_ms, write_peer_status,
+};
 use crate::peer_status::PEER_STATUS_REASON_KEEPALIVE_MISS;
 use crate::peer_status::{PeerStatusData, PEER_STATUS_CONNECTED, PEER_STATUS_SUSPECT};
 use crate::remote::{send_execute, RemoteEndpoint, RemoteState};
@@ -215,6 +217,12 @@ async fn keepalive_loop(ctx: KeepaliveCtx) {
         data.reason = Some(PEER_STATUS_REASON_KEEPALIVE_MISS.to_string());
         data.last_error = Some(format!("{} consecutive keepalive misses", missed));
         data.last_seen = last_seen_snapshot(endpoint.as_ref());
+        data.failing_since = episode_failing_since(
+            ctx.content_store.as_ref(),
+            ctx.location_index.as_ref(),
+            &ctx.local_peer_id,
+            &endpoint.remote_identity_hash(),
+        );
         write_peer_status(
             ctx.content_store.as_ref(),
             ctx.location_index.as_ref(),
@@ -288,6 +296,7 @@ async fn ping(
         None,
         None,
         &no_chain,
+        None,
     );
     match with_deadline(timeout_ms, sent).await {
         Some(Ok(resp)) => {

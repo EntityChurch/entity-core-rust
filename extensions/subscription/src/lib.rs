@@ -1158,6 +1158,7 @@ mod tests {
             handler_grant_hash: None,
             bounds: None,
             is_external: false,
+            reactive_trigger: false,
         };
         let result = handler.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_BAD_REQUEST);
@@ -1205,6 +1206,7 @@ mod tests {
             handler_grant_hash: None,
             bounds: None,
             is_external: false,
+            reactive_trigger: false,
         };
         let result = handler.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_NOT_FOUND);
@@ -1747,6 +1749,7 @@ mod tests {
             handler_grant_hash: None,
             bounds: None,
             is_external: false,
+            reactive_trigger: false,
         }
     }
 

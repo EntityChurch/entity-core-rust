@@ -144,6 +144,15 @@ pub trait PeerLink: Send + Sync {
     /// §3.13 entity (cohort shape) and the `closed` connection transition.
     fn write_released(&self, peer_id: &str, identity_hash: &Hash);
 
+    /// §2.2 terminal write on retry exhaustion (ruling 6): an OPTIONAL
+    /// give-up bound was reached, so the relationship is abandoned —
+    /// `{status: disconnected, reason: retry-exhausted}`, preserving the
+    /// episode's `failing_since` so the record says how long we tried.
+    ///
+    /// Not a fourth status: the §3.13 enum stays three-state and `reason`
+    /// says why. Only reachable when a caller opted into a bound.
+    fn write_retry_exhausted(&self, peer_id: &str, identity_hash: &Hash, failing_since: u64);
+
     /// §4.4 local close transition: `system/connection/{hex}` → `closed`
     /// (attachment-preserving RMW, idempotent).
     fn mark_connection_closed(&self, identity_hash: &Hash);
@@ -163,6 +172,24 @@ pub struct BackoffCfg {
     pub min_ms: u64,
     pub max_ms: u64,
     pub strategy: String,
+    /// OPTIONAL §2.2 bound by count: once this many retries have FIRED,
+    /// the relationship is abandoned. `None` ⇒ no bound.
+    pub max_attempts: Option<u64>,
+    /// OPTIONAL §2.2 bound by wall-clock: once this long has passed
+    /// since `failing_since`, the relationship is abandoned. `None` ⇒
+    /// no bound.
+    ///
+    /// Both bounds default to unset, which is **retry-forever** — the
+    /// normative behaviour, because a peer offline for a week and coming
+    /// back is the P2P norm; "give up after N" imports a client-server
+    /// assumption that does not hold here. They exist for callers who
+    /// know a relationship is disposable; they are not a recommended
+    /// default.
+    ///
+    /// Exhaustion is not a fourth status: it terminates at
+    /// `disconnected` with reason `retry-exhausted` (the §3.13 enum is
+    /// three-state, and `reason` is the field that says why).
+    pub max_elapsed_ms: Option<u64>,
 }
 
 impl Default for BackoffCfg {
@@ -171,30 +198,177 @@ impl Default for BackoffCfg {
             min_ms: 1000,
             max_ms: 60000,
             strategy: "exponential".to_string(),
+            max_attempts: None,
+            max_elapsed_ms: None,
         }
     }
 }
 
-/// §2.2 delay for the given consecutive-failure attempt (1-based).
-pub fn backoff_delay_ms(cfg: &BackoffCfg, attempt: u64) -> u64 {
+/// §2.2 delay before retry `k`, where `k` is **1-indexed**: `k = 1` is
+/// the first retry after the failure, and `delay(0)` is 0 (no retry, no
+/// wait).
+///
+/// ```text
+/// constant     min
+/// linear       min · k
+/// exponential  min · 2^(k-1)
+/// ```
+///
+/// all clamped to `max` (and `max` is raised to `min` when a config
+/// inverts them, so the delay is never below `min`). Arithmetic
+/// saturates rather than wrapping: a config with an absurd `min` cannot
+/// make a huge `k` produce a tiny delay.
+pub fn backoff_delay_ms(cfg: &BackoffCfg, k: u64) -> u64 {
+    if k == 0 {
+        return 0;
+    }
     let min_ms = cfg.min_ms;
     let max_ms = cfg.max_ms.max(min_ms);
     let ms = match cfg.strategy.as_str() {
         "constant" => min_ms,
-        "linear" => min_ms.saturating_mul(attempt.max(1)),
+        "linear" => min_ms.saturating_mul(k),
         // "exponential" (default)
         _ => {
             let mut ms = min_ms;
-            for _ in 1..attempt.max(1) {
-                ms = ms.saturating_mul(2);
+            for _ in 1..k {
                 if ms >= max_ms {
                     break;
                 }
+                ms = ms.saturating_mul(2);
             }
             ms
         }
     };
     ms.min(max_ms)
+}
+
+/// The §2.2 retry pacing for one failure episode — DERIVED from
+/// (`failing_since`, backoff config, `now`), never stored. See
+/// [`derive_retry_state`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RetryState {
+    /// How many retries have already FIRED this episode: 0 in the
+    /// interval between the failure and the first retry coming due.
+    pub attempt: u64,
+    /// When the next retry comes due, ms since epoch. `None` when
+    /// `exhausted` — there is no next attempt.
+    pub next_attempt_at: Option<u64>,
+    /// An OPTIONAL §2.2 bound (`max_attempts` / `max_elapsed_ms`) has
+    /// been reached and the relationship is abandoned. Always `false`
+    /// under the default config, which is retry-forever.
+    pub exhausted: bool,
+}
+
+/// Compute the retry pacing for the failure episode that began at
+/// `failing_since` (ms since epoch), as of `now_ms`.
+///
+/// This is the whole of the retry state machine, as one pure function.
+/// Nothing counts attempts, and nothing is written per attempt (§A4):
+/// the k-th retry is due at a fixed offset from `failing_since`, so
+/// "which retry are we on" is a question about elapsed time, answerable
+/// from a stamp the tree already holds. Two things fall out of that.
+/// Restart-hammering dies — a process that restarts beside a peer dead
+/// for a month re-derives a large `attempt` and a max-length wait, where
+/// an in-memory counter would reset to 0 and redial in `min_ms`. And
+/// pacing converges: two peers reading the same `failing_since` agree on
+/// the schedule without exchanging retry state.
+///
+/// The schedule, with `elapsed = now_ms - failing_since`:
+///
+/// ```text
+/// elapsed_to(0)   = 0
+/// elapsed_to(k)   = elapsed_to(k-1) + delay(k)
+/// attempt         = max{ k : elapsed_to(k) <= elapsed }
+/// next_attempt_at = failing_since + elapsed_to(attempt + 1)
+/// ```
+///
+/// The boundary is INCLUSIVE: at exactly `elapsed_to(k)` the k-th retry
+/// has fired.
+///
+/// Worked example — the §2.2 defaults (exponential, min 1s, max 60s).
+/// Delays run 1s, 2s, 4s, 8s…; `elapsed_to` runs 1s, 3s, 7s, 15s…. At
+/// `elapsed = 5s`: two retries have fired (`elapsed_to(2) = 3s <= 5s`,
+/// `elapsed_to(3) = 7s > 5s`), so `attempt = 2` and the third comes due
+/// at `failing_since + 7s`.
+///
+/// No jitter in v1 — the schedule is a deterministic function of its
+/// inputs, which is what makes it testable as a vector table and
+/// comparable across impls. Jitter, if it lands, is a later opt-in that
+/// perturbs the output here.
+///
+/// `failing_since == None` means no episode (the `connected` write
+/// clears the stamp), and returns the default [`RetryState`]. A
+/// degenerate config whose delay works out to 0 also returns `attempt`
+/// 0 with `next_attempt_at == failing_since` — always due, never counted
+/// — rather than looping forever counting instantaneous retries.
+pub fn derive_retry_state(cfg: &BackoffCfg, failing_since: Option<u64>, now_ms: u64) -> RetryState {
+    let Some(failing_since) = failing_since else {
+        return RetryState::default();
+    };
+    let elapsed = now_ms.saturating_sub(failing_since);
+    let paced = derive_pacing(cfg, failing_since, elapsed);
+
+    // The OPTIONAL §2.2 bounds. Unset ⇒ retry-forever, so the default
+    // config never takes either branch.
+    if cfg.max_attempts.is_some_and(|max| paced.attempt >= max)
+        || cfg.max_elapsed_ms.is_some_and(|max| elapsed >= max)
+    {
+        return RetryState {
+            attempt: paced.attempt,
+            next_attempt_at: None,
+            exhausted: true,
+        };
+    }
+    paced
+}
+
+/// Walks the schedule; see [`derive_retry_state`] for the semantics.
+fn derive_pacing(cfg: &BackoffCfg, failing_since: u64, elapsed: u64) -> RetryState {
+    // The delay sequence is non-decreasing and every strategy plateaus
+    // (constant from k=1; linear and exponential once they clamp at
+    // max), so as soon as two consecutive delays match, the rest of the
+    // schedule is arithmetic and the tail closes in one step. Without
+    // that, a peer dead for a month at a 60s cap would cost ~43k
+    // iterations here.
+    let mut attempt = 0u64; // retries fired so far
+    let mut cum = 0u64; // elapsed_to(attempt)
+    let mut prev_delay = 0u64;
+
+    for k in 1u64.. {
+        let delay = backoff_delay_ms(cfg, k);
+        if delay == 0 {
+            return RetryState {
+                attempt,
+                next_attempt_at: Some(failing_since.saturating_add(cum)),
+                exhausted: false,
+            };
+        }
+        if k > 1 && delay == prev_delay {
+            // Plateaued: every remaining retry costs exactly `delay`,
+            // and cum <= elapsed still holds (we'd have returned
+            // otherwise).
+            let extra = (elapsed - cum) / delay;
+            attempt += extra;
+            cum = cum.saturating_add(extra.saturating_mul(delay));
+            return RetryState {
+                attempt,
+                next_attempt_at: Some(failing_since.saturating_add(cum.saturating_add(delay))),
+                exhausted: false,
+            };
+        }
+        let next = cum.saturating_add(delay);
+        if next > elapsed {
+            return RetryState {
+                attempt,
+                next_attempt_at: Some(failing_since.saturating_add(next)),
+                exhausted: false,
+            };
+        }
+        cum = next;
+        attempt = k;
+        prev_delay = delay;
+    }
+    unreachable!("the schedule walk returns from inside the loop")
 }
 
 /// Decoded §2.1 maintain-request. `raw` preserves the original params data
@@ -212,15 +386,36 @@ struct MaintainParams {
 
 struct SessionState {
     params: MaintainParams,
-    /// Consecutive failed reconnect attempts since the last establish.
-    attempt: u64,
+    /// FALLBACK episode start (ms since epoch; `None` = not failing) for
+    /// the derived §2.2 pacing. The AUTHORITATIVE stamp is the §3.13
+    /// status entity's `failing_since`, written by the demotion seam and
+    /// read back from the tree — that is the copy that survives a
+    /// restart, and the one [`NetworkHandler::retry_state`] prefers.
+    ///
+    /// This exists because a peer that never connected has no demotion
+    /// transition to stamp: a failed DIAL writes no status entity (only
+    /// a transport error on an established connection does). Without a
+    /// local stamp, its pacing would restart from `min_ms` on every
+    /// attempt. Whether a failed dial against a MAINTAINED peer should
+    /// itself write a §3.13 demotion is a real cross-impl question —
+    /// logged in `docs/SPEC-AMBIGUITIES.md`; the Go seat routed the same
+    /// question (`docs/validation/spec-issues/`
+    /// `2026-07-16-failing-since-never-connected.md`) and holds this same
+    /// interim. Until it is ruled, this keeps the never-connected curve
+    /// growing without inventing a write site.
+    failing_since: Option<u64>,
     /// Monotonic token for pending backoff timers: a fired timer whose
     /// captured epoch is stale (superseded schedule or teardown) bails.
     sched_epoch: u64,
     subscription_ids: Vec<String>,
     graph_installed: bool,
-    /// The remote's identity hash — the status-path key. Set on the first
-    /// successful establish.
+    /// The remote's identity hash — the status-path key. Derived from
+    /// the `peer_id` at session creation (see
+    /// [`identity_hash_from_peer_id`]), so the §3.13 status entity is
+    /// readable with no live connection; re-confirmed from the binding
+    /// on each successful establish. `None` only for a SHA-256-form
+    /// `peer_id` that has never connected — its key isn't derivable
+    /// from the string.
     remote_hash: Option<Hash>,
 }
 
@@ -301,11 +496,16 @@ impl NetworkHandler {
             session_id,
             state: Mutex::new(SessionState {
                 params,
-                attempt: 0,
+                failing_since: None,
                 sched_epoch: 0,
                 subscription_ids: Vec::new(),
                 graph_installed: false,
-                remote_hash: None,
+                // Derived from the peer_id, NOT waited for from an
+                // establish: a session created beside an already-failing
+                // peer must be able to read the tree's `failing_since`
+                // on its very first retry — including in a process that
+                // restarted and has never seen this peer connect.
+                remote_hash: identity_hash_from_peer_id(peer_id),
             }),
         });
         sessions.insert(peer_id.to_string(), session.clone());
@@ -377,6 +577,59 @@ impl NetworkHandler {
         let entity = self.content_store.get(&hash)?;
         decode_text_field(&entity.data, "status")
     }
+
+    /// The §3.13 status entity's `failing_since` for a maintained peer —
+    /// the authoritative, restart-surviving episode start.
+    fn read_failing_since(&self, session: &Session) -> Option<u64> {
+        let remote_hash = session.state.lock().unwrap().remote_hash?;
+        let hash = self.location_index.get(&self.status_path(&remote_hash))?;
+        let entity = self.content_store.get(&hash)?;
+        decode_uint_field(&entity.data, "failing_since")
+    }
+
+    /// Derive the §2.2 pacing for the session's current failure episode
+    /// as of `now_ms`, and report the episode start it used.
+    ///
+    /// Nothing counts attempts. The episode start is the only state, and
+    /// the TREE's `failing_since` wins when present: it is durable, so a
+    /// process that restarts beside a long-dead peer re-derives a large
+    /// attempt count and a max-length wait instead of redialing in
+    /// `min_ms`. The session's own stamp is only the fallback for a peer
+    /// that never connected (see [`SessionState::failing_since`]).
+    ///
+    /// Returns `None` for the episode start when no episode is on record
+    /// anywhere — a caller that has just observed a failure and finds
+    /// none is starting one.
+    fn retry_state(&self, session: &Session, now_ms: u64) -> (RetryState, Option<u64>) {
+        let failing_since = self
+            .read_failing_since(session)
+            .or_else(|| session.state.lock().unwrap().failing_since);
+        let cfg = session.state.lock().unwrap().params.backoff.clone();
+        (
+            derive_retry_state(&cfg, failing_since, now_ms),
+            failing_since,
+        )
+    }
+}
+
+/// The §3.13 status-path key for a remote peer, derived from its
+/// `peer_id` alone (Go `types.ComputePeerIdentityHashFromPeerID`).
+///
+/// A PURE derivation, deliberately: the status path must be resolvable
+/// with no live connection and no prior establish, because the whole
+/// point of the durable `failing_since` stamp is that a process which
+/// restarts beside a long-dead peer can read back the episode it never
+/// witnessed. Keying the path off a pooled binding (`identity_hash_of`)
+/// would make the stamp readable only while connected — precisely when
+/// it isn't needed.
+///
+/// `None` for a SHA-256-form `peer_id`, which is a fingerprint: the
+/// public key must come from a separate exchange, so the hash is not
+/// derivable from the string.
+fn identity_hash_from_peer_id(peer_id: &str) -> Option<Hash> {
+    let (public_key, key_type_byte) = entity_crypto::PeerId::from(peer_id).derive_public_key()?;
+    let key_type = entity_crypto::KeyType::from_byte(key_type_byte).ok()?;
+    entity_crypto::peer_identity_hash_with_key_type(&public_key, key_type).ok()
 }
 
 fn new_session_id() -> String {
@@ -592,15 +845,20 @@ impl NetworkHandler {
         match link.ensure_connected(&peer_id, address.as_deref()).await {
             Ok(conn) => {
                 let mut st = session.state.lock().unwrap();
-                st.attempt = 0;
+                // Recovery ends the failure episode. The establish path
+                // already cleared the TREE's stamp (the `connected` write
+                // omits it); this clears the never-connected fallback, so
+                // the next episode starts a fresh curve rather than
+                // resuming this one.
+                st.failing_since = None;
                 st.params = params;
                 st.remote_hash = Some(conn.identity_hash);
             }
             Err(e) => {
                 if existed && reconnect_enabled {
                     // Re-entry from the backoff continuation: keep the
-                    // retry loop alive — re-install the consumed one-shot
-                    // and schedule the next delayed advance.
+                    // retry loop alive — re-arm the standing resident and
+                    // schedule the next derived advance.
                     if let Err(arm_err) = self.arm_backoff_retry(ctx, &session, &link) {
                         tracing::warn!(
                             peer = %peer_id,
@@ -608,11 +866,36 @@ impl NetworkHandler {
                             "maintain-peer: re-arm backoff failed"
                         );
                     }
-                } else if !existed {
+                    // 200, not 502 (arch ruling 2). maintain-peer's contract
+                    // is MAINTAIN, not "connect now": with the retry armed the
+                    // operation did what it promises — the relationship is
+                    // being kept alive, and the peer being unreachable this
+                    // instant is the condition it exists to handle, not a
+                    // failure of it.
+                    //
+                    // 502 here also made the backoff continuation's own
+                    // re-EXECUTE look like a failed chain dispatch, so the
+                    // engine bound a lost marker per retry: an error record
+                    // for the retry loop working correctly. With ruling 3's
+                    // `on_error` on the on-disconnect trigger, this is the
+                    // other half of taking a dead peer's marker tree to empty.
+                    //
+                    // No `status` field on the result — that would rebuild the
+                    // connected/disconnected mirror §3.13 already owns.
+                    tracing::debug!(
+                        peer = %peer_id,
+                        error = %e,
+                        "maintain-peer: unreachable, retry armed — 200 (maintain, not connect-now)"
+                    );
+                    return self.maintain_result(&session);
+                }
+                if !existed {
                     // First imperative call failed — no session, no graph
                     // (§4.1 step 1's 502 contract).
                     self.drop_session(&peer_id);
                 }
+                // 502 stands for `reconnect: false`, where "connect now" IS
+                // the whole contract and there is no retry to succeed later.
                 return Ok(error_result(
                     STATUS_BAD_GATEWAY,
                     "connection_failed",
@@ -678,16 +961,27 @@ impl NetworkHandler {
         }
 
         // 6. Session info (§2.4).
-        let (sub_ids, _) = {
-            let st = session.state.lock().unwrap();
-            (st.subscription_ids.clone(), ())
-        };
+        self.maintain_result(&session)
+    }
+
+    /// The §2.4 `maintain-result`. Returned by BOTH maintain-peer exits that
+    /// keep the relationship: a live establish, and an armed re-entry against
+    /// an unreachable peer (ruling 2 — the contract is maintain, not
+    /// connect-now, so both are 200 and both describe the same session).
+    ///
+    /// There is deliberately no `status` field: that would rebuild the
+    /// connected/disconnected mirror §3.13 already owns.
+    fn maintain_result(&self, session: &Session) -> Result<HandlerResult, HandlerError> {
+        let sub_ids = session.state.lock().unwrap().subscription_ids.clone();
         let result_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
             (
                 entity_ecf::text("chain_id"),
                 entity_ecf::text(&session.chain_id),
             ),
-            (entity_ecf::text("peer_id"), entity_ecf::text(&peer_id)),
+            (
+                entity_ecf::text("peer_id"),
+                entity_ecf::text(&session.peer_id),
+            ),
             (
                 entity_ecf::text("session_id"),
                 entity_ecf::text(&session.session_id),
@@ -743,7 +1037,9 @@ impl NetworkHandler {
         };
         match link.ensure_connected(&peer_id, address.as_deref()).await {
             Ok(_) => {
-                session.state.lock().unwrap().attempt = 0;
+                // Recovery ends the failure episode (see maintain-peer's
+                // establish branch).
+                session.state.lock().unwrap().failing_since = None;
                 outcome_result("reconnected")
             }
             Err(e) => {
@@ -884,15 +1180,29 @@ impl NetworkHandler {
         drop(st);
         let reconnect_params = entity_ecf::to_ecf(&entity_ecf::Value::Map(reconnect_fields));
 
-        // Standing on-disconnect trigger (result_field null, remaining
-        // null). No on_error: a failed reconnect dispatch binds the §3.10
-        // lost-error marker — retry pacing is the handler's job.
+        // Standing on-disconnect trigger (result_field null, remaining null),
+        // carrying an `on_error` to the backoff seam (arch ruling 3).
+        //
+        // Without it, a failed `reconnect` is a non-2xx with no `on_error`,
+        // so the engine binds a §3.10 lost-error marker per attempt — ~1,440
+        // nodes/day against a peer that stays dead, for a failure that is
+        // entirely expected and already handled. That was a category error:
+        // the marker is for EXCEPTIONAL failure, and the fix belongs at the
+        // source rather than in the marker's retention policy. A dead peer's
+        // marker tree is now empty.
+        //
+        // Routing an `on_error` at `system/inbox/*` is correct here per ruling
+        // 4 precisely because the error is MEANT to drive the next step: this
+        // failure IS the retry trigger. The trap that guidance guards against
+        // is unintended advancement; a chain-errors sink is for passive
+        // observation, which this is not.
+        let backoff_path = self.backoff_path(&peer_id);
         self.bind_continuation(
             session,
             &self.on_disconnect_path(&peer_id),
             "reconnect",
             reconnect_params,
-            None,
+            Some((backoff_path.as_str(), "advance")),
             grant_hash,
         )?;
         // Standing backoff resident re-EXECUTing maintain-peer with the
@@ -943,13 +1253,18 @@ impl NetworkHandler {
     /// Stores a `system/continuation` entity and binds it at `path` via a
     /// handler-authorized write. The bind's `ExecutionContext` carries the
     /// W6 attribution (handler grant authorized this write).
+    /// Every continuation in the §4.1 graph is STANDING
+    /// (`remaining_executions` absent — arch ruling 1), so this takes no
+    /// execution count: there is no longer a caller that wants one, and a
+    /// one-shot cannot survive this graph anyway (the re-install lands inside
+    /// the dispatch while the advance's consume runs after it).
     fn bind_continuation(
         &self,
         session: &Session,
         path: &str,
         operation: &str,
         params_bytes: Vec<u8>,
-        remaining_executions: Option<u64>,
+        on_error: Option<(&str, &str)>,
         grant_hash: Hash,
     ) -> Result<(), String> {
         let mut fields = vec![
@@ -974,10 +1289,15 @@ impl NetworkHandler {
                 entity_ecf::text(HANDLER_PATTERN),
             ),
         ];
-        if let Some(n) = remaining_executions {
+        // §3.5 `on_error` is a bare `system/delivery-spec` map — a typed
+        // struct field, not an entity wrapper.
+        if let Some((uri, operation)) = on_error {
             fields.push((
-                entity_ecf::text("remaining_executions"),
-                entity_ecf::integer(n as i64),
+                entity_ecf::text("on_error"),
+                entity_ecf::Value::Map(vec![
+                    (entity_ecf::text("operation"), entity_ecf::text(operation)),
+                    (entity_ecf::text("uri"), entity_ecf::text(uri)),
+                ]),
             ));
         }
         let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(fields));
@@ -1087,7 +1407,7 @@ impl NetworkHandler {
         Ok(())
     }
 
-    // --- §2.2 backoff pacing (impl-internal timer + attempt counter) ------
+    // --- §2.2 backoff pacing (derived; impl-internal timer) ---------------
 
     /// Re-installs the standing backoff continuation (idempotent — the
     /// advance no longer consumes it, ruling 1) and schedules its delayed
@@ -1102,6 +1422,10 @@ impl NetworkHandler {
             return Err("network handler grant not bound".to_string());
         };
         let raw = session.state.lock().unwrap().params.raw.clone();
+        // No `on_error` on the backoff resident itself: it re-EXECUTEs
+        // maintain-peer, whose own failure branch re-arms and reschedules.
+        // Routing its error back to `advance` would fire the next retry
+        // immediately and defeat the §2.2 pacing this exists to apply.
         self.bind_continuation(
             session,
             &self.backoff_path(&session.peer_id),
@@ -1114,27 +1438,90 @@ impl NetworkHandler {
         Ok(())
     }
 
-    /// After the computed delay, self-advance the backoff continuation,
-    /// which one-shot re-EXECUTEs maintain-peer. The advance is a
-    /// self-authored EXECUTE — no request context is alive when the timer
-    /// fires. A fired timer whose session was released (or superseded by a
-    /// newer schedule) bails on the epoch check.
+    /// The §2.2 give-up (ruling 6): an OPTIONAL bound was reached, so stop
+    /// retrying and write the terminal `disconnected` + `retry-exhausted`
+    /// status.
+    ///
+    /// The write matters as much as the stopping. Without it the loop simply
+    /// goes quiet and the peer's last status stays `suspect` forever — a
+    /// relationship that has been abandoned but still looks like one that is
+    /// trying, which is the worst of both readings for whoever is looking.
+    ///
+    /// Only reachable when a caller opted into a bound; retry-forever is the
+    /// normative default.
+    fn abandon_relationship(
+        &self,
+        session: &Arc<Session>,
+        link: &Arc<dyn PeerLink>,
+        state: &RetryState,
+        failing_since: u64,
+    ) {
+        // Supersede any pending timer: a fired advance after this point would
+        // retry a relationship we just recorded as abandoned.
+        session.state.lock().unwrap().sched_epoch += 1;
+        tracing::debug!(
+            peer = %session.peer_id,
+            attempt = state.attempt,
+            failing_since,
+            "reconnect: giving up after {} attempt(s) — §2.2 retry bound reached",
+            state.attempt,
+        );
+        let Some(remote_hash) = session.state.lock().unwrap().remote_hash else {
+            // No status-path key (a SHA-256-form peer_id that never
+            // connected): nothing to write the terminal status against.
+            return;
+        };
+        link.write_retry_exhausted(&session.peer_id, &remote_hash, failing_since);
+    }
+
+    /// At the DERIVED next-attempt time, self-advance the backoff
+    /// continuation, which one-shot re-EXECUTEs maintain-peer. The
+    /// advance is a self-authored EXECUTE — no request context is alive
+    /// when the timer fires. A fired timer whose session was released (or
+    /// superseded by a newer schedule) bails on the epoch check.
+    ///
+    /// The schedule is DERIVED, not counted (§2.2 / §A4, rulings 7/8):
+    /// the next attempt is a pure function of (`failing_since`, cfg,
+    /// now), so nothing here increments and nothing is written per
+    /// attempt. Opening an episode stamps `failing_since` once, which is
+    /// what a later restart re-reads.
     fn schedule_backoff_advance(&self, session: &Arc<Session>, link: &Arc<dyn PeerLink>) {
-        let (delay_ms, epoch, attempt) = {
+        let now = now_ms();
+        let (mut state, failing_since) = self.retry_state(session, now);
+        let failing_since = match failing_since {
+            Some(fs) => fs,
+            None => {
+                // No episode on record anywhere: this failure opens one.
+                // Stamping it here (rather than counting) is what makes
+                // the delay grow across attempts — every later attempt
+                // re-derives from this instant.
+                session.state.lock().unwrap().failing_since = Some(now);
+                state = self.retry_state(session, now).0;
+                now
+            }
+        };
+
+        // The §2.2 give-up, if the caller opted into a bound (ruling 6).
+        // Derived like the pacing, so nothing had to remember to record that
+        // we gave up. Never taken under the default config, which is
+        // retry-forever.
+        let Some(next_attempt_at) = state.next_attempt_at else {
+            self.abandon_relationship(session, link, &state, failing_since);
+            return;
+        };
+
+        let delay_ms = next_attempt_at.saturating_sub(now);
+        let epoch = {
             let mut st = session.state.lock().unwrap();
-            st.attempt += 1;
             st.sched_epoch += 1;
-            (
-                backoff_delay_ms(&st.params.backoff, st.attempt),
-                st.sched_epoch,
-                st.attempt,
-            )
+            st.sched_epoch
         };
         tracing::debug!(
             peer = %session.peer_id,
-            attempt,
+            attempt = state.attempt,
+            failing_since,
             delay_ms,
-            "reconnect: attempt failed, scheduling backoff retry"
+            "reconnect: attempt failed, scheduling derived backoff retry"
         );
         let weak = self.self_weak.read().unwrap().clone();
         let link_for_task = link.clone();
@@ -1514,6 +1901,20 @@ fn decode_maintain_request(data: &[u8]) -> Result<MaintainParams, String> {
                                     params.backoff.strategy = s.to_string();
                                 }
                             }
+                            // The OPTIONAL §2.2 give-up bounds (ruling 6).
+                            // Absent ⇒ retry-forever, which is the normative
+                            // default: a peer offline for a week and coming
+                            // back is the P2P norm.
+                            Some("max_attempts") => {
+                                if let Some(n) = bv.as_integer() {
+                                    params.backoff.max_attempts = u64::try_from(n).ok();
+                                }
+                            }
+                            Some("max_elapsed_ms") => {
+                                if let Some(n) = bv.as_integer() {
+                                    params.backoff.max_elapsed_ms = u64::try_from(n).ok();
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -1641,7 +2042,678 @@ mod tests {
             min_ms,
             max_ms,
             strategy: strategy.to_string(),
+            ..Default::default()
         }
+    }
+
+    // ---------------------------------------------------------------
+    // The §2.2 retry pacing, as a vector table (rulings 7/8).
+    //
+    // `derive_retry_state` is a pure function of (failing_since, backoff
+    // config, now), so the whole surface tests as data: no peers, no
+    // sockets, no timing flake. These vectors are also the convergence
+    // artifact — the shape a sibling impl reproduces is a table of
+    // inputs and outputs, not a prose description of a state machine.
+    // Ported from the Go seat's `core/types/network_backoff_test.go`,
+    // which is the pinned table; the two must agree value-for-value.
+    //
+    // Semantics pinned here (the rulings, in executable form):
+    //   - k is 1-INDEXED: delay(1) is the wait before the FIRST retry.
+    //   - attempt counts retries FIRED — 0 in the gap between the
+    //     failure and the first retry coming due.
+    //   - elapsed_to(0) = 0.
+    //   - The boundary is INCLUSIVE: at exactly elapsed_to(k), retry k
+    //     has fired.
+    //   - No jitter in v1: same inputs, same outputs, always.
+    // ---------------------------------------------------------------
+
+    /// An arbitrary but realistic `failing_since` (ms since epoch). The
+    /// derivation only ever uses `now - failing_since`, so the absolute
+    /// value is immaterial — it is fixed so a failure prints a stable
+    /// number.
+    const FS_BASE: u64 = 1_700_000_000_000;
+
+    /// The §2.2 default config: exponential, min 1s, max 60s.
+    /// Delays:     1s, 2s, 4s, 8s, 16s, 32s, 60s (capped), 60s, …
+    /// elapsed_to: 1s, 3s, 7s, 15s, 31s, 63s, 123s, 183s, …
+    fn default_backoff() -> BackoffCfg {
+        BackoffCfg::default()
+    }
+
+    fn strategy_cfg(strategy: &str, min_ms: u64) -> BackoffCfg {
+        BackoffCfg {
+            min_ms,
+            strategy: strategy.to_string(),
+            ..Default::default()
+        }
+    }
+
+    /// `delay(k)` across every strategy, clamp, and overflow edge.
+    #[test]
+    fn a12_backoff_delay_vectors() {
+        let d = default_backoff();
+        let cases: Vec<(&str, BackoffCfg, u64, u64)> = vec![
+            ("default k=0 is no wait", d.clone(), 0, 0),
+            ("default k=1 is min", d.clone(), 1, 1000),
+            ("default k=2 doubles", d.clone(), 2, 2000),
+            ("default k=3 doubles", d.clone(), 3, 4000),
+            ("default k=6 doubles", d.clone(), 6, 32000),
+            ("default k=7 clamps at max", d.clone(), 7, 60000),
+            ("default k=8 stays clamped", d.clone(), 8, 60000),
+            ("default k=100 stays clamped", d.clone(), 100, 60000),
+            (
+                "constant ignores k",
+                strategy_cfg("constant", 5000),
+                1,
+                5000,
+            ),
+            (
+                "constant ignores k (later)",
+                strategy_cfg("constant", 5000),
+                9,
+                5000,
+            ),
+            ("linear k=1", strategy_cfg("linear", 1000), 1, 1000),
+            ("linear k=3", strategy_cfg("linear", 1000), 3, 3000),
+            (
+                "linear clamps at max",
+                strategy_cfg("linear", 1000),
+                100,
+                60000,
+            ),
+            // A config with max < min is not a licence to wait less than
+            // min: max is raised to min, so the delay is min flat.
+            ("inverted min/max yields min", cfg(5000, 1000, ""), 1, 5000),
+            ("inverted min/max stays min", cfg(5000, 1000, ""), 5, 5000),
+            // Saturating arithmetic: a huge k must not wrap into a small
+            // delay.
+            (
+                "linear cannot overflow into a short delay",
+                cfg(u64::MAX / 2, u64::MAX, "linear"),
+                4,
+                u64::MAX,
+            ),
+            (
+                "exponential cannot overflow into a short delay",
+                cfg(u64::MAX / 2, u64::MAX, "exponential"),
+                4,
+                u64::MAX,
+            ),
+            ("degenerate zero min", cfg(0, 0, ""), 3, 0),
+        ];
+        for (name, c, k, want) in cases {
+            assert_eq!(backoff_delay_ms(&c, k), want, "{name}: delay({k})");
+        }
+    }
+
+    /// One `derive_retry_state` vector: (name, cfg, failing_since, now,
+    /// want_attempt, want_next_attempt_at).
+    type PacingVector = (&'static str, BackoffCfg, Option<u64>, u64, u64, Option<u64>);
+
+    /// `derive_retry_state` across the default curve, each strategy, the
+    /// restart-hammering case, and the edges.
+    #[test]
+    fn a12_derive_retry_state_vectors() {
+        let d = default_backoff();
+        let cases: Vec<PacingVector> = vec![
+            // --- the default curve; elapsed_to = 1s,3s,7s,15s,31s,63s,123s
+            (
+                "at the failure, nothing has fired",
+                d.clone(),
+                Some(FS_BASE),
+                FS_BASE,
+                0,
+                Some(FS_BASE + 1000),
+            ),
+            (
+                "1ms before the first retry",
+                d.clone(),
+                Some(FS_BASE),
+                FS_BASE + 999,
+                0,
+                Some(FS_BASE + 1000),
+            ),
+            (
+                "exactly at the first retry (inclusive)",
+                d.clone(),
+                Some(FS_BASE),
+                FS_BASE + 1000,
+                1,
+                Some(FS_BASE + 3000),
+            ),
+            (
+                "between first and second",
+                d.clone(),
+                Some(FS_BASE),
+                FS_BASE + 2999,
+                1,
+                Some(FS_BASE + 3000),
+            ),
+            (
+                "exactly at the second",
+                d.clone(),
+                Some(FS_BASE),
+                FS_BASE + 3000,
+                2,
+                Some(FS_BASE + 7000),
+            ),
+            // The worked example from derive_retry_state's doc comment.
+            (
+                "worked example: 5s elapsed",
+                d.clone(),
+                Some(FS_BASE),
+                FS_BASE + 5000,
+                2,
+                Some(FS_BASE + 7000),
+            ),
+            (
+                "exactly at the third",
+                d.clone(),
+                Some(FS_BASE),
+                FS_BASE + 7000,
+                3,
+                Some(FS_BASE + 15000),
+            ),
+            (
+                "exactly at the sixth",
+                d.clone(),
+                Some(FS_BASE),
+                FS_BASE + 63000,
+                6,
+                Some(FS_BASE + 123000),
+            ),
+            // Crossing into the plateau: delay(7) is the first clamped delay.
+            (
+                "exactly at the seventh, on the plateau",
+                d.clone(),
+                Some(FS_BASE),
+                FS_BASE + 123000,
+                7,
+                Some(FS_BASE + 183000),
+            ),
+            (
+                "mid-plateau",
+                d.clone(),
+                Some(FS_BASE),
+                FS_BASE + 150000,
+                7,
+                Some(FS_BASE + 183000),
+            ),
+            // --- constant: elapsed_to = 5s, 10s, 15s, …
+            (
+                "constant, before the first",
+                strategy_cfg("constant", 5000),
+                Some(FS_BASE),
+                FS_BASE + 4999,
+                0,
+                Some(FS_BASE + 5000),
+            ),
+            (
+                "constant, two fired",
+                strategy_cfg("constant", 5000),
+                Some(FS_BASE),
+                FS_BASE + 12000,
+                2,
+                Some(FS_BASE + 15000),
+            ),
+            // --- linear: delays 1s,2s,3s,4s,5s → elapsed_to = 1s,3s,6s,10s,15s
+            (
+                "linear, three fired",
+                strategy_cfg("linear", 1000),
+                Some(FS_BASE),
+                FS_BASE + 9999,
+                3,
+                Some(FS_BASE + 10000),
+            ),
+            (
+                "linear, four fired (inclusive)",
+                strategy_cfg("linear", 1000),
+                Some(FS_BASE),
+                FS_BASE + 10000,
+                4,
+                Some(FS_BASE + 15000),
+            ),
+            // --- THE restart-hammering vector.
+            //
+            // A peer dead for 30 days. The point is the derived delay:
+            // the next retry is one max-length (60s) interval out, NOT
+            // min_ms. An in-memory attempt counter reset by the restart
+            // would redial in 1s here and keep doing so forever — which
+            // is the bug this whole design deletes.
+            //
+            // elapsed_to(7) = 123000 (last pre-plateau), then 60s/retry:
+            //   extra   = (2592000000 - 123000) / 60000 = 43197
+            //   attempt = 7 + 43197                     = 43204
+            //   cum     = 123000 + 43197*60000          = 2591943000
+            //   next    = FS_BASE + 2591943000 + 60000
+            (
+                "a peer dead for 30 days resumes the curve, it does not hammer",
+                d.clone(),
+                Some(FS_BASE),
+                FS_BASE + 2592000000,
+                43204,
+                Some(FS_BASE + 2592003000),
+            ),
+            // --- the OPTIONAL §2.2 bounds, while still within them:
+            // pacing is unaffected. Reaching them is the exhaustion
+            // table's job.
+            (
+                "max_attempts not yet reached",
+                BackoffCfg {
+                    max_attempts: Some(3),
+                    ..Default::default()
+                },
+                Some(FS_BASE),
+                FS_BASE + 3000,
+                2,
+                Some(FS_BASE + 7000),
+            ),
+            (
+                "max_elapsed_ms not yet reached",
+                BackoffCfg {
+                    max_elapsed_ms: Some(10000),
+                    ..Default::default()
+                },
+                Some(FS_BASE),
+                FS_BASE + 3000,
+                2,
+                Some(FS_BASE + 7000),
+            ),
+            // --- edges
+            (
+                "no episode: failing_since unset",
+                d.clone(),
+                None,
+                FS_BASE + 5000,
+                0,
+                None,
+            ),
+            (
+                "clock skew: now before failing_since",
+                d.clone(),
+                Some(FS_BASE),
+                FS_BASE - 10000,
+                0,
+                Some(FS_BASE + 1000),
+            ),
+            (
+                "degenerate zero delay is always due, never counted",
+                cfg(0, 0, ""),
+                Some(FS_BASE),
+                FS_BASE + 100000,
+                0,
+                Some(FS_BASE),
+            ),
+        ];
+        for (name, c, failing_since, now, want_attempt, want_next) in cases {
+            let got = derive_retry_state(&c, failing_since, now);
+            assert_eq!(got.attempt, want_attempt, "{name}: attempt");
+            assert_eq!(got.next_attempt_at, want_next, "{name}: next_attempt_at");
+        }
+    }
+
+    /// The OPTIONAL §2.2 give-up bounds. Retry-forever is the normative
+    /// default, so the headline vector is the one proving the default
+    /// never gives up: a peer dead for a year is still retrying.
+    #[test]
+    fn a12_derive_retry_state_exhaustion_vectors() {
+        const YEAR: u64 = 365 * 24 * 60 * 60 * 1000;
+        let attempts = |n: u64| BackoffCfg {
+            max_attempts: Some(n),
+            ..Default::default()
+        };
+        let elapsed = |n: u64| BackoffCfg {
+            max_elapsed_ms: Some(n),
+            ..Default::default()
+        };
+        // (name, cfg, now, want_exhausted, want_attempt)
+        let cases: Vec<(&str, BackoffCfg, u64, bool, u64)> = vec![
+            // Delays 1s,2s,4s,8s…; elapsed_to 1s,3s,7s,15s,31s…
+            // 525604 = the 7 pre-plateau retries + (year - 123s)/60s at
+            // the cap. The number is incidental; `exhausted` staying
+            // false is the point.
+            (
+                "default config never exhausts, even after a year",
+                default_backoff(),
+                FS_BASE + YEAR,
+                false,
+                525604,
+            ),
+            (
+                "max_attempts=3, two fired",
+                attempts(3),
+                FS_BASE + 3000,
+                false,
+                2,
+            ),
+            (
+                "max_attempts=3, exactly three fired",
+                attempts(3),
+                FS_BASE + 7000,
+                true,
+                3,
+            ),
+            // elapsed_to(5)=31s <= 60s < elapsed_to(6)=63s, so 5 fired.
+            (
+                "max_attempts=3, well past",
+                attempts(3),
+                FS_BASE + 60000,
+                true,
+                5,
+            ),
+            (
+                "max_attempts=0 gives up immediately",
+                attempts(0),
+                FS_BASE,
+                true,
+                0,
+            ),
+            (
+                "max_elapsed_ms=10s, before",
+                elapsed(10000),
+                FS_BASE + 9999,
+                false,
+                3,
+            ),
+            (
+                "max_elapsed_ms=10s, exactly at (inclusive)",
+                elapsed(10000),
+                FS_BASE + 10000,
+                true,
+                3,
+            ),
+            (
+                "max_elapsed_ms=10s, past",
+                elapsed(10000),
+                FS_BASE + 11000,
+                true,
+                3,
+            ),
+            // Whichever bound trips first wins.
+            (
+                "both set, attempts trips first",
+                BackoffCfg {
+                    max_attempts: Some(2),
+                    max_elapsed_ms: Some(600000),
+                    ..Default::default()
+                },
+                FS_BASE + 3000,
+                true,
+                2,
+            ),
+            (
+                "both set, elapsed trips first",
+                BackoffCfg {
+                    max_attempts: Some(99),
+                    max_elapsed_ms: Some(5000),
+                    ..Default::default()
+                },
+                FS_BASE + 5000,
+                true,
+                2,
+            ),
+        ];
+        for (name, c, now, want_exhausted, want_attempt) in cases {
+            let got = derive_retry_state(&c, Some(FS_BASE), now);
+            assert_eq!(got.exhausted, want_exhausted, "{name}: exhausted");
+            assert_eq!(got.attempt, want_attempt, "{name}: attempt");
+            // An exhausted episode has no next attempt: a Some here
+            // would have the caller schedule a retry it just decided
+            // not to make.
+            if got.exhausted {
+                assert_eq!(
+                    got.next_attempt_at, None,
+                    "{name}: exhausted next_attempt_at"
+                );
+            } else {
+                assert!(
+                    got.next_attempt_at.is_some(),
+                    "{name}: live next_attempt_at"
+                );
+            }
+        }
+    }
+
+    /// The plateau shortcut is an optimisation, so it must agree exactly
+    /// with the naive schedule it replaces. This walks `elapsed_to` by
+    /// hand and compares.
+    #[test]
+    fn a12_derive_retry_state_matches_naive_schedule() {
+        // naive: the largest k with elapsed_to(k) <= elapsed, and the
+        // offset of retry k+1 — the definition, one retry at a time.
+        fn naive(c: &BackoffCfg, elapsed: u64) -> (u64, u64) {
+            let mut cum = 0u64;
+            for k in 1u64.. {
+                let next = cum + backoff_delay_ms(c, k);
+                if next > elapsed {
+                    return (k - 1, next);
+                }
+                cum = next;
+            }
+            unreachable!()
+        }
+        let cfgs = [
+            ("default exponential", default_backoff()),
+            ("constant 5s", strategy_cfg("constant", 5000)),
+            ("linear 1s", strategy_cfg("linear", 1000)),
+            ("tight cap", cfg(1000, 1500, "")),
+        ];
+        for (name, c) in cfgs {
+            for elapsed in (0..=400_000).step_by(250) {
+                let (want_attempt, want_next) = naive(&c, elapsed);
+                let got = derive_retry_state(&c, Some(FS_BASE), FS_BASE + elapsed);
+                assert_eq!(
+                    (got.attempt, got.next_attempt_at),
+                    (want_attempt, Some(FS_BASE + want_next)),
+                    "{name}: elapsed {elapsed} disagrees with the naive schedule"
+                );
+            }
+        }
+    }
+
+    /// Invariants that must hold for any config, at any point in an
+    /// episode.
+    #[test]
+    fn a12_derive_retry_state_invariants() {
+        let cfgs = [
+            default_backoff(),
+            strategy_cfg("constant", 5000),
+            strategy_cfg("linear", 1000),
+            cfg(5000, 1000, ""), // inverted
+            cfg(1, 3, ""),       // very tight
+        ];
+        for c in cfgs {
+            let mut prev_attempt = 0u64;
+            for elapsed in (0..=200_000).step_by(137) {
+                let now = FS_BASE + elapsed;
+                let got = derive_retry_state(&c, Some(FS_BASE), now);
+                let next = got
+                    .next_attempt_at
+                    .expect("live episode has a next attempt");
+                // The next retry is always still ahead: a derivation
+                // that returned a due-in-the-past time would spin the
+                // retry loop.
+                assert!(
+                    next > now,
+                    "{c:?} elapsed {elapsed}: next_attempt_at {next} is not after now {now}"
+                );
+                // attempt only ever grows as time passes in an episode.
+                assert!(
+                    got.attempt >= prev_attempt,
+                    "{c:?} elapsed {elapsed}: attempt went backwards, {prev_attempt} then {}",
+                    got.attempt
+                );
+                // The wait until the next retry never exceeds one
+                // max-length delay.
+                let wait = next - now;
+                assert!(
+                    wait <= c.max_ms.max(c.min_ms),
+                    "{c:?} elapsed {elapsed}: wait {wait} exceeds the max delay"
+                );
+                prev_attempt = got.attempt;
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // The restart-hammering seam (ruling 7).
+    //
+    // The vector table above proves the pure function resumes a long
+    // curve. These prove the HANDLER actually feeds it the durable
+    // stamp — which is the half that kills restart-hammering, and the
+    // half a pure-function table cannot see.
+    // ---------------------------------------------------------------
+
+    /// A peer whose `peer_id` is derivable gets its status-path key at
+    /// session creation, with no connection and no prior establish.
+    ///
+    /// This is load-bearing for the restart case: a process that
+    /// restarts beside a long-dead peer has never seen it connect, so a
+    /// `remote_hash` that only arrived on establish would leave the
+    /// durable stamp unreadable exactly when it is needed, and every
+    /// attempt would re-stamp `now` and redial at `min_ms` forever.
+    #[test]
+    fn a12_status_key_is_derivable_without_a_connection() {
+        let kp = entity_crypto::Keypair::from_seed([0x71; 32]);
+        assert_eq!(
+            identity_hash_from_peer_id(kp.peer_id().as_str()),
+            Some(kp.peer_identity_hash()),
+            "the status-path key must derive from the peer_id alone"
+        );
+        // A fingerprint peer_id carries no embedded key: not derivable,
+        // and honest about it rather than guessing a wrong path.
+        assert_eq!(identity_hash_from_peer_id("not-a-peer-id"), None);
+    }
+
+    /// THE restart-hammering vector, at the handler seam: a session that
+    /// has never connected, beside a status entity left by a previous
+    /// process, resumes that episode's curve instead of restarting it.
+    ///
+    /// Without the durable read this returns `attempt = 0` and a
+    /// `min_ms` delay — a fresh process redialing a month-dead peer
+    /// every second, forever.
+    #[test]
+    fn a12_retry_pacing_resumes_from_the_trees_stamp_after_a_restart() {
+        let content_store: Arc<dyn ContentStore> =
+            Arc::new(entity_store::MemoryContentStore::new());
+        let location_index: Arc<dyn LocationIndex> =
+            Arc::new(entity_store::MemoryLocationIndex::new());
+        let local = entity_crypto::Keypair::from_seed([0x72; 32]);
+        let remote = entity_crypto::Keypair::from_seed([0x73; 32]);
+        let remote_pid = remote.peer_id().as_str().to_string();
+
+        let handler = NetworkHandler::new(
+            content_store.clone(),
+            location_index.clone(),
+            local.peer_id().as_str().to_string(),
+        );
+
+        // A previous process recorded a failure episode 30 days ago and
+        // exited. All that survives is the tree.
+        let now = now_ms();
+        let failing_since = now - 2_592_000_000;
+        let status = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+            (
+                entity_ecf::text("failing_since"),
+                entity_ecf::Value::Integer(failing_since.into()),
+            ),
+            (entity_ecf::text("peer_id"), entity_ecf::text(&remote_pid)),
+            (entity_ecf::text("status"), entity_ecf::text("disconnected")),
+        ]));
+        let entity = Entity::new("system/peer/status", status).unwrap();
+        let hash = content_store.put(entity).unwrap();
+        location_index.set(&handler.status_path(&remote.peer_identity_hash()), hash);
+
+        // A fresh session, as a restarted process would create: never
+        // connected, no in-memory episode of its own.
+        let params = MaintainParams {
+            peer_id: remote_pid.clone(),
+            address: None,
+            reconnect: true,
+            resubscribe: true,
+            backoff: BackoffCfg::default(),
+            raw: Vec::new(),
+        };
+        let (session, existed) = handler.get_or_create_session(&remote_pid, params);
+        assert!(!existed, "precondition: a fresh session");
+        assert_eq!(
+            session.state.lock().unwrap().failing_since,
+            None,
+            "precondition: no in-memory episode survived the restart"
+        );
+
+        let (state, used) = handler.retry_state(&session, now);
+        assert_eq!(
+            used,
+            Some(failing_since),
+            "the tree's durable stamp must win: this is the copy that survives a restart"
+        );
+        // 30 days into the default curve — the numbers are the vector
+        // table's `a peer dead for 30 days` row, reached through the
+        // handler rather than the pure function.
+        assert_eq!(
+            state.attempt, 43204,
+            "must resume the curve, not restart it"
+        );
+        let wait = state.next_attempt_at.unwrap() - now;
+        assert!(
+            wait > 1000,
+            "a restarted process must not redial at min_ms — waited {wait}ms"
+        );
+        assert!(
+            wait <= 60_000,
+            "the wait never exceeds one max-length delay, got {wait}ms"
+        );
+    }
+
+    /// The tree wins over the session's fallback stamp. The fallback
+    /// exists only for a peer that never connected (no demotion
+    /// transition to stamp); it must never shadow the durable copy.
+    #[test]
+    fn a12_tree_stamp_wins_over_the_session_fallback() {
+        let content_store: Arc<dyn ContentStore> =
+            Arc::new(entity_store::MemoryContentStore::new());
+        let location_index: Arc<dyn LocationIndex> =
+            Arc::new(entity_store::MemoryLocationIndex::new());
+        let local = entity_crypto::Keypair::from_seed([0x74; 32]);
+        let remote = entity_crypto::Keypair::from_seed([0x75; 32]);
+        let remote_pid = remote.peer_id().as_str().to_string();
+        let handler = NetworkHandler::new(
+            content_store.clone(),
+            location_index.clone(),
+            local.peer_id().as_str().to_string(),
+        );
+
+        let now = now_ms();
+        let tree_stamp = now - 63_000; // 6 retries fired on the default curve
+        let status = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+            (
+                entity_ecf::text("failing_since"),
+                entity_ecf::Value::Integer(tree_stamp.into()),
+            ),
+            (entity_ecf::text("peer_id"), entity_ecf::text(&remote_pid)),
+            (entity_ecf::text("status"), entity_ecf::text("suspect")),
+        ]));
+        let hash = content_store
+            .put(Entity::new("system/peer/status", status).unwrap())
+            .unwrap();
+        location_index.set(&handler.status_path(&remote.peer_identity_hash()), hash);
+
+        let params = MaintainParams {
+            peer_id: remote_pid.clone(),
+            address: None,
+            reconnect: true,
+            resubscribe: true,
+            backoff: BackoffCfg::default(),
+            raw: Vec::new(),
+        };
+        let (session, _) = handler.get_or_create_session(&remote_pid, params);
+        // A younger in-memory fallback that would restart the curve.
+        session.state.lock().unwrap().failing_since = Some(now);
+
+        let (state, used) = handler.retry_state(&session, now);
+        assert_eq!(used, Some(tree_stamp), "the durable stamp must win");
+        assert_eq!(state.attempt, 6);
     }
 
     /// §2.2 delay table across the three strategies, clamped to max_ms.

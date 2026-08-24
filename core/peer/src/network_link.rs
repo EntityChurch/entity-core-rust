@@ -22,6 +22,7 @@ use entity_network::{ConnectedPeer, PeerLink, ScheduledTask};
 
 use crate::peer_status::{
     PeerStatusData, PEER_STATUS_DISCONNECTED, PEER_STATUS_REASON_LOCAL_RELEASE,
+    PEER_STATUS_REASON_RETRY_EXHAUSTED,
 };
 use crate::{connection, connection_state, liveness, remote, runtime, PeerShared};
 
@@ -160,6 +161,38 @@ impl PeerLink for PeerNetworkLink {
         // `local-release`) matches the cohort shape.
         let mut data = PeerStatusData::bare(peer_id, PEER_STATUS_DISCONNECTED);
         data.reason = Some(PEER_STATUS_REASON_LOCAL_RELEASE.to_string());
+        liveness::write_peer_status(
+            self.shared.content_store.as_ref(),
+            self.shared.location_index.as_ref(),
+            self.local_pid(),
+            identity_hash,
+            &data,
+        );
+        connection_state::mark_connection_closed(
+            self.shared.content_store.as_ref(),
+            self.shared.location_index.as_ref(),
+            self.local_pid(),
+            identity_hash,
+        );
+    }
+
+    fn write_retry_exhausted(&self, peer_id: &str, identity_hash: &Hash, failing_since: u64) {
+        // §2.2 give-up (ruling 6). `last_error`/`last_seen` carry forward from
+        // the episode's last demotion — the record an operator reads next to
+        // "we stopped trying" should say what was failing, not just that we
+        // gave up. `failing_since` is preserved, not cleared: it says how long
+        // we tried before abandoning.
+        let prev = liveness::read_peer_status(
+            self.shared.content_store.as_ref(),
+            self.shared.location_index.as_ref(),
+            self.local_pid(),
+            identity_hash,
+        );
+        let mut data = PeerStatusData::bare(peer_id, PEER_STATUS_DISCONNECTED);
+        data.reason = Some(PEER_STATUS_REASON_RETRY_EXHAUSTED.to_string());
+        data.last_error = prev.as_ref().and_then(|d| d.last_error.clone());
+        data.last_seen = prev.as_ref().and_then(|d| d.last_seen);
+        data.failing_since = Some(failing_since);
         liveness::write_peer_status(
             self.shared.content_store.as_ref(),
             self.shared.location_index.as_ref(),

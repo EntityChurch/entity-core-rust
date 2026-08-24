@@ -239,6 +239,14 @@ async fn try_advance_continuation_async(
             targets: vec![path.to_string()],
             exclude: vec![],
         }),
+        // PROPOSAL-CONTINUATION-STANDING-MODEL §3 / standing-model O1: this
+        // advance is a **reactive delivery trigger** — the inbox route advancing
+        // a continuation as a consequence of a delivered message. Declaring it
+        // in-band (rather than an impl inferring it from the dispatch seam) is
+        // the pinned O1 signal the cohort converges on. The advance runs under
+        // the continuation's own `dispatch_capability`; the deliverer never
+        // needs advance-cap on the continuation path.
+        reactive_trigger: true,
         ..Default::default()
     };
 
@@ -420,6 +428,7 @@ mod tests {
             handler_grant_hash: None,
             bounds: None,
             is_external: false,
+            reactive_trigger: false,
         }
     }
 

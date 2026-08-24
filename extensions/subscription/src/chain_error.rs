@@ -11,7 +11,8 @@
 use std::sync::Arc;
 
 use entity_entity::Entity;
-use entity_store::{ContentStore, LocationIndex};
+use entity_hash::Hash;
+use entity_store::{ContentStore, ExecutionContext, LocationIndex};
 
 /// Reason codes for limit-suppression cases (§4.6).
 pub(crate) const REASON_MAX_EVENTS_REACHED: &str = "max_events_reached";
@@ -26,31 +27,41 @@ const REASON_RECV_TIMEOUT: &str = "recv_timeout";
 const REASON_CONNECTION_BROKEN: &str = "connection_broken";
 const REASON_PROTOCOL_ERROR: &str = "protocol_error";
 
-/// Path-safety sanitizer per EXTENSION-CONTINUATION v1.19 §3.10.5
-/// (V7 §1.4 path-segment rules). See note in module header re: duplication.
+/// Path-safety sanitizer for the `{reason}` coordinate per EXTENSION-CONTINUATION
+/// §3.10.5 (V7 §1.4 path-segment rules).
 ///
 /// §3.10.5 prescribes sentinel-substitution here (raw code preserved in the
-/// body's `code` field), which is why `{reason}` collapses while the other
-/// two coordinates hash via `sanitize_path_segment` — see the continuation
-/// twin's doc comment for the full reasoning.
+/// body's `code` field). Delegates to the shared `entity_entity::sanitize_path_segment`
+/// so all three coordinates run the ONE function (arch round-2 ruling 1) — the
+/// continuation twin already converged here; this was the straggler. The prior
+/// hand-rolled copy additionally rejected spaces, which §1.4 explicitly permits
+/// ("All other UTF-8 characters are valid in path segments") and which the
+/// continuation twin passes through — a quiet de-convergence, now closed.
 pub(crate) fn sanitize_reason_segment(reason: &str) -> String {
-    if reason.is_empty() {
-        return "unspecified_error".to_string();
-    }
-    // §1.4's enumeration does not name `.` / `..`; they are nonetheless
-    // traversal tokens once concatenated. Logged in docs/SPEC-AMBIGUITIES.md.
-    if reason == "." || reason == ".." {
-        return "unspecified_error".to_string();
-    }
-    for b in reason.bytes() {
-        if b == 0 || b == b'/' || b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
-            return "unspecified_error".to_string();
-        }
-        if b < 0x20 || b == 0x7f {
-            return "unspecified_error".to_string();
-        }
-    }
-    reason.to_string()
+    entity_entity::sanitize_path_segment(reason, entity_entity::SENTINEL_UNSPECIFIED_ERROR)
+        .to_string()
+}
+
+/// W6 attribution for a §4.7 marker bind (marker-proposal option (ii) / round-1
+/// ruling 18, now MUST).
+///
+/// The bind is a **substrate** write: a `SyncTreeHook` / delivery worker holds
+/// no chain capability and cannot 403, so F2's substrate-authority ruling
+/// removed the cap's accidental containment. The subscription component's own
+/// grant (`system/subscription`) authorizes the write, and the triggering
+/// caller's cap rides along as `caller_capability`, noted-not-authorizing —
+/// the **only** record of who caused a substrate-authorized write. Mirrors the
+/// continuation twin's `write_lost_error_marker` bind context.
+pub(crate) struct MarkerAttribution {
+    /// Identity that initiated the request chain (preserved cascade field).
+    pub author: Option<Hash>,
+    /// The triggering caller's capability — noted, not authorizing.
+    pub caller_capability: Option<Hash>,
+    /// Correlation ID from the originating EXECUTE.
+    pub request_id: Option<String>,
+    /// Where the marker was bound: `"notify"` for the synchronous limit/token
+    /// sites inside `on_tree_change`, `"deliver"` for the async delivery worker.
+    pub operation: &'static str,
 }
 
 /// Best-effort extract the target peer ID from an absolute URI of the form
@@ -130,27 +141,37 @@ pub(crate) fn write_lost_error_marker(
     reason: &str,
     status: u32,
     timestamp_ms: u64,
+    attribution: &MarkerAttribution,
 ) {
     let safe_reason = sanitize_reason_segment(reason);
-    let chain_id_segment = if chain_id.is_empty() {
+    let chain_id_original = if chain_id.is_empty() {
         subscription_id
     } else {
         chain_id
     };
     // `chain_id` rides in from `bounds`, and a subscription_id can be
-    // caller-chosen — neither may name a path segment unvetted (ruling 13 /
-    // §1.4). Sanitized once, ahead of the body, so a marker's recorded
-    // coordinate always matches where it is actually bound. This site is NOT
-    // reachable by Go's probe (it needs subscription setup) — Go had the same
-    // defect at all three of its binding sites, so all three of ours are done.
-    let chain_id_segment = entity_entity::sanitize_path_segment(chain_id_segment);
-    let step_index = entity_entity::sanitize_path_segment(subscription_id);
+    // caller-chosen — neither may name a path segment unvetted (§1.4 /
+    // round-2 ruling 1). Sanitized once, ahead of the body, so a marker's
+    // recorded coordinate always matches where it is actually bound. This site
+    // is NOT reachable by Go's probe (it needs subscription setup) — Go had the
+    // same defect at all three of its binding sites, so all three of ours are
+    // done.
+    //
+    // Path gets the sanitized form; body keeps the original (round-2 ruling 2).
+    let chain_id_segment = entity_entity::sanitize_path_segment(
+        chain_id_original,
+        entity_entity::SENTINEL_UNSPECIFIED_CHAIN_ID,
+    );
+    let step_index_segment = entity_entity::sanitize_path_segment(
+        subscription_id,
+        entity_entity::SENTINEL_UNSPECIFIED_STEP_INDEX,
+    );
     let target_peer_id = peer_id_from_uri(deliver_uri).unwrap_or_default();
 
     let body_fields = vec![
         (
             entity_ecf::text("chain_id"),
-            entity_ecf::text(chain_id_segment.as_ref()),
+            entity_ecf::text(chain_id_original),
         ),
         (entity_ecf::text("code"), entity_ecf::text(reason)),
         (entity_ecf::text("reason"), entity_ecf::text(&safe_reason)),
@@ -160,7 +181,7 @@ pub(crate) fn write_lost_error_marker(
         ),
         (
             entity_ecf::text("step_index"),
-            entity_ecf::text(step_index.as_ref()),
+            entity_ecf::text(subscription_id),
         ),
         (
             entity_ecf::text("target_peer_id"),
@@ -192,13 +213,33 @@ pub(crate) fn write_lost_error_marker(
         "/{}/system/runtime/chain-errors/lost/{}/{}/{}/{}",
         local_peer_id,
         chain_id_segment,
-        step_index,
+        step_index_segment,
         safe_reason,
         entity.content_hash.to_hex(),
     );
     match content_store.put(entity) {
         Ok(h) => {
-            location_index.set(&marker_path, h);
+            // W6 attribution (ruling 18 — MUST). The subscription component's
+            // own grant authorizes this substrate write; the triggering
+            // caller's cap is NOTED as `caller_capability`. `set_with_context`
+            // carries the split on the emit pathway so attribution-persisting
+            // consumers (history's W6 rule) record who caused it — the binding
+            // itself is byte-identical to a plain `set`. A `None` grant (the
+            // grant not yet bootstrapped, or a foreign build) degrades to the
+            // pre-W6 unattributed bind, exactly as the continuation twin.
+            let component_grant = resolve_component_grant(location_index, local_peer_id);
+            let bind_ctx = ExecutionContext {
+                chain_id: Some(chain_id_original.to_string()),
+                author: attribution.author,
+                caller_capability: attribution.caller_capability,
+                request_id: attribution.request_id.clone(),
+                capability: component_grant,
+                handler_grant: component_grant,
+                handler_pattern: Some("system/subscription".to_string()),
+                operation: Some(attribution.operation.to_string()),
+                ..Default::default()
+            };
+            location_index.set_with_context(&marker_path, h, bind_ctx);
         }
         Err(e) => {
             tracing::warn!(
@@ -210,15 +251,189 @@ pub(crate) fn write_lost_error_marker(
     }
 }
 
+/// Resolve the subscription component's self-issued handler grant, bound at
+/// `/{peer}/system/capability/grants/system/subscription` by §6.9 step 6
+/// (`create_handler_grant`). This is the authority the marker write rides —
+/// substrate authority, not a chain cap. Looked up at bind time (an exceptional
+/// failure path, not a hot path) so it is robust to bootstrap ordering: the
+/// engine is constructed before the grant is minted, but every marker bind
+/// happens long after. `None` when the grant is absent.
+fn resolve_component_grant(
+    location_index: &Arc<dyn LocationIndex>,
+    local_peer_id: &str,
+) -> Option<Hash> {
+    location_index.get(&format!(
+        "/{}/system/capability/grants/system/subscription",
+        local_peer_id
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use entity_store::{
+        CascadeHalt, MemoryContentStore, MemoryLocationIndex, NotifyingLocationIndex, SyncTreeHook,
+        TreeChangeEvent,
+    };
+
+    /// §4.7 marker bind carries the W6 attribution split (ruling 18 — MUST).
+    /// The emit-pathway `ExecutionContext` MUST record `capability`/`handler_grant`
+    /// = the subscription component's own grant (what AUTHORIZED the substrate
+    /// write) and `caller_capability` = the triggering caller's cap (NOTED, never
+    /// authorizing) — the only record of who caused the write. Observed via a
+    /// capture hook on the notifying index, the same surface history's W6 rule
+    /// persists from. Mirrors the continuation twin's
+    /// `w6_marker_bind_carries_attribution_split`.
+    #[test]
+    fn w6_marker_bind_carries_attribution_split() {
+        struct Capture {
+            seen: std::sync::Mutex<Vec<(String, ExecutionContext)>>,
+        }
+        impl SyncTreeHook for Capture {
+            fn on_tree_change(
+                &self,
+                event: &TreeChangeEvent,
+                _ctx: &mut ExecutionContext,
+            ) -> Result<(), CascadeHalt> {
+                if let Some(c) = &event.context {
+                    self.seen
+                        .lock()
+                        .unwrap()
+                        .push((event.path.clone(), c.clone()));
+                }
+                Ok(())
+            }
+            fn name(&self) -> &str {
+                "test/w6-capture"
+            }
+            fn handler_pattern(&self) -> &str {
+                "test"
+            }
+        }
+
+        let capture = Arc::new(Capture {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let notifying = Arc::new(NotifyingLocationIndex::new(
+            Arc::new(MemoryLocationIndex::new()),
+            Arc::new(|_evt| {}),
+        ));
+        notifying.register_hook(capture.clone());
+
+        // NotifyingLocationIndex validates the first segment as a peer id
+        // (§5.4), so use a well-formed 46-char Base58 id.
+        let peer = "1".repeat(46);
+
+        // Bind the subscription component's self-grant so `resolve_component_grant`
+        // finds it — §6.9 step 6 mints this in a real peer.
+        let component_grant = Hash::compute("test", b"w6-subscription-grant");
+        notifying.set(
+            &format!("/{peer}/system/capability/grants/system/subscription"),
+            component_grant,
+        );
+
+        let content_store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
+        let location_index: Arc<dyn LocationIndex> = notifying;
+
+        let caller_cap = Hash::compute("test", b"w6-caller-cap");
+        let author = Hash::compute("test", b"w6-author");
+        write_lost_error_marker(
+            &content_store,
+            &location_index,
+            &peer,
+            "chain-w6",
+            "sub-w6",
+            "entity://target-peer/user/inbox",
+            "recv_timeout",
+            0,
+            7u64,
+            &MarkerAttribution {
+                author: Some(author),
+                caller_capability: Some(caller_cap),
+                request_id: Some("req-w6".to_string()),
+                operation: "deliver",
+            },
+        );
+
+        let seen = capture.seen.lock().unwrap();
+        let (path, bind_ctx) = seen
+            .iter()
+            .find(|(p, _)| p.contains("/system/runtime/chain-errors/lost/chain-w6/sub-w6/"))
+            .expect("marker bind fired the emit pathway with a context");
+        assert!(path.contains("/recv_timeout/"), "reason segment");
+        assert_eq!(
+            bind_ctx.capability,
+            Some(component_grant),
+            "W6: the AUTHORIZING cap is the subscription component's own grant"
+        );
+        assert_eq!(
+            bind_ctx.handler_grant,
+            Some(component_grant),
+            "W6: handler_grant attribution present"
+        );
+        assert_eq!(
+            bind_ctx.caller_capability,
+            Some(caller_cap),
+            "W6: the triggering caller's cap is NOTED as caller_capability"
+        );
+        assert_eq!(bind_ctx.author, Some(author));
+        assert_eq!(bind_ctx.chain_id.as_deref(), Some("chain-w6"));
+        assert_eq!(bind_ctx.request_id.as_deref(), Some("req-w6"));
+        assert_eq!(
+            bind_ctx.handler_pattern.as_deref(),
+            Some("system/subscription")
+        );
+        assert_eq!(bind_ctx.operation.as_deref(), Some("deliver"));
+    }
+
+    /// A `None` component grant degrades to the pre-W6 unattributed bind rather
+    /// than dropping the marker — the write still lands so the failure remains
+    /// observable even before the grant is bootstrapped.
+    #[test]
+    fn w6_absent_grant_degrades_to_unattributed_bind() {
+        let content_store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
+        let location_index: Arc<dyn LocationIndex> = Arc::new(MemoryLocationIndex::new());
+        // No grant bound at the canonical path.
+        write_lost_error_marker(
+            &content_store,
+            &location_index,
+            "peerx",
+            "chain-x",
+            "sub-x",
+            "entity://t/u",
+            "recv_timeout",
+            0,
+            1u64,
+            &MarkerAttribution {
+                author: None,
+                caller_capability: None,
+                request_id: None,
+                operation: "notify",
+            },
+        );
+        // The marker still bound under the reason prefix (terminal segment is
+        // the marker hash), even with no authorizing grant to record.
+        let bound = location_index
+            .list("/peerx/system/runtime/chain-errors/lost/chain-x/sub-x/recv_timeout");
+        assert_eq!(bound.len(), 1, "marker binds even when the grant is absent");
+    }
 
     #[test]
-    fn sanitize_returns_unspecified_for_slashes() {
+    fn sanitize_returns_unspecified_for_unsafe_segments() {
         assert_eq!(sanitize_reason_segment("has/slash"), "unspecified_error");
-        assert_eq!(sanitize_reason_segment("has space"), "unspecified_error");
         assert_eq!(sanitize_reason_segment(""), "unspecified_error");
+        assert_eq!(sanitize_reason_segment("."), "unspecified_error");
+        assert_eq!(sanitize_reason_segment(".."), "unspecified_error");
+        // Control bytes collapse; a tab is one such.
+        assert_eq!(sanitize_reason_segment("has\ttab"), "unspecified_error");
+    }
+
+    #[test]
+    fn sanitize_passes_spaces_per_1_4() {
+        // The prior hand-rolled copy rejected spaces; §1.4 permits them and the
+        // continuation twin passes them through (arch round-2 ruling 1 — the
+        // three coordinates run one function).
+        assert_eq!(sanitize_reason_segment("has space"), "has space");
     }
 
     #[test]

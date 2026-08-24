@@ -102,6 +102,23 @@ fn new_chain_id() -> String {
     format!("chain-{:016x}", rand::random::<u64>())
 }
 
+/// Maximum causal continuation-advancement chain depth before the dispatch
+/// layer suspends (§3.9, PROPOSAL-CONTINUATION-BOUNDS-PROPAGATION §4/§8).
+/// **Peer-local and implementation-defined** — the proposal pins no number
+/// (O3); what is cross-peer-observable is that the *value being tested* is
+/// global (inherited across the wire, §4), not that any specific ceiling is
+/// shared. The runaway this catches is a *synchronous* causal chain; a
+/// schedule-paced retry-forever roots fresh each tick (§5) and never reaches it.
+const MAX_CHAIN_DEPTH: u64 = 64;
+
+/// §3.9 suspension reason for a causal chain that exceeded [`MAX_CHAIN_DEPTH`].
+/// This is a continuation **suspend reason**, a distinct namespace from the
+/// capability authority-chain-walk wire error of the same spelling
+/// (`ProtocolError::ChainTooDeep`); the shared string is deliberate — it is the
+/// reason the proposal (§4) and Go both name, and the two axes never collide in
+/// one field.
+const CODE_CHAIN_DEPTH_EXCEEDED: &str = "chain_depth_exceeded";
+
 /// §3.6 step 6: the bounds for a dispatch made out of an advance.
 ///
 /// Handing the execute seam `None` makes it inherit the parent's bounds and
@@ -120,7 +137,29 @@ fn dispatch_bounds(chain_err: &ChainErr) -> Option<Bounds> {
         None => Bounds::default(),
     };
     bounds.chain_id = Some(chain_err.chain_id.clone());
+    bounds.chain_depth = Some(next_chain_depth(chain_err.parent_bounds.as_ref()));
     Some(bounds)
+}
+
+/// §3.6 step 6 / §4 / §5: `chain_depth = (context.chain_depth or 0) + 1`.
+///
+/// **O1 signal — the presence of an inherited `bounds.chain_depth`, nothing
+/// else** (core-go's pin, confirmed cross-cohort):
+/// - **Causal advancement** — dispatched *from within* another advancement's
+///   execution — arrives with `parent_bounds.chain_depth` present, so it
+///   inherits that value and `+1`s (the chain climbs).
+/// - **Standing continuation on a fresh external trigger** (timer tick,
+///   `system/peer/status` write, inbound message) arrives with no inherited
+///   `chain_depth`, roots at 0, and dispatches at 1 — never accumulating across
+///   separate triggers. This is what keeps NETWORK's schedule-paced
+///   retry-forever safe while a synchronous zero-delay self-redispatch climbs to
+///   the ceiling (§5). Deliberately **not** keyed on `remaining_executions` or
+///   trigger type/source — those are the readings that spring apart at the seam.
+fn next_chain_depth(parent_bounds: Option<&Bounds>) -> u64 {
+    parent_bounds
+        .and_then(|b| b.chain_depth)
+        .unwrap_or(0)
+        .saturating_add(1)
 }
 
 /// The continuation handler: system/continuation with advance, resume, abandon.
@@ -144,37 +183,19 @@ pub struct ContinuationHandler {
 /// reaching the path concat. A remote handler's `result.data.code` is
 /// remote-controlled, so this is a wire boundary.
 ///
-/// §3.10.5 is explicit about the shape here, and it differs from what
-/// `sanitize_path_segment` does for the other two coordinates: a non-path-safe
-/// code SHOULD be **sentinel-substituted** (`{reason}` = `unspecified_error`)
-/// "with the raw `code` preserved in the marker body's `code` field". So the
-/// collapse is prescribed, and it does not lose the event the way collapsing
-/// `chain_id` would — the body's `code` field carries the original verbatim.
-/// (Go hashes this coordinate instead, per ruling 13's general rule; that
-/// reads as a deviation from §3.10.5's SHOULD. Routed, not copied.)
+/// §3.10.5 is explicit about the shape: a non-path-safe code SHOULD be
+/// **sentinel-substituted** (`{reason}` = `unspecified_error`) "with the raw
+/// `code` preserved in the marker body's `code` field". Round-2 ruling 1
+/// generalized exactly this shape to the other two coordinates, so this is no
+/// longer a special case — it is [`sanitize_path_segment`] with §3.10.5's
+/// landed sentinel, and the body's `code` field carries the original verbatim.
 ///
 /// The dot tokens are the gap this closes: `.` and `..` satisfy §1.4's
 /// enumerated rules (UTF-8, no null, non-empty, no `/`) and so passed through
-/// here verbatim, which is a traversal token in a path segment.
+/// verbatim, which is a traversal token in a path segment.
 fn sanitize_reason_segment(reason: &str) -> String {
-    if reason.is_empty() {
-        return "unspecified_error".to_string();
-    }
-    // §1.4's enumeration does not name `.` / `..`; they are nonetheless
-    // traversal tokens once concatenated. Logged in docs/SPEC-AMBIGUITIES.md.
-    if reason == "." || reason == ".." {
-        return "unspecified_error".to_string();
-    }
-    for b in reason.bytes() {
-        // V7 §1.4: no null byte, no embedded `/`, no whitespace, ASCII printable.
-        if b == 0 || b == b'/' || b == b' ' || b == b'\t' || b == b'\n' || b == b'\r' {
-            return "unspecified_error".to_string();
-        }
-        if b < 0x20 || b == 0x7f {
-            return "unspecified_error".to_string();
-        }
-    }
-    reason.to_string()
+    entity_entity::sanitize_path_segment(reason, entity_entity::SENTINEL_UNSPECIFIED_ERROR)
+        .to_string()
 }
 
 /// Best-effort extract the target peer ID (base58) from an absolute URI of
@@ -322,7 +343,20 @@ impl ContinuationHandler {
             }
         };
 
-        tracing::debug!(request_id = %ctx.request_id, path = %path, "continuation advance");
+        // Standing-model §3 / O1: classify how this advance was reached. A
+        // reactive delivery trigger (the deliverer declared `reactive_trigger`)
+        // advances under the continuation's own `dispatch_capability` by
+        // delivery-reachability; a bare `advance` EXECUTE is an administrative
+        // invoke, path-cap-gated at the wire dispatch seam. Rust enforces caps
+        // at that seam (not in this handler), so both are already correct by
+        // construction — this records the *declared* classification the cohort
+        // converges on rather than leaving it inferred from the dispatch path.
+        tracing::debug!(
+            request_id = %ctx.request_id,
+            path = %path,
+            reactive_trigger = ctx.reactive_trigger,
+            "continuation advance"
+        );
 
         // Decode advance request: {result: bytes, status: optional uint}
         let (result_bytes, status) = decode_advance_request(&ctx.params.data)?;
@@ -502,22 +536,30 @@ impl ContinuationHandler {
     ) {
         let safe_reason = sanitize_reason_segment(reason);
         // Both coordinates originate on the wire (`bounds.chain_id` and the
-        // request id), so neither may name a path segment unvetted (ruling
-        // 13 / §1.4). Sanitized once, ahead of the body, so a marker's
+        // request id), so neither may name a path segment unvetted (§1.4 /
+        // round-2 ruling 1). Sanitized once, ahead of the body, so a marker's
         // recorded coordinate always matches where it is actually bound.
-        let chain_id = entity_entity::sanitize_path_segment(&ce.chain_id);
-        let step_index = entity_entity::sanitize_path_segment(&ce.step_index);
+        let chain_id_segment = entity_entity::sanitize_path_segment(
+            &ce.chain_id,
+            entity_entity::SENTINEL_UNSPECIFIED_CHAIN_ID,
+        );
+        let step_index_segment = entity_entity::sanitize_path_segment(
+            &ce.step_index,
+            entity_entity::SENTINEL_UNSPECIFIED_STEP_INDEX,
+        );
         // §3.10.6 body fields. Reserved-across-both-kinds: reason, timestamp,
         // chain_id, step_index. Reserved on `lost`: target_uri (was
         // `failed_uri` in pre-v1.20 Rust), target_peer_id (best-effort
         // derived below), status (was `original_status`). Mirror body field
         // (when present): `rejected_marker_hash`.
+        //
+        // `chain_id`, `step_index`, and `code` hold the ORIGINALS (round-2
+        // ruling 2) while the path holds the sanitized forms — the body is
+        // the record, the path is an index. That split is what makes
+        // collapsing a hostile coordinate lossless.
         let target_peer_id = peer_id_from_uri(failed_uri).unwrap_or_default();
         let mut body_fields = vec![
-            (
-                entity_ecf::text("chain_id"),
-                entity_ecf::text(chain_id.as_ref()),
-            ),
+            (entity_ecf::text("chain_id"), entity_ecf::text(&ce.chain_id)),
             (entity_ecf::text("code"), entity_ecf::text(reason)),
             (entity_ecf::text("reason"), entity_ecf::text(&safe_reason)),
             (
@@ -526,7 +568,7 @@ impl ContinuationHandler {
             ),
             (
                 entity_ecf::text("step_index"),
-                entity_ecf::text(step_index.as_ref()),
+                entity_ecf::text(&ce.step_index),
             ),
             (
                 entity_ecf::text("target_peer_id"),
@@ -564,8 +606,8 @@ impl ContinuationHandler {
         let marker_path = format!(
             "/{}/system/runtime/chain-errors/lost/{}/{}/{}/{}",
             self.local_peer_id,
-            chain_id,
-            step_index,
+            chain_id_segment,
+            step_index_segment,
             safe_reason,
             entity.content_hash.to_hex(),
         );
@@ -602,6 +644,121 @@ impl ContinuationHandler {
                 );
             }
         }
+    }
+
+    /// §3.9 suspend: a causal advancement chain reached [`MAX_CHAIN_DEPTH`].
+    /// Persist a `system/continuation/suspended` entity capturing the *pending*
+    /// onward dispatch (target/operation/resource/params) so an operator
+    /// `resume` can re-issue it — rooting `chain_depth` fresh (§3.7) — rather
+    /// than losing the work, and **stop** the chain (do not dispatch). The
+    /// suspend reason and the global depth ride the entity body for
+    /// observability (§8 anchor 1: the suspension is attributable to the global
+    /// depth). The write reuses the same W6 attribution + `set_with_context`
+    /// emit path as the lost-error marker; it is best-effort — a failed persist
+    /// still stops the runaway (the load-bearing half), it only costs the
+    /// resume affordance.
+    #[allow(clippy::too_many_arguments)]
+    async fn suspend_for_chain_depth(
+        &self,
+        chain_err: &ChainErr,
+        target: &str,
+        operation: &str,
+        resource: Option<&entity_capability::ResourceTarget>,
+        params: &Entity,
+        depth: u64,
+    ) -> Result<HandlerResult, HandlerError> {
+        let chain_id_segment = entity_entity::sanitize_path_segment(
+            &chain_err.chain_id,
+            entity_entity::SENTINEL_UNSPECIFIED_CHAIN_ID,
+        );
+        let suspended_path = format!(
+            "/{}/system/continuation/suspended/{}",
+            self.local_peer_id, chain_id_segment,
+        );
+
+        // `system/continuation/suspended` body — the shape `decode_suspended`
+        // reads (target/operation/resource/params), plus `reason`/`chain_id`/
+        // `chain_depth` for observation (decode ignores the extras).
+        let mut body = vec![
+            (
+                entity_ecf::text("chain_depth"),
+                entity_ecf::integer(depth as i64),
+            ),
+            (
+                entity_ecf::text("chain_id"),
+                entity_ecf::text(&chain_err.chain_id),
+            ),
+            (entity_ecf::text("operation"), entity_ecf::text(operation)),
+            (
+                entity_ecf::text("params"),
+                entity_ecf::Value::Bytes(params.data.clone()),
+            ),
+            (
+                entity_ecf::text("reason"),
+                entity_ecf::text(CODE_CHAIN_DEPTH_EXCEEDED),
+            ),
+            (entity_ecf::text("target"), entity_ecf::text(target)),
+        ];
+        if let Some(rt) = resource {
+            let targets_arr: Vec<entity_ecf::Value> =
+                rt.targets.iter().map(entity_ecf::text).collect();
+            let mut rf = vec![(
+                entity_ecf::text("targets"),
+                entity_ecf::Value::Array(targets_arr),
+            )];
+            if !rt.exclude.is_empty() {
+                let exclude_arr: Vec<entity_ecf::Value> =
+                    rt.exclude.iter().map(entity_ecf::text).collect();
+                rf.push((
+                    entity_ecf::text("exclude"),
+                    entity_ecf::Value::Array(exclude_arr),
+                ));
+            }
+            body.push((entity_ecf::text("resource"), entity_ecf::Value::Map(rf)));
+        }
+        let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(body));
+
+        match Entity::new("system/continuation/suspended", data) {
+            Ok(entity) => match self.content_store.put(entity) {
+                Ok(h) => {
+                    let bind_ctx = entity_store::ExecutionContext {
+                        chain_id: Some(chain_err.chain_id.clone()),
+                        author: chain_err.author,
+                        caller_capability: chain_err.caller_capability,
+                        request_id: Some(chain_err.request_id.clone()),
+                        capability: chain_err.handler_grant,
+                        handler_grant: chain_err.handler_grant,
+                        handler_pattern: Some("system/continuation".to_string()),
+                        operation: Some("advance".to_string()),
+                        ..Default::default()
+                    };
+                    self.location_index
+                        .set_with_context(&suspended_path, h, bind_ctx);
+                    tracing::info!(
+                        chain_id = %chain_err.chain_id,
+                        chain_depth = depth,
+                        suspended_path = %suspended_path,
+                        "§3.9: chain_depth exceeded — continuation SUSPENDED (chain stopped)"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        chain_id = %chain_err.chain_id,
+                        error = %e,
+                        "§3.9 suspend: suspended-entity put FAILED (chain still stopped)"
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    chain_id = %chain_err.chain_id,
+                    error = %e,
+                    "§3.9 suspend: suspended-entity build FAILED (chain still stopped)"
+                );
+            }
+        }
+
+        Ok(suspended_result(CODE_CHAIN_DEPTH_EXCEEDED, &suspended_path))
     }
 
     #[allow(clippy::too_many_arguments)] // advance plumbing: every arg is a distinct §3.6 input
@@ -748,13 +905,42 @@ impl ContinuationHandler {
             }
         };
 
+        // §3.6 step 6 bounds — inherit chain identity + causal depth (§4/§5).
+        // Computed once so the §3.9 depth brake can inspect it before dispatch.
+        let child_bounds = dispatch_bounds(chain_err);
+
+        // §3.9 depth brake: a causal advancement chain that would dispatch past
+        // MAX_CHAIN_DEPTH is SUSPENDED, not dispatched — the runaway (§1) stops
+        // globally, because `chain_depth` is inherited across the wire (§4), so
+        // the value tested is the global count, not a per-peer counter. TTL/
+        // budget refill never resets it (§6.2); an operator `resume` roots it
+        // fresh (§3.7). This is the cross-peer termination guarantee the NETWORK
+        // Amendment-12 ping-pong needs — the direct end-to-end proof of the fix.
+        if let Some(depth) = child_bounds.as_ref().and_then(|b| b.chain_depth) {
+            if depth > MAX_CHAIN_DEPTH {
+                return self
+                    .suspend_for_chain_depth(
+                        chain_err,
+                        &dispatch_target,
+                        &dispatch_operation,
+                        dispatch_resource.as_ref(),
+                        &params_entity,
+                        depth,
+                    )
+                    .await;
+            }
+        }
+
         let opts = ExecuteOptions {
             resource: dispatch_resource,
             capability: dispatch_cap,
             deliver_to: cont.deliver_to.clone(),
             request_id: None,
-            bounds: dispatch_bounds(chain_err),
+            bounds: child_bounds,
             included: Vec::new(),
+            // The continuation's own onward chain dispatch is never a reactive
+            // delivery trigger — the marker tags only the deliverer's advance.
+            reactive_trigger: false,
         };
 
         tracing::debug!(
@@ -947,8 +1133,15 @@ impl ContinuationHandler {
                 capability: dispatch_cap,
                 deliver_to: cont.deliver_to.clone(),
                 request_id: None,
+                // Join-slot forward dispatch also inherits chain identity +
+                // causal depth (§4). The barrier fires at most once per round
+                // and a standing join resets, so the runaway shape lives on the
+                // forward chain (braked in `advance_forward`); the join simply
+                // propagates the depth so a chain that passes through it stays
+                // globally counted.
                 bounds: dispatch_bounds(chain_err),
                 included: Vec::new(),
+                reactive_trigger: false,
             };
 
             match execute_fn(
@@ -1454,9 +1647,19 @@ impl ContinuationHandler {
         self.location_index.remove(&path);
         self.content_store.remove(&hash);
 
-        // Dispatch to the suspended target
+        // Dispatch to the suspended target. §3.7: resume is an operator-
+        // authorized *fresh* dispatch — it MUST root `chain_depth` at 0, else a
+        // chain resumed after a `chain_depth_exceeded` suspension re-suspends
+        // immediately. Fresh operator intent = fresh root, exactly as a fresh
+        // external trigger roots (§5). Explicit rather than relying on the
+        // resume EXECUTE carrying empty bounds — defends the seam if resume is
+        // itself reached from within a chain.
         let opts = ExecuteOptions {
             resource: suspended.resource.clone(),
+            bounds: Some(Bounds {
+                chain_depth: Some(0),
+                ..Default::default()
+            }),
             ..Default::default()
         };
 
@@ -2911,6 +3114,28 @@ fn advancement_not_found() -> HandlerResult {
     advancement_result(false)
 }
 
+/// §3.9 result for a chain-depth suspension: `advanced: false`, `suspended:
+/// true`, plus the reason and the path of the persisted
+/// `system/continuation/suspended` entity so a caller can `resume` it. Returns
+/// 200 — the advance was *handled* (the chain paused cleanly), it did not error.
+fn suspended_result(reason: &str, suspended_path: &str) -> HandlerResult {
+    let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+        (entity_ecf::text("advanced"), entity_ecf::bool_val(false)),
+        (entity_ecf::text("reason"), entity_ecf::text(reason)),
+        (entity_ecf::text("suspended"), entity_ecf::bool_val(true)),
+        (
+            entity_ecf::text("suspended_path"),
+            entity_ecf::text(suspended_path),
+        ),
+    ]));
+    let result = Entity::new("system/continuation/advancement-result", data).unwrap();
+    HandlerResult {
+        status: STATUS_OK,
+        result,
+        included: std::collections::HashMap::new(),
+    }
+}
+
 fn error_result(status: u32, code: &str, message: &str) -> HandlerResult {
     let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
         (entity_ecf::text("code"), entity_ecf::text(code)),
@@ -2991,6 +3216,7 @@ mod tests {
             handler_grant_hash: None,
             bounds: None,
             is_external: false,
+            reactive_trigger: false,
         };
         let result = h.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_BAD_REQUEST);
@@ -3021,6 +3247,7 @@ mod tests {
             handler_grant_hash: None,
             bounds: None,
             is_external: false,
+            reactive_trigger: false,
         };
         let result = h.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_NOT_FOUND);
@@ -3061,6 +3288,7 @@ mod tests {
             handler_grant_hash: None,
             bounds: None,
             is_external: false,
+            reactive_trigger: false,
         };
         let result = h.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
@@ -4231,6 +4459,7 @@ mod tests {
             handler_grant_hash: None,
             bounds: None,
             is_external: false,
+            reactive_trigger: false,
         }
     }
 
@@ -5287,9 +5516,24 @@ mod tests {
         );
         assert_eq!(sanitize_reason_segment("not_found"), "not_found");
         assert_eq!(sanitize_reason_segment("has/slash"), "unspecified_error");
-        assert_eq!(sanitize_reason_segment("has space"), "unspecified_error");
         assert_eq!(sanitize_reason_segment(""), "unspecified_error");
         assert_eq!(sanitize_reason_segment("has\0null"), "unspecified_error");
+        // Dot tokens: §1.4's enumeration doesn't name them, but they are
+        // traversal tokens once concatenated (logged in SPEC-AMBIGUITIES).
+        assert_eq!(sanitize_reason_segment(".."), "unspecified_error");
+        assert_eq!(sanitize_reason_segment("."), "unspecified_error");
+
+        // A space PASSES THROUGH, and that is a deliberate change. §1.4 says
+        // "All other UTF-8 characters are valid in path segments" — only null
+        // bytes and empty segments are named — and Go's `IsSafePathSegment`
+        // rejects only the C0 range + DEL. This function used to enforce its
+        // own stricter "no whitespace" rule, which disagreed with our OWN
+        // `is_safe_path_segment` (the other two coordinates already let a
+        // space through) and de-converged `{reason}` from Go: a space-carrying
+        // code quarantined here and passed through there. Round-2 ruling 1
+        // makes all three coordinates one function, which settles it in favour
+        // of the spec's letter.
+        assert_eq!(sanitize_reason_segment("has space"), "has space");
     }
 
     #[test]
@@ -5303,5 +5547,294 @@ mod tests {
             Some("abcd")
         );
         assert_eq!(peer_id_from_uri("system/tree"), None);
+    }
+
+    // -----------------------------------------------------------------------
+    // PROPOSAL-CONTINUATION-BOUNDS-PROPAGATION — the wired chain_depth brake
+    // (§3.6 step 6 inherit/increment, §3.9 suspend, §3.7 resume roots fresh)
+    // + PROPOSAL-CONTINUATION-STANDING-MODEL §3 — reactive-trigger own-authority
+    // -----------------------------------------------------------------------
+
+    /// Capturing mock: records the `bounds` the continuation dispatched with,
+    /// then returns 200. Lets a test assert the §3.6-step-6 child bounds.
+    fn capturing_mock(sink: Arc<std::sync::Mutex<Option<Bounds>>>) -> ExecuteFn {
+        Arc::new(move |_uri, _op, _params, opts: ExecuteOptions| {
+            *sink.lock().unwrap() = opts.bounds.clone();
+            Box::pin(async {
+                Ok(HandlerResult {
+                    status: 200,
+                    result: Entity::new(
+                        "primitive/null",
+                        entity_ecf::to_ecf(&entity_ecf::Value::Null),
+                    )
+                    .unwrap(),
+                    included: HashMap::new(),
+                })
+            })
+        })
+    }
+
+    /// Install a standing continuation at `path` dispatching to `app/sink`
+    /// under its own `dispatch_capability`. Returns the author.
+    async fn install_standing_cont(h: &ContinuationHandler, path: &str) -> Hash {
+        let author = Hash::compute("test", b"chain-depth-author");
+        let cap = make_cap_entity_for_install(author, author, None);
+        let cap_hash = cap.content_hash;
+        let included: HashMap<Hash, Entity> = [(cap_hash, cap)].into();
+        let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+            (entity_ecf::text("operation"), entity_ecf::text("process")),
+            (entity_ecf::text("target"), entity_ecf::text("app/sink")),
+            (
+                entity_ecf::text("dispatch_capability"),
+                entity_ecf::Value::Bytes(cap_hash.to_bytes().to_vec()),
+            ),
+        ]));
+        let params = Entity::new(entity_types::TYPE_CONTINUATION, data).unwrap();
+        let ctx = make_install_ctx(author, path, params, included);
+        assert_eq!(h.handle(&ctx).await.unwrap().status, STATUS_OK);
+        author
+    }
+
+    fn advance_ctx_with_bounds(
+        author: Hash,
+        path: &str,
+        mock: ExecuteFn,
+        bounds: Option<Bounds>,
+    ) -> HandlerContext {
+        let adv_params = make_params(entity_ecf::Value::Map(vec![(
+            entity_ecf::text("result"),
+            entity_ecf::Value::Null,
+        )]));
+        let mut ctx = make_install_ctx(author, path, adv_params, HashMap::new());
+        ctx.operation = "advance".to_string();
+        ctx.execute_fn = Some(mock);
+        ctx.bounds = bounds;
+        ctx
+    }
+
+    /// O1 — the classification keys ONLY on the presence of an inherited
+    /// `chain_depth`: a fresh trigger (none) roots at 0 and dispatches at 1; a
+    /// causal advancement inherits + 1.
+    #[test]
+    fn test_next_chain_depth_roots_at_zero_and_increments() {
+        assert_eq!(
+            next_chain_depth(None),
+            1,
+            "no bounds → fresh root, dispatch 1"
+        );
+        assert_eq!(
+            next_chain_depth(Some(&Bounds::default())),
+            1,
+            "bounds present but no chain_depth = fresh handler entry → root at 0"
+        );
+        assert_eq!(
+            next_chain_depth(Some(&Bounds {
+                chain_depth: Some(0),
+                ..Default::default()
+            })),
+            1
+        );
+        assert_eq!(
+            next_chain_depth(Some(&Bounds {
+                chain_depth: Some(41),
+                ..Default::default()
+            })),
+            42,
+            "causal advancement inherits 41 and +1"
+        );
+    }
+
+    /// §3.6 step 6: a causal advance dispatches with the inherited chain_depth
+    /// + 1 and the same chain_id — the accumulation the cross-peer brake needs.
+    #[tokio::test]
+    async fn test_advance_dispatches_incremented_chain_depth() {
+        let h = make_handler();
+        let path = format!("/{}/system/continuation/cd-inherit", test_peer_id());
+        let author = install_standing_cont(&h, &path).await;
+
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let ctx = advance_ctx_with_bounds(
+            author,
+            &path,
+            capturing_mock(captured.clone()),
+            Some(Bounds {
+                chain_id: Some("cd-chain".into()),
+                chain_depth: Some(7),
+                ..Default::default()
+            }),
+        );
+
+        assert_eq!(h.handle(&ctx).await.unwrap().status, STATUS_OK);
+        let dispatched = captured.lock().unwrap().clone().expect("dispatch happened");
+        assert_eq!(
+            dispatched.chain_depth,
+            Some(8),
+            "causal advance inherits 7 and +1"
+        );
+        assert_eq!(
+            dispatched.chain_id.as_deref(),
+            Some("cd-chain"),
+            "chain_id rides through unchanged (correlation axis)"
+        );
+    }
+
+    /// A fresh trigger with no inherited chain_depth roots the dispatched chain
+    /// at 1 — so schedule-paced retry-forever never accumulates (§5).
+    #[tokio::test]
+    async fn test_fresh_trigger_roots_chain_depth_at_one() {
+        let h = make_handler();
+        let path = format!("/{}/system/continuation/cd-fresh", test_peer_id());
+        let author = install_standing_cont(&h, &path).await;
+
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        // No bounds on the advance = a fresh external trigger.
+        let ctx = advance_ctx_with_bounds(author, &path, capturing_mock(captured.clone()), None);
+
+        assert_eq!(h.handle(&ctx).await.unwrap().status, STATUS_OK);
+        let dispatched = captured.lock().unwrap().clone().expect("dispatch happened");
+        assert_eq!(
+            dispatched.chain_depth,
+            Some(1),
+            "fresh trigger roots at 0 → 1"
+        );
+    }
+
+    /// §3.9 depth brake: at the ceiling the advance SUSPENDS rather than
+    /// dispatching — the runaway stops, a resumable suspended entity is
+    /// persisted, and the outcome is attributable to the (global) chain_depth.
+    #[tokio::test]
+    async fn test_advance_suspends_at_chain_depth_ceiling() {
+        let h = make_handler();
+        let path = format!("/{}/system/continuation/cd-brake", test_peer_id());
+        let author = install_standing_cont(&h, &path).await;
+
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        // Parent already at the ceiling → the next dispatch (MAX+1) exceeds it.
+        let ctx = advance_ctx_with_bounds(
+            author,
+            &path,
+            capturing_mock(captured.clone()),
+            Some(Bounds {
+                chain_id: Some("runaway".into()),
+                chain_depth: Some(MAX_CHAIN_DEPTH),
+                ..Default::default()
+            }),
+        );
+
+        let r = h.handle(&ctx).await.unwrap();
+        assert_eq!(
+            r.status, STATUS_OK,
+            "suspension is a clean handled outcome, not an error"
+        );
+        assert!(
+            captured.lock().unwrap().is_none(),
+            "the chain MUST be stopped — no onward dispatch past the ceiling"
+        );
+
+        let body: ciborium::Value = ciborium::from_reader(r.result.data.as_slice()).unwrap();
+        let get = |k: &str| {
+            body.as_map()
+                .unwrap()
+                .iter()
+                .find(|(kk, _)| kk.as_text() == Some(k))
+                .map(|(_, v)| v.clone())
+        };
+        assert_eq!(get("suspended").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            get("reason")
+                .and_then(|v| v.as_text().map(str::to_string))
+                .as_deref(),
+            Some(CODE_CHAIN_DEPTH_EXCEEDED),
+            "the suspension names the global depth as the cause (§8 anchor 1)"
+        );
+        // A resumable suspended entity was persisted at the reported path.
+        let susp_path = get("suspended_path")
+            .and_then(|v| v.as_text().map(str::to_string))
+            .expect("suspended_path in result");
+        let susp_hash = h
+            .location_index
+            .get(&susp_path)
+            .expect("suspended entity bound at path");
+        assert_eq!(
+            h.content_store.get(&susp_hash).unwrap().entity_type,
+            "system/continuation/suspended"
+        );
+    }
+
+    /// §3.7: `resume` is a fresh operator dispatch — it MUST root chain_depth at
+    /// 0 even if reached from within a chain carrying ambient depth, else a
+    /// chain resumed after `chain_depth_exceeded` re-suspends immediately.
+    #[tokio::test]
+    async fn test_resume_roots_chain_depth_fresh() {
+        let h = make_handler();
+        let susp_path = format!("/{}/system/continuation/cd-resume", test_peer_id());
+        let susp_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+            (entity_ecf::text("operation"), entity_ecf::text("process")),
+            (entity_ecf::text("target"), entity_ecf::text("app/sink")),
+            (
+                entity_ecf::text("reason"),
+                entity_ecf::text(CODE_CHAIN_DEPTH_EXCEEDED),
+            ),
+        ]));
+        let susp = Entity::new("system/continuation/suspended", susp_data).unwrap();
+        let hash = h.content_store.put(susp).unwrap();
+        h.location_index.set(&susp_path, hash);
+
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let mut ctx = make_install_ctx(
+            Hash::compute("test", b"operator"),
+            &susp_path,
+            make_params(entity_ecf::Value::Map(vec![])),
+            HashMap::new(),
+        );
+        ctx.operation = "resume".to_string();
+        ctx.execute_fn = Some(capturing_mock(captured.clone()));
+        // Ambient depth that MUST be ignored by resume.
+        ctx.bounds = Some(Bounds {
+            chain_depth: Some(99),
+            ..Default::default()
+        });
+
+        assert_eq!(h.handle(&ctx).await.unwrap().status, STATUS_OK);
+        let dispatched = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("resume re-dispatched the suspended target");
+        assert_eq!(
+            dispatched.chain_depth,
+            Some(0),
+            "§3.7: resume roots chain_depth at 0 regardless of ambient bounds"
+        );
+    }
+
+    /// Standing-model §3: a reactive delivery trigger advances under the
+    /// continuation's OWN `dispatch_capability` with NO caller capability on the
+    /// context — the deliverer needs no advance-cap on the continuation path.
+    /// (Rust enforces caps at the dispatch seam, so this holds by construction;
+    /// the test pins that a reactive advance carrying the flag still advances.)
+    #[tokio::test]
+    async fn test_reactive_advance_runs_under_own_authority() {
+        let h = make_handler();
+        let path = format!("/{}/system/continuation/reactive", test_peer_id());
+        let author = install_standing_cont(&h, &path).await;
+
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let mut ctx =
+            advance_ctx_with_bounds(author, &path, capturing_mock(captured.clone()), None);
+        // The delivery mechanism declares the reactive classification in-band…
+        ctx.reactive_trigger = true;
+        // …and holds NO caller capability over the continuation path.
+        ctx.caller_capability = None;
+
+        let r = h.handle(&ctx).await.unwrap();
+        assert_eq!(
+            r.status, STATUS_OK,
+            "a reactive trigger advances under the continuation's own authority"
+        );
+        assert!(
+            captured.lock().unwrap().is_some(),
+            "the reactive advance dispatched (own dispatch_capability), no advance-cap required"
+        );
     }
 }

@@ -1774,6 +1774,7 @@ async fn process_async_delivery(
             None, // delivery dispatch — no nested deliver_to
             None, // no scoped dispatch_capability override
             &no_chain,
+            None, // async delivery of a finished result — no chain bounds
         )
         .await
         {
@@ -2399,6 +2400,24 @@ pub fn make_execute_fn(
                         chain_bundle.entry(*h).or_insert_with(|| ent.clone());
                     }
 
+                    // §3.11 / bounds-propagation Delta 1: the cross-peer EXECUTE
+                    // MUST carry `system/bounds` (chain_id/chain_depth/ttl/budget)
+                    // — the pre-fix remote branch dropped them, so a cross-peer
+                    // continuation chain had nothing accumulating. Same child
+                    // bounds the local branch installs: explicit `opts.bounds`
+                    // override (a continuation advance passes its §3.6-step-6
+                    // bounds here, chain_depth already incremented), else the
+                    // decremented parent bounds (§5.9), else none.
+                    let wire_bounds = match opts.bounds.clone() {
+                        Some(b) => Some(b),
+                        None => match parent_bounds {
+                            Some(ref pb) => Some(pb.decrement().map_err(|_| {
+                                HandlerError::Internal("ttl_exhausted".to_string())
+                            })?),
+                            None => None,
+                        },
+                    };
+
                     let resp = match crate::remote::send_execute(
                         conn.as_ref(),
                         &shared.keypair,
@@ -2409,6 +2428,7 @@ pub fn make_execute_fn(
                         deliver_to_params.as_ref(),
                         dispatch_cap,
                         &chain_bundle,
+                        wire_bounds.as_ref(),
                     )
                     .await
                     {
@@ -2626,6 +2646,12 @@ pub fn make_execute_fn(
                 if let Some(b) = child_bounds {
                     builder = builder.bounds(b);
                 }
+                // Standing-model O1: the reactive-delivery-trigger classification
+                // is declared per-dispatch by the caller (e.g. the inbox route)
+                // and threaded onto the child context here — never inherited from
+                // the parent, mirroring `is_external`. A bare internal dispatch
+                // leaves it false.
+                builder = builder.reactive_trigger(opts.reactive_trigger);
                 let ctx = builder.build();
 
                 // EXTENSION-INBOX §4.3 (v5.6, PROPOSAL-CONTENT-INGEST-PASS-THROUGH
@@ -3013,14 +3039,28 @@ fn try_bind_rejected_marker(
     // Both coordinates come off the wire, and this marker is bound precisely
     // BECAUSE the sender's cap check failed — an unauthorized caller reaches
     // here by construction, so nothing upstream vetted these. Sanitize before
-    // either value names a path segment (§1.4 / ruling 13). Sanitized once,
-    // ahead of the body, so a marker's recorded coordinate always matches
-    // where it is actually bound.
-    let chain_id = entity_entity::sanitize_path_segment(&chain_id).into_owned();
-    let step_index = entity_entity::sanitize_path_segment(request_id).into_owned();
+    // either value names a path segment (§1.4 / round-2 ruling 1). Sanitized
+    // once, ahead of the body, so a marker's recorded coordinate always
+    // matches where it is actually bound.
+    //
+    // The PATH gets the sanitized form; the BODY keeps the original
+    // (§3.10.6's pinned schema, round-2 ruling 2). That split is what makes
+    // collapsing lossless: an operator reading the marker that exists to
+    // observe a hostile failure can still answer "what did the attacker
+    // send?", which hashing the coordinate could not.
+    let chain_id_segment = entity_entity::sanitize_path_segment(
+        &chain_id,
+        entity_entity::SENTINEL_UNSPECIFIED_CHAIN_ID,
+    );
+    let step_index_segment = entity_entity::sanitize_path_segment(
+        request_id,
+        entity_entity::SENTINEL_UNSPECIFIED_STEP_INDEX,
+    );
 
     // §3.10.6 body fields (rejected kind): reason, timestamp, chain_id,
-    // step_index, requesting_peer_id, attempted_uri.
+    // step_index, requesting_peer_id, attempted_uri. `chain_id` and
+    // `step_index` hold the ORIGINALS — the body is the record, the path is
+    // an index.
     let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
         (
             entity_ecf::text("attempted_uri"),
@@ -3035,10 +3075,7 @@ fn try_bind_rejected_marker(
             entity_ecf::text("requesting_peer_id"),
             entity_ecf::text(&requesting_peer_id),
         ),
-        (
-            entity_ecf::text("step_index"),
-            entity_ecf::text(&step_index),
-        ),
+        (entity_ecf::text("step_index"), entity_ecf::text(request_id)),
         (
             entity_ecf::text("timestamp"),
             entity_ecf::integer(timestamp as i64),
@@ -3055,8 +3092,8 @@ fn try_bind_rejected_marker(
     let marker_path = format!(
         "/{}/system/runtime/chain-errors/rejected/{}/{}/capability_denied/{}",
         shared.peer_id.as_str(),
-        chain_id,
-        step_index,
+        chain_id_segment,
+        step_index_segment,
         marker_hash.to_hex(),
     );
     match shared.content_store.put(entity) {
@@ -3142,6 +3179,15 @@ fn decode_bounds_data(value: &ciborium::Value) -> Option<entity_handler::Bounds>
             Some("cascade_depth") => {
                 if let Some(i) = v.as_integer() {
                     bounds.cascade_depth = u64::try_from(i).ok();
+                }
+            }
+            Some("chain_depth") => {
+                // Causal continuation-advancement depth, inherited across the
+                // peer boundary (PROPOSAL-CONTINUATION-BOUNDS-PROPAGATION §4;
+                // the §3.11 wire field beside cascade_depth). The receiver
+                // initializes its local chain from this value.
+                if let Some(i) = v.as_integer() {
+                    bounds.chain_depth = u64::try_from(i).ok();
                 }
             }
             Some("chain_id") => {
@@ -3419,6 +3465,83 @@ mod marker_injection_tests {
             !cleaned.split('/').any(|seg| seg == ".." || seg == "."),
             "a dot token survived as a path segment: {}",
             cleaned,
+        );
+
+        // Round-2 ruling 1: the hostile coordinates COLLAPSE to their
+        // per-coordinate sentinels rather than hashing to a fresh node each.
+        assert!(
+            cleaned.contains(entity_entity::SENTINEL_UNSPECIFIED_CHAIN_ID),
+            "hostile chain_id must collapse to its sentinel: {cleaned}"
+        );
+        assert!(
+            cleaned.contains(entity_entity::SENTINEL_UNSPECIFIED_STEP_INDEX),
+            "hostile step_index must collapse to its sentinel: {cleaned}"
+        );
+
+        // Round-2 ruling 2, and the reason collapsing is lossless: the BODY
+        // recovers what the path collapsed. Without this the operator reading
+        // the marker that exists to observe a hostile failure cannot answer
+        // "what did the attacker send?" — which is exactly the one-way loss
+        // that got the hashing rule reversed.
+        let marker = shared
+            .content_store
+            .get(&bound.unwrap())
+            .expect("marker entity missing from the store");
+        let body: ciborium::Value = ciborium::from_reader(marker.data.as_slice()).unwrap();
+        let field = |key: &str| -> Option<String> {
+            match &body {
+                ciborium::Value::Map(m) => m.iter().find_map(|(k, v)| match (k, v) {
+                    (ciborium::Value::Text(t), ciborium::Value::Text(s)) if t == key => {
+                        Some(s.clone())
+                    }
+                    _ => None,
+                }),
+                _ => None,
+            }
+        };
+        assert_eq!(
+            field("chain_id").as_deref(),
+            Some(hostile),
+            "the body MUST carry the original chain_id verbatim"
+        );
+        assert_eq!(
+            field("step_index").as_deref(),
+            Some(hostile),
+            "the body MUST carry the original step_index (request id) verbatim"
+        );
+
+        // §3.10.6's registry, asserted as a set. The registry exists so that
+        // equivalent markers hash-equal cross-impl; a field renamed here
+        // silently breaks the §3.10.4 mirror-pointer walk against Go and
+        // Python, and NO same-seat test would notice — every seat only ever
+        // reads its own markers. Go shipped four divergent names for exactly
+        // that reason. This is the assertion that would have caught it.
+        let names: std::collections::BTreeSet<String> = match &body {
+            ciborium::Value::Map(m) => m
+                .iter()
+                .filter_map(|(k, _)| match k {
+                    ciborium::Value::Text(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => panic!("marker body is not a CBOR map"),
+        };
+        let reserved: std::collections::BTreeSet<String> = [
+            // Reserved across both kinds.
+            "reason",
+            "timestamp",
+            "chain_id",
+            "step_index",
+            // Reserved on the `rejected` kind.
+            "requesting_peer_id",
+            "attempted_uri",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            names, reserved,
+            "rejected-marker body drifted from the §3.10.6 registry"
         );
     }
 }

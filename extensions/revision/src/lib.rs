@@ -3111,6 +3111,10 @@ fn clone_ctx_with(parent: &HandlerContext, params: Entity, operation: String) ->
         // external-origin flag so receiver-local-op rejection still fires
         // for inner ops dispatched from a wire-originated chain.
         is_external: parent.is_external,
+        // reactive_trigger is per-dispatch (never inherited onto an onward
+        // chain); a revision inner-op clone carries the parent's value
+        // unchanged — neutral, since revision ops are never reactive triggers.
+        reactive_trigger: parent.reactive_trigger,
     }
 }
 
@@ -4189,6 +4193,7 @@ mod tests {
             handler_grant_hash: None,
             bounds: None,
             is_external: false,
+            reactive_trigger: false,
         }
     }
 

@@ -741,13 +741,29 @@ mod memory {
     /// `memory://<peer-id>` URL form).
     pub struct MemoryTransportRegistry {
         listeners: Mutex<HashMap<String, mpsc::Sender<Connection>>>,
+        dials: std::sync::atomic::AtomicU64,
     }
 
     impl MemoryTransportRegistry {
         pub fn new() -> Arc<Self> {
             Arc::new(Self {
                 listeners: Mutex::new(HashMap::new()),
+                dials: std::sync::atomic::AtomicU64::new(0),
             })
+        }
+
+        /// Total `connect` attempts made through this registry, whether or
+        /// not a listener was there to answer.
+        ///
+        /// The retry loop's observable from OUTSIDE the peer (the Go seat
+        /// counts dials for the same reason). A dial is what "an attempt"
+        /// physically IS, so unlike counting the tree records an attempt
+        /// happens to leave, this survives changes to what those records are:
+        /// arch rulings 2 and 3 took a dead peer's marker tree to empty
+        /// precisely so a working retry loop stops writing error records, and
+        /// a vector counting markers would have read that as the loop dying.
+        pub fn dial_count(&self) -> u64 {
+            self.dials.load(std::sync::atomic::Ordering::Relaxed)
         }
 
         /// Returns the process-global shared registry. Lazily
@@ -772,6 +788,7 @@ mod memory {
         fn default() -> Self {
             Self {
                 listeners: Mutex::new(HashMap::new()),
+                dials: std::sync::atomic::AtomicU64::new(0),
             }
         }
     }
@@ -870,6 +887,11 @@ mod memory {
     #[async_trait]
     impl Connector for MemoryConnector {
         async fn connect(&self, addr: &str) -> Result<Connection, TransportError> {
+            // Counted before the listener lookup: a dial at a dead endpoint
+            // is exactly the attempt this counter exists to see.
+            self.registry
+                .dials
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let endpoint = addr.strip_prefix("memory://").ok_or_else(|| {
                 TransportError::ConnectError(format!(
                     "MemoryConnector: expected memory:// scheme, got {}",

@@ -63,7 +63,14 @@ pub struct ExecuteOptions {
     pub capability: Option<Entity>,
     /// Delivery specification for continuation routing.
     pub deliver_to: Option<DeliverySpec>,
-    /// Override request_id for the child context (default: "internal").
+    /// Override request_id for the child context. Absent ⇒ a freshly
+    /// generated `internal-{random}`.
+    ///
+    /// This defaulted to the literal `"internal"` until ruling 9 / F1: a
+    /// CONSTANT SENTINEL IS NOT CONFORMANT as a `{step_index}` coordinate,
+    /// and every handler-to-handler dispatch in the workspace shared that one
+    /// name, so all their markers collided at `.../{chain}/internal/`. A
+    /// caller that can name its dispatch better still should.
     pub request_id: Option<String>,
     /// Override bounds for the child dispatch. If absent, parent bounds are
     /// inherited and TTL is decremented (§5.9 bounds propagation).
@@ -76,6 +83,21 @@ pub struct ExecuteOptions {
     /// cannot find an in-band chain. This is the Rust analog of Go's
     /// `WithIncludedChain`. Default empty: ordinary dispatch is unchanged.
     pub included: Vec<Entity>,
+    /// Marks this dispatch as a **reactive delivery trigger**
+    /// (PROPOSAL-CONTINUATION-STANDING-MODEL §3, standing-model O1). Set by a
+    /// delivery mechanism — the inbox route, a subscription poke — when it
+    /// advances a standing continuation as a consequence of a *delivered*
+    /// event, so the classification is **declared in-band by the deliverer**
+    /// rather than inferred from caller identity / cap shape (the inference Go
+    /// pins as the seam that springs apart cross-peer). The Rust analog of Go's
+    /// `ExecuteOpts.ReactiveTrigger`. Per-dispatch, **not inherited**: it tags
+    /// only the one advance the deliverer initiated, never the continuation's
+    /// onward chain. Default false: a bare `advance` EXECUTE (administrative
+    /// invoke) never sets it. Rust already advances under the continuation's
+    /// own `dispatch_capability` with no advance-time caller-cap check (caps are
+    /// enforced at the dispatch seam), so this is the convergence signal, not a
+    /// gate — see `docs/status/ROUTING-2026-07-18-*`.
+    pub reactive_trigger: bool,
 }
 
 /// Delivery specification (target URI + operation for forwarding results).
@@ -95,6 +117,17 @@ pub struct Bounds {
     pub ttl: Option<u64>,
     pub budget: Option<u64>,
     pub cascade_depth: Option<u64>,
+    /// Causal continuation-advancement chain depth (§3.9 / §3.11,
+    /// PROPOSAL-CONTINUATION-BOUNDS-PROPAGATION). A non-negative counter that
+    /// rides in `system/bounds` on the wire and is **inherited across the peer
+    /// boundary** — exactly as `cascade_depth` is — so a cross-peer advancement
+    /// chain (A→B→A→…) is globally bounded rather than reset each hop. The
+    /// continuation advance dispatch inherits and `+1`s this on a causal
+    /// advancement (§3.6 step 6) and roots it fresh on a standing continuation's
+    /// external re-fire (§5). TTL/budget refill does **not** reset it (§6.2).
+    /// Distinct from the capability authority-chain depth
+    /// (`ProtocolError::ChainTooDeep`); that is a different axis.
+    pub chain_depth: Option<u64>,
     pub chain_id: Option<String>,
     pub parent_chain_id: Option<String>,
     pub visited: Vec<String>,
@@ -377,6 +410,17 @@ pub struct HandlerContext {
     /// remote caller — the trap that sank the original
     /// PROPOSAL-REVISION-DIFF-SINCE-LOCAL-HEAD POC.
     pub is_external: bool,
+    /// True when this advance was reached as a **reactive delivery trigger**
+    /// (PROPOSAL-CONTINUATION-STANDING-MODEL §3, standing-model O1) — a
+    /// delivery mechanism (inbox route / subscription poke) advancing a
+    /// standing continuation as a consequence of a delivered event, set via
+    /// [`ExecuteOptions::reactive_trigger`] and threaded through the dispatch
+    /// seam (mirrors `is_external`). A bare `advance` EXECUTE
+    /// (administrative invoke) leaves it false. This is the **declared** O1
+    /// signal — the delivery mechanism knows it is doing reactive routing and
+    /// says so in-band, rather than an impl inferring it from the dispatch
+    /// path. Per-dispatch, not inherited onto the continuation's onward chain.
+    pub reactive_trigger: bool,
 }
 
 impl HandlerContext {
@@ -409,6 +453,7 @@ impl HandlerContext {
             handler_grant_hash: None,
             bounds: None,
             is_external: false,
+            reactive_trigger: false,
         }
     }
 }
@@ -435,6 +480,7 @@ pub struct HandlerContextBuilder {
     handler_grant_hash: Option<Hash>,
     bounds: Option<Bounds>,
     is_external: bool,
+    reactive_trigger: bool,
 }
 
 impl HandlerContextBuilder {
@@ -506,6 +552,12 @@ impl HandlerContextBuilder {
         self.is_external = v;
         self
     }
+    /// Mark this advance as a reactive delivery trigger (standing-model §3 /
+    /// O1). Set by the dispatch seam from [`ExecuteOptions::reactive_trigger`].
+    pub fn reactive_trigger(mut self, v: bool) -> Self {
+        self.reactive_trigger = v;
+        self
+    }
 
     pub fn build(self) -> HandlerContext {
         HandlerContext {
@@ -527,6 +579,7 @@ impl HandlerContextBuilder {
             handler_grant_hash: self.handler_grant_hash,
             bounds: self.bounds,
             is_external: self.is_external,
+            reactive_trigger: self.reactive_trigger,
         }
     }
 }

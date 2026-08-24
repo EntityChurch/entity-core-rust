@@ -741,6 +741,7 @@ mod tests {
             handler_grant_hash: Some(Hash::compute("test", b"hgrant")),
             bounds: None,
             is_external: false,
+            reactive_trigger: false,
             session_peer_id: None,
         }
     }

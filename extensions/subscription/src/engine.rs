@@ -69,6 +69,13 @@ pub(crate) struct DeliveryWork {
     /// marker at the spec'd path per §4.7. Empty when the originating tree
     /// change carried no chain context.
     chain_id: String,
+    /// W6 attribution captured from the triggering tree-change context at
+    /// enqueue time (ruling 18). The async delivery worker has no
+    /// `ExecutionContext` of its own, so a terminal-failure marker it binds
+    /// would otherwise record nothing about who caused the substrate write.
+    author: Option<Hash>,
+    caller_capability: Option<Hash>,
+    request_id: Option<String>,
 }
 
 /// The delivery function type — injected by peer setup.
@@ -482,6 +489,17 @@ impl SyncTreeHook for Engine {
         // Collect IDs that need termination (deferred to avoid holding locks during removal).
         let mut to_terminate = Vec::new();
 
+        // W6 attribution shared by every synchronous §4.7 marker bind below
+        // (ruling 18). These sites fire inside `on_tree_change` with the
+        // triggering caller's context still in hand; the async delivery-worker
+        // site captures the same fields into `DeliveryWork` instead.
+        let sync_attribution = crate::chain_error::MarkerAttribution {
+            author: ctx.author,
+            caller_capability: ctx.caller_capability,
+            request_id: ctx.request_id.clone(),
+            operation: "notify",
+        };
+
         for sub_id in matching_ids {
             let sub_data = {
                 let mut subs = self.subscriptions.write().unwrap();
@@ -522,6 +540,7 @@ impl SyncTreeHook for Engine {
                             reason,
                             0,
                             crate::chain_error::capture_failure_timestamp_ms(),
+                            &sync_attribution,
                         );
                         to_terminate.push(id);
                         continue;
@@ -542,6 +561,7 @@ impl SyncTreeHook for Engine {
                             reason,
                             0,
                             crate::chain_error::capture_failure_timestamp_ms(),
+                            &sync_attribution,
                         );
                         continue;
                     }
@@ -566,6 +586,7 @@ impl SyncTreeHook for Engine {
                         crate::chain_error::REASON_CAPABILITY_DENIED,
                         403,
                         crate::chain_error::capture_failure_timestamp_ms(),
+                        &sync_attribution,
                     );
                     to_terminate.push(sub_id.clone());
                     continue;
@@ -591,6 +612,7 @@ impl SyncTreeHook for Engine {
                             crate::chain_error::REASON_CAPABILITY_DENIED,
                             403,
                             crate::chain_error::capture_failure_timestamp_ms(),
+                            &sync_attribution,
                         );
                         to_terminate.push(sub_id.clone());
                         continue;
@@ -688,6 +710,12 @@ impl SyncTreeHook for Engine {
                 subscription_id: sub_id,
                 request,
                 chain_id: ctx.chain_id.clone().unwrap_or_default(),
+                // W6 attribution (ruling 18): snapshot the triggering caller's
+                // identity/cap/request-id now, while we still hold the context —
+                // the async worker binds the marker without it.
+                author: ctx.author,
+                caller_capability: ctx.caller_capability,
+                request_id: ctx.request_id.clone(),
             });
         }
 
@@ -777,6 +805,12 @@ impl Engine {
                     reason,
                     0,
                     crate::chain_error::capture_failure_timestamp_ms(),
+                    &crate::chain_error::MarkerAttribution {
+                        author: work.author,
+                        caller_capability: work.caller_capability,
+                        request_id: work.request_id.clone(),
+                        operation: "deliver",
+                    },
                 );
                 // §2.1 #7 deliver hook — failure arm.
                 if !deliver_hooks.is_empty() {
@@ -1130,6 +1164,9 @@ mod tests {
                 included: HashMap::new(),
             },
             chain_id: String::new(),
+            author: None,
+            caller_capability: None,
+            request_id: None,
         };
 
         // Success case.
@@ -1619,6 +1656,9 @@ mod tests {
                         included: HashMap::new(),
                     },
                     chain_id: String::new(),
+                    author: None,
+                    caller_capability: None,
+                    request_id: None,
                 })
                 .unwrap();
         }

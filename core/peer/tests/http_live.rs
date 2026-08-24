@@ -2118,6 +2118,7 @@ async fn http_outbound_execute_via_send_execute_round_trip() {
         None,
         None,
         &no_chain,
+        None,
     )
     .await
     .expect("send_execute over HttpConnection should succeed");

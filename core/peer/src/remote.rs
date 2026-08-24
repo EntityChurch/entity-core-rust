@@ -1570,6 +1570,7 @@ pub fn build_authenticated_execute(
     params: &Entity,
     resource: Option<&entity_capability::ResourceTarget>,
     deliver_to_params: Option<&DeliverToParams>,
+    bounds: Option<&entity_handler::Bounds>,
 ) -> Result<Envelope, PeerError> {
     let identity = keypair
         .peer_entity()
@@ -1645,6 +1646,60 @@ pub fn build_authenticated_execute(
             entity_ecf::text("deliver_token"),
             entity_ecf::Value::Bytes(dt.deliver_token.content_hash.to_bytes().to_vec()),
         ));
+    }
+
+    // §3.11 / PROPOSAL-CONTINUATION-BOUNDS-PROPAGATION Delta 1: bounds MUST ride
+    // the cross-peer EXECUTE. Before this the remote branch dropped bounds
+    // entirely — `chain_depth`/`chain_id`/`ttl` were lost at every peer hop, so
+    // a cross-peer continuation chain had nothing accumulating (Go finding 2).
+    // `system/bounds` is a **typed-struct field → a bare CBOR map** (like
+    // `deliver_to`/`durability`), not a `{type,data}` entity wrapper (AGENTS
+    // interop invariant). Optional fields are absent when unset (SHOULD-absent).
+    if let Some(b) = bounds {
+        let mut bounds_fields: Vec<(entity_ecf::Value, entity_ecf::Value)> = Vec::new();
+        if let Some(ttl) = b.ttl {
+            bounds_fields.push((entity_ecf::text("ttl"), entity_ecf::integer(ttl as i64)));
+        }
+        if let Some(budget) = b.budget {
+            bounds_fields.push((
+                entity_ecf::text("budget"),
+                entity_ecf::integer(budget as i64),
+            ));
+        }
+        if let Some(cd) = b.cascade_depth {
+            bounds_fields.push((
+                entity_ecf::text("cascade_depth"),
+                entity_ecf::integer(cd as i64),
+            ));
+        }
+        if let Some(chd) = b.chain_depth {
+            bounds_fields.push((
+                entity_ecf::text("chain_depth"),
+                entity_ecf::integer(chd as i64),
+            ));
+        }
+        if let Some(ref cid) = b.chain_id {
+            bounds_fields.push((entity_ecf::text("chain_id"), entity_ecf::text(cid)));
+        }
+        if let Some(ref pcid) = b.parent_chain_id {
+            bounds_fields.push((entity_ecf::text("parent_chain_id"), entity_ecf::text(pcid)));
+        }
+        if !b.visited.is_empty() {
+            let visited_arr: Vec<entity_ecf::Value> =
+                b.visited.iter().map(entity_ecf::text).collect();
+            bounds_fields.push((
+                entity_ecf::text("visited"),
+                entity_ecf::Value::Array(visited_arr),
+            ));
+        }
+        // Only attach `bounds` when it carries something — an all-absent bounds
+        // is indistinguishable from no bounds and stays off the wire.
+        if !bounds_fields.is_empty() {
+            fields.push((
+                entity_ecf::text("bounds"),
+                entity_ecf::Value::Map(bounds_fields),
+            ));
+        }
     }
 
     let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(fields));
@@ -1743,6 +1798,7 @@ pub async fn send_execute(
     deliver_to_params: Option<&DeliverToParams>,
     dispatch_cap: Option<&Entity>,
     chain_bundle: &HashMap<Hash, Entity>,
+    bounds: Option<&entity_handler::Bounds>,
 ) -> Result<entity_protocol::ParsedResponse, PeerError> {
     let request_id = conn.next_request_id();
 
@@ -1762,6 +1818,7 @@ pub async fn send_execute(
         params,
         resource,
         deliver_to_params,
+        bounds,
     )?;
 
     tracing::debug!(
@@ -2618,6 +2675,82 @@ mod tests {
         panic!("EXECUTE has no capability field");
     }
 
+    /// PROPOSAL-CONTINUATION-BOUNDS-PROPAGATION Delta 1 (§3.11): bounds MUST
+    /// ride the cross-peer EXECUTE. The remote branch previously dropped them —
+    /// `chain_depth`/`chain_id`/`ttl` were lost at every peer hop, so a
+    /// cross-peer continuation chain had nothing accumulating. This pins the
+    /// encode→decode round-trip through the SAME `extract_bounds` a receiving
+    /// peer runs, so the inherited depth survives the wire (the inheritance §4
+    /// depends on). `system/bounds` is encoded as a bare CBOR map (typed-struct
+    /// field), and an all-absent bounds stays off the wire entirely.
+    #[test]
+    fn test_bounds_ride_cross_peer_execute() {
+        let kp = IdentityKeypair::Ed25519(Keypair::generate());
+        let cap = Entity::new("system/capability", vec![0xC0]).unwrap();
+        let params = Entity::new(
+            "primitive/any",
+            entity_ecf::to_ecf(&entity_ecf::Value::Null),
+        )
+        .unwrap();
+        let empty: HashMap<Hash, Entity> = HashMap::new();
+
+        let bounds = entity_handler::Bounds {
+            ttl: Some(9),
+            budget: Some(3),
+            cascade_depth: Some(2),
+            chain_depth: Some(17),
+            chain_id: Some("network-maintain-42".to_string()),
+            parent_chain_id: None,
+            visited: vec![],
+        };
+        let env = build_authenticated_execute(
+            &kp,
+            &cap,
+            &empty,
+            &empty,
+            "req-b",
+            "entity://peerB/system/continuation",
+            "advance",
+            &params,
+            None,
+            None,
+            Some(&bounds),
+        )
+        .unwrap();
+
+        let decoded = crate::connection::extract_bounds(&env.root)
+            .expect("bounds MUST be present on the wire EXECUTE");
+        assert_eq!(
+            decoded.chain_depth,
+            Some(17),
+            "chain_depth survives the wire (§4 inheritance)"
+        );
+        assert_eq!(decoded.chain_id.as_deref(), Some("network-maintain-42"));
+        assert_eq!(decoded.ttl, Some(9));
+        assert_eq!(decoded.budget, Some(3));
+        assert_eq!(decoded.cascade_depth, Some(2));
+
+        // No bounds → no `bounds` field on the wire (SHOULD-absent).
+        let env_none = build_authenticated_execute(
+            &kp,
+            &cap,
+            &empty,
+            &empty,
+            "req-n",
+            "entity://peerB/system/tree",
+            "get",
+            &params,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(
+            crate::connection::extract_bounds(&env_none.root).is_none(),
+            "an EXECUTE with no bounds carries no `bounds` field"
+        );
+    }
+
     /// G2 (EXTENSION-CONTINUATION §3.6 step 5 / §4.2 case 3 / §4.3): when a
     /// scoped dispatch_capability is passed, the dispatched EXECUTE's
     /// `capability` MUST be that cap (never a silent fallback to the
@@ -2658,6 +2791,7 @@ mod tests {
             &params,
             None,
             None,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -2684,6 +2818,7 @@ mod tests {
             "entity://peerB/system/tree",
             "get",
             &params,
+            None,
             None,
             None,
         )
@@ -2732,6 +2867,7 @@ mod tests {
             "entity://peerB/system/tree",
             "put",
             &params,
+            None,
             None,
             None,
         )
@@ -2943,6 +3079,7 @@ mod tests {
                     None,
                     None,
                     &no_chain,
+                    None,
                 )
                 .await
             }));
@@ -3013,6 +3150,7 @@ mod tests {
                     None,
                     None,
                     &no_chain,
+                    None,
                 )
                 .await
             })
@@ -3033,6 +3171,7 @@ mod tests {
                     None,
                     None,
                     &no_chain,
+                    None,
                 )
                 .await
             })

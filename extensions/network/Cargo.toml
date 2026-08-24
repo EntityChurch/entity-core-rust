@@ -8,6 +8,7 @@ description = "EXTENSION-NETWORK §3–§4 — system/network handler: maintain-
 entity-ecf.workspace = true
 entity-hash.workspace = true
 entity-entity.workspace = true
+entity-crypto.workspace = true
 entity-types.workspace = true
 entity-store.workspace = true
 entity-handler.workspace = true

@@ -38,13 +38,15 @@ use crate::PeerShared;
 /// Write the §3.13 liveness entity for a remote peer to the local tree
 /// at `/{local}/system/peer/status/{remote_hex}`.
 ///
-/// Straight write (not read-modify-write): the status entity has no
-/// field the caller must preserve. The §A1 no-clobber discipline — do
-/// not demote a concurrently-established live re-entry — is the
-/// CALLER's responsibility at the transport-error seam (pool
-/// pointer-identity guard, see [`demote_peer_on_transport_error`]),
-/// because only the caller knows whether the failed connection is
-/// still the bound one.
+/// Straight write (not read-modify-write). Two things are therefore the
+/// CALLER's responsibility, both for the same reason — only the caller
+/// knows the history this write sits in:
+/// - the §A1 no-clobber discipline (do not demote a concurrently-
+///   established live re-entry — pool pointer-identity guard, see
+///   [`demote_peer_on_transport_error`]);
+/// - carrying `failing_since` forward across an escalation (see
+///   [`episode_failing_since`]). It is the one field a demotion write
+///   must preserve.
 ///
 /// Soft-fail: the liveness write is observability-only and must never
 /// mask the transport/handshake outcome the caller is about to return.
@@ -87,6 +89,60 @@ pub(crate) fn write_peer_status(
             );
         }
     }
+}
+
+/// Read the §3.13 liveness entity a prior [`write_peer_status`] bound
+/// for a remote peer, if one is present and decodable.
+///
+/// A plain read of published operational state, not the read half of a
+/// read-modify-write: [`write_peer_status`] stays a straight write. A
+/// miss (never written, evicted, undecodable) is an ordinary "no status
+/// known" — every caller has a defined behaviour for it.
+pub(crate) fn read_peer_status(
+    content_store: &dyn ContentStore,
+    location_index: &dyn LocationIndex,
+    local_peer_id: &str,
+    remote_identity_hash: &Hash,
+) -> Option<PeerStatusData> {
+    let path = format!(
+        "/{}/{}",
+        local_peer_id,
+        PeerStatusData::relative_path(remote_identity_hash)
+    );
+    let hash = location_index.get(&path)?;
+    let entity = content_store.get(&hash)?;
+    PeerStatusData::from_entity(&entity).ok()
+}
+
+/// The §A6.5 `failing_since` stamp for a demotion write (rulings 7/8):
+/// the START of the current failure episode.
+///
+/// Returns the episode already in progress when there is one, and
+/// `now` otherwise. That "already in progress" branch is the whole
+/// point: a `suspect` → `disconnected` escalation (or a redial that
+/// trips the transport seam again mid-episode) must carry the ORIGINAL
+/// stamp forward, or the derived §2.2 curve restarts at `min_ms` every
+/// time the peer fails a little harder. Only the `connected` write
+/// clears it, by omission.
+///
+/// This is the one field a demotion caller must preserve, so it lives
+/// at the caller — the same seam that already owns the §A1 no-clobber
+/// guard, for the same reason: only the caller knows the episode's
+/// history.
+pub(crate) fn episode_failing_since(
+    content_store: &dyn ContentStore,
+    location_index: &dyn LocationIndex,
+    local_peer_id: &str,
+    remote_identity_hash: &Hash,
+) -> Option<u64> {
+    let carried = read_peer_status(
+        content_store,
+        location_index,
+        local_peer_id,
+        remote_identity_hash,
+    )
+    .and_then(|d| d.failing_since);
+    Some(carried.unwrap_or_else(now_ms))
 }
 
 /// Current wall-clock ms since epoch (WASM-safe).
@@ -137,6 +193,12 @@ pub(crate) fn demote_peer_on_transport_error(
     data.reason = Some(PEER_STATUS_REASON_TRANSPORT_ERROR.to_string());
     data.last_error = Some(cause.to_string());
     data.last_seen = crate::keepalive::last_seen_snapshot(failed.as_ref());
+    data.failing_since = episode_failing_since(
+        shared.content_store.as_ref(),
+        shared.location_index.as_ref(),
+        shared.peer_id.as_str(),
+        &failed.remote_identity_hash(),
+    );
     write_peer_status(
         shared.content_store.as_ref(),
         shared.location_index.as_ref(),
@@ -184,6 +246,12 @@ pub(crate) fn demote_peer_on_keepalive_miss(
     let mut data = PeerStatusData::bare(failed.remote_peer_id(), PEER_STATUS_DISCONNECTED);
     data.reason = Some(PEER_STATUS_REASON_KEEPALIVE_MISS.to_string());
     data.last_seen = crate::keepalive::last_seen_snapshot(failed.as_ref());
+    data.failing_since = episode_failing_since(
+        content_store,
+        location_index,
+        local_peer_id,
+        &failed.remote_identity_hash(),
+    );
     write_peer_status(
         content_store,
         location_index,
@@ -431,6 +499,95 @@ mod tests {
         assert!(
             shared.remote.get_inbound(&remote_pid).is_none(),
             "failed reentry endpoint should be unregistered"
+        );
+    }
+
+    /// Rulings 7/8: the first demotion OPENS the failure episode, and
+    /// every later demotion write in that episode carries the original
+    /// stamp forward. Re-stamping on escalation would restart the
+    /// derived §2.2 curve at `min_ms` every time the peer fails a
+    /// little harder — the backoff would never actually back off.
+    #[test]
+    fn a12_failing_since_opens_once_and_survives_escalation() {
+        let peer = test_peer(0x58);
+        let shared = peer.shared();
+        let remote_kp = Keypair::from_seed([0x59; 32]);
+        let remote_pid = remote_kp.peer_id().to_string();
+        let remote_hash = remote_kp.peer_identity_hash();
+
+        let first_conn: Arc<dyn RemoteEndpoint> =
+            Arc::new(FakeEndpoint::for_remote(&remote_kp, remote_hash));
+        shared
+            .remote
+            .insert_endpoint(&remote_pid, first_conn.clone());
+        seed_connected(&shared, &remote_pid, &remote_hash);
+
+        demote_peer_on_transport_error(&shared, &remote_pid, &first_conn, "first failure");
+        let opened = status_of(&shared, &remote_hash).expect("status entity vanished");
+        assert_eq!(opened.status, PEER_STATUS_SUSPECT);
+        let episode_start = opened
+            .failing_since
+            .expect("the first demotion must open a failure episode");
+
+        // Advance the clock past ms resolution, so a re-stamp would be
+        // visible as a different value rather than hiding in the same
+        // millisecond.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // A redial that trips the transport seam again, still in the
+        // same episode. The demotion above evicted the failed conn, so
+        // bind a fresh one — as a real redial would.
+        let redial: Arc<dyn RemoteEndpoint> =
+            Arc::new(FakeEndpoint::for_remote(&remote_kp, remote_hash));
+        shared.remote.insert_endpoint(&remote_pid, redial.clone());
+        demote_peer_on_transport_error(&shared, &remote_pid, &redial, "still failing");
+
+        let escalated = status_of(&shared, &remote_hash).expect("status entity vanished");
+        assert_eq!(
+            escalated.failing_since,
+            Some(episode_start),
+            "a demotion inside a live episode re-stamped failing_since"
+        );
+    }
+
+    /// Recovery ENDS the episode: the `connected` write omits
+    /// `failing_since`, clearing it. A stamp surviving a re-establish
+    /// would have the next failure resume a stale curve instead of
+    /// starting a fresh one.
+    #[test]
+    fn a12_recovery_clears_the_failure_episode() {
+        let peer = test_peer(0x5a);
+        let shared = peer.shared();
+        let remote_kp = Keypair::from_seed([0x5b; 32]);
+        let remote_pid = remote_kp.peer_id().to_string();
+        let remote_hash = remote_kp.peer_identity_hash();
+
+        let conn: Arc<dyn RemoteEndpoint> =
+            Arc::new(FakeEndpoint::for_remote(&remote_kp, remote_hash));
+        shared.remote.insert_endpoint(&remote_pid, conn.clone());
+        seed_connected(&shared, &remote_pid, &remote_hash);
+        demote_peer_on_transport_error(&shared, &remote_pid, &conn, "failed");
+        assert!(
+            status_of(&shared, &remote_hash)
+                .and_then(|d| d.failing_since)
+                .is_some(),
+            "precondition: an episode is open"
+        );
+
+        write_connected_status(
+            shared.content_store.as_ref(),
+            shared.location_index.as_ref(),
+            shared.peer_id.as_str(),
+            &remote_pid,
+            &remote_hash,
+            None,
+        );
+
+        let recovered = status_of(&shared, &remote_hash).expect("status entity vanished");
+        assert_eq!(recovered.status, PEER_STATUS_CONNECTED);
+        assert_eq!(
+            recovered.failing_since, None,
+            "re-establishing must close the failure episode"
         );
     }
 

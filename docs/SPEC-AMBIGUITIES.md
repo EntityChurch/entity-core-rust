@@ -3501,3 +3501,103 @@ spec's shape and routes the conflict rather than picking. **Arch: does ruling
 the exception because its raw value survives in the body?** Whichever way it
 lands, one of Go and Rust changes — this is a live cross-impl divergence on a
 coordinate, not a style question.
+
+---
+
+## EXTENSION-NETWORK §2.2 / §3.13 — `failing_since` has no writer for a peer that never connected
+
+**Spec:** EXTENSION-NETWORK §2.2 (retry pacing) + ENTITY-CORE-PROTOCOL §3.13, as
+ruled by arch rulings 7/8 (`entity-system-architecture`
+`docs/status/ROUTING-2026-07-16-arch-rulings-to-cohort.md`): retry state lives in
+the tree as ONE field, `failing_since`, written at the transition only;
+`attempt` / `next_attempt_at` are derived, never stored.
+
+**Ambiguity.** The durability of that derivation rests on a transition a
+never-connected peer never makes. `failing_since` is stamped at the transition
+OUT of `connected`; a peer that has never connected has never been `connected`,
+and a failed **dial** writes no status entity (only a transport error on an
+*established* connection demotes — `demote_peer_on_transport_error`,
+`core/peer/src/liveness.rs`). So for `maintain-peer` against a peer that is not
+up yet — a node booting before its neighbour, an address that is right but early
+— the tree holds no stamp, and a derivation reading only the tree computes
+`attempt = 0` on every attempt: no backoff growth at all. Whether a failed dial
+against a MAINTAINED peer should itself write a §3.13 demotion is the open
+question; it is a question about the model, not about one seat.
+
+**Not our question first — Go routed it.** `entity-core-go`
+`docs/validation/spec-issues/2026-07-16-failing-since-never-connected.md` states
+it in full and notes "Rust/Python not probed". **Rust is now probed: the gap is
+real here, identically.** Logged for our own traceability and to confirm the
+cohort reading; arch should answer Go's issue, not two copies of it.
+
+**Interim choice — converged with Go's, deliberately.** Prefer the tree's
+`failing_since` when present (the authoritative, restart-surviving copy); keep an
+in-memory episode start on the session as the FALLBACK for the never-connected
+case only (`SessionState::failing_since`, resolved by `NetworkHandler::retry_state`,
+`extensions/network/src/lib.rs`). The month-dead-peer win lands fully — that peer
+*was* connected, so its stamp is in the tree and a restart re-derives from it
+(pinned by `a12_retry_pacing_resumes_from_the_trees_stamp_after_a_restart`). The
+never-connected case keeps today's behaviour: the curve grows within the process
+and resets on restart. No regression, and no write site invented to paper over
+the gap.
+
+**One Rust-specific note for the cohort.** Reading the tree's stamp requires the
+status-path key (the remote's identity hash) with NO live connection. Rust
+previously set that key only on a successful establish, which would have made the
+durable stamp unreadable in exactly the restart case that motivates it — the
+ruling's headline win would have silently not landed. It is now derived from the
+`peer_id` alone at session creation (`identity_hash_from_peer_id`), mirroring
+Go's `types.ComputePeerIdentityHashFromPeerID` at the top of `maintain-peer`.
+Seats deriving pacing from the tree should check they can *address* the stamp
+before they can be said to read it.
+
+## EXTENSION-CONTINUATION §3.4/§5 (marker retention) — MUST-collect vs. a peer that has no GC (ruling 19 / #19)
+
+**Date:** 2026-07-17. **Status:** routed back to architecture; NOT built here.
+
+Ruling 19 affirmed `PROPOSAL-CONTINUATION-LOST-ERROR-MARKER-MUST` §5, which
+elevates marker collection from **MAY** (the landed text — *"Implementations MAY
+garbage-collect markers after a configured retention window; suggested default:
+24 hours"*, EXTENSION-CONTINUATION §3.4/§5.x, unchanged in `70c52b4`) to a
+**MUST**: self-collection at a `system/config/chain-errors` → `retention_ms` key,
+default 24h, mirroring EXTENSION-DISCOVERY's `candidate_history_retention` shape.
+Ruling 19's own words: *"the retention MUST prevents unbounded growth by accident,
+not a deliberate opt-in — spell it as a value of the retention key, one knob not
+two"* (i.e. `RetainMarkersForever` is a sentinel VALUE of `retention_ms`, not a
+separate boolean).
+
+**Why this is logged rather than built.** Three facts pull against building the
+MUST here now, and they are a question about the model, not about one seat:
+
+1. **Rust has no marker-collection machinery at all** — no retention config, no
+   sweep, no GC of `system/runtime/chain-errors/**`. Neither does the pattern the
+   proposal says to mirror: `candidate_history_retention` is **not implemented**
+   in Rust's `extensions/discovery` (exhaustive grep, 2026-07-17). So the MUST is
+   not "add a value to an existing knob" — it is "build a whole background
+   collection subsystem," with a WASM-timer story, that no seat has today.
+2. **The landed spec still says MAY.** The MUST lives in an affirmed-but-unfolded
+   proposal. Building a background deleter of a peer's own audit trail ahead of
+   the fold is a real behavior change (markers *disappearing*) that deserves the
+   fold's scrutiny, not a rider.
+3. **The blast radius already shrank to near-zero.** Rulings 2+3 (landed,
+   `d7d0d79`) took a dead peer's marker tree from ~1,440 nodes/day to **empty** —
+   the retry loop no longer generates markers at all. Retention is no longer the
+   line of defense against an unbounded generator; it is ordinary hygiene against
+   a slow trickle of genuine exceptional failures. A MUST-delete is a heavy
+   instrument for that.
+
+**Also: it is effectively untestable as specified.** The observable is "markers
+gone after `retention_ms`"; with the 24h default that is a wall-clock test no
+conformance run exercises. A convergence vector would have to inject a tiny
+`retention_ms` and assert deletion — which tests the *config plumbing*, not the
+"prevents unbounded growth" property the MUST is for.
+
+**Interim choice:** none needed — nothing collects today, and with the empty
+dead-peer tree nothing accumulates from the retry path. If a marker sink ever
+does grow, an operator can prune `system/runtime/chain-errors/**` out of band.
+**Routed to architecture** (`docs/status/ROUTING-2026-07-17-marker-feasibility-and-retention-rust.md`):
+is a self-collection MUST warranted for a surface this small, or should §5 stay a
+MAY (a peer that never collects is then conformant)? If the MUST stands, the
+one-knob spelling is confirmed and the sweep is a scoped follow-on, not this
+cycle. **Answer the model question before three seats each build a background
+deleter.**

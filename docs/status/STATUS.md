@@ -1,6 +1,6 @@
 # entity-core-rust — status
 
-_Updated: 2026-07-15 · public: v0.8.0 (master)_
+_Updated: 2026-07-18 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -47,6 +47,149 @@ wasm-worker stack gained `DisconnectPeer` connection eviction at protocol
 `-D warnings` clean across every `bindings/*` crate for the first time
 (`make clippy` only ever covered default-members, which excludes them), with
 `cargo fmt --check` clean workspace-wide.
+
+_Latest 2026-07-16 — arch rulings absorbed + a security fix_
+(`docs/status/HANDOFF-2026-07-16-arch-rulings-and-injection-rust.md`). The arch
+packet came back **empty — every open question across three rungs is ruled**
+(`entity-system-architecture`
+`docs/status/ROUTING-2026-07-16-arch-rulings-to-cohort.md`). Landed on `dev`:
+
+- **Marker path injection — CONFIRMED and contained** (ruling 13). Go's new
+  `security` probe FAILed Rust 29/30: a tree node literally named `..`, put in
+  our marker tree by an **unauthorized** peer — the §3.10.3 rejected marker is
+  bound *because* the cap check failed, so an attacker reaches the binding site
+  by construction. Reproduced here, fixed at all three binding sites, with
+  `sanitize_path_segment` converging byte-for-byte with Go's.
+- **The retry loop survives** (ruling 1 — STANDING). Last session's held fix,
+  unheld: **2 → 16 attempts** in 3s at min 60/max 200, stable 3/3. A peer that
+  goes offline is recovered again.
+- **Marker coordinates mean something** (rulings 9 + 11):
+  `.../lost/chain-8a1c.../internal/...` →
+  `.../lost/network-maintain-4814.../network-backoff-advance-{nanos}/...`.
+  `"internal"` was `ExecuteOptions::request_id`'s default — the seam's name for
+  a *category* of dispatch, shared by every handler-to-handler dispatch in the
+  workspace.
+- **`entity://` canonicalization — RESOLVED** (ruling 24): `canonicalize` now
+  resolves `entity://{p}/x` → `/{p}/x`. Rust's longest-standing "cross-impl
+  blocker" was never one; cleaning ≠ canonicalizing, and the answer was
+  readable in Go's source the whole time. Does **not** close cross-peer
+  delivery to a Rust subscriber (the SDK-side stack behind it is still open).
+
+_Latest 2026-07-17 — arch round 2 absorbed + the ruled list nearly closed_
+(`docs/status/HANDOFF-2026-07-17-round2-and-derived-pacing-rust.md`). Landed on
+`dev` (`ae2bf31`, `32403c1`, `d7d0d79`, `de42323`):
+
+- **Retry pacing is DERIVED, not counted** (#7/#8). `failing_since` is the one
+  durable field — stamped at the transition out of `connected`, preserved
+  across escalation, cleared on recovery; `attempt`/`next_attempt_at` are a
+  pure function of (`failing_since`, cfg, now). The §A6.5 formula is pinned as
+  a vector table ported from Go's `core/types/network_backoff_test.go` and
+  reproduces its numbers value-for-value. **The table could not see the bug
+  that mattered:** the status-path key was only set on a successful establish,
+  so a restarted process could not *address* the stamp it was meant to
+  re-derive from — restart-hammering, the ruling's headline win, would have
+  silently not landed under a green table.
+- **Collapse to sentinel, not hash** (round-2 ruling 1, amending 13). Rust was
+  the last seat hashing. An attacker could mint unbounded path nodes — the
+  pollution vector the injection fix closed, re-opened one layer up. Pinned:
+  1000 distinct hostile values → exactly 1 node. The body now carries the
+  originals (round-2 ruling 2), which is what makes collapsing lossless.
+- **A dead peer's marker tree is EMPTY** (#3 + #2). ~1,440 nodes/day → 0.
+  **#2 and #3 are not independent** despite being numbered that way: the
+  `on_error` only removes the `reconnect` path's markers; the rest come from
+  the backoff's own `maintain-peer` re-EXECUTE returning 502, which ruling 2's
+  200-on-armed is what removes.
+- **The §2.2 give-up says so** (#6): `max_attempts`/`max_elapsed_ms` decode,
+  and exhaustion writes `disconnected` + `reason: retry-exhausted` (no fourth
+  status value). Retry-forever remains the normative default.
+
+Ruling 14 is **N/A for Rust** (no synthesized fallback key — `{step_index}` is
+`ctx.request_id` directly; evidence in the handoff).
+
+_Latest 2026-07-17 (later) — the ruled list is now CLOSED_ (`53d928b`, `840a2cb`;
+routing docs `ROUTING-2026-07-17-marker-feasibility-and-retention-rust.md`,
+`ROUTING-2026-07-17-bounds-propagation-rust-position.md`):
+
+- **§4.7 subscription markers record who caused the substrate write** (#18, now
+  MUST — `53d928b`). Every §4.7 lost-error bind — four synchronous limit/token
+  sites + the async delivery worker — now uses `set_with_context` with the W6
+  split: `capability`/`handler_grant` = the subscription component's own grant
+  (resolved lazily; `None` degrades, never drops), `caller_capability`/`author`/
+  `request_id` = the triggering caller (captured into `DeliveryWork` for the
+  worker, which has no ctx). Also converged the `{reason}` sanitizer to the
+  shared `sanitize_path_segment` (ruling 1 straggler — the hand-rolled copy
+  wrongly rejected spaces §1.4 permits).
+- **Marker handler-grant feasibility — ANSWERED** (owed to the cohort). Option
+  (ii) works on Rust with no cap-check rework, for a stronger reason than Go's:
+  the bind is a substrate write through `set_with_context`, and Rust enforces
+  caps at the dispatch seam, not the write seam — `set_impl` reads no
+  `dispatch_capability`, so the F2 trap cannot occur by construction. option (i)
+  MUST-provision not needed here.
+- **Retention / `RetainMarkersForever` (#19) — ROUTED, not built.** Rust has no
+  marker-collection machinery (nor does the DISCOVERY pattern the proposal says
+  to mirror), the landed spec still says MAY, and rulings 2+3 already took the
+  dead-peer marker tree to empty — so a self-collection MUST is a heavy,
+  effectively-untestable (24h) instrument for a surface that barely grows. Asked
+  arch: is the MUST warranted, or does §5 stay a MAY? Logged in SPEC-AMBIGUITIES.
+- **Cross-peer chain bound (`chain_depth` in `system/bounds`) — shape + O1
+  confirmed, build HELD.** core-go's bounds-propagation proposal is DRAFT and
+  touches wire-core; core-go itself held the cross-peer half. Rust has no
+  `chain_depth` mechanism at all. Rather than lead a speculative wire-shape solo,
+  Rust confirmed the field shape and the O1 causal-vs-standing signal (key on the
+  presence of inherited `bounds.chain_depth`, matching Go) and will build the
+  wired brake once the proposal folds or a second seat lands the field.
+
+_Latest 2026-07-18 — both held builds UNBLOCKED and landed_
+(`ROUTING-2026-07-18-bounds-and-q2-build-rust.md`; Go's
+`ROUTING-2026-07-18-go-standing-model-q2-and-o1.md` landed the wired field + pinned
+both O1s — the exact hold conditions Rust's 2026-07-17 note set):
+
+- **Wired `chain_depth` brake built** (bounds-propagation, from the field up — Rust
+  had no `chain_depth` at all). `chain_depth` on `Bounds` + CBOR + `system/bounds`
+  type; **Delta 1 fixed** — the remote branch dropped bounds entirely (no encoder
+  existed), now `build_authenticated_execute`/`send_execute` carry a bare-map
+  `system/bounds` so `chain_depth`/`chain_id`/`ttl` survive the hop; inherit+`+1`
+  on causal advance, root-at-0 on a fresh trigger (O1 = presence of inherited
+  `bounds.chain_depth`, verbatim with Go); **§3.9 suspend** persists a resumable
+  `system/continuation/suspended` entity with `reason: chain_depth_exceeded` and
+  stops the chain; **§3.7 resume roots `chain_depth` at 0**. `chain_depth` is the
+  independent brake regardless of ttl (Q1 §4a).
+- **Standing-model §3 (Q2) — split holds by construction, marker adopted for
+  convergence.** Rust has no advance-time caller-cap check (caps at the dispatch
+  seam), so anchor 1 passes by construction — no Q2 defect, same shape as the
+  marker-grant feasibility answer. Adopted the explicit per-dispatch
+  `reactive_trigger` signal (Go's `ReactiveTrigger` analog) set by the inbox
+  deliverer and threaded through `make_execute_fn` — the declared O1 signal, not
+  an inference.
+- **Gate green:** clippy `-D warnings` clean, 119 test-suites pass (6 new unit
+  tests + a wire round-trip), fmt clean, wasm32 CI build green. **Owed:** the
+  cross-impl `validate-peer` / Go↔Rust anchor-1 run (a same-side round-trip cannot
+  prove wire fidelity); ttl-refill parity (§6) is flagged, not built.
+
+_Earlier 2026-07-16:_ Go's `network` category asked two questions it had never
+asked before, and **both found real defects on all three seats**
+(`docs/status/HANDOFF-2026-07-16-network-retry-survival-rust.md`; the cohort
+report is `entity-core-go` `docs/validation/reports/`
+`2026-07-16-retry-survival-cohort.md`). Yesterday's `network` 4/4 stands — it
+was true; the category simply did not ask.
+
+- **The reconnect retry loop stops after 2 attempts** — confirmed on Rust from
+  our own substrate (2 attempts in 3000ms where §2.2 predicts ~20,
+  reproducible 3/3), by counting §3.10 markers in-process rather than Go's
+  external dial socket. §4.1's one-shot backoff continuation is re-armed by
+  the very `maintain-peer` it dispatches, so the advance's post-dispatch
+  consume deletes the re-arm. A peer that goes offline is never recovered.
+  **Not fixed here — blocked on the §4.1 lifecycle ruling** (arch's call;
+  Go's standing-continuation fix is explicitly not offered as a cohort
+  answer). Pinned by `a12_retry_survives_outage`, `#[ignore]`d because it
+  asserts the *current, defective* behavior.
+- **`chain_id` must be a single path segment** (§3.11) — §4.1's literal
+  `network/maintain/{sid}` forks the marker tree. Landed (opaque, shim-free).
+- **§3.6 step 6 was unimplemented** — the advance dispatched with no bounds,
+  so a chain-less trigger left every marker binder inventing a coordinate;
+  Rust's fallback was the request id, which is the literal `"internal"` for
+  handler-to-handler dispatch. Landed: mint the chain once, use it for both
+  the marker and the dispatch bounds.
 
 Still queued: cross-peer subscription delivery to a Rust subscriber; the
 §7.2 second-half arch call and the rung-3 convergence pass (tracker #7).
@@ -96,20 +239,27 @@ up only if a future profile shows `verify_request` back on the hot path.
 
 ## Waiting on
 
+- **Nothing is blocked on architecture.** Rounds 1 and 2 are both absorbed.
+  The `{reason}` sentinel-vs-hash divergence is **closed** — round-2 ruling 1
+  ruled sentinel everywhere, which is the shape Rust already held; all three
+  coordinates now use it and Go has converged. Two questions stay routed and
+  block nothing: §1.4 not naming the dot tokens, and whether ruling 11's
+  "keepalive carries `network-maintain-{session}`" is reachable without
+  inverting the core/peer ← network layering. Both in
+  `docs/SPEC-AMBIGUITIES.md`.
+- **`failing_since` for a never-connected peer** — a real cross-impl gap in the
+  rulings-7/8 model (the stamp is written at the transition out of `connected`;
+  a peer that never connected never makes one). **Go routed it and Rust
+  converged on their interim**; arch should answer Go's spec-issue, not two
+  copies. Logged in `docs/SPEC-AMBIGUITIES.md` with the pointer.
 - **Protocol spec (upstream):** this repo implements the landed spec and does
   not define it. Several backlog items (mutual-auth test coverage, the cross-impl
   `Batch`/`Transaction` shape) are gated on upstream design landing.
-- **Cross-impl coordination on `entity://` capability-scope canonicalization
-  (the structural blocker for Rust-subscriber cross-peer delivery).** The spec
-  uses the `entity://peer/path` URI form for a cross-peer `deliver_uri`, so a
-  `deliver_token`'s `resources` scope carries that form; but
-  `core/capability::canonicalize` does not recognize the `entity://` scheme and
-  mangles it so it can never match the normalized delivery-time request target →
-  403 "operation permission denied". This bites even the spec-model inbox
-  delivery. Whether `canonicalize` MUST strip `entity://` (treating
-  `entity://{p}/x` ≡ `/{p}/x` as addresses, as dispatch routing already does) is
-  a cross-implementation question — logged in `docs/SPEC-AMBIGUITIES.md`, not
-  patched unilaterally, pending Go/Python alignment.
+- **Cross-peer subscription delivery to a Rust subscriber** — no longer blocked
+  on the `entity://` question (ruled + fixed), but still open: the SDK-side
+  `deliver_token` grantee/signature/handler-scope mismatches
+  (`bindings/sdk/src/subscription.rs`, `extensions/subscription/src/lib.rs`)
+  are diagnosed but unlanded.
 - **Cross-impl coordination on SDK-surface items** (`PeerSurface` trait, SQLite
   pool split mirroring the Go peer) waits on those consumers/decisions.
 
@@ -135,10 +285,10 @@ up only if a future profile shows `verify_request` back on the hot path.
     writes the response back over the same connection (previously the dialer
     reader handled only EXECUTE_RESPONSE and silently dropped reentry
     deliveries).
-  - The remaining Rust-*subscriber*-side stack is diagnosed but unlanded:
-    SDK-level `deliver_token` grantee/signature/handler-scope mismatches
-    (`bindings/sdk/src/subscription.rs`, `extensions/subscription/src/lib.rs`),
-    and the core `entity://` canonicalization gap above.
+  - The core `entity://` canonicalization gap is **fixed** (ruling 24). The
+    remaining Rust-*subscriber*-side stack is diagnosed but unlanded: SDK-level
+    `deliver_token` grantee/signature/handler-scope mismatches
+    (`bindings/sdk/src/subscription.rs`, `extensions/subscription/src/lib.rs`).
 - **Trust stack — Role extension v1.0 → v2.0:** root-cap shape, SEC-2
   assign/exclude atomicity, and bearer-cap rejection (the new
   `unresolvable_grantee` 401).
@@ -166,11 +316,28 @@ up only if a future profile shows `verify_request` back on the hot path.
 
 ## Next
 
-1. **Cross-peer subscription delivery to a Rust subscriber** is the highest-
-   value in-flight thread: take the `entity://` canonicalization question to the
-   architecture team (Go/Python alignment), then land the SDK-side
-   grantee/signature/handler-scope fixes behind it.
-2. Otherwise, pick up a spec-load-bearing backlog item — per-write capability
-   selection in handlers (caller vs handler grant) is the most central open one.
-3. Keep the green gate (`make check` = lint + test) and `make wasm` passing on
+1. **Two questions routed to architecture — waiting on the model answer, not on
+   Rust.** (a) Retention: is a self-collection MUST warranted, or does §5 stay a
+   MAY? (`ROUTING-2026-07-17-marker-feasibility-and-retention-rust.md`). (b)
+   `chain_depth` in `system/bounds`: Rust confirmed the shape + O1 signal and
+   held the wire build pending fold / a second wired seat
+   (`ROUTING-2026-07-17-bounds-propagation-rust-position.md`). The ruled list
+   itself is otherwise **closed** (#18 landed, feasibility answered, #14 N/A).
+2. **Cross-peer chain bound build — DONE (2026-07-18).** The wired `chain_depth`
+   brake is built (field + CBOR, cross-peer bounds propagation, step-6
+   inherit/increment, O1 signal, §3.9 suspend + §3.7 resume) plus the standing-model
+   §3 (Q2) `reactive_trigger` convergence marker
+   (`ROUTING-2026-07-18-bounds-and-q2-build-rust.md`). **Owed:** run the cross-impl
+   `validate-peer` / Go↔Rust `continuation_bounds` anchor-1 and file the report
+   under `docs/validation/reports/` — a same-side round-trip cannot prove wire
+   fidelity, and it needs the Go peer this tree cannot drive alone.
+3. **Cross-peer subscription delivery to a Rust subscriber** — unblocked at the
+   core by ruling 24; land the SDK-side grantee/signature/handler-scope fixes.
+4. Keep the green gate (`make check` = lint + test) and `make wasm` passing on
    any change; run `validate-peer` / `wire-conformance` on any wire-shape touch.
+   **Two re-probes are owed from Go's side and neither has run:** the `security`
+   category (30/30 — the injection FAIL is fixed here, and the coordinate has
+   since churned from the hash to sentinels, so the probe's expected value moved
+   with it), and `network_reconnect_anchor` (was 4/5 on Rust; #3 + #2 are the
+   fix). Our own vectors are green on both; a same-seat suite cannot close
+   either.

@@ -153,6 +153,7 @@ fn build_ctx(
         handler_grant_hash: None,
         bounds: None,
         is_external: false,
+        reactive_trigger: false,
         session_peer_id: None,
     }
 }

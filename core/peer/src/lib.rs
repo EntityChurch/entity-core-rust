@@ -3326,6 +3326,7 @@ mod tests {
                 handler_grant_hash: None,
                 bounds: None,
                 is_external: false,
+                reactive_trigger: false,
             }
         };
 
@@ -5408,6 +5409,7 @@ mod tests {
             None,
             None,
             &std::collections::HashMap::new(),
+            None,
         )
         .await
         .unwrap_or_else(|e| panic!("send_execute {client_kt:?}-client: {e}"));
@@ -5618,6 +5620,7 @@ mod tests {
             &put_params,
             Some(&resource),
             None,
+            None,
         )
         .unwrap();
         // The opaque inner: a `system/envelope` entity whose data is the inner
@@ -5662,6 +5665,7 @@ mod tests {
             None,
             None,
             &included,
+            None,
         )
         .await
         .unwrap();
@@ -5852,6 +5856,7 @@ mod tests {
             &put_params,
             Some(&resource),
             None,
+            None,
         )
         .unwrap();
         let inner_entity = entity_entity::Entity::new(
@@ -5893,6 +5898,7 @@ mod tests {
             None,
             None,
             &included,
+            None,
         )
         .await
         .unwrap();
@@ -6938,8 +6944,15 @@ mod tests {
 
         // The graph is in the tree: two inbox residents + the managed-
         // namespace backoff resident, all system/continuation entities
-        // carrying the handler grant as dispatch_capability, no on_error →
-        // system/inbox/*.
+        // carrying the handler grant as dispatch_capability.
+        //
+        // `on_error` is asserted per-path, not blanket-absent. This loop used
+        // to require it absent everywhere, citing marker-proposal §5's "never
+        // route on_error at system/inbox/*" — guidance arch has since WITHDRAWN
+        // as too broad (ruling 4): routing there is correct when the error is
+        // MEANT to drive the next step, and the on-disconnect trigger's failed
+        // `reconnect` is exactly that — the failure IS the retry trigger. The
+        // trap the old rule guarded against is unintended advancement.
         let grant_hash = client_shared
             .location_index
             .get(&format!(
@@ -6978,12 +6991,49 @@ mod tests {
                 })
                 .expect("dispatch_capability present");
             assert_eq!(dc, grant_hash, "continuation at {} rides wrong cap", path);
-            let on_error = cmap.iter().find(|(k, _)| k.as_text() == Some("on_error"));
-            assert!(
-                on_error.is_none(),
-                "continuation at {} carries on_error (marker-proposal §5 forbids inbox routing)",
-                path
-            );
+
+            let on_error = cmap
+                .iter()
+                .find(|(k, _)| k.as_text() == Some("on_error"))
+                .map(|(_, v)| {
+                    let m = v.as_map().expect("on_error is a bare delivery-spec map");
+                    let f = |key: &str| {
+                        m.iter()
+                            .find(|(k, _)| k.as_text() == Some(key))
+                            .and_then(|(_, v)| v.as_text())
+                            .unwrap_or("")
+                            .to_string()
+                    };
+                    (f("uri"), f("operation"))
+                });
+
+            if path.ends_with("/on-disconnect") {
+                // Ruling 3: the failed reconnect routes to the backoff seam
+                // instead of binding a lost marker per attempt (~1,440
+                // nodes/day against a peer that stays dead).
+                let (uri, operation) =
+                    on_error.expect("on-disconnect MUST carry on_error → the backoff seam");
+                assert_eq!(
+                    uri,
+                    format!(
+                        "/{}/system/network/peers/{}/on-reconnect-backoff",
+                        client_pid, server_pid
+                    ),
+                    "on-disconnect on_error must target the backoff resident"
+                );
+                assert_eq!(operation, "advance");
+            } else {
+                // The other two stay absent. The backoff resident in
+                // particular must NOT route its error back to `advance`: it
+                // re-EXECUTEs maintain-peer, whose own failure branch re-arms
+                // and reschedules, so an on_error here would fire the next
+                // retry immediately and defeat the §2.2 pacing.
+                assert!(
+                    on_error.is_none(),
+                    "continuation at {} must not carry on_error",
+                    path
+                );
+            }
         }
 
         // Idempotent re-entry: same params → same session.
@@ -7116,22 +7166,24 @@ mod tests {
         }
         assert!(demoted, "peer never demoted after kill");
 
-        // The graph is now retrying against a dead address: reconnect
-        // dispatches fail and land as lost-error markers (no-on_error
-        // forward non-2xx, keyed by RequestID).
-        let marker_prefix = format!("/{}/system/runtime/chain-errors/lost/", client_pid);
-        let mut saw_marker = false;
-        for _ in 0..400 {
-            if !client_shared.location_index.list(&marker_prefix).is_empty() {
-                saw_marker = true;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        assert!(
-            saw_marker,
-            "reconnect failure never bound a §3.10 lost-error marker"
-        );
+        // The graph is now retrying against a dead address. The observable
+        // for that is the §3.13 FAILURE EPISODE, not a marker.
+        //
+        // This vector used to require a lost-error marker here (the
+        // marker-proposal §4 shape: no-`on_error` forward non-2xx, keyed by
+        // RequestID). That requirement is RETIRED — rulings 2 and 3 route the
+        // failed reconnect through `on_error` to the backoff seam and return
+        // 200 with the retry armed, so a peer that is merely offline produces
+        // no error record at all. `a12_retry_survives_outage` now asserts that
+        // tree is empty; requiring a marker here would contradict it.
+        //
+        // What replaces it is a stronger claim about the same failure: the
+        // demotion stamped `failing_since`, which is the one durable input the
+        // §2.2 pacing derives from (rulings 7/8). A retry loop with no episode
+        // on record is one that re-derives `attempt = 0` forever.
+        let episode = liveness_status_of(&client_shared, &server_hash)
+            .and_then(|d| d.failing_since)
+            .expect("the demotion must stamp the failure episode (§3.13 failing_since)");
 
         // Restart the server: same keypair, same memory endpoint — the
         // retry loop must find it and re-establish without intervention.
@@ -7149,6 +7201,21 @@ mod tests {
 
         // Re-established after restart.
         wait_liveness_status(&client_shared, &server_hash, "connected").await;
+
+        // Recovery ENDS the episode. A `failing_since` surviving a
+        // re-establish would have the NEXT failure resume this episode's stale
+        // §2.2 curve — starting at a max-length wait instead of min_ms — so a
+        // peer that flaps once would then reconnect slowly forever. The
+        // `connected` write clears it by omission; this is that, observed.
+        let recovered = liveness_status_of(&client_shared, &server_hash)
+            .expect("status entity vanished after re-establish");
+        assert_eq!(
+            recovered.failing_since, None,
+            "re-established connected but the §3.13 status still carries \
+             failing_since={:?} (episode opened at {}) — the failure episode \
+             was never closed",
+            recovered.failing_since, episode,
+        );
 
         // The lifecycle subscriptions survived the outage (still two).
         let subs = client_shared
@@ -7186,14 +7253,22 @@ mod tests {
     /// path. Ordering, not timing. Ruling 1 resolved it to standing; this
     /// now asserts survival, which is what it was always for.
     ///
-    /// Counts markers, not dials: every failed reconnect binds one §3.10
-    /// lost-error marker, and §3.10.6's timestamp gives each occurrence a
-    /// distinct `{marker_hash}`, so the marker count IS the attempt count.
-    /// (Ruling 3 will retire this observable — once the backoff continuation
-    /// carries an `on_error`, a failed retry routes there instead of binding
-    /// a marker, and a dead peer's marker tree goes empty. When that lands,
-    /// count dispatches instead. The `>= 4` claim is what must survive, not
-    /// the way it is counted.)
+    /// **Counts dials, not markers** — and the switch is the point.
+    ///
+    /// This vector used to count §3.10 lost-error markers: every failed
+    /// reconnect bound one, so the marker count WAS the attempt count. Rulings
+    /// 2 and 3 retired that observable exactly as predicted when it was
+    /// written — the failed `reconnect` now routes through the on-disconnect
+    /// trigger's `on_error` to the backoff seam, and maintain-peer returns 200
+    /// with the retry armed, so a dead peer's marker tree is empty. A
+    /// marker-counting vector would have read a correctly working loop as a
+    /// dead one.
+    ///
+    /// So it counts what an attempt physically IS (a dial, from outside the
+    /// peer — the Go seat counts dials for the same reason), and asserts the
+    /// empty marker tree as a SEPARATE property. The loop is alive AND silent;
+    /// the old observable could not express both at once. The `>= 4` claim is
+    /// what had to survive, not the way it was counted.
     #[cfg(feature = "network")]
     #[tokio::test]
     async fn a12_retry_survives_outage() {
@@ -7255,51 +7330,29 @@ mod tests {
         }
         assert!(demoted, "peer never demoted after kill");
 
-        // Let the retry loop run well past several backoff periods.
-        let marker_prefix = format!("/{}/system/runtime/chain-errors/lost/", client_pid);
+        // Let the retry loop run well past several backoff periods, counting
+        // dials from OUTSIDE the peer.
+        let before = registry.dial_count();
         tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
-        // `{reason}` is a path segment (§3.10.5) — count only the reconnect
-        // failures, so an unrelated marker kind can't inflate the count.
-        let failures: Vec<String> = client_shared
+        let attempts = registry.dial_count() - before;
+
+        // Rulings 2 + 3: a dead peer's marker tree is EMPTY. The failed
+        // `reconnect` routes through the on-disconnect trigger's `on_error`
+        // to the backoff seam, and the backoff's own maintain-peer re-EXECUTE
+        // returns 200 with the retry armed — so the retry loop working
+        // correctly writes no error records at all. ~1,440 nodes/day → 0.
+        //
+        // This assertion is the other half of the count above: together they
+        // say the loop is alive AND silent. Counting markers could not express
+        // that — the two halves would contradict each other.
+        let marker_prefix = format!("/{}/system/runtime/chain-errors/lost/", client_pid);
+        let markers: Vec<String> = client_shared
             .location_index
             .list(&marker_prefix)
             .into_iter()
             .map(|e| e.path)
             .filter(|p| p.contains("/connection_failed/"))
             .collect();
-        let attempts = failures.len();
-
-        // Ruling 11 + ruling 9: the retry's coordinates must both MEAN
-        // something. The retries belong to the session's chain — the handler
-        // holds `network-maintain-{session}` and MUST set it, so the tree
-        // carries one node per relationship rather than forking once per
-        // attempt. And `{step_index}` is the originating request id: a
-        // constant sentinel (`internal`) is not conformant.
-        let retry_prefix = format!("{}{}/", marker_prefix, session_chain);
-        let retries: Vec<&String> = failures
-            .iter()
-            .filter(|p| p.starts_with(&retry_prefix))
-            .collect();
-        assert!(
-            retries.len() >= attempts - 1,
-            "retry markers are not on the session's chain {:?} — the handler \
-             holds it and MUST set bounds.chain_id (ruling 11); a fresh chain \
-             per attempt forks the tree once per retry.\n  {:#?}",
-            session_chain,
-            failures,
-        );
-        for p in &retries {
-            let step = p
-                .strip_prefix(&retry_prefix)
-                .and_then(|r| r.split('/').next())
-                .unwrap_or_default();
-            assert!(
-                !step.is_empty() && step != "internal" && step != "unknown",
-                "{{step_index}} is a constant sentinel, not a request id \
-                 (ruling 9 / F1): {}",
-                p,
-            );
-        }
 
         // The standing resident is still there: nothing consumes it, so
         // nothing races to re-create it (ruling 1).
@@ -7309,16 +7362,19 @@ mod tests {
         );
         let resident = client_shared.location_index.get(&backoff_path).is_some();
         eprintln!(
-            "a12 retry survival: {} reconnect attempt(s) in 3000ms at \
-             min_ms=60/max_ms=200, backoff resident={}",
-            attempts, resident,
+            "a12 retry survival: {} dial(s) in 3000ms at min_ms=60/max_ms=200, \
+             backoff resident={}, connection_failed markers={} (chain {})",
+            attempts,
+            resident,
+            markers.len(),
+            session_chain,
         );
 
         assert!(
             attempts >= 4,
-            "retry loop stalled: only {} reconnect attempt(s) in 3s at \
-             min_ms=60/max_ms=200 — want >= 4 (retry-forever is normative, \
-             ruling 6). backoff resident={}",
+            "retry loop stalled: only {} dial(s) in 3s at min_ms=60/max_ms=200 \
+             — want >= 4 (retry-forever is normative, ruling 6). backoff \
+             resident={}",
             attempts,
             resident,
         );
@@ -7327,6 +7383,102 @@ mod tests {
             "the standing backoff continuation was consumed — a one-shot \
              cannot re-arm itself through the operation it dispatches \
              (ruling 1)",
+        );
+        assert!(
+            markers.is_empty(),
+            "a working retry loop bound {} lost-error marker(s) against a peer \
+             that is merely offline — the marker is for EXCEPTIONAL failure \
+             (rulings 2 + 3). At this pacing that is ~1,440 nodes/day for a \
+             dead peer.\n  {:#?}",
+            markers.len(),
+            markers,
+        );
+    }
+
+    /// The §2.2 give-up (ruling 6): a caller that opted into `max_attempts`
+    /// gets a loop that stops AND says so.
+    ///
+    /// The stopping is half of it. Without the terminal write the loop just
+    /// goes quiet and the peer's last status stays `suspect` forever — a
+    /// relationship that has been abandoned while still looking like one that
+    /// is trying. Exhaustion is not a fourth status: it terminates at
+    /// `disconnected` with `reason: retry-exhausted`, and the enum stays
+    /// three-state.
+    ///
+    /// The counterpart of `a12_retry_survives_outage`: same rig, same dead
+    /// peer, opposite claim — that one proves the DEFAULT never gives up,
+    /// this one proves an opted-in bound does.
+    #[cfg(feature = "network")]
+    #[tokio::test]
+    async fn a12_retry_exhausted_is_terminal_and_recorded() {
+        let registry = transport::MemoryTransportRegistry::new();
+        let short = keepalive::KeepaliveConfig {
+            interval_ms: 50,
+            timeout_ms: 60,
+            max_missed: 2,
+            enabled: true,
+        };
+        let (server, _ss, server_handle, server_pid, client, client_shared) =
+            rung3_pair(registry.clone(), 0x8c, 0x8d, short).await;
+        let client_pid = client_shared.peer_id.as_str().to_string();
+        let server_hash = server.shared().identity_hash;
+        let addr = format!("memory://{}", server_pid);
+
+        // min 60 / max 100, give up after 3 retries — reached in well under
+        // the window below.
+        let maintain = {
+            let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+                (entity_ecf::text("address"), entity_ecf::text(&addr)),
+                (
+                    entity_ecf::text("backoff"),
+                    entity_ecf::Value::Map(vec![
+                        (entity_ecf::text("max_attempts"), entity_ecf::integer(3)),
+                        (entity_ecf::text("max_ms"), entity_ecf::integer(100)),
+                        (entity_ecf::text("min_ms"), entity_ecf::integer(60)),
+                    ]),
+                ),
+                (entity_ecf::text("peer_id"), entity_ecf::text(&server_pid)),
+            ]));
+            entity_entity::Entity::new(entity_network::TYPE_MAINTAIN_REQUEST, data).unwrap()
+        };
+        let resp = maintain_with_retry(&client, &client_pid, maintain).await;
+        assert_eq!(resp.status, 200, "maintain-peer baseline");
+        wait_liveness_status(&client_shared, &server_hash, "connected").await;
+
+        server_handle.abort();
+        drop(server);
+
+        // The bound trips, and the terminal write lands.
+        let mut exhausted = None;
+        for _ in 0..400 {
+            if let Some(d) = liveness_status_of(&client_shared, &server_hash) {
+                if d.reason.as_deref() == Some("retry-exhausted") {
+                    exhausted = Some(d);
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let d = exhausted.expect(
+            "max_attempts was reached but no terminal retry-exhausted status was written — \
+             the loop went quiet without saying it had given up",
+        );
+        assert_eq!(
+            d.status, "disconnected",
+            "exhaustion terminates at disconnected — it is NOT a fourth status value"
+        );
+        assert!(
+            d.failing_since.is_some(),
+            "the terminal record must keep failing_since: it says how long we tried"
+        );
+
+        // And it STAYS stopped: no further dials once abandoned.
+        let settled = registry.dial_count();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        assert_eq!(
+            registry.dial_count(),
+            settled,
+            "kept dialing after recording the relationship as abandoned"
         );
     }
 

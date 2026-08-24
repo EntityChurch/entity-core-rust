@@ -22,7 +22,9 @@
 //! re-derive the shape from put-site examples. `reason`/`last_error`
 //! are the Amendment 12 §A2 additive OPTIONAL fields (declaration home
 //! ruled §3.13 upstream, ruling A; NETWORK owns the enum semantics +
-//! recovery mapping).
+//! recovery mapping). `failing_since` is the §A6.5 additive OPTIONAL
+//! field (rulings 7/8) — the one durable input the retry pacing derives
+//! from; see [`PeerStatusData::failing_since`].
 
 use entity_entity::Entity;
 use entity_hash::Hash;
@@ -72,6 +74,15 @@ pub const PEER_STATUS_REASON_PEER_IDLE: &str = "peer-idle";
 pub const PEER_STATUS_REASON_PEER_MIGRATION: &str = "peer-migration";
 /// §A2 reason: local release (§4.2) — terminal.
 pub const PEER_STATUS_REASON_LOCAL_RELEASE: &str = "local-release";
+/// §2.2 reason: an OPTIONAL retry bound (`max_attempts` /
+/// `max_elapsed_ms`) was reached and the relationship is abandoned
+/// (arch ruling 6) — terminal.
+///
+/// Exhaustion is deliberately NOT a fourth status value: the §3.13 enum
+/// stays three-state and terminates at `disconnected`, with `reason`
+/// saying why. Only reachable when a caller opted into a bound —
+/// retry-forever is the normative default.
+pub const PEER_STATUS_REASON_RETRY_EXHAUSTED: &str = "retry-exhausted";
 
 /// Decoded `system/peer/status/{peer}` entity (§3.13 + §A2).
 ///
@@ -101,6 +112,27 @@ pub struct PeerStatusData {
     /// §A2 OPTIONAL coded/opaque detail for humans + logs, never
     /// parsed by a recovery path.
     pub last_error: Option<String>,
+    /// ms since epoch of the transition out of `connected` that began
+    /// the current failure episode — the single durable input the §2.2
+    /// retry pacing derives from (Amendment 12 rulings 7/8). OPTIONAL;
+    /// absent ⇒ not currently failing.
+    ///
+    /// Written ONCE, at the first demotion (`connected` → `suspect`, or
+    /// straight to `disconnected`), and PRESERVED across every later
+    /// demotion write in the same episode: a `suspect` → `disconnected`
+    /// escalation must not re-stamp it, or the derived backoff curve
+    /// restarts at `min_ms` every time the peer fails a little harder.
+    /// The `connected` write omits it, which clears it — recovery ends
+    /// the episode.
+    ///
+    /// It is deliberately the ONLY retry state that exists: `attempt`
+    /// and `next_attempt_at` are DERIVED from (failing_since, backoff
+    /// cfg, now) — never stored, never written per attempt (§A4: the
+    /// status entity is transition-written only). Because it is durable
+    /// in the tree rather than an in-memory counter, a peer that
+    /// restarts beside a long-dead remote resumes the curve where it
+    /// left off instead of hammering from `min_ms`.
+    pub failing_since: Option<u64>,
 }
 
 /// Errors decoding a peer-status entity.
@@ -131,6 +163,7 @@ impl PeerStatusData {
             connection: None,
             reason: None,
             last_error: None,
+            failing_since: None,
         }
     }
 
@@ -159,6 +192,12 @@ impl PeerStatusData {
         }
         if let Some(ref c) = self.connection {
             fields.push((entity_ecf::text("connection"), entity_ecf::text(c)));
+        }
+        if let Some(fs) = self.failing_since {
+            fields.push((
+                entity_ecf::text("failing_since"),
+                entity_ecf::Value::Integer(fs.into()),
+            ));
         }
         if let Some(ref le) = self.last_error {
             fields.push((entity_ecf::text("last_error"), entity_ecf::text(le)));
@@ -207,6 +246,7 @@ impl PeerStatusData {
             connection: field_text(&map, "connection"),
             reason: field_text(&map, "reason"),
             last_error: field_text(&map, "last_error"),
+            failing_since: field_uint(&map, "failing_since"),
         })
     }
 }
@@ -295,10 +335,58 @@ mod tests {
             connection: Some("system/connection/00ab".into()),
             reason: Some(PEER_STATUS_REASON_TRANSPORT_ERROR.into()),
             last_error: Some("write: broken pipe".into()),
+            failing_since: Some(1_700_000_050_000),
         };
         let entity = original.to_entity();
         let decoded = PeerStatusData::from_entity(&entity).unwrap();
         assert_eq!(decoded, original);
+    }
+
+    /// Rulings 7/8: `failing_since` is the one durable retry field, and
+    /// it must survive the wire as an integer under its spec name — a
+    /// sibling reading this entity derives its whole backoff curve from
+    /// it, so a rename or a re-type is a silent cross-impl pacing bug.
+    #[test]
+    fn a12_status_failing_since_encodes_under_its_spec_name() {
+        let mut data = PeerStatusData::bare("p", PEER_STATUS_SUSPECT);
+        data.failing_since = Some(1_700_000_000_000);
+        let entity = data.to_entity();
+        let value: ciborium::Value = ciborium::from_reader(entity.data.as_slice()).unwrap();
+        let map = match value {
+            ciborium::Value::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        let got = map.iter().find_map(|(k, v)| match (k, v) {
+            (ciborium::Value::Text(t), ciborium::Value::Integer(i)) if t == "failing_since" => {
+                Some(u64::try_from(*i).unwrap())
+            }
+            _ => None,
+        });
+        assert_eq!(got, Some(1_700_000_000_000));
+    }
+
+    /// Absent ⇒ not currently failing. A `connected` write clears the
+    /// episode BY OMISSION, so `None` must encode as true CBOR absence:
+    /// a null would decode back as "no episode" here but is a distinct
+    /// wire shape, and the bare write must stay byte-identical to the
+    /// pre-Amendment-12 one.
+    #[test]
+    fn a12_status_failing_since_absent_is_true_absence() {
+        let entity = PeerStatusData::bare("p", PEER_STATUS_CONNECTED).to_entity();
+        let value: ciborium::Value = ciborium::from_reader(entity.data.as_slice()).unwrap();
+        let map = match value {
+            ciborium::Value::Map(m) => m,
+            _ => panic!("expected map"),
+        };
+        assert!(
+            !map.iter()
+                .any(|(k, _)| matches!(k, ciborium::Value::Text(t) if t == "failing_since")),
+            "a connected write must omit failing_since entirely, not null it"
+        );
+        assert_eq!(
+            PeerStatusData::from_entity(&entity).unwrap().failing_since,
+            None
+        );
     }
 
     #[test]
