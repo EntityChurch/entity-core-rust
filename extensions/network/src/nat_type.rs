@@ -300,14 +300,14 @@ mod tests {
     fn port_divergence_is_endpoint_dependent_and_not_punchable() {
         let a = classify_mapping(
             "10.1.0.2:20001",
-            &[
-                obs("r1", "10.0.0.1:41000"),
-                obs("r2", "10.0.0.1:52000"),
-            ],
+            &[obs("r1", "10.0.0.1:41000"), obs("r2", "10.0.0.1:52000")],
         );
         assert_eq!(a.class, MappingClass::EndpointDependent);
         assert!(!a.punchable());
-        assert!(a.mapping.is_none(), "a divergent mapping has no agreed value");
+        assert!(
+            a.mapping.is_none(),
+            "a divergent mapping has no agreed value"
+        );
         assert!(
             a.reason.contains("41000 (r1) vs 52000 (r2)"),
             "the reason must quote the divergence itself: {}",
@@ -327,7 +327,11 @@ mod tests {
         );
         assert_eq!(a.class, MappingClass::EndpointDependent);
         assert!(a.reason.contains("public IP differs"), "{}", a.reason);
-        assert!(a.reason.contains("203.0.113.7 (r1) vs 203.0.113.9 (r2)"), "{}", a.reason);
+        assert!(
+            a.reason.contains("203.0.113.7 (r1) vs 203.0.113.9 (r2)"),
+            "{}",
+            a.reason
+        );
     }
 
     /// **The load-bearing test.** The lone observation here is *correct* — a
@@ -337,9 +341,15 @@ mod tests {
     /// other test in this file.
     #[test]
     fn one_reflector_refuses_even_when_the_observation_is_correct() {
-        let a = classify_mapping("10.1.0.2:20001", &[obs("10.0.0.254:4050", "10.0.0.1:20001")]);
+        let a = classify_mapping(
+            "10.1.0.2:20001",
+            &[obs("10.0.0.254:4050", "10.0.0.1:20001")],
+        );
         assert_eq!(a.class, MappingClass::Unknown);
-        assert!(a.mapping.is_none(), "no conclusion means no mapping is asserted");
+        assert!(
+            a.mapping.is_none(),
+            "no conclusion means no mapping is asserted"
+        );
         assert!(a.reason.contains("advisory"), "{}", a.reason);
         // Still worth punching: refusing to conclude is not evidence against it.
         assert!(a.punchable());
@@ -392,6 +402,10 @@ mod tests {
             ],
         );
         assert_eq!(a.class, MappingClass::EndpointDependent);
-        assert!(a.reason.contains("20001 (r1, r2) vs 41337 (r3)"), "{}", a.reason);
+        assert!(
+            a.reason.contains("20001 (r1, r2) vs 41337 (r3)"),
+            "{}",
+            a.reason
+        );
     }
 }

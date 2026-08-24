@@ -49,7 +49,7 @@ PODMAN_BUILD_CAPS := --memory=$(CAP_MEM) --memory-swap=$(CAP_SWAP) $(_cap_cgp)
 PODMAN_RUN_CAPS   := --memory=$(CAP_MEM) --memory-swap=$(CAP_SWAP) \
                      --pids-limit=$(CAP_PIDS) --cpus=$(CAP_CPUS) $(_cap_cgp)
 
-.PHONY: help build image toolchain test clippy lint fmt check clean wasm
+.PHONY: help build image toolchain test clippy lint fmt check clean wasm probe-webkit
 
 .DEFAULT_GOAL := help
 
@@ -66,6 +66,7 @@ help:
 	@echo "  check    lint + test (the green gate)"
 	@echo "  clean    remove the build + toolchain images"
 	@echo "  clippy   clippy only · wasm   wasm32 cross-compile check"
+	@echo "  probe-webkit  run a browser probe under WebKitGTK (PROBE=<file.html>)"
 
 # Release build: compiles the `entity` CLI inside the container (Dockerfile
 # builder stage) and produces the runtime image. Green on a bare box.
@@ -135,3 +136,24 @@ clean:
 WASM_FEATURES := inbox,continuation,subscription,clock,revision,query,history,compute,handlers,identity,role,registry,discovery,type-system,content,signaling,network
 wasm: toolchain
 	$(call RUN_TOOLCHAIN,cargo build --target wasm32-unknown-unknown -p entity-peer --no-default-features --features $(WASM_FEATURES))
+
+# ----------------------------------------------------------------------------
+# Browser probes — runtime facts a compile cannot establish
+# ----------------------------------------------------------------------------
+# WebKitGTK is `entity-browser-rust`'s Tauri desktop engine and was never
+# measured; our RTC results are Firefox-only. Their AGENTS.md records the exact
+# failure class ("green in Firefox/Selenium != works in WebKitGTK ... missing
+# WorkerNavigator.storage bit us"), so this runs the probes against the engine
+# that actually ships rather than the one that was convenient.
+#
+# Default probe is the load-bearing one: does WebRTC WORK here — construct, ICE,
+# DTLS, and a delivered message — not merely "is the binding present". A missing
+# channel transfer costs one main-thread hop; a missing RTCPeerConnection costs
+# the whole substrate on that runtime.
+PROBE ?= rtc-loopback-datachannel.html
+
+probe-webkit:
+	podman build $(PODMAN_BUILD_CAPS) -t $(IMAGE)-webkit-probe -f tools/browser-probes/Dockerfile.webkit tools/browser-probes
+	podman run --rm $(PODMAN_RUN_CAPS) \
+		-v $(CURDIR)/tools/browser-probes:/probes:ro,Z \
+		$(IMAGE)-webkit-probe $(PROBE)

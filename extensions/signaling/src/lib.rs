@@ -100,6 +100,9 @@ pub mod pool;
 /// §7 punch choreography — substrate-agnostic, so it builds everywhere the
 /// coordination layer does (§7.3.1).
 pub mod punch;
+/// `EXTENSION-SIGNALING.md` §6.5 — the WebRTC substrate's SDP/ICE
+/// coordination (the browser leg). Rides the same carrier as §6.1.
+pub mod webrtc;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod client;
@@ -247,4 +250,25 @@ pub enum SignalingError {
     Decode(String),
     #[error("signaling entity encode failed: {0}")]
     Encode(String),
+    /// A §6.5 negotiation was attempted against this peer's own id — which means
+    /// §6.4's *skip your own messages* MUST was not applied upstream.
+    ///
+    /// Loud on purpose. A peer that negotiates with itself "succeeds" at every
+    /// individual step, which is exactly the failure §6.4 calls miserable to
+    /// diagnose. Matches `entity-core-go`'s `ErrSelfNegotiation`
+    /// (`ext/signaling/webrtc.go`) so the two impls refuse the same input.
+    #[error("negotiation against own peer_id (§6.4 skip-own was not applied)")]
+    SelfNegotiation,
+    /// §6.3 check (a) failed: the `public_key` does not derive the claimed
+    /// peer-id, so the message does not belong to who it says it does.
+    #[error("public_key does not derive the claimed peer_id (§6.3)")]
+    SignerMismatch,
+    /// §6.3 check (b) failed: the signature does not verify over the entity's
+    /// content hash.
+    #[error("signature does not verify over the entity content hash (§6.3)")]
+    BadSignature,
+    /// A caller tried to take SDP out of an entity whose signature was never
+    /// verified — the §6.5 channel-identity MUST, refused at the type level.
+    #[error("refusing to release SDP from an unverified entity (§6.5)")]
+    UnverifiedSdp,
 }

@@ -498,7 +498,7 @@ pub fn find_request<'a>(
 // CBOR helpers
 // ---------------------------------------------------------------------------
 
-fn decode_map(data: &[u8]) -> Result<Vec<(Value, Value)>, SignalingError> {
+pub(crate) fn decode_map(data: &[u8]) -> Result<Vec<(Value, Value)>, SignalingError> {
     let value: Value =
         ciborium::from_reader(data).map_err(|e| SignalingError::Decode(e.to_string()))?;
     value
@@ -516,14 +516,14 @@ fn get_field<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
     })
 }
 
-fn field_text(map: &[(Value, Value)], key: &str) -> Result<String, SignalingError> {
+pub(crate) fn field_text(map: &[(Value, Value)], key: &str) -> Result<String, SignalingError> {
     get_field(map, key)
         .and_then(|v| v.as_text())
         .map(|s| s.to_string())
         .ok_or_else(|| SignalingError::Decode(format!("missing/invalid text field {}", key)))
 }
 
-fn field_bytes(map: &[(Value, Value)], key: &str) -> Result<Vec<u8>, SignalingError> {
+pub(crate) fn field_bytes(map: &[(Value, Value)], key: &str) -> Result<Vec<u8>, SignalingError> {
     get_field(map, key)
         .and_then(|v| v.as_bytes())
         .map(|b| b.to_vec())
@@ -534,7 +534,7 @@ fn field_bytes(map: &[(Value, Value)], key: &str) -> Result<Vec<u8>, SignalingEr
 /// being clamped or widened: `fire_at` is a delay (§4.1), so a negative one is
 /// not a small mistake to tolerate — it is the wall-clock reading of a field
 /// that has none, and acting on it means firing into a window that has passed.
-fn field_u64(map: &[(Value, Value)], key: &str) -> Result<u64, SignalingError> {
+pub(crate) fn field_u64(map: &[(Value, Value)], key: &str) -> Result<u64, SignalingError> {
     get_field(map, key)
         .and_then(|v| v.as_integer())
         .and_then(|i| u64::try_from(i).ok())

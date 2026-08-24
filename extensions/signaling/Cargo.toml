@@ -15,6 +15,10 @@ entity-entity.workspace = true
 entity-hash.workspace = true
 entity-types.workspace = true
 entity-capability.workspace = true
+# §6.3 verification: Ed25519 verify + the canonical peer-id derivation. The
+# derivation is deliberately the canonical one, NOT §6.3's spelled-out legacy
+# byte string — see docs/SPEC-AMBIGUITIES.md.
+entity-crypto.workspace = true
 entity-handler.workspace = true
 # Canonical {type, data, content_hash} entity codec for the opaque coordination
 # blobs — data embedded raw, never decode+re-encoded (byte fidelity).
@@ -27,6 +31,15 @@ sha2.workspace = true
 # Exchange nonces (§3) only.
 rand.workspace = true
 web-time = "1.1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# `SessionId::generate` (§6.5) and `Nonce::generate` (§3) call `OsRng`. On
+# wasm32-unknown-unknown that resolves to `crypto.getRandomValues` ONLY with
+# getrandom's `js` backend; without it there is no backend and the call fails.
+# `entity-crypto` already declares this and feature unification would carry it
+# here transitively — but a `[security — MUST]` on our own function should not
+# rest on a sibling crate's target block, so it is stated locally too.
+getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

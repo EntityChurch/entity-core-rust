@@ -4250,3 +4250,82 @@ anywhere — so the convention above is agreed but **unproven against a real NAT
 convention if it stands — and state whether listening on the shared port is conformant with step
 4's "each side sends", since the answer determines whether the dual-hole sequencing is a §7.5
 hardening detail or a correction to step 4 itself.
+
+## §6.3's peer-id derivation is the legacy form both implementations refuse to mint
+
+**Passage.** `EXTENSION-SIGNALING.md` §6.3 *The signature* `[security — MUST]`:
+
+> A verifier (a) recomputes `Base58(0x01 ‖ 0x01 ‖ SHA-256(public_key))` and checks it equals the
+> claimed `initiator` / `responder` peer-id […]
+
+**The ambiguity.** That literal derivation is `key_type = 0x01` ‖ `hash_type = 0x01` — the
+**SHA-256 form**, which the core protocol made legacy-decode-only in V7 §1.5 v7.65 Amendment 3
+(canonical form is identity-multihash, `hash_type = 0x00`). Both reference implementations
+therefore **refuse to mint it**, by explicit design and with the amendment cited in the refusal:
+
+- Rust — `PeerId::from_public_key_with_hash_type` returns `InvalidPeerId` for `HASH_TYPE_SHA256`
+  ("SHA-256-form is legacy-decode-only for Ed25519", `core/crypto/src/lib.rs`).
+- Go — `PeerIDFromPublicKeyWithHashType` errors with "v7.65 §4 / v7.66 §3 — Ed25519 canonical
+  hash_type is 0x00 […] no mint API path is provided" (`core/crypto/peerid.go`).
+
+So an implementer following §6.3 **literally** cannot perform check (a) with either implementation's
+API. The failure mode is quiet in the worst way: a derivation that did produce the legacy form would
+compare unequal against every canonical-form peer-id, and §6.3 says a message failing the check
+**MUST be skipped exactly as an undecodable one is** — never an error. Every coordination message
+would be silently discarded and the rendezvous would simply never complete.
+
+**Interim choice.** Derive the peer-id with the ordinary canonical derivation
+(`PeerId::from_public_key`, identity-multihash) rather than §6.3's literal string, matching Go's
+`PeerIDFromPublicKey` — which selects `CanonicalHashType(keyType)` for the same reason. The two
+impls already agree here, so this is spec staleness rather than an interop divergence; it is logged
+because a third implementer reading §6.3 alone would build the broken form and see only silence.
+
+**Question for arch.** Restate §6.3's check (a) in terms of *the* canonical peer-id derivation
+rather than a spelled-out byte string, so it cannot drift from the core spec's canonical-form
+mandate again. If the spelled-out form is retained for clarity, it needs to be the identity-multihash
+form and to carry a pointer to V7 §1.5 v7.65 Amendment 3.
+
+## §6.3's `key_type = 0x01` — is a coordination signer restricted to Ed25519, or is that a simplification?
+
+**Passage.** `EXTENSION-SIGNALING.md` §6.3 *The signature* `[security — MUST]` — the same sentence as
+the entry above:
+
+> A verifier (a) recomputes `Base58(0x01 ‖ 0x01 ‖ SHA-256(public_key))` […]
+
+**The ambiguity.** The entry above treats the *second* `0x01` (the `hash_type` axis). This one is
+about the **first**: `key_type = 0x01` is Ed25519. §6.3 never says whether that is a *constraint on
+who may sign a coordination entity* or merely the common case written out longhand. The two readings
+are not distinguishable from the text, and they differ in observable behaviour:
+
+- **Restriction reading** — an Ed448 identity may not sign `webrtc/offer` / `answer` / `candidate`,
+  and a verifier must refuse `key_type = 0x02`.
+- **Simplification reading** — §6.3 describes the derivation generically and the key type travels
+  with the key, as it does everywhere else in V7.
+
+This matters because Ed448 is not hypothetical here: V7 §1.5 v7.67 §3 allocates `KEY_TYPE_ED448 =
+0x02`, both implementations mint Ed448 identities (`Ed448Keypair::peer_id`,
+`PeerIDFromPublicKeyWithHashType`), and `core/peer/tests/cohort_compare_v767_phase1.rs` already
+cross-validates ed448-goldilocks against Go's CIRCL. So an Ed448 peer is a peer this ecosystem
+produces, and under the restriction reading it simply cannot use WebRTC coordination.
+
+The failure mode is the same quiet one as the entry above, and for the same reason: §6.3 says a
+message failing the check **MUST be skipped exactly as an undecodable one is**. An Ed448 peer's
+offers would vanish with nothing anywhere naming the key type as the cause.
+
+**Interim choice.** Dispatch on `key_type` rather than hardcoding Ed25519 —
+`verify_coordination_signature` (`extensions/signaling/src/webrtc.rs`) decodes it via
+`KeyType::from_byte`, verifies through `verify_for_key_type`, and derives via
+`PeerId::from_public_key_with_key_type`. This interoperates with **either** ruling: under the
+simplification reading it is correct, and under the restriction reading it is over-permissive in a
+way that admits no confusion attack, because the peer-id embeds the key type — an Ed448 key derives
+an Ed448 peer-id and cannot present itself as an Ed25519 one. An unallocated or sign-incapable
+`key_type` is refused as `SignerMismatch` (a signer fault), distinct from `BadSignature`.
+
+Go implemented the same way and reached it independently; this was surfaced by their §6.5 vector file
+(`docs/validation/vectors/webrtc-coordination-go.cbor` @ `f464e0a`), which crosses an `ed448/valid`
+row **deliberately** to localize exactly this bug. Rust's pre-fix
+`verify_coordination_signature` refused `key_type != 0x01` outright and would have failed that row.
+Carried by core-go as the third of three pins on their §6.3 spec issue.
+
+**Question for arch.** State explicitly whether §6.3's `0x01` constrains the signer's key type or is
+illustrative. If illustrative, spell check (a) parametrically over `key_type` as the rest of V7 does.

@@ -1,7 +1,11 @@
 <!doctype html><meta charset=utf-8><title>rtc-transfer-probe</title>
 <body><pre id=out>running…</pre><script>
 function report(lines){
-  dump("\n===PROBE2-BEGIN===\n" + lines.join("\n") + "\n===PROBE2-END===\n");
+  // Engine-portable: Firefox has dump() (pref-gated), WebKitGTK/Blink surface
+  // console.log. Emit both so one file serves every engine.
+  var blob = "\n===PROBE2-BEGIN===\n" + lines.join("\n") + "\n===PROBE2-END===\n";
+  try { if (typeof dump === "function") dump(blob); } catch (e) {}
+  try { console.log(blob); } catch (e) {}
   setTimeout(function(){ window.close(); }, 150);
 }
 var results = [];

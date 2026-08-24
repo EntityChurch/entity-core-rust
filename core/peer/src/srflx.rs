@@ -211,7 +211,6 @@ async fn observe_at(
 }
 
 impl SrflxGatherer {
-
     /// The §6.7.3 candidate set for a peer with no reflector: `host` only
     /// (plus a configured `relay`, if any).
     ///
@@ -498,7 +497,10 @@ mod tests {
         )
         .await;
 
-        assert_eq!(d.reflector_all, 1, "the duplicate must not inflate the count");
+        assert_eq!(
+            d.reflector_all, 1,
+            "the duplicate must not inflate the count"
+        );
         assert!(
             d.errors.iter().any(|e| e.contains("listed more than once")),
             "the rejection must be reported: {:?}",
@@ -523,6 +525,11 @@ mod tests {
         assert_eq!(d.reflector_ok, 0);
         assert!(!d.conclusive(), "no observations cannot be a conclusion");
         assert_eq!(d.assessment.class, MappingClass::Unknown);
-        assert_eq!(d.errors.len(), 2, "each failure is reported: {:?}", d.errors);
+        assert_eq!(
+            d.errors.len(),
+            2,
+            "each failure is reported: {:?}",
+            d.errors
+        );
     }
 }

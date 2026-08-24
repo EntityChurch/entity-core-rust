@@ -56,6 +56,10 @@ members = [
     # Rust's seat in the cross-impl PUNCH (G2) — the §3.1 driver contract
     # agreed with Go: same flags, same JSON line, same exit rule.
     "cmd/signaling-punch",
+    # Rust's seat in the §6.5 coordination crossing — the emit/verify contract
+    # agreed with Go (their cmd/webrtc-vectors). Pure functions only: this
+    # crosses the coordination half, never transport.
+    "cmd/webrtc-vectors",
     "bindings/ffi",
     "bindings/godot",
     "bindings/sdk",
@@ -119,6 +123,7 @@ default-members = [
     "cmd/entity-signaling-node",
     "cmd/signaling-meet",
     "cmd/signaling-punch",
+    "cmd/webrtc-vectors",
 ]
 
 [workspace.package]

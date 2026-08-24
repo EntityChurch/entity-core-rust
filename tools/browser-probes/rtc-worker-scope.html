@@ -1,7 +1,14 @@
 <!doctype html><meta charset=utf-8><title>rtc-worker-probe</title>
 <body><pre id=out>running…</pre><script>
 function report(lines){
-  dump("\n===PROBE-BEGIN===\n" + lines.join("\n") + "\n===PROBE-END===\n");
+  // Engine-portable reporting. Firefox exposes dump() (needs a pref); WebKitGTK
+  // and Blink surface console.log, which the WebKit harness captures via
+  // WebKitSettings:enable-write-console-messages-to-stdout. Emit BOTH so one
+  // probe file serves every engine — the whole point of these files is that a
+  // result is only ever claimed for the engine it was measured on.
+  var blob = "\n===PROBE-BEGIN===\n" + lines.join("\n") + "\n===PROBE-END===\n";
+  try { if (typeof dump === "function") dump(blob); } catch (e) {}
+  try { console.log(blob); } catch (e) {}
   document.getElementById('out').textContent = lines.join("\n");
   setTimeout(function(){ window.close(); }, 150);
 }

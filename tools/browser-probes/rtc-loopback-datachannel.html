@@ -1,0 +1,107 @@
+<!doctype html><meta charset=utf-8><title>rtc-loopback-datachannel-probe</title>
+<body><pre id=out>running…</pre><script>
+// Does WebRTC actually WORK on this engine — not "is the binding present"?
+//
+// Two RTCPeerConnections in one page, wired to each other, carrying a message
+// over a data channel. That exercises construction, ICE (host candidates over
+// loopback, so no STUN server and no network), the DTLS handshake, SCTP, and
+// delivery. An open data channel IS evidence the DTLS handshake completed —
+// SCTP rides DTLS, so the channel cannot open without it.
+//
+// This is the load-bearing question for the browser leg. A missing
+// transferable-RTCDataChannel costs one main-thread hop (a brokered
+// MessageChannel covers it). RTCPeerConnection not working at all costs the
+// whole substrate on that runtime, and nothing in our design recovers from it.
+//
+// Deliberately NO STUN/TURN: a reflexive candidate would make this a network
+// test, and a firewalled CI box would then report a false negative about the
+// engine. Host candidates over loopback isolate the engine.
+function report(lines){
+  var blob = "\n===PROBE3-BEGIN===\n" + lines.join("\n") + "\n===PROBE3-END===\n";
+  try { if (typeof dump === "function") dump(blob); } catch (e) {}
+  try { console.log(blob); } catch (e) {}
+  document.getElementById('out').textContent = lines.join("\n");
+  setTimeout(function(){ window.close(); }, 150);
+}
+
+var r = [];
+var done = false;
+function finish(){ if (done) return; done = true; clearTimeout(timer); report(r); }
+
+var timer = setTimeout(function(){
+  r.push("result=TIMEOUT");
+  finish();
+}, 15000);
+
+r.push("typeof_RTCPeerConnection=" + (typeof RTCPeerConnection));
+if (typeof RTCPeerConnection !== "function") {
+  r.push("result=FAIL_NO_CONSTRUCTOR");
+  finish();
+} else {
+  run();
+}
+
+function run(){
+  var a, b;
+  try {
+    a = new RTCPeerConnection({iceServers: []});
+    b = new RTCPeerConnection({iceServers: []});
+    r.push("construct=OK");
+  } catch (e) {
+    r.push("construct=THREW:" + e.name + ":" + e.message);
+    r.push("result=FAIL_CONSTRUCT");
+    return finish();
+  }
+
+  // Trickle both directions, exactly as the §6.5 carrier does — this also
+  // sanity-checks that addIceCandidate accepts what onicecandidate produced.
+  a.onicecandidate = function(e){ if (e.candidate) b.addIceCandidate(e.candidate).catch(function(err){ r.push("b.addIceCandidate=REJECTED:" + err); }); };
+  b.onicecandidate = function(e){ if (e.candidate) a.addIceCandidate(e.candidate).catch(function(err){ r.push("a.addIceCandidate=REJECTED:" + err); }); };
+
+  a.oniceconnectionstatechange = function(){ if (a.iceConnectionState === "failed") { r.push("a.iceConnectionState=failed"); r.push("result=FAIL_ICE"); finish(); } };
+
+  var ch;
+  try {
+    ch = a.createDataChannel("probe");
+    r.push("createDataChannel=OK");
+  } catch (e) {
+    r.push("createDataChannel=THREW:" + e.name + ":" + e.message);
+    r.push("result=FAIL_DATACHANNEL");
+    return finish();
+  }
+
+  b.ondatachannel = function(ev){
+    ev.channel.onmessage = function(m){
+      r.push("delivered=" + (m.data === "ping" ? "OK" : "WRONG:" + m.data));
+      r.push("a.connectionState=" + a.connectionState);
+      // The channel opened, so SCTP came up, so DTLS completed. Recorded as an
+      // inference with its reason rather than as a separate measurement.
+      r.push("dtls=COMPLETED (inferred: SCTP rides DTLS and the channel opened)");
+      r.push("result=PASS");
+      finish();
+    };
+  };
+  ch.onopen = function(){ r.push("channel.onopen=OK"); ch.send("ping"); };
+  ch.onerror = function(e){ r.push("channel.onerror=" + (e && e.message)); };
+
+  a.createOffer()
+    .then(function(o){ return a.setLocalDescription(o); })
+    .then(function(){
+      // Sign the FINALIZED local description, per EXTENSION-SIGNALING §6.5 —
+      // asserted here so the probe also confirms the fingerprint is present in
+      // localDescription, which is what the browser leg signs.
+      var sdp = a.localDescription.sdp;
+      r.push("localDescription.has_fingerprint=" + (sdp.indexOf("a=fingerprint") !== -1));
+      return b.setRemoteDescription(a.localDescription);
+    })
+    .then(function(){ return b.createAnswer(); })
+    .then(function(ans){ return b.setLocalDescription(ans); })
+    .then(function(){ return a.setRemoteDescription(b.localDescription); })
+    .then(function(){ r.push("offer_answer=OK"); })
+    .catch(function(e){
+      r.push("negotiation=THREW:" + (e && e.name) + ":" + (e && e.message));
+      r.push("result=FAIL_NEGOTIATION");
+      finish();
+    });
+}
+</script></body>

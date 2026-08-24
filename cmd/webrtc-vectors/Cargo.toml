@@ -1,0 +1,19 @@
+[package]
+name = "webrtc-vectors"
+version = "0.8.0"
+edition.workspace = true
+description = "Rust's seat in the §6.5 coordination crossing — emit this impl's vector file, verify a sibling's"
+
+[[bin]]
+name = "webrtc-vectors"
+path = "src/main.rs"
+
+[dependencies]
+entity-signaling.workspace = true
+entity-crypto.workspace = true
+entity-entity.workspace = true
+entity-wire.workspace = true
+entity-ecf.workspace = true
+entity-hash.workspace = true
+ciborium.workspace = true
+anyhow.workspace = true

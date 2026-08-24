@@ -8,6 +8,12 @@ pub mod connection_state;
 pub use entity_durability as durability;
 #[cfg(all(feature = "local-files", not(target_arch = "wasm32")))]
 pub use entity_local_files as local_files;
+#[cfg(feature = "network")]
+/// The §7.3.1 coordination half — offer/collect at a signaling node. Shared by
+/// every punch substrate, so it is **not** gated on `wasm32`: the browser leg's
+/// WebRTC exchange (`EXTENSION-SIGNALING.md` §6.5) rides the same carrier.
+#[cfg(feature = "signaling")]
+pub mod carrier;
 #[cfg(all(feature = "http-live", not(target_arch = "wasm32")))]
 pub mod http_connection;
 #[cfg(all(feature = "http-live", not(target_arch = "wasm32")))]
@@ -16,7 +22,6 @@ pub mod ingest;
 pub mod keepalive;
 pub mod live_establish;
 pub mod liveness;
-#[cfg(feature = "network")]
 pub mod network_link;
 pub mod peer_status;
 pub mod published_root;
