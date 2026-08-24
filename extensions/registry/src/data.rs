@@ -339,9 +339,11 @@ pub struct IssuerPolicyData {
     pub mode: String,
     /// Allow-listed `target_peer_id`s (allowlist mode). `None` = no allowlist.
     pub allowlist: Option<Vec<String>>,
-    /// Optional glob bounding which names may be issued. **Its grammar is
-    /// unruled** — see `registration::name_constraints_match`; it is NOT §4's
-    /// closed dispatch grammar.
+    /// Optional glob bounding which names may be issued. **Its grammar IS
+    /// §4's closed dispatch grammar** `[MUST, REGISTRY 1.15]` — one name
+    /// matcher per registry; see `registration::name_constraints_match`, which
+    /// calls `resolver::dispatch_match`. No pattern is invalid, so nothing is
+    /// rejected at `set-issuer-policy`.
     pub name_constraints: Option<String>,
     pub default_ttl: Option<u64>,
     /// §6a.9.1 `[MUST, v1.11]` — the issuer-side ceiling. **REQUIRED on any

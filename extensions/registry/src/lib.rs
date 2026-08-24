@@ -39,7 +39,10 @@ pub use local_name::LocalNameHandler;
 pub use log::ResolutionLog;
 pub use peer_issued::resolve_one as peer_issued_resolve_one;
 pub use registration::RegisterRequestHandler;
-pub use resolver::RegistryHandler;
+pub use resolver::{
+    disclosure_violations, is_name_transmitting_kind, pattern_matches_unscoped_name,
+    RegistryHandler,
+};
 
 use entity_hash::Hash;
 use thiserror::Error;
@@ -81,11 +84,21 @@ pub const REGISTRY_SEED_CAPS: &[&str] = &[
     CAP_REGISTRY_LOCAL_NAME_LIST,
 ];
 
-// Backend-kind discriminators (resolver-config.backend_kind).
+// Backend-kind discriminators (resolver-config.backend_kind). Hyphenation is
+// normative (§2.4.1 — the cohort-convergence vocabulary pin).
 pub const BACKEND_KIND_LOCAL_NAME: &str = "local-name";
 /// Peer-issued backend (PROPOSAL-PEER-ISSUED-REGISTRY-BACKEND). Reads + verifies
 /// a remote registry's signed bindings against a pinned registry key.
 pub const BACKEND_KIND_PEER_ISSUED: &str = "peer-issued";
+
+// The four kinds §4.1 step 2 DECLARES name-transmitting. None is implemented
+// here; they are named because a *config* may name them and the write-time
+// disclosure MUST is a property of the config, not of what this build can
+// resolve (see [`resolver::is_name_transmitting_kind`]).
+pub const BACKEND_KIND_DNS_TXT: &str = "dns-txt";
+pub const BACKEND_KIND_WELL_KNOWN_URL: &str = "well-known-url";
+pub const BACKEND_KIND_DID_WEB: &str = "did-web";
+pub const BACKEND_KIND_CONSENSUS_ANCHORED: &str = "consensus-anchored";
 
 /// Wire entity type for the `:resolve` return payload (§2.1 erratum
 /// / Ruling-3). The `ResolutionResult` fields are carried **flat** under `data`;

@@ -5074,7 +5074,16 @@ deny, retention — so `pending_hash` names a fetchable entity and the
 withholding assertion in `register_manual_queues_pending_review` has been
 replaced by the resolvability half of `REG-PENDING-HANDLE-1`.
 
-**Two cohort divergences found while applying this — routed, not converged on:**
+**Two cohort divergences found while applying this — routed, not converged on.
+Both are FIXED in go's tree and these entries are stale** (read at go `6ae71c4` by
+arch, `ROUTING-2026-08-19-c` §2; re-verified here at go `7671f06`): `"registered"`
+is gone — `core/types/registry_peerissued.go` declares `RegisterStatusBound =
+"bound"` and both emit sites use it, the old string surviving only in a historical
+comment — and go is on `pending-binding` throughout, including their own oracle
+checks. **Routing them was right; leaving them marked live was not.** Arch records
+nearly relaying both to go as live work off this report, which is the
+dated-measurement failure our own charter names, caught only by opening go's tree.
+The original filings, for the record:
 
 - **go emits `status: "registered"` on the 200** (`RegisterStatusRegistered`,
   `core/types/registry_peerissued.go`; written at
@@ -5097,9 +5106,32 @@ replaced by the resolvability half of `REG-PENDING-HANDLE-1`.
 
 ---
 
-## §6a.9.3 leaves three things unpinned, found by building it
+## ~~§6a.9.3 leaves three things unpinned, found by building it~~ RESOLVED
 
-**Status:** OPEN upstream. All three surfaced while implementing REGISTRY v1.3
+> **RULED — all three closed at REGISTRY v1.4, confirmed by arch
+> `ROUTING-2026-08-19-c` §2 reading the section back to us. Our interim was the
+> ruling in every case; no code changed.**
+>
+> 1. **`deny-request`'s undeclared `status`.** The `register-result` declaration now
+>    enumerates `"denied"`, and the spec records the defect as arch's own — *"the same
+>    defect §6a.9 recorded about itself, reproduced in the section written to fix
+>    it."* Our reading (emit `"denied"`, treat the enumeration as the stale half)
+>    stands.
+> 2. **No input entity type on the decision ops.** §6a.9.3 now carries *"the decision
+>    operations take an un-typed input, and handlers MUST decode by shape,"* plus a
+>    **MUST NOT** on registering a type definition for
+>    `system/registry/approve-request` or `.../deny-request`. Our reason for reading a
+>    bare CBOR map — *a type invented here is a type the next impl invents
+>    differently* — is the reason the spec gives.
+> 3. **Deciding a SUPERSEDED head.** **`404 not_found` `[MUST]`**, with the sentence
+>    we asked for: *"one pending head per pair is a rule about what is decidable, not
+>    only about what is listed."* All three seats reached `404` independently.
+>
+> **Recorded as a process point, not a spec one:** this sat marked OPEN here for six
+> days after it was ruled, and arch found the ruling by reading the section — not by
+> being told. A routed item that closes upstream does not close itself in this file.
+
+**Status:** ~~OPEN upstream~~ **RULED at v1.4 (see above).** All three surfaced while implementing REGISTRY v1.3
 §6a.9.3; `entity-core-go` independently hit the first two and routed them
 (`spec-issues/2026-08-13-d`). Recorded here because rust made the same calls and
 they should converge or be corrected together, not settle by whoever built last.
@@ -5539,7 +5571,52 @@ sorted-store implementation reports a pass it did not earn.
 
 ---
 
-## EXTENSION-REGISTRY §4.1 step 2 — the dispatch filter has two readings, we and core-go each hold one, and neither is right on both cases
+## ~~EXTENSION-REGISTRY §4.1 step 2 — the dispatch filter has two readings, we and core-go each hold one, and neither is right on both cases~~ RESOLVED
+
+> **RULED 2026-08-19 — arch `86643f8`, routed as `ROUTING-2026-08-19-a` (REGISTRY
+> 1.13 → 1.14). RESOLVED; landed here at `898e55b`.**
+>
+> **Eligibility is a pure function of the name.** Rules absent or empty → the filter
+> is disabled; otherwise the eligible set is the **union of the matching rules'
+> `backend_kinds`**, and a name matching no rule yields the **empty set** → the chain
+> narrows to empty → `chain_exhausted` (fail-closed). A kind reaches eligibility only
+> by being **named**: no per-backend default, no "match all" for a kind named nowhere.
+>
+> **Neither seat's reading survived, and the ask above was answered in the third
+> way.** The paragraph answered the same question twice — one sentence set-valued,
+> the next per-backend — and the per-backend sentence was withdrawn as a **category
+> error**, not a wording problem: rules name `backend_kinds`, not backends, so *"a
+> backend without a `name_format_dispatch` entry"* had no referent. §4's *"a name
+> matching no entry is treated as matching the catch-all"* went with it (the catch-all
+> is `*`, which matches every name, so the sentence named a row with no referent) —
+> which is the half go implemented as *"no filtering"*, the one meaning it cannot
+> carry. The `<POSIX shell-glob>` schema declaration, still present under the closed
+> §4 grammar, was removed in the same pass; arch places it at `70c52b4`, the initial
+> public release, and calls that one word *"the entire provenance of the `?`
+> question."*
+>
+> **Our row 1 lost, on the argument we filed against ourselves.** The security
+> property stated above — a MUST bypassable by *omitting* a row — is what decided it,
+> and arch widened the privacy MUST from the catch-all row to the **configuration**
+> so the third door (leave the kind out of every rule) is closed by construction.
+> `a_backend_kind_named_by_no_dispatch_rule_is_never_narrowed_out` flipped and is now
+> `a_kind_named_by_no_dispatch_rule_is_not_eligible`;
+> `meta_resolver_dispatch_filter_excludes_local_name` did not move; the `None` branch
+> (absent rules disable the filter, rather than narrowing to empty) is newly pinned by
+> `an_absent_dispatch_list_disables_the_filter_rather_than_narrowing_to_empty`. All
+> three verified by mutation, one failing test per branch.
+>
+> **The "one thing worth telling core-go" below was adopted verbatim and go pulled
+> the check** (`8d2f5ad`); arch's `-a` §4 says pulling it was right and the diagnosis
+> is the one to keep. The replacement wire vector is **deferred until all three seats
+> land the ruling** — constructed before then it FAILs a conformant peer, which is the
+> same deceptive-green trap that pulled v15.
+>
+> **`REG-DISPATCH-CATCHALL-LOCAL-1` was retargeted** in the same ruling (remoteness →
+> name transmission, because §4.1a row 6 recommends `peer-issued`, which *is* a remote
+> read). Arch asks every seat to re-check fixtures asserting on *remoteness*: **we
+> have none** — the only catch-all references in `extensions/registry/src` are the two
+> comments corrected by `898e55b`, so the retarget is inert here.
 
 **Spec:** `EXTENSION-REGISTRY` §4.1 step 2 (the `name_format_dispatch` filter) ⨯ §4's
 *"filter, not a routing table"* paragraph ⨯ §4.1a's catch-all `MUST`.
@@ -5602,3 +5679,183 @@ for the wrong reason. The grammar half is a real requirement and is separately g
 (`reg_dispatch_grammar_1`, `extensions/registry/src/tests.rs`, verified red against a POSIX
 matcher by mutation). Suggest the check name the kind it narrows to in the chain as well, so
 the two readings agree on the setup and the discriminator is the matcher.
+
+---
+
+## ~~EXTENSION-REGISTRY §6a.9.1 `name_constraints` — a `<glob>` with no grammar, over the same domain as §4's closed one~~ RESOLVED
+
+> **RULED 2026-08-19 — arch `c984f93`, routed as `ROUTING-2026-08-19-c` §1 (REGISTRY
+> 1.14 → 1.15). RESOLVED; landed here at `898e55b`.**
+>
+> **`name_constraints` uses §4's matcher — ONE name matcher per registry.** `*` is
+> the only metacharacter, every other byte is a literal, `*` crosses `/`, and **no
+> pattern is invalid**.
+>
+> **We never filed this; go (`spec-issue 2026-08-18-e`) and py (`SA-PY-14`) did, and
+> we held the divergent side.** It is recorded here because the ruling changed our
+> behaviour and this file is where a reader looks for why. Our
+> `name_constraints_match` was a POSIX matcher — `?` one character, `[…]` a class
+> with `!` negation — deliberately kept **separate** from the ruled `dispatch_match`
+> and documented as unruled at the `fn`, on the reasoning that converging a
+> cross-impl-observable admission gate ahead of a ruling is how three impls end up
+> with three matchers. That posture was right and the split is what made the landing
+> a one-line call; the *reading* was wrong, and it was wrong on the wire.
+>
+> **What the ruling turns on:** §6a.9.1 said `<glob | null>` and defined the grammar
+> nowhere, while v1.13's own scoping sentence (*"a registry-local matcher, scoped to
+> this field"*) — written to fence §4's matcher off from `ENTITY-CORE-PROTOCOL` §5.4,
+> which it still does — read `name_constraints` out of the ruling landing beside it.
+> Two glob fields, one domain (the user-facing name string), one handler, two
+> subsections apart. The field's only example, `*.lab`, is grammar-identical under
+> every candidate reading and therefore discriminated nothing, which is how it
+> survived review. **Third instance of the class in two days** — `EXTENSION-REVISION`
+> §2.4 (`SA-PY-11`), §2.3 (`SA-PY-12`), this — all found by implementers, none by
+> review: *a `<glob>` in a schema block is an undefined referent unless a grammar is
+> cited at that field.*
+>
+> **Measured, not asserted.** go's `registry_issuer.name_constraints_grammar`
+> (`fbaf838`) FAILed against us at row 1 — policy `"a?c"`, request `abc` → **200
+> here, 403 required**. Rows 2 and 4 sat behind the short-circuit and were also
+> wrong: `[a-c]x` admitted `bx`, and `a[b` — an unterminated class under POSIX —
+> **refused the literal name its own policy names**. Same defect as go's, opposite
+> symptom: go 500ed row 4 (`path.Match` error arm), we answered a wrong 403. After
+> `898e55b`: `registry_issuer` **32 · 0F · 0S** and `registry` **14 · 0F · 0S**
+> against a live rust peer, go oracle `7671f06`.
+>
+> **Row 3 (`*` crosses `/`) is unbindable through `register-request` here**, exactly
+> as in go: `handle_register` runs §6.3 `validate_name_safety` before the policy
+> check, so no request carrying `x/y/z` reaches the matcher. Pinned in-tree with that
+> reason asserted (`name_constraints_uses_the_closed_dispatch_grammar`), not claimed
+> on the wire — independent corroboration of go's spec-issue `2026-08-19-b`, which
+> asks §11.1 to mark both `/`-crossing rows in-tree-only.
+>
+> **No write-time refusal is owed, and the code says so.** This is the opposite
+> disposition to `EXTENSION-REVISION` §4.4.17 V6 (refuse at the writer), one section
+> of our own charter away — so `name_constraints_match` states the absence of a
+> refusal at the `fn`, or the next reader ports V6 across and starts 400-ing legal
+> policies.
+
+---
+
+## EXTENSION-REGISTRY §3.1 vs §6a.6 — two revocation-discovery rules, and a cohort item routed against the wrong one
+
+**Spec:** `EXTENSION-REGISTRY` §3.1 (`:resolve` MUST check for a revocation) ⨯ §6a.6
+(*"by-target index, normative"*) ⨯ §6a.4 (`require not revoked(registry, binding_hash)`)
+⨯ §11.1 `registry.v6_meta_resolver_revocation_honored`.
+**Surfaced by:** implementing cohort ledger item **R-4** (arch `ROUTING-2026-08-19-d` §6.1,
+relayed by go's armed-gate report `2026-08-19-d`) — and by the armed gate rejecting the
+implementation.
+
+**Status: ROUTED. R-4 is not deferred here; it is reported as mis-scoped, with the
+measurement.** This peer implements §3.1 as a scan and §6a.6 as a keyed lookup, deliberately.
+
+### The two sentences
+
+| | §3.1 | §6a.6 |
+|---|---|---|
+| Rule | *"`:resolve` MUST check for a `system/registry/revocation` targeting a candidate binding before returning `resolved`"* | *"`revoked(registry, binding_hash)` is an O(1) index lookup, **not** a scan"* |
+| Argument | a **candidate binding**, from any backend | a **`registry`** |
+| Called from | `meta_resolve` step 3, every kind | **§6a.4**, the peer-issued resolve algorithm |
+| Storage path | **none stated**; the cohort convention is own-hash-keyed | `by-target/{hex(binding_hash)}`, stated |
+| Our reader | `resolver::is_revoked` — scan | `peer_issued::is_revoked` — keyed since `a23bb27`, write side included |
+
+**R-4 quotes §6a.6 at the §3.1 reader.** Implemented as written (`aaa591e`), it produced a
+**conformance failure**: `registry.v6_meta_resolver_revocation_honored` writes a revocation at
+the own-hash path with `tree-put` — never through `revoke-request`, so no by-target entry
+exists — and requires exclusion. Reverted at `cf570b2`.
+
+### Three things measured while checking it
+
+1. **`entity-core-go`'s meta-resolver scans too** — `ext/registry/registry.go` `revocationFor`
+   lists `system/registry/revocation/` and filters on `revokes`, read at go `ca53e2a`. The seat
+   R-4 names as conformant is in the same state at this layer; the comparison behind the item
+   read go's **§6a** reader against our **§3.1** reader.
+2. **An index-first fast path is not a distinguishable behaviour here** — `by-target/{hex}` is a
+   child of `revocation_prefix`, so the scan finds every revocation a keyed lookup would.
+   Verified by mutation: deleting the fast-path branch failed **no** test. It is therefore not
+   shipped, and the containment is pinned by
+   `revocation_by_target_is_inside_the_scanned_prefix` so the claim stays true or fails loudly.
+3. **The scaling argument lands on §6a, not §3.1.** The §3.1 reader walks the **local** peer's
+   own revocation subtree — bounded by what this peer itself revoked. §6a.6 governs a **remote
+   registry's** subtree, which is the internet-scale case, and is where the index already is.
+   That is a coherent reason for the spec to have put the index where it did.
+
+### Ask
+
+**Does §3.1 owe an indexed discovery path, or is the scan its intended shape?** Either answer
+is implementable and only one is a MUST:
+
+- **If the scan is intended** — say so at §3.1 (*"discovery is over the revocation subtree; the
+  §6a.6 index is scoped to §6a.4"*), and R-4 closes as answered rather than built.
+- **If §3.1 should be keyed** — then the **write** side is the half that must change first, and
+  it is a wire-visible change: `v6` drives a raw `tree-put` at the own-hash path, so a keyed
+  §3.1 reader makes that vector unpassable by any conformant peer. The vector and the rule move
+  together or a cohort of peers fails a check that is correct.
+
+**Interim choice:** unchanged — §3.1 scans, §6a.4 is keyed, and the reason is written at both
+functions so neither reads as an oversight. **Not fixed unilaterally** for the reason the
+`name_constraints` near-miss taught: this is cross-impl-observable, both seats behave the same
+way today, and turning one reader keyed to satisfy an item's wording made a green peer red.
+
+---
+
+## EXTENSION-REGISTRY §4.1 step 2 — *"eligible for an unscoped name"* is the load-bearing term of a MUST, and it is defined only by example
+
+**Spec:** `EXTENSION-REGISTRY` §4.1 step 2 (*"a distribution's shipped `resolver-config` MUST NOT
+make a name-transmitting backend eligible for an **unscoped** name"* `[MUST, v1.14]`) ⨯ §4.1a (the
+recommended default dispatch list) ⨯ §4.3's write-time refusal `[MUST, v1.18]`.
+**Surfaced by:** implementing §4.3 (`set-resolver-config`) — the operation whose whole job is to
+compute this predicate and refuse.
+
+**Status: ROUTED, with an interim choice that is derived from the spec's own table.** Not a
+blocker: the two shapes the conformance vector drives are unambiguous, and go and rust agree on
+them and on everything else measured. Filed because the *boundary* between them is not.
+
+### The gap
+
+§4.3 turns a descriptive sentence into an executable refusal, so `is_broad(pattern)` is now a
+**decision procedure a peer must implement**, and §4 gives the matcher (`dispatch_match`) a closed
+grammar while giving this predicate none. The spec names the concept by contrast — *"a
+name-transmitting backend stays fully reachable through an explicit scoped form
+(`alice@example.org`), which is the user stating which authority they are willing to tell"* — and
+by the six rows of §4.1a. It never says what makes a *pattern* scoped.
+
+### What is pinned by the text, and what is not
+
+`REG-DISPATCH-CONFIG-REFUSED-1` drives exactly two patterns: `*` (must be broad) and `did:web:*`
+(must be narrow). Everything between them is inferred. §4.1a constrains the rest **indirectly and
+completely enough to be usable**: a distribution SHOULD ship that list and the catch-all MUST lives
+inside it, so every non-catch-all row has to classify narrow or the recommended list violates its
+own MUST. That makes `*.eth` → **narrow** a *derived* requirement (row 3 names
+`consensus-anchored`, a transmitting kind) rather than a style choice — which is the strongest
+thing available here, and it is what both seats used.
+
+Undetermined by any of that: `*.*`, `a*`, a bare literal `alice`, `*@`, `x*z`. We and core-go
+both read `*.*` as **broad** (its suffix is a star, not a literal) and a bare literal as **broad**
+— but from independent code, not from a sentence.
+
+### Interim choice (ours, and it matches core-go's `patternMatchesUnscopedName`)
+
+A pattern is **scoped** iff it forces one of the three scope markers §4.1a's non-catch-all rows
+carry: an `@` anywhere (rows 4–5), a `:` anywhere (rows 1–2), or `*.<literal>` with no further `*`
+(row 3). Everything else is broad. `resolver::pattern_matches_unscoped_name`, pinned by
+`the_recommended_default_dispatch_list_satisfies_its_own_catch_all_must` — which asserts the §4.1a
+table itself, so the fixture is the spec's and not ours.
+
+The direction of the residual is deliberate and is §4.1's own argument: a false *broad* refuses a
+presently-harmless config and costs the operator one edit; a false *narrow* discloses every bare
+name a user types, silently and irreversibly.
+
+### Ask
+
+**Give the predicate a grammar, or state that it has none and the classifier is
+implementation-defined within the §4.1a rows.** Either is implementable; the difference is whether
+a peer that reads `*.*` as narrow is non-conformant or merely unlike us. If the answer is a
+grammar, the natural shape is the one §4 already used for `dispatch_match` — enumerate the scoped
+forms and say every other pattern is broad — and `REG-DISPATCH-CONFIG-REFUSED-1` gains a row per
+form. If the answer is implementation-defined, say so at §4.1 step 2 so nobody ports a stricter
+reading across and starts refusing configurations a sibling accepts.
+
+**Not urgent, and specifically not a divergence report:** we measured go's classifier and ours as
+behaviourally identical on every pattern either spec section names. This is filed so the agreement
+stays a fact somebody chose rather than a coincidence nobody checked.

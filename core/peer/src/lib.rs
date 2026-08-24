@@ -2154,7 +2154,16 @@ impl PeerBuilder {
                 &pid,
                 "registry",
                 "system/registry",
-                &["resolve", "invalidate-cache"],
+                // The §4.3 `[v1.18]` config pair is advertised here with the
+                // resolve pair: `system/capability/registry-configure` named
+                // an act with no operation until 1.18, and the §4.4
+                // advertised-handler discipline is what makes it callable.
+                &[
+                    "resolve",
+                    "invalidate-cache",
+                    "set-resolver-config",
+                    "get-resolver-config",
+                ],
             )?;
 
             let local_name_handler = Arc::new(entity_registry::LocalNameHandler::new(

@@ -41,6 +41,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use entity_entity::EntityUri;
 use entity_peer::carrier::PeerCarrier;
@@ -84,6 +85,42 @@ struct MainThreadWebRtcIo {
     /// Monotonic base for [`WebRtcIo::now_ms`]. `web_time::Instant`, never
     /// `Date.now()`, per the trait contract that the value never hits the wire.
     started: web_time::Instant,
+    /// Every local candidate this negotiation gathered, as its raw SDP line,
+    /// accumulated for [`IceObserver`].
+    ///
+    /// A **tee**, and it has to be one: `drain_local_candidates` is destructive
+    /// by design (trickle hands each batch to the choreography and forgets it),
+    /// so by the time a negotiation ends the session holds nothing and there is
+    /// nowhere left to ask what was gathered.
+    seen: Rc<RefCell<Vec<String>>>,
+}
+
+/// Told what one negotiation's ICE agent gathered, once, when it finishes.
+///
+/// # Why this exists
+///
+/// The gathered candidate types **are** the topology: host-only means we can
+/// only reach a LAN; host+srflx with no nominated pair means this network needs
+/// a relay. Without them, every reachability failure — no reflector configured,
+/// reflector down, both sides restrictive, UDP blocked — reaches a user as the
+/// one sentence *"that peer is not connected"*, indistinguishable from the peer
+/// having closed their laptop. A consumer that cannot tell *"this network needs
+/// a relay"* from *"my friend is offline"* can never point anyone at the one
+/// thing that would fix it.
+///
+/// # Contract
+///
+/// - Called **exactly once per negotiation**, on success and failure alike. A
+///   consumer that classifies only failures still needs the success call, to
+///   clear advice it was already showing.
+/// - `local_candidates` are **our own** agent's raw SDP lines. They say nothing
+///   about the far side; a consumer inferring the pair from them alone will be
+///   confidently wrong.
+/// - Observation only. Nothing here feeds the §10.3 seam result, and this is
+///   called on the negotiation path — an implementation that panics or blocks is
+///   a consumer bug.
+pub trait IceObserver: Send + Sync {
+    fn negotiation_finished(&self, peer_id: &str, local_candidates: &[String], established: bool);
 }
 
 #[async_trait::async_trait(?Send)]
@@ -109,8 +146,14 @@ impl WebRtcIo for MainThreadWebRtcIo {
         // `WebRtcSession` gathers into `transport::WireLocalCandidate`; the
         // choreography speaks `entity_signaling::LocalCandidate`. Same fields,
         // one map — no digest, because nothing crosses a thread.
-        self.session
-            .drain_candidates()
+        let drained = self.session.drain_candidates();
+        // Tee for the observer BEFORE the mapping consumes them — this is the
+        // only point where a gathered candidate is visible, and the drain is
+        // destructive.
+        self.seen
+            .borrow_mut()
+            .extend(drained.iter().map(|c| c.candidate.clone()));
+        drained
             .into_iter()
             .map(|c| LocalCandidate {
                 candidate: c.candidate,
@@ -174,6 +217,10 @@ pub struct MainThreadWebRtcEstablisher {
     /// Local negotiation-id source. The Worker arm draws these from the control
     /// port; on this arm they are only map keys, so a plain counter suffices.
     next_negotiation_id: AtomicU64,
+    /// Optional reachability observer — see [`IceObserver`] and
+    /// [`Self::with_ice_observer`]. `None` costs one branch per negotiation and
+    /// keeps the tee empty.
+    ice_observer: Option<Arc<dyn IceObserver>>,
 }
 
 impl MainThreadWebRtcEstablisher {
@@ -202,6 +249,30 @@ impl MainThreadWebRtcEstablisher {
             ice_servers,
             sessions: SendWrapper(Rc::new(RefCell::new(HashMap::new()))),
             next_negotiation_id: AtomicU64::new(1),
+            ice_observer: None,
+        }
+    }
+
+    /// Install a reachability observer (see [`IceObserver`]).
+    ///
+    /// A builder method rather than a seventh argument to [`Self::new`]
+    /// deliberately: observation is optional and additive, and every existing
+    /// caller — the app, the worker host, the tests — should keep compiling
+    /// unchanged. `new`'s required arguments are the ones whose *absence would
+    /// be a silent posture decision* (`trust`, `ice_servers`); this is not one
+    /// of those, because a missing observer degrades to today's behaviour
+    /// exactly.
+    pub fn with_ice_observer(mut self, observer: Arc<dyn IceObserver>) -> Self {
+        self.ice_observer = Some(observer);
+        self
+    }
+
+    /// Report one finished negotiation. Called on **every** exit path after the
+    /// session exists — a consumer that only ever hears about failures cannot
+    /// clear the advice it is showing when the peer finally connects.
+    fn report_ice(&self, peer_id: &str, seen: &Rc<RefCell<Vec<String>>>, established: bool) {
+        if let Some(obs) = &self.ice_observer {
+            obs.negotiation_finished(peer_id, &seen.borrow(), established);
         }
     }
 
@@ -285,9 +356,11 @@ impl LiveEstablish for MainThreadWebRtcEstablisher {
             .borrow_mut()
             .insert(negotiation_id, session.clone());
 
+        let seen: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let io = MainThreadWebRtcIo {
             session,
             started: web_time::Instant::now(),
+            seen: seen.clone(),
         };
 
         let session_id = SessionId::generate();
@@ -338,6 +411,10 @@ impl LiveEstablish for MainThreadWebRtcEstablisher {
                 web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(&format!(
                     "§6.5 (direct): negotiation to '{peer_id}' failed — {label}: {e}"
                 )));
+                // Report AFTER `discard_session` but BEFORE returning: the tee
+                // outlives the session, and this is the failure a consumer most
+                // needs to classify.
+                self.report_ice(peer_id, &seen, false);
                 return Err(mapped);
             }
         };
@@ -349,6 +426,10 @@ impl LiveEstablish for MainThreadWebRtcEstablisher {
         web_sys::console::log_1(&wasm_bindgen::JsValue::from_str(&format!(
             "§6.5 (direct): a WebRTC data channel is OPEN to '{peer_id}' — live path established"
         )));
+        // The success half of the contract. A consumer told only about failures
+        // would keep showing "this network needs a relay" over a working
+        // connection — the cry-wolf failure, arriving late instead of early.
+        self.report_ice(peer_id, &seen, true);
 
         // §6.5 → §7.4.1, "one role assignment, not two": the peer that offered
         // is the initiator and sends HELLO; the peer that answered serves it.

@@ -322,6 +322,16 @@ pub const TYPE_REGISTRY_REVOCATION: &str = "system/registry/revocation";
 pub const TYPE_REGISTRY_RESOLVER_CONFIG: &str = "system/registry/resolver-config";
 pub const TYPE_REGISTRY_LOCAL_NAME_CONFIG: &str = "system/registry/local-name-config";
 pub const TYPE_REGISTRY_RESOLUTION_LOG: &str = "system/registry/resolution-log";
+/// `set-resolver-config` params (REGISTRY §4.3 `[v1.18]`) — the config entity
+/// to store plus the operator's `acknowledge_name_disclosure` act.
+///
+/// **The acknowledgement rides the operation, never the config entity.** §4.3
+/// `[MUST]`: a field would be written by whoever writes the bytes (so a
+/// distribution could set it and defeat the rule it bounds) and it would move
+/// a content-addressed type's hash to carry a claim it cannot secure. Hence
+/// this wrapper type rather than a new field on `resolver-config`.
+pub const TYPE_REGISTRY_SET_RESOLVER_CONFIG_REQUEST: &str =
+    "system/registry/set-resolver-config-request";
 // Peer-issued live registration (EXTENSION-REGISTRY §6a.9).
 pub const TYPE_REGISTRY_REGISTER_REQUEST: &str = "system/registry/register-request";
 pub const TYPE_REGISTRY_REGISTER_RESULT: &str = "system/registry/register-result";

@@ -2842,6 +2842,7 @@ pub fn all_core_types() -> Vec<TypeDefinition> {
         system_registry_resolve_request(),
         system_registry_resolution_result(),
         system_registry_invalidate_cache_request(),
+        system_registry_set_resolver_config_request(),
         system_registry_local_name_bind_request(),
         system_registry_local_name_bind_result(),
         system_registry_local_name_unbind_request(),
@@ -3260,6 +3261,24 @@ fn system_registry_resolution_result() -> TypeDefinition {
 fn system_registry_invalidate_cache_request() -> TypeDefinition {
     TypeDefBuilder::new("system/registry/invalidate-cache-request")
         .field("name", opt("primitive/string"))
+        .build()
+}
+
+/// `set-resolver-config` params (§4.3 `[v1.18]`).
+///
+/// `config` is typed `core/entity` — a genuine nested entity wrapper
+/// (`{type, data, content_hash}`), not a bare map — because the operation's
+/// whole contract is that the submitted config round-trips **byte-exact**:
+/// `get-resolver-config` MUST return the bytes that were written. A bare map
+/// would force the peer to re-author the entity and move its content hash.
+///
+/// `acknowledge_name_disclosure` is a parameter of the operation and is
+/// deliberately absent from `system/registry/resolver-config` (§4.3 `[MUST]` —
+/// a field is forgeable by whoever writes the bytes).
+fn system_registry_set_resolver_config_request() -> TypeDefinition {
+    TypeDefBuilder::new("system/registry/set-resolver-config-request")
+        .field("config", t("core/entity"))
+        .field("acknowledge_name_disclosure", opt("primitive/bool"))
         .build()
 }
 

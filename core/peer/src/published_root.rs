@@ -452,8 +452,32 @@ pub trait ContentFetcher: Send + Sync {
 
 /// A hash-verifying [`ContentStore`] view over a [`ContentFetcher`], so the
 /// shared sync [`trie_get`] walk fetches + verifies each HAMT node by hash.
+///
+/// **It records a hash mismatch, because `ContentStore::get` cannot report
+/// one.** The trait returns `Option<Entity>`, so a body that does not hash to
+/// its own address leaves by the same door as a body that was never there — and
+/// [`trie_get`] then reads that as *no such branch*, so the walk ends
+/// `Ok(None)`. A consumer therefore learns "that key is not in the signed tree"
+/// about an origin that just served bytes matching no hash the root committed
+/// to: an absence, reported for a forgery.
+///
+/// Found downstream (entity-browser-rust, 2026-08-19) by flipping one byte in
+/// each blob a resolve fetches. The **leaf** was always safe — [`resolve`]
+/// hashes it directly and returns [`PublishedRootError::ContentHashMismatch`] —
+/// and every **interior** node was not.
+///
+/// The mismatch is latched here and consulted by [`PublishedRootClient::resolve`]
+/// before it believes a `None`. A flag rather than an error channel because the
+/// store is `&self` behind a trait we do not own — and an **atomic** rather than
+/// a `Cell` because `ContentStore` is `Send + Sync`, so interior mutability here
+/// has to be too, even though the walk is single-threaded per resolve and the
+/// store is built fresh for each one.
+///
+/// [`resolve`]: PublishedRootClient::resolve
 struct VerifyingFetchStore<'a> {
     fetcher: &'a dyn ContentFetcher,
+    /// Set once any fetched node's bytes failed to hash to its own address.
+    mismatch: std::sync::atomic::AtomicBool,
 }
 
 impl ContentStore for VerifyingFetchStore<'_> {
@@ -462,7 +486,14 @@ impl ContentStore for VerifyingFetchStore<'_> {
     }
     fn get(&self, hash: &Hash) -> Option<Entity> {
         let bytes = self.fetcher.content(hash).ok()?;
-        verify_content(&bytes, hash).ok()
+        match verify_content(&bytes, hash) {
+            Ok(entity) => Some(entity),
+            Err(_) => {
+                self.mismatch
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                None
+            }
+        }
     }
     fn has(&self, hash: &Hash) -> bool {
         self.get(hash).is_some()
@@ -537,13 +568,27 @@ impl<F: ContentFetcher> PublishedRootClient<F> {
     /// Resolve `relative_key` by walking the HAMT from the verified signed root.
     /// Returns the hash-verified leaf entity, or `None` if the key is not in the
     /// signed tree (host-fabricated bindings cannot appear here — §1.1).
+    ///
+    /// **`None` means absent, never "the origin served something that did not
+    /// verify."** A node whose body fails its hash check cannot say so through
+    /// `ContentStore::get` (see [`VerifyingFetchStore`]), so the walk would end
+    /// indistinguishable from a genuine miss; the mismatch is latched and
+    /// checked here, and a forgery leaves as
+    /// [`PublishedRootError::ContentHashMismatch`].
     pub fn resolve(&self, relative_key: &str) -> Result<Option<Entity>, PublishedRootError> {
         let root = self.fetch_root()?;
         let store = VerifyingFetchStore {
             fetcher: &self.fetcher,
+            mismatch: std::sync::atomic::AtomicBool::new(false),
         };
         let leaf = match trie_get(&store, root.root_hash, relative_key) {
             Some(h) => h,
+            // Checked BEFORE reporting an absence, not after: the walk stops at
+            // the unverifiable node, so "not found" is exactly what a tampered
+            // interior node produces.
+            None if store.mismatch.load(std::sync::atomic::Ordering::Relaxed) => {
+                return Err(PublishedRootError::ContentHashMismatch)
+            }
             None => return Ok(None),
         };
         let bytes = self
@@ -955,6 +1000,82 @@ mod tests {
             Err(PublishedRootError::ContentHashMismatch) => {}
             other => panic!("expected ContentHashMismatch, got {:?}", other),
         }
+    }
+
+    /// **A tampered INTERIOR node is a forgery, not an absence.**
+    ///
+    /// `consumer_rejects_tampered_content` above covers the leaf, which
+    /// `resolve` hashes itself. Everything the *walk* fetches went through
+    /// `ContentStore::get`, whose `Option` return has no way to say "this did
+    /// not verify" — so a HAMT node serving bytes that hash to nothing left by
+    /// the same door as a node that was never published, `trie_get` read it as
+    /// *no such branch*, and `resolve` answered `Ok(None)`.
+    ///
+    /// That answer is *"the publisher never bound that key"* — said about an
+    /// origin that just served a forgery. Every consumer of a signed root got
+    /// it; reported from entity-browser-rust 2026-08-19, found by flipping one
+    /// byte in each blob a resolve fetches.
+    ///
+    /// The control matters as much as the attack: a key the trie genuinely does
+    /// not carry must still be `Ok(None)` afterwards, or the fix has traded a
+    /// silent forgery for a loud absence.
+    #[test]
+    fn a_tampered_interior_node_is_a_mismatch_not_an_absence() {
+        // Enough keys that the root is a real interior node with children, so
+        // the walk has to fetch and verify it before it can find anything.
+        let leaves: Vec<Entity> = (0..8).map(|i| leaf_entity(&format!("leaf-{i}"))).collect();
+        let mut bindings = BTreeMap::new();
+        for (i, l) in leaves.iter().enumerate() {
+            bindings.insert(format!("system/k{i}"), l.content_hash);
+        }
+        let (store, li, keypair, peer_id, head) = build_published(bindings);
+        for l in &leaves {
+            store.put(l.clone()).unwrap();
+        }
+
+        let client = client_for(store, li, &keypair, &peer_id, head);
+        // Precondition: it all resolves honestly first, or the assertions below
+        // could pass against a fixture that never worked.
+        assert_eq!(
+            client.resolve("system/k3").unwrap().unwrap().content_hash,
+            leaves[3].content_hash
+        );
+        assert!(client.resolve("system/nope").unwrap().is_none(), "control: a real absence");
+
+        // The attack: serve a valid, well-formed entity for the TRIE ROOT's
+        // hash. It decodes, it re-hashes to something else, and the walk cannot
+        // proceed past it.
+        let trie_root = client.fetch_root().unwrap().root_hash;
+        let impostor = leaf_entity("impostor");
+        client
+            .fetcher
+            .content_override
+            .lock()
+            .unwrap()
+            .insert(trie_root, entity_wire::encode_entity(&impostor));
+
+        match client.resolve("system/k3") {
+            Err(PublishedRootError::ContentHashMismatch) => {}
+            other => panic!(
+                "a tampered interior node must be a mismatch, not an absence — got {other:?}"
+            ),
+        }
+        // And the same for a key that is genuinely absent: with the tree
+        // unwalkable we cannot know it is absent, so it must NOT come back as
+        // one. This is the half that makes the answer honest rather than merely
+        // different.
+        match client.resolve("system/nope") {
+            Err(PublishedRootError::ContentHashMismatch) => {}
+            other => panic!("an unwalkable tree cannot report an absence — got {other:?}"),
+        }
+
+        // Control, restored: with the tamper removed, absence is absence again.
+        client.fetcher.content_override.lock().unwrap().clear();
+        assert!(client.resolve("system/nope").unwrap().is_none());
+        assert_eq!(
+            client.resolve("system/k3").unwrap().unwrap().content_hash,
+            leaves[3].content_hash
+        );
     }
 
     // ----- verify_content: §1.2 host-bytes-distrust (Gap A + Gap B) -----

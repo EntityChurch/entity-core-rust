@@ -13,6 +13,7 @@ entity-store.workspace = true
 entity-types.workspace = true
 entity-capability.workspace = true
 entity-handler.workspace = true
+entity-wire.workspace = true
 async-trait.workspace = true
 ciborium.workspace = true
 thiserror.workspace = true

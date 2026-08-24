@@ -1356,120 +1356,44 @@ fn clamp_to_ceiling(resolved: Option<u64>, policy: &IssuerPolicyData) -> Option<
 }
 
 // ---------------------------------------------------------------------------
-// §6a.9.1 `issuer-policy.name_constraints` — grammar UNRULED, deliberately
-// left on the POSIX reading
+// §6a.9.1 `issuer-policy.name_constraints` — §4's matcher, ONE per registry
+// `[MUST, REGISTRY 1.15]`
 // ---------------------------------------------------------------------------
 
 /// Match a name against `issuer-policy.name_constraints` (§6a.9.1).
 ///
-/// **This is NOT [`crate::resolver::dispatch_match`], and the split is the
-/// point.** §4's `name_format_dispatch.pattern` grammar was closed at
-/// `REGISTRY 1.13` — `*` only, every other byte a literal. §6a.9.1's
-/// `name_constraints` is the *fourth* glob-shaped field in this extension and
-/// its grammar is **unruled**: the spec says only *"`<glob | null>`, e.g. only
-/// issue `"*.lab"`"*, which every POSIX and every closed reading satisfies
-/// identically.
+/// **This IS [`crate::resolver::dispatch_match`], and sharing it is the
+/// ruling.** §6a.9.1 said `<glob | null>` and defined the grammar nowhere,
+/// while §4's was closed at `REGISTRY 1.13` — two glob fields over **one**
+/// domain (the user-facing name string), in one handler, two subsections
+/// apart. v1.13's own scoping sentence (*"a registry-local matcher, scoped to
+/// this field"*) was written to fence §4's matcher off from
+/// `ENTITY-CORE-PROTOCOL` §5.4, which it still does; it fenced off
+/// `name_constraints` as collateral. Arch ruled that collateral away at
+/// `1.15`: **`*` is the only metacharacter, every other byte is a literal,
+/// `*` crosses `/`, and no pattern is invalid** — one name matcher per
+/// registry (`ROUTING-2026-08-19-c` §1, arch `c984f93`).
 ///
-/// `entity-core-go` surfaced this by running the matcher-convergence grep its
-/// own discipline mandates, and **routed it (spec-issue `2026-08-18-e`)
-/// rather than converging a cross-impl-observable surface unilaterally** —
-/// which is the call arch upheld on the dispatch matter one field over. We
-/// hold the same line: this field decides which names a registry will sign,
-/// so a peer that reads `app-[0-9]` as a character class and one that reads
-/// it as five literal bytes admit **different name sets** from the same
-/// stored policy. Converging it here, ahead of a ruling, is how three
-/// implementations end up with three matchers.
+/// This replaced a POSIX matcher granting `?` a one-character meaning and
+/// `[…]` a character class, which is the same defect §4 carried until `1.13`
+/// and which we held here **deliberately** while it was unruled: the field
+/// decides `403 not_entitled` versus a signed, published binding, so two
+/// registries running the *same* operator policy admitted different names.
+/// The field's only spec example, `*.lab`, is grammar-identical under every
+/// candidate reading and discriminated nothing — which is how it survived
+/// review in both directions.
 ///
-/// So this keeps the POSIX behaviour the field has always had —
-/// `*` (any run), `?` (one character), `[…]` character classes with `!`
-/// negation — **unchanged and unshared**, and it is a separate function from
-/// the ruled one so that neither can drift into the other. Two matchers in
-/// one tree silently agreeing is exactly what core-go's finding names.
+/// **It is a call, not a copy.** A second matcher agreeing byte-for-byte with
+/// the first is the shape core-go's own finding names: two functions drift,
+/// one cannot. Do not re-inline this.
 ///
-/// **Owed when arch rules:** if the answer is "same closed grammar as §4",
-/// this collapses to a call to `dispatch_match` and the vector rows below
-/// invert.
+/// **No pattern is invalid here either, so there is no write-time rejection
+/// and none is owed** — `set-issuer-policy` MUST store `a[b` and admit the
+/// literal name `a[b`, and any error arm for a "malformed" constraint is
+/// unreachable rather than defensive. Stated here because the opposite
+/// disposition (`EXTENSION-REVISION` §4.4.17 V6, which refuses at the writer)
+/// is one section of our own charter away, and porting it across would `400`
+/// legal policies.
 pub(crate) fn name_constraints_match(pattern: &str, name: &str) -> bool {
-    posix_glob(pattern.as_bytes(), name.as_bytes())
-}
-
-fn posix_glob(mut p: &[u8], mut t: &[u8]) -> bool {
-    loop {
-        match p.first() {
-            None => return t.is_empty(),
-            Some(b'*') => {
-                while p.first() == Some(&b'*') {
-                    p = &p[1..];
-                }
-                if p.is_empty() {
-                    return true;
-                }
-                for i in 0..=t.len() {
-                    if posix_glob(p, &t[i..]) {
-                        return true;
-                    }
-                }
-                return false;
-            }
-            Some(b'?') => {
-                if t.is_empty() {
-                    return false;
-                }
-                p = &p[1..];
-                t = &t[1..];
-            }
-            Some(b'[') => {
-                if t.is_empty() {
-                    return false;
-                }
-                match posix_class(&p[1..], t[0]) {
-                    Some(consumed) => {
-                        p = &p[1 + consumed..];
-                        t = &t[1..];
-                    }
-                    None => return false,
-                }
-            }
-            Some(&c) => {
-                if t.first() != Some(&c) {
-                    return false;
-                }
-                p = &p[1..];
-                t = &t[1..];
-            }
-        }
-    }
-}
-
-/// Match `ch` against a `[...]` class starting after the `[`. Returns the
-/// number of bytes consumed up to and including the closing `]`, or `None` if
-/// no match / malformed.
-fn posix_class(spec: &[u8], ch: u8) -> Option<usize> {
-    let mut i = 0;
-    let negate = spec.first() == Some(&b'!');
-    if negate {
-        i += 1;
-    }
-    let mut matched = false;
-    let start = i;
-    while i < spec.len() {
-        let c = spec[i];
-        if c == b']' && i > start {
-            return if matched != negate { Some(i + 1) } else { None };
-        }
-        if i + 2 < spec.len() && spec[i + 1] == b'-' && spec[i + 2] != b']' {
-            let lo = c;
-            let hi = spec[i + 2];
-            if ch >= lo && ch <= hi {
-                matched = true;
-            }
-            i += 3;
-        } else {
-            if ch == c {
-                matched = true;
-            }
-            i += 1;
-        }
-    }
-    None // unterminated class
+    crate::resolver::dispatch_match(pattern, name)
 }

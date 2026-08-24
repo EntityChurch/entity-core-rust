@@ -530,10 +530,13 @@ async fn meta_resolver_revocation_honored() {
             .unwrap(),
     )
     .unwrap();
-    // Install a revocation under the cohort convention: keyed by the
-    // revocation entity's OWN content hash, not the binding it revokes (Go
-    // `RevocationStoragePath`, validate-peer v6). `:resolve` discovers it by
-    // scanning the revocation subtree and matching `revokes:`.
+    // §3.1's discovery contract constrains **no storage path**, and the cohort
+    // convention is own-hash-keyed: a revocation written straight to the tree
+    // — no `revoke-request`, so no by-target entry — MUST still exclude. This
+    // is `registry.v6_meta_resolver_revocation_honored` in go's oracle, driven
+    // by `tree-put` at exactly this path. An index-only reader fails it while
+    // every in-tree test stays green, which is how the first attempt at R-4
+    // was caught: green suite, red armed gate.
     let rev = RevocationData {
         revokes: binding_hash,
         revoked_at: 1,
@@ -549,11 +552,173 @@ async fn meta_resolver_revocation_honored() {
         .handle(&ctx("resolve", vec![(text("name"), text("dave"))]))
         .await
         .unwrap();
-    let res = decode_result(&r);
-    // revoked → excluded → chain_exhausted (no other backend)
     assert_eq!(
-        result_field(&res, "status").unwrap().as_text(),
+        result_field(&decode_result(&r), "status")
+            .unwrap()
+            .as_text(),
+        Some("chain_exhausted"),
+        "an own-hash-keyed revocation excludes — §3.1 pins no path, and v6 \
+         drives exactly this shape over the wire"
+    );
+
+    // A revocation reached only through the §6a.6 by-target key — what
+    // `revoke-request` writes — also excludes. **This row does not
+    // discriminate and is not claimed to**: `by-target/{hex}` sits inside
+    // `revocation_prefix`, so the scan finds it too (pinned structurally by
+    // `revocation_by_target_is_inside_the_scanned_prefix`). It is here as
+    // coverage of the shape the write path produces, not as evidence about
+    // which reader ran.
+    let (cs2, li2) = stores();
+    let pet2 = LocalNameHandler::new(cs2.clone(), li2.clone(), PEER.into());
+    let h2 = pet2
+        .handle(&ctx(
+            "bind",
+            vec![
+                (text("name"), text("dave")),
+                (text("target_peer_id"), text("z6MkDave")),
+            ],
+        ))
+        .await
+        .unwrap();
+    let bh2 = Hash::from_bytes(
+        result_field(&decode_result(&h2), "binding_hash")
+            .unwrap()
+            .as_bytes()
+            .unwrap(),
+    )
+    .unwrap();
+    let rev2 = RevocationData {
+        revokes: bh2,
+        revoked_at: 1,
+        reason: None,
+    };
+    let rev2_hash = cs2.put(rev2.to_entity().unwrap()).unwrap();
+    li2.set(&crate::revocation_by_target_path(PEER, &bh2), rev2_hash);
+    let r2 = registry(&cs2, &li2)
+        .handle(&ctx("resolve", vec![(text("name"), text("dave"))]))
+        .await
+        .unwrap();
+    assert_eq!(
+        result_field(&decode_result(&r2), "status")
+            .unwrap()
+            .as_text(),
+        Some("chain_exhausted"),
+        "a revocation filed ONLY in the by-target index excludes"
+    );
+
+    // Both keys, as `revoke-request` writes them.
+    li.set(
+        &crate::revocation_by_target_path(PEER, &binding_hash),
+        rev_hash,
+    );
+    let r = reg
+        .handle(&ctx("resolve", vec![(text("name"), text("dave"))]))
+        .await
+        .unwrap();
+    assert_eq!(
+        result_field(&decode_result(&r), "status")
+            .unwrap()
+            .as_text(),
         Some("chain_exhausted")
+    );
+}
+
+/// The index KEY is a host-served pointer and proves nothing: a genuine
+/// revocation naming binding A, filed by a hostile tree under `by-target/{B}`,
+/// must not revoke B — the signed body's own `revokes` is the commitment.
+///
+/// **Stated honestly: this cannot currently fail at this reader**, because
+/// §3.1 discovery here is a scan that matches on `revokes` and so cannot be
+/// misfiled at all. It is kept as the regression guard for the keyed form —
+/// it *did* go red against the index-only reader that shipped and was reverted
+/// this session, and it is the assertion a future scan→lookup rewrite drops
+/// first. The discriminating copy lives where the keyed reader actually is:
+/// `peer_issued_misfiled_revocation_does_not_revoke_the_wrong_binding`.
+#[tokio::test]
+async fn meta_resolver_misfiled_revocation_does_not_revoke_the_wrong_binding() {
+    let (cs, li) = stores();
+    let pet = LocalNameHandler::new(cs.clone(), li.clone(), PEER.into());
+    let victim = pet
+        .handle(&ctx(
+            "bind",
+            vec![
+                (text("name"), text("victim")),
+                (text("target_peer_id"), text("z6MkVictim")),
+            ],
+        ))
+        .await
+        .unwrap();
+    let victim_hash = Hash::from_bytes(
+        result_field(&decode_result(&victim), "binding_hash")
+            .unwrap()
+            .as_bytes()
+            .unwrap(),
+    )
+    .unwrap();
+
+    // A second, unrelated binding — and a revocation that genuinely revokes
+    // THAT one.
+    let other = pet
+        .handle(&ctx(
+            "bind",
+            vec![
+                (text("name"), text("other")),
+                (text("target_peer_id"), text("z6MkOther")),
+            ],
+        ))
+        .await
+        .unwrap();
+    let other_hash = Hash::from_bytes(
+        result_field(&decode_result(&other), "binding_hash")
+            .unwrap()
+            .as_bytes()
+            .unwrap(),
+    )
+    .unwrap();
+    let rev = RevocationData {
+        revokes: other_hash,
+        revoked_at: 1,
+        reason: None,
+    };
+    let rev_hash = cs.put(rev.to_entity().unwrap()).unwrap();
+    // Misfiled under the victim's index key.
+    li.set(
+        &crate::revocation_by_target_path(PEER, &victim_hash),
+        rev_hash,
+    );
+
+    let reg = registry(&cs, &li);
+    let r = reg
+        .handle(&ctx("resolve", vec![(text("name"), text("victim"))]))
+        .await
+        .unwrap();
+    assert_eq!(
+        result_field(&decode_result(&r), "status")
+            .unwrap()
+            .as_text(),
+        Some("resolved"),
+        "a revocation whose signed `revokes` names another binding must not \
+         revoke this one — the index key is not evidence"
+    );
+}
+
+/// The containment that makes an index-first fast path at the §3.1 reader
+/// **unobservable** — `by-target/{hex}` is a child of the scanned revocation
+/// prefix, so a keyed lookup can only find revocations the scan already finds.
+///
+/// Pinned by construction because it is the reason this peer ships **no** such
+/// branch: deleting one fails no test, and a branch that reads as covered and
+/// cannot fail is worse than its absence. If the paths ever diverge — §3.1
+/// gaining its own index, or the key moving out from under the prefix — this
+/// fails, and the fast path becomes a real behaviour that owes a real row.
+#[test]
+fn revocation_by_target_is_inside_the_scanned_prefix() {
+    let bh = Hash::from_bytes(&[0u8; 33]).expect("zero hash");
+    let by_target = crate::revocation_by_target_path(PEER, &bh);
+    assert!(
+        by_target.starts_with(&crate::revocation_prefix(PEER)),
+        "the by-target index key must sit under the scanned prefix — the §3.1 \
+         scan and the §6a.6 lookup would otherwise see different sets"
     );
 }
 
@@ -691,22 +856,24 @@ fn dispatch_grammar_closed_clauses() {
     assert!(!dispatch_match("a[b", "ab"));
 }
 
-/// The **other half** of §4.1 step 2's per-backend rule, and the row on
-/// which `entity-core-go`'s `registry.v15_dispatch_grammar` measures us as
-/// FAIL: *"Backends without a `name_format_dispatch` entry default to 'match
-/// all' (no filtering)."*
+/// §4.1 step 2 `[MUST, REGISTRY 1.14]` — **eligibility is a pure function of
+/// the name**: the union of the matching rules' `backend_kinds`, and a kind
+/// reaches eligibility only by being *named*.
 ///
-/// A `local-name` backend named by no rule stays consulted even while a rule
-/// matching the queried name narrows to `did-web`. core-go restricts the
-/// chain to the union of the matching rules' kinds and so excludes it. Both
-/// readings are in §4.1 step 2 — ours in its second sentence, theirs in its
-/// first — and the divergence is routed, not accidental (see
-/// `docs/SPEC-AMBIGUITIES.md`). Pinned here so it is explicit: if arch rules
-/// for the union reading, **this is the test that must flip**, and the
-/// companion `meta_resolver_dispatch_filter_excludes_local_name` is the one
-/// that must NOT.
+/// This test asserted the opposite until the ruling (*"a kind named by no rule
+/// defaults to match-all"*), which is the branch this peer shipped and routed;
+/// arch's `ROUTING-2026-08-19-a` confirmed the contradiction report and changed
+/// the text, ruling **against** this row. It is the row that made step 2's own
+/// privacy MUST evadable by omitting a rule — a `dns-txt` backend named
+/// nowhere was consulted for every bare name — which is the argument we filed
+/// against our own reading.
+///
+/// **Teeth:** reinstating the old `restricted`-set branch in `meta_resolve`
+/// flips exactly this test and leaves
+/// `meta_resolver_dispatch_filter_excludes_local_name` (the other row, which
+/// we always had right) green.
 #[tokio::test]
-async fn a_backend_kind_named_by_no_dispatch_rule_is_never_narrowed_out() {
+async fn a_kind_named_by_no_dispatch_rule_is_not_eligible() {
     let (cs, li) = stores();
     let pet = LocalNameHandler::new(cs.clone(), li.clone(), PEER.into());
     pet.handle(&ctx(
@@ -720,7 +887,8 @@ async fn a_backend_kind_named_by_no_dispatch_rule_is_never_narrowed_out() {
     .unwrap();
 
     // A rule that MATCHES the queried name and names a kind the chain does
-    // not carry. `local-name` appears in no rule at all.
+    // not carry. `local-name` appears in no rule at all, so it is not in the
+    // eligible union and the chain narrows to empty.
     let cfg = ResolverConfigData {
         resolver_chain: vec![ResolverChainEntry {
             backend_kind: "local-name".into(),
@@ -745,8 +913,53 @@ async fn a_backend_kind_named_by_no_dispatch_rule_is_never_narrowed_out() {
         result_field(&decode_result(&r), "status")
             .unwrap()
             .as_text(),
+        Some("chain_exhausted"),
+        "a kind named by no dispatch rule is not eligible (§4.1 step 2, 1.14)"
+    );
+}
+
+/// The `None` branch of the same ruling: *"if `rules` is absent or empty,
+/// return ALL"* — the filter is **disabled**, not empty-set. Pinned because
+/// the fail-closed reading above is one line away from swallowing the
+/// unconfigured deployment, which is every peer that never writes a
+/// resolver-config (`default_local_name_only`).
+#[tokio::test]
+async fn an_absent_dispatch_list_disables_the_filter_rather_than_narrowing_to_empty() {
+    let (cs, li) = stores();
+    let pet = LocalNameHandler::new(cs.clone(), li.clone(), PEER.into());
+    pet.handle(&ctx(
+        "bind",
+        vec![
+            (text("name"), text("alice")),
+            (text("target_peer_id"), text("z6MkAlice")),
+        ],
+    ))
+    .await
+    .unwrap();
+
+    let cfg = ResolverConfigData {
+        resolver_chain: vec![ResolverChainEntry {
+            backend_kind: "local-name".into(),
+            backend_id: PEER.into(),
+            priority: 0,
+            accepted_trust_anchors: vec![],
+            hints: None,
+        }],
+        name_format_dispatch: vec![], // no rules at all
+        ..Default::default()
+    };
+    install_config(&cs, &li, &cfg);
+    let reg = registry(&cs, &li);
+    let r = reg
+        .handle(&ctx("resolve", vec![(text("name"), text("alice"))]))
+        .await
+        .unwrap();
+    assert_eq!(
+        result_field(&decode_result(&r), "status")
+            .unwrap()
+            .as_text(),
         Some("resolved"),
-        "a kind named by no dispatch rule defaults to match-all (§4.1 step 2)"
+        "an empty name_format_dispatch disables the filter (§4.1 step 2, 1.14)"
     );
 }
 
@@ -757,11 +970,14 @@ async fn a_backend_kind_named_by_no_dispatch_rule_is_never_narrowed_out() {
 /// The bounded region that makes the enumeration exhaustive is *every
 /// construction of a `ResolverConfigData` and every write to
 /// `resolver_config_path` in non-test code*, not a grep for `did:web:`.
-/// There are exactly two: `RegistryHandler::default_local_name_only` (below)
-/// and `cmd/entity-peer`'s `--peer-issued-registry` install, which builds its
-/// chain explicitly and takes `name_format_dispatch` from
-/// `..Default::default()`. `DispatchRule` itself is constructed only by the
-/// decoder — i.e. only from a config an operator supplied.
+/// There are exactly three: `RegistryHandler::default_local_name_only`
+/// (below); `cmd/entity-peer`'s `--peer-issued-registry` install, which builds
+/// its chain explicitly and takes `name_format_dispatch` from
+/// `..Default::default()`; and — since §4.3 `[v1.18]` — the
+/// `set-resolver-config` handler, which stores the **operator's** submitted
+/// bytes verbatim and authors no list of its own. `DispatchRule` itself is
+/// constructed only by the decoder — i.e. only from a config an operator
+/// supplied.
 ///
 /// This is the gate, not the proof: if a seed policy ever *does* ship the
 /// §4.1a list, this test fails and rows 2 (`did:key:*` → `self-certifying`)
@@ -775,45 +991,85 @@ fn we_ship_no_default_dispatch_list_so_rows_2_and_6_are_inert() {
         "shipping a §4.1a default list makes rows 2 and 6 owed — see arch ROUTING-2026-08-18-q §3"
     );
 
-    // A name matching no entry is treated as matching the catch-all (§4.1a),
-    // and with no entries at all every backend is unrestricted — which is the
-    // behaviour `meta_resolver_dispatch_filter_excludes_local_name` pins from
-    // the other side.
+    // With no entries at all the filter is disabled and every backend is
+    // eligible (§4.1 step 2, 1.14) — pinned from the other side by
+    // `an_absent_dispatch_list_disables_the_filter_rather_than_narrowing_to_empty`.
+    // §4's *"a name matching no entry is treated as matching the catch-all"*
+    // was **withdrawn** at 1.14 and is deliberately not cited here: the
+    // catch-all is `*`, which matches every name, so the sentence named a row
+    // with no referent.
     assert!(cfg.resolver_chain.is_empty());
 }
 
-/// §6a.9.1 `name_constraints` is a **separate, unruled** matcher and keeps
-/// its POSIX reading until arch answers core-go's spec-issue `2026-08-18-e`.
+/// `REG-NAME-CONSTRAINTS-GRAMMAR-1` (§11.1) — §6a.9.1's `name_constraints`
+/// is **§4's closed grammar** `[MUST, REGISTRY 1.15]`, one name matcher per
+/// registry (arch `c984f93`, `ROUTING-2026-08-19-c` §1).
 ///
-/// Pinned so the divergence is explicit rather than accidental: these rows
-/// are the exact inverse of `REG-DISPATCH-GRAMMAR-1`'s first two, and they
-/// are what will flip if the ruling says "same closed grammar as §4".
+/// Every row here asserted the **opposite** until the ruling: the field said
+/// `<glob | null>` and defined the grammar nowhere, so this peer held the
+/// POSIX reading it had always had and routed rather than converged. core-go's
+/// `registry_issuer.name_constraints_grammar` measured that as a live FAIL
+/// against us at row 1 (`"a?c"` admitted `abc`, 200 where the ruling says
+/// 403) — the admission gate two registries running one operator policy
+/// disagreed on.
 #[test]
-fn name_constraints_keeps_the_unruled_posix_reading() {
-    // The documented example works under either reading — which is why the
-    // field's grammar was never forced.
+fn name_constraints_uses_the_closed_dispatch_grammar() {
+    // Control — the field's only spec example. Grammar-identical under every
+    // candidate reading, which is why it discriminated nothing and the
+    // divergence survived review on both sides of the wire for as long as it
+    // did.
     assert!(name_constraints_match("*.lab", "widget.lab"));
     assert!(!name_constraints_match("*.lab", "widget.com"));
 
-    // …and these are where the two readings part company.
-    assert!(
-        name_constraints_match("a?c", "abc"),
-        "POSIX: `?` is any one char"
-    );
-    assert!(
-        name_constraints_match("[a-c]x", "bx"),
-        "POSIX: `[…]` is a class"
-    );
-    assert!(!name_constraints_match("[a-c]x", "dx"));
-    assert!(name_constraints_match("[!a-c]x", "dx"));
+    // Row 1 — `?` is a LITERAL.
+    assert!(!name_constraints_match("a?c", "abc"));
+    assert!(name_constraints_match("a?c", "a?c"));
 
-    // The two matchers MUST NOT be the same function. If a future edit
-    // collapses them, this is the assertion that says so out loud.
-    assert_ne!(
-        name_constraints_match("a?c", "abc"),
-        dispatch_match("a?c", "abc"),
-        "the §4 grammar is ruled and §6a.9.1's is not — they are separate matchers"
+    // Row 2 — `[…]` is literal bytes, not a character class, and `!` negates
+    // nothing.
+    assert!(!name_constraints_match("[a-c]x", "bx"));
+    assert!(name_constraints_match("[a-c]x", "[a-c]x"));
+    assert!(!name_constraints_match("[!a-c]x", "dx"));
+
+    // Row 4 — **no pattern is invalid**, which is why it is asserted apart
+    // from row 2: a shell-glob fails this row by *erroring* rather than by
+    // answering wrongly. go 500ed here; we answered a wrong 403, because
+    // `posix_class` returned `None` on the unterminated class and so refused
+    // the literal name the policy names. Neither is reachable now — there is
+    // no error path to take and nothing for `set-issuer-policy` to reject.
+    assert!(name_constraints_match("a[b", "a[b"));
+    assert!(!name_constraints_match("a[b", "ab"));
+
+    // Row 3 — `*` crosses `/` — holds at the matcher and is **unbindable over
+    // the wire on this peer**, for a reason 1.15 does not control:
+    // `handle_register` runs §6.3 `validate_name_safety` (no `/` in a name)
+    // BEFORE the policy check, so no register-request carrying `x/y/z` ever
+    // reaches the matcher. Same shape as `REG-DISPATCH-GRAMMAR-1`'s `x*z` row,
+    // and the same in core-go (`normalizeName`) — their spec-issue
+    // `2026-08-19-b` asks §11.1 to mark both rows in-tree-only. Pinned here,
+    // not claimed on the wire.
+    assert!(name_constraints_match("x*z", "x/y/z"));
+    assert!(
+        crate::data::validate_name_safety("x/y/z").is_err(),
+        "row 3 is unbindable through register-request — §6.3 rejects the name first"
     );
+
+    // ONE matcher, not two agreeing. This was an `assert_ne!` — "these MUST
+    // NOT be the same function" — until the ruling; the drift it guarded
+    // against is now prevented by there being nothing to drift.
+    for (p, n) in [
+        ("a?c", "abc"),
+        ("[a-c]x", "bx"),
+        ("a[b", "a[b"),
+        ("x*z", "x/y/z"),
+        ("*.lab", "widget.lab"),
+    ] {
+        assert_eq!(
+            name_constraints_match(p, n),
+            dispatch_match(p, n),
+            "§6a.9.1 and §4 are one matcher (1.15) — pattern {p:?} vs name {n:?}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1612,6 +1868,94 @@ async fn register_policy_allowlist() {
     assert_eq!(
         resolved.peer_id.as_deref(),
         Some(allowed.peer_id().as_str())
+    );
+}
+
+/// `REG-NAME-CONSTRAINTS-GRAMMAR-1` through the **admission gate** — the half
+/// that is observable on the wire, and the half that decides `403
+/// not_entitled` versus a signed, published binding.
+///
+/// `name_constraints_uses_the_closed_dispatch_grammar` pins the matcher; this
+/// pins that the matcher is what `register-request` actually consults. core-go
+/// measured exactly this shape against us over the wire
+/// (`registry_issuer.name_constraints_grammar` row 1: policy `"a?c"`, request
+/// `abc` → **200 on this peer**, expected 403) — so the in-tree half alone
+/// would not have caught it, and a matcher test alone would not catch a future
+/// edit that stops calling it.
+///
+/// Row 4 is here too: under the POSIX matcher `a[b` was an *unterminated
+/// class* and the literal name `a[b` was refused by the very policy naming it.
+/// No pattern is invalid now, so it admits.
+#[tokio::test]
+async fn name_constraints_admission_reads_the_pattern_as_literal_bytes() {
+    let (cs, li) = stores();
+    let registry = IdentityKeypair::Ed25519(Keypair::generate());
+    install_policy(
+        &cs,
+        &li,
+        registry.peer_id().as_str(),
+        &IssuerPolicyData {
+            mode: MODE_OPEN.into(),
+            name_constraints: Some("a?c".into()),
+            ..Default::default()
+        },
+    );
+    let handler = reg_handler(&cs, &li, &registry);
+
+    // Row 1 — `?` is a literal, so `abc` is OUTSIDE the constraint. This
+    // returned 200 until 1.15.
+    let owner = Keypair::generate();
+    let rej = handler
+        .handle(&register_ctx(
+            mk_request("abc", owner.peer_id().as_str(), b"nc-1"),
+            &owner,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rej.status, 403, "`?` is a literal — `abc` is not `a?c`");
+    assert_eq!(
+        result_field(&decode_result(&rej), "code").and_then(|v| v.as_text()),
+        Some("not_entitled")
+    );
+
+    // …and the literal name the policy names is admitted.
+    let ok = handler
+        .handle(&register_ctx(
+            mk_request("a?c", owner.peer_id().as_str(), b"nc-2"),
+            &owner,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        ok.status, 200,
+        "the literal name `a?c` is what `a?c` admits"
+    );
+
+    // Row 4 — a "malformed" class is just literal bytes. Fresh registry: the
+    // policy is whole-replace and the name is a different one.
+    let (cs2, li2) = stores();
+    let reg2 = IdentityKeypair::Ed25519(Keypair::generate());
+    install_policy(
+        &cs2,
+        &li2,
+        reg2.peer_id().as_str(),
+        &IssuerPolicyData {
+            mode: MODE_OPEN.into(),
+            name_constraints: Some("a[b".into()),
+            ..Default::default()
+        },
+    );
+    let h2 = reg_handler(&cs2, &li2, &reg2);
+    let ok2 = h2
+        .handle(&register_ctx(
+            mk_request("a[b", owner.peer_id().as_str(), b"nc-3"),
+            &owner,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        ok2.status, 200,
+        "no pattern is invalid — `a[b` stores and admits its own literal, with no 5xx"
     );
 }
 
@@ -3458,9 +3802,144 @@ async fn reg_renew_ttl_nullpred_1() {
     );
 }
 
+/// `REG-TTL-RESOLVER-CEILING-1` `[v1.16]` — the resolver-side ceiling vector,
+/// all four rows, against a chain entry carrying `hints.max_ttl`.
+///
+/// **This is R-5 on the cohort ledger and it is new for every seat.** The two
+/// pre-existing TTL vectors test the *issuer* side; nothing tested the clamp
+/// that protects a **consumer**, which is how four seats put the ceiling in
+/// three different config keys with no instrument noticing (arch `d3752ca`,
+/// GAP 2 → §4's `resolver_chain[].hints.max_ttl`).
+///
+/// Row (a)'s hash half is also pinned by
+/// `resolver_ceiling_does_not_move_the_binding_hash` — deliberately, and this
+/// one is written self-contained anyway: a vector row a reader has to
+/// reassemble from two tests is a row nobody can check against the table.
+///
+/// **Row (d) — the sticky binding — is the row an implementation passes by
+/// accident and fails on inspection**, because `min` over a null has no
+/// natural answer. Arch ruled it in this peer's shape: the ceiling bounds *how
+/// long a value may be honored*, so applying it only where a bound already
+/// exists leaves exactly the unbounded case uncovered.
+///
+/// **Reported, not asserted:** the row's *"or `pinned`"* half is unreachable
+/// here by construction. §4.1 step 1 returns a pinned binding from
+/// `synthesize_pin` **before** the chain is consulted, so no
+/// `resolver_chain[]` entry — and therefore no `hints.max_ttl` — is in scope
+/// for a pin. Routed rather than worked around; `local-name` is the sticky
+/// kind this peer can drive through the ceiling.
+#[tokio::test]
+async fn reg_ttl_resolver_ceiling_1() {
+    let (cs, li) = stores();
+    let registry_kp = Keypair::generate();
+    let rid = registry_kp.peer_id().as_str().to_string();
+    let target = Keypair::generate().peer_id().as_str().to_string();
+    cs.put(registry_kp.peer_entity().unwrap()).unwrap();
+    let issued = 86_400_000; // 1 day, as issued
+    publish_binding(
+        &cs,
+        &li,
+        &rid,
+        &registry_kp,
+        "billslab.com",
+        &target,
+        crate::log::now_ms(),
+        Some(issued),
+    );
+    let ceiling = |ms: i64| {
+        pi_entry(
+            &rid,
+            Some(Value::Map(vec![(text("max_ttl"), entity_ecf::integer(ms))])),
+        )
+    };
+    let resolve = |entry: &ResolverChainEntry| {
+        crate::resolver::apply_resolver_ceiling(
+            crate::peer_issued::resolve_one(&cs, &li, entry, "billslab.com").expect("resolves"),
+            entry,
+        )
+    };
+
+    // (a) ttl ABOVE the ceiling → effective lifetime is exactly max_ttl, and
+    //     the binding's content hash is UNCHANGED. Assert the hash, not only
+    //     the number: a resolver that rewrites the binding to carry the
+    //     clamped value moves its address and invalidates every signature
+    //     over it.
+    let bare = pi_entry(&rid, None);
+    let unclamped = resolve(&bare);
+    let a = ceiling(3_600_000);
+    let clamped = resolve(&a);
+    assert_eq!(clamped.ttl, Some(3_600_000), "(a) effective lifetime");
+    assert_eq!(clamped.binding, unclamped.binding, "(a) hash unchanged");
+    assert_eq!(
+        binding_ttl(&cs, clamped.binding.unwrap()),
+        Some(issued),
+        "(a) the stored body still carries the ISSUED value"
+    );
+
+    // (b) ttl BELOW the ceiling → returned untouched.
+    let b = ceiling(999_000_000);
+    assert_eq!(resolve(&b).ttl, Some(issued), "(b) untouched");
+
+    // (c) `max_ttl: 0` behaves IDENTICALLY to an absent `hints` — the
+    //     binding's own ttl survives. Asserted against the absent-hints
+    //     result, not just against the number, because "identical to absent"
+    //     is the rule and a peer could special-case 0 to some other value.
+    let c = ceiling(0);
+    assert_eq!(resolve(&c).ttl, unclamped.ttl, "(c) 0 is undeclared");
+    assert_eq!(resolve(&c).ttl, Some(issued));
+
+    // (d) a STICKY binding (no `ttl`) resolves with effective lifetime
+    //     max_ttl. Driven end-to-end through `:resolve` rather than through
+    //     `apply_resolver_ceiling` directly — the arm is only worth anything
+    //     if the chain actually reaches it.
+    let (cs2, li2) = stores();
+    let pet = LocalNameHandler::new(cs2.clone(), li2.clone(), PEER.into());
+    pet.handle(&ctx(
+        "bind",
+        vec![
+            (text("name"), text("sticky")),
+            (text("target_peer_id"), text("z6MkSticky")),
+        ],
+    ))
+    .await
+    .unwrap();
+    let cfg = ResolverConfigData {
+        resolver_chain: vec![ResolverChainEntry {
+            backend_kind: "local-name".into(),
+            backend_id: PEER.into(),
+            priority: 0,
+            accepted_trust_anchors: vec![],
+            hints: Some(Value::Map(vec![(
+                text("max_ttl"),
+                entity_ecf::integer(1_800_000),
+            )])),
+        }],
+        ..Default::default()
+    };
+    install_config(&cs2, &li2, &cfg);
+    let r = registry(&cs2, &li2)
+        .handle(&ctx("resolve", vec![(text("name"), text("sticky"))]))
+        .await
+        .unwrap();
+    let res = decode_result(&r);
+    assert_eq!(
+        result_field(&res, "status").unwrap().as_text(),
+        Some("resolved"),
+        "(d) the sticky binding still resolves"
+    );
+    assert_eq!(
+        result_field(&res, "ttl").and_then(|v| v.as_integer()),
+        Some(1_800_000i64.into()),
+        "(d) a binding with no ttl takes the ceiling as its lifetime — `min` \
+         over a null has no natural answer, and leaving it absent is the one \
+         case a ceiling exists to bound"
+    );
+}
+
 /// The **resolver's** ceiling (§6a.9.1 `[MUST when present]`) —
 /// `min(binding.ttl, local_max)`, computed at resolution and **never written
-/// back**.
+/// back**. Row (a) of `REG-TTL-RESOLVER-CEILING-1`; kept alongside the named
+/// vector because arch's fold quotes this test by name.
 ///
 /// The load-bearing assertion is the *binding hash*, not the number: if a
 /// refactor ever rewrote the binding to carry the clamped TTL, the content
@@ -3611,4 +4090,721 @@ async fn approve_request_applies_the_ceiling_live_not_as_queued() {
         Some(1_800_000),
         "approve signs under the ceiling the operator set, not the one at queue time"
     );
+}
+
+// ---------------------------------------------------------------------------
+// §4.3 `[v1.18]` — `set-resolver-config` / `get-resolver-config`, and the
+// §4.1 step 2 name-disclosure MUST that finally has a surface to bind to.
+//
+// Arch ruled 1.18 on the derivation, not on the cohort: a distribution's
+// artifact is extended by parties it will never see, so a safety property that
+// does not survive extension is not one a shipper can be held to. That is what
+// makes the check KIND-SCOPED, and the kind-scoped row is the one no
+// resolve-time observable can settle — the absence of a request is name-blind
+// under either reading. It has to be measured at the write.
+// ---------------------------------------------------------------------------
+
+use crate::resolver::{disclosure_violations, pattern_matches_unscoped_name};
+
+/// A `system/registry/set-resolver-config-request` carrying `cfg_entity`
+/// nested and, when `ack`, the operator's acknowledgement.
+///
+/// The acknowledgement is a key of THIS entity and never of the config —
+/// which is exactly what `the_acknowledgement_cannot_be_forged_into_the_config`
+/// exercises from the other side.
+fn set_config_request(cfg_entity: &Entity, ack: bool) -> Entity {
+    let data: Value = ciborium::from_reader(cfg_entity.data.as_slice()).unwrap();
+    let nested = Value::Map(vec![
+        (
+            text("content_hash"),
+            Value::Bytes(cfg_entity.content_hash.to_bytes().to_vec()),
+        ),
+        (text("data"), data),
+        (text("type"), text(&cfg_entity.entity_type)),
+    ]);
+    let mut fields = vec![(text("config"), nested)];
+    if ack {
+        fields.push((text("acknowledge_name_disclosure"), Value::Bool(true)));
+    }
+    Entity::new(
+        entity_types::TYPE_REGISTRY_SET_RESOLVER_CONFIG_REQUEST,
+        to_ecf(&Value::Map(fields)),
+    )
+    .unwrap()
+}
+
+fn set_config_ctx(cfg: &ResolverConfigData, ack: bool) -> HandlerContext {
+    policy_ctx(
+        "set-resolver-config",
+        set_config_request(&cfg.to_entity().unwrap(), ack),
+    )
+}
+
+fn chain_entry(kind: &str, priority: u32) -> ResolverChainEntry {
+    ResolverChainEntry {
+        backend_kind: kind.into(),
+        backend_id: "x".into(),
+        priority,
+        accepted_trust_anchors: vec![],
+        hints: None,
+    }
+}
+
+fn dispatch(pattern: &str, kinds: &[&str]) -> DispatchRule {
+    DispatchRule {
+        pattern: pattern.into(),
+        backend_kinds: kinds.iter().map(|k| k.to_string()).collect(),
+    }
+}
+
+/// The §4.3 control: a **scoped** rule naming a transmitting kind is accepted,
+/// and `get` returns the stored bytes byte-for-byte.
+///
+/// Byte-identity is asserted on the *hash*, not on the decoded fields: a peer
+/// that re-encodes through `ResolverConfigData::to_entity` produces the same
+/// fields under a different address, and would silently drop every key this
+/// codec does not model.
+#[tokio::test]
+async fn set_resolver_config_stores_the_submitted_bytes_and_get_returns_them() {
+    let (cs, li) = stores();
+    let handler = registry(&cs, &li);
+    let cfg = ResolverConfigData {
+        resolver_chain: vec![chain_entry("local-name", 0), chain_entry("did-web", 1)],
+        name_format_dispatch: vec![dispatch("did:web:*", &["did-web"])],
+        ..Default::default()
+    };
+    let submitted = cfg.to_entity().unwrap();
+
+    let set = handler.handle(&set_config_ctx(&cfg, false)).await.unwrap();
+    assert_eq!(
+        set.status, 200,
+        "a scoped `did:web:*` rule discloses nothing — the user named the authority"
+    );
+    assert_eq!(set.result.content_hash, submitted.content_hash);
+
+    let got = handler
+        .handle(&no_params_ctx("get-resolver-config"))
+        .await
+        .unwrap();
+    assert_eq!(got.status, 200);
+    assert_eq!(
+        got.result.content_hash, submitted.content_hash,
+        "the round-trip is byte-exact, not field-equivalent"
+    );
+    assert_eq!(got.result.data, submitted.data);
+
+    // **The row that makes byte-exactness observable.** Against a config this
+    // codec fully models, storing the submitted bytes and re-encoding through
+    // `ResolverConfigData::to_entity` produce the same address, so a re-encode
+    // is an invisible defect. A config carrying a key we do not model — a
+    // forward-compat field, the shape §4.2 exists to permit — separates them:
+    // a re-encoding peer silently drops it and returns a different hash.
+    let with_unknown_key = Entity::new(
+        entity_types::TYPE_REGISTRY_RESOLVER_CONFIG,
+        to_ecf(&Value::Map(vec![
+            (
+                text("name_format_dispatch"),
+                Value::Array(vec![Value::Map(vec![
+                    (
+                        text("backend_kinds"),
+                        Value::Array(vec![text("local-name")]),
+                    ),
+                    (text("pattern"), text("*")),
+                ])]),
+            ),
+            (
+                text("resolver_chain"),
+                Value::Array(vec![Value::Map(vec![
+                    (text("backend_id"), text("x")),
+                    (text("backend_kind"), text("local-name")),
+                    (text("priority"), entity_ecf::integer(0)),
+                ])]),
+            ),
+            (text("schema_version_2027"), entity_ecf::integer(2)),
+        ])),
+    )
+    .unwrap();
+    let set = handler
+        .handle(&policy_ctx(
+            "set-resolver-config",
+            set_config_request(&with_unknown_key, false),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(set.status, 200);
+    let got = handler
+        .handle(&no_params_ctx("get-resolver-config"))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.result.content_hash, with_unknown_key.content_hash,
+        "a key this codec does not model MUST survive the write — the stored \
+         entity is the operator's bytes, not our re-encoding of them"
+    );
+}
+
+/// `get-resolver-config` is `404` when unset, and MUST NOT synthesize the
+/// local-name-only default `meta_resolve` runs with.
+///
+/// That default is what the resolver *does* with no config; it is not what an
+/// operator *wrote*. Returning it would report a configuration that does not
+/// exist — §6a.9.2's "unset is not a mode", one operation over.
+#[tokio::test]
+async fn get_resolver_config_is_404_when_unset_and_synthesizes_nothing() {
+    let (cs, li) = stores();
+    let got = registry(&cs, &li)
+        .handle(&no_params_ctx("get-resolver-config"))
+        .await
+        .unwrap();
+    assert_eq!(got.status, 404);
+    assert_eq!(err_code(&got).as_deref(), Some("not_found"));
+}
+
+/// Door 1 — a broad rule naming a name-transmitting kind is refused `403
+/// policy_rejected`, **with every violation listed**, not the first.
+#[tokio::test]
+async fn a_broad_dispatch_rule_naming_a_transmitting_kind_is_refused() {
+    let (cs, li) = stores();
+    let handler = registry(&cs, &li);
+    let cfg = ResolverConfigData {
+        resolver_chain: vec![chain_entry("local-name", 0), chain_entry("did-web", 1)],
+        name_format_dispatch: vec![dispatch("*", &["did-web", "dns-txt"])],
+        ..Default::default()
+    };
+    let r = handler.handle(&set_config_ctx(&cfg, false)).await.unwrap();
+    assert_eq!(r.status, 403);
+    assert_eq!(err_code(&r).as_deref(), Some("policy_rejected"));
+
+    let msg = result_field(&decode_result(&r), "message")
+        .and_then(|v| v.as_text())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        msg.contains("did-web") && msg.contains("dns-txt"),
+        "every violation, not the first — an operator repairing a chain wants \
+         the whole list. got: {msg}"
+    );
+}
+
+/// **The kind-scoped discriminator `[MUST, v1.17/v1.18]`.** A broad `*` rule
+/// naming `did-web` is refused even though the chain holds **no** `did-web`
+/// entry.
+///
+/// This is the single row that separates the two readings, and it cannot be
+/// measured at resolution: with no `did-web` backend in the chain, a
+/// chain-scoped peer and a kind-scoped peer emit exactly the same traffic
+/// (none). Mutation: make `disclosure_violations`' door 1 also require a
+/// matching `resolver_chain` entry and this test — alone — goes red.
+///
+/// The reason it is the conservative direction and not merely the strict one:
+/// a false positive costs the operator one edit against a config that is
+/// presently harmless, while a false negative arms silent, irreversible
+/// disclosure of every bare name the moment an unrelated chain entry appears.
+#[tokio::test]
+async fn the_disclosure_check_is_kind_scoped_not_chain_scoped() {
+    let (cs, li) = stores();
+    let cfg = ResolverConfigData {
+        resolver_chain: vec![chain_entry("local-name", 0)],
+        name_format_dispatch: vec![dispatch("*", &["did-web"])],
+        ..Default::default()
+    };
+    let r = registry(&cs, &li)
+        .handle(&set_config_ctx(&cfg, false))
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status, 403,
+        "a shipped artifact's safety must survive a downstream operator adding \
+         the backend later — an extension the shipper can never re-review"
+    );
+    assert_eq!(err_code(&r).as_deref(), Some("policy_rejected"));
+}
+
+/// Door 2 — an **absent** `name_format_dispatch` with a transmitting kind in
+/// the chain is refused: the filter is disabled, every kind is eligible for
+/// every name, and there is no catch-all row to inspect.
+///
+/// This door is the one that reads the chain, and it must: with no rules there
+/// is nothing else to read.
+#[tokio::test]
+async fn an_absent_dispatch_list_with_a_transmitting_kind_in_the_chain_is_refused() {
+    let (cs, li) = stores();
+    let cfg = ResolverConfigData {
+        resolver_chain: vec![chain_entry("did-web", 0)],
+        ..Default::default()
+    };
+    let r = registry(&cs, &li)
+        .handle(&set_config_ctx(&cfg, false))
+        .await
+        .unwrap();
+    assert_eq!(r.status, 403);
+    assert_eq!(err_code(&r).as_deref(), Some("policy_rejected"));
+
+    // …and the same empty list with only safe kinds is fine. Without this arm
+    // the row above would also pass against a peer that refuses every
+    // dispatch-less config.
+    let safe = ResolverConfigData {
+        resolver_chain: vec![chain_entry("local-name", 0), chain_entry("peer-issued", 1)],
+        ..Default::default()
+    };
+    let ok = registry(&cs, &li)
+        .handle(&set_config_ctx(&safe, false))
+        .await
+        .unwrap();
+    assert_eq!(
+        ok.status, 200,
+        "`peer-issued` is name-blind by §6a.4 — the banned property is name \
+         transmission, not remoteness"
+    );
+}
+
+/// **No partial application `[MUST]`** — a refusal writes nothing, and the
+/// following `get` returns the *previous* bytes.
+#[tokio::test]
+async fn a_refusal_writes_nothing_and_get_returns_the_prior_bytes() {
+    let (cs, li) = stores();
+    let handler = registry(&cs, &li);
+    let good = ResolverConfigData {
+        resolver_chain: vec![chain_entry("local-name", 0)],
+        name_format_dispatch: vec![dispatch("*", &["local-name"])],
+        ..Default::default()
+    };
+    assert_eq!(
+        handler
+            .handle(&set_config_ctx(&good, false))
+            .await
+            .unwrap()
+            .status,
+        200
+    );
+    let baseline = good.to_entity().unwrap().content_hash;
+
+    let bad = ResolverConfigData {
+        resolver_chain: vec![chain_entry("did-web", 0)],
+        name_format_dispatch: vec![dispatch("*", &["did-web"])],
+        ..Default::default()
+    };
+    assert_eq!(
+        handler
+            .handle(&set_config_ctx(&bad, false))
+            .await
+            .unwrap()
+            .status,
+        403
+    );
+
+    let got = handler
+        .handle(&no_params_ctx("get-resolver-config"))
+        .await
+        .unwrap();
+    assert_eq!(got.status, 200);
+    assert_eq!(
+        got.result.content_hash, baseline,
+        "the stored config moved on a REFUSAL — a refusal MUST write nothing"
+    );
+}
+
+/// The operator `MAY`, honored: the **same** config that was refused is stored
+/// byte-exact when the write carries `acknowledge_name_disclosure`.
+///
+/// Without this row a peer that refuses unconditionally — deleting the
+/// override it was granted — scores identically to a conformant one.
+#[tokio::test]
+async fn the_operator_acknowledgement_stores_the_refused_config_byte_exact() {
+    let (cs, li) = stores();
+    let handler = registry(&cs, &li);
+    let cfg = ResolverConfigData {
+        resolver_chain: vec![chain_entry("did-web", 0)],
+        name_format_dispatch: vec![dispatch("*", &["did-web"])],
+        ..Default::default()
+    };
+    assert_eq!(
+        handler
+            .handle(&set_config_ctx(&cfg, false))
+            .await
+            .unwrap()
+            .status,
+        403,
+        "unacknowledged: refused"
+    );
+    let acked = handler.handle(&set_config_ctx(&cfg, true)).await.unwrap();
+    assert_eq!(
+        acked.status, 200,
+        "acknowledged: the operator's own peer, their call"
+    );
+
+    let got = handler
+        .handle(&no_params_ctx("get-resolver-config"))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.result.content_hash,
+        cfg.to_entity().unwrap().content_hash
+    );
+}
+
+/// **The acknowledgement is an act, not a byte `[MUST]`.** A config entity
+/// carrying `acknowledge_name_disclosure: true` *inside its own data* is still
+/// refused — the flag is read from the operation's params and nowhere else.
+///
+/// This is the whole reason §4.3 exists as an operation rather than a field: a
+/// field is written by whoever writes the bytes, so a distribution could set
+/// it and defeat the rule it is meant to bound, and it would move a
+/// content-addressed type's hash to carry a claim it cannot secure.
+#[tokio::test]
+async fn the_acknowledgement_cannot_be_forged_into_the_config_entity() {
+    let (cs, li) = stores();
+    // Hand-built so the forged key really is in the config's own bytes —
+    // `ResolverConfigData::to_entity` has no way to emit it.
+    let forged = Entity::new(
+        entity_types::TYPE_REGISTRY_RESOLVER_CONFIG,
+        to_ecf(&Value::Map(vec![
+            (text("acknowledge_name_disclosure"), Value::Bool(true)),
+            (
+                text("name_format_dispatch"),
+                Value::Array(vec![Value::Map(vec![
+                    (text("backend_kinds"), Value::Array(vec![text("did-web")])),
+                    (text("pattern"), text("*")),
+                ])]),
+            ),
+            (
+                text("resolver_chain"),
+                Value::Array(vec![Value::Map(vec![
+                    (text("backend_id"), text("x")),
+                    (text("backend_kind"), text("did-web")),
+                    (text("priority"), entity_ecf::integer(0)),
+                ])]),
+            ),
+        ])),
+    )
+    .unwrap();
+    let r = registry(&cs, &li)
+        .handle(&policy_ctx(
+            "set-resolver-config",
+            set_config_request(&forged, false),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status, 403,
+        "a flag inside the bytes is not an act by an identified, capability-gated actor"
+    );
+}
+
+/// §4.2 `[MUST, v1.14]` — an **unknown** backend kind is not a
+/// name-transmitting kind and MUST NOT be treated as one.
+///
+/// Refusing a config because a broad rule names a kind this build does not
+/// recognize rejects a deployment authored against a *newer* vocabulary, which
+/// is the case §4.2 exists to permit. The control below is the same config
+/// with a declared kind, so the row measures the vocabulary and not the shape.
+#[tokio::test]
+async fn an_unknown_backend_kind_is_not_name_transmitting() {
+    let (cs, li) = stores();
+    let future_kind = ResolverConfigData {
+        resolver_chain: vec![chain_entry("some-2027-backend", 0)],
+        name_format_dispatch: vec![dispatch("*", &["some-2027-backend"])],
+        ..Default::default()
+    };
+    assert_eq!(
+        registry(&cs, &li)
+            .handle(&set_config_ctx(&future_kind, false))
+            .await
+            .unwrap()
+            .status,
+        200,
+        "an undeclared kind consults nothing this build can reach and discloses nothing"
+    );
+
+    let declared = ResolverConfigData {
+        resolver_chain: vec![chain_entry("consensus-anchored", 0)],
+        name_format_dispatch: vec![dispatch("*", &["consensus-anchored"])],
+        ..Default::default()
+    };
+    assert_eq!(
+        registry(&cs, &li)
+            .handle(&set_config_ctx(&declared, false))
+            .await
+            .unwrap()
+            .status,
+        403,
+        "control — the same shape with a DECLARED transmitting kind is refused"
+    );
+}
+
+/// **The §4.1a recommended default list is the fixture that pins is-broad.**
+///
+/// A distribution SHOULD ship this list and the catch-all MUST lives *inside*
+/// it, so every non-catch-all row has to classify **narrow** or the
+/// recommended list would violate its own MUST. Row 3 is decisive: `*.eth`
+/// names `consensus-anchored`, a transmitting kind, so a classifier that reads
+/// `*.eth` as broad refuses the exact list §4.1a recommends.
+///
+/// We derive the classifier from this table rather than from any shell-glob
+/// convention — and this test is the derivation, executable.
+#[test]
+fn the_recommended_default_dispatch_list_satisfies_its_own_catch_all_must() {
+    let list = ResolverConfigData {
+        resolver_chain: vec![
+            chain_entry("local-name", 0),
+            chain_entry("did-web", 1),
+            chain_entry("dns-txt", 2),
+            chain_entry("consensus-anchored", 3),
+        ],
+        name_format_dispatch: vec![
+            dispatch("did:web:*", &["did-web"]),
+            dispatch("did:key:*", &["self-certifying"]),
+            dispatch("*.eth", &["consensus-anchored"]),
+            dispatch("*@*.*", &["dns-txt", "well-known-url"]),
+            dispatch("*@*", &["peer-issued"]),
+            dispatch(
+                "*",
+                &[
+                    "local-name",
+                    "self-certifying",
+                    "out-of-band",
+                    "peer-issued",
+                ],
+            ),
+        ],
+        ..Default::default()
+    };
+    assert!(
+        disclosure_violations(&list).is_empty(),
+        "the list a distribution SHOULD ship must not violate the MUST inside it: {:?}",
+        disclosure_violations(&list)
+    );
+
+    // Each marker, and the shapes that carry none of them.
+    for narrow in ["did:web:*", "did:key:*", "*.eth", "*@*.*", "*@*"] {
+        assert!(!pattern_matches_unscoped_name(narrow), "{narrow} is scoped");
+    }
+    for broad in ["*", "a*", "*.*", "alice"] {
+        assert!(
+            pattern_matches_unscoped_name(broad),
+            "{broad} reaches a bare name — `*.*`'s suffix is a star, not a \
+             literal, so it matches `alice.bob` as readily as a domain"
+        );
+    }
+}
+
+/// A config whose `content_hash` lies is refused `400` (V7 §1.8
+/// validate-on-receipt).
+///
+/// The envelope layer validates the **params** entity; a nested entity inside
+/// its `data` is opaque bytes to it, so this is the only place the claim is
+/// checked — and our `ContentStore::put` keys on the *claimed* hash, so a lie
+/// would file the bytes under one key while the location index points at
+/// another, and the config just accepted would read back `404`.
+#[tokio::test]
+async fn a_config_whose_content_hash_lies_is_refused() {
+    let (cs, li) = stores();
+    let real = ResolverConfigData {
+        resolver_chain: vec![chain_entry("local-name", 0)],
+        ..Default::default()
+    }
+    .to_entity()
+    .unwrap();
+    let lying = Entity {
+        entity_type: real.entity_type.clone(),
+        data: real.data.clone(),
+        content_hash: Hash::compute("x", b"not-this-config"),
+    };
+    let handler = registry(&cs, &li);
+    let r = handler
+        .handle(&policy_ctx(
+            "set-resolver-config",
+            set_config_request(&lying, false),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status, 400);
+    assert_eq!(
+        handler
+            .handle(&no_params_ctx("get-resolver-config"))
+            .await
+            .unwrap()
+            .status,
+        404,
+        "and nothing was written"
+    );
+}
+
+/// **At load: surface it, never normalize it, never refuse to start `[MUST,
+/// v1.17]`** — driven through the door §4.3 deliberately leaves open, a raw
+/// tree-write that carries no acknowledgement.
+///
+/// All four halves of the rule are asserted, because three of them are
+/// invisible if you only check the fourth:
+/// - the resolve still **runs** (refusing to start would delete the operator
+///   `MAY` — a peer that will not boot on a config the operator deliberately
+///   wrote has revoked the override it was granted);
+/// - the chain is **not narrowed** in memory (silent normalization makes the
+///   operator's stored bytes lie);
+/// - the stored entity is **not rewritten** (reading is not writing, at any
+///   configuration surface — a rewrite moves the hash and republishes the
+///   operator's intent as the peer's);
+/// - and the condition **is** surfaced.
+#[tokio::test]
+async fn a_seeded_violating_config_is_surfaced_at_load_not_refused_or_normalized() {
+    let (cs, li) = stores();
+    let pet = LocalNameHandler::new(cs.clone(), li.clone(), PEER.into());
+    pet.handle(&ctx(
+        "bind",
+        vec![
+            (text("name"), text("seeded")),
+            (text("target_peer_id"), text("z6MkSeeded")),
+        ],
+    ))
+    .await
+    .unwrap();
+
+    // The out-of-band seed: written straight to the tree, so it bypasses
+    // `set-resolver-config` and carries no acknowledgement.
+    let cfg = ResolverConfigData {
+        resolver_chain: vec![chain_entry("local-name", 0), chain_entry("did-web", 1)],
+        name_format_dispatch: vec![dispatch("*", &["local-name", "did-web"])],
+        ..Default::default()
+    };
+    install_config(&cs, &li, &cfg);
+    let seeded_hash = cfg.to_entity().unwrap().content_hash;
+
+    let handler = registry(&cs, &li);
+    let r = handler
+        .handle(&ctx("resolve", vec![(text("name"), text("seeded"))]))
+        .await
+        .unwrap();
+    assert_eq!(
+        result_field(&decode_result(&r), "status")
+            .unwrap()
+            .as_text(),
+        Some("resolved"),
+        "the peer runs on the operator's bytes — surfacing is not refusing"
+    );
+    assert_eq!(
+        li.get(&crate::resolver_config_path(PEER)),
+        Some(seeded_hash),
+        "the stored config was not rewritten by the act of reading it"
+    );
+
+    let (hash, violations) = handler
+        .last_config_diagnostic()
+        .expect("a violating stored config MUST be surfaced at load");
+    assert_eq!(hash, seeded_hash);
+    assert_eq!(violations.len(), 1);
+    assert!(violations[0].contains("did-web"));
+}
+
+/// The other side of the surfacing: a clean stored config leaves no
+/// diagnostic. Without this row, a peer that surfaces unconditionally — a
+/// permanent warning nobody can act on — would pass the row above.
+#[tokio::test]
+async fn a_clean_stored_config_surfaces_nothing_at_load() {
+    let (cs, li) = stores();
+    let cfg = ResolverConfigData {
+        resolver_chain: vec![chain_entry("local-name", 0), chain_entry("did-web", 1)],
+        name_format_dispatch: vec![
+            dispatch("*", &["local-name"]),
+            dispatch("did:web:*", &["did-web"]),
+        ],
+        ..Default::default()
+    };
+    install_config(&cs, &li, &cfg);
+    let handler = registry(&cs, &li);
+    handler
+        .handle(&ctx("resolve", vec![(text("name"), text("nobody"))]))
+        .await
+        .unwrap();
+    assert!(handler.last_config_diagnostic().is_none());
+}
+
+/// `REG-TTL-CEILING-REREAD-1` (§6a.9.1 `[v1.17]`), in-tree — the resolver
+/// ceiling is **read at resolution**, not latched at start.
+///
+/// One handler, three resolutions of one bound name, with the config rewritten
+/// through `set-resolver-config` between them: `hints.max_ttl` absent →
+/// present → lower. A peer that caches the config at construction passes
+/// resolve 1 and fails 2 and 3.
+///
+/// The vector was **not constructible before §4.3** — with only a raw
+/// tree-write there was no wire-reachable way to rewrite the config mid-process,
+/// which is why it arrives in the same packet as the operations.
+#[tokio::test]
+async fn the_resolver_ceiling_tracks_the_stored_config_across_rewrites() {
+    let (cs, li) = stores();
+    let pet = LocalNameHandler::new(cs.clone(), li.clone(), PEER.into());
+    pet.handle(&ctx(
+        "bind",
+        vec![
+            (text("name"), text("reread")),
+            (text("target_peer_id"), text("z6MkReread")),
+        ],
+    ))
+    .await
+    .unwrap();
+    let handler = registry(&cs, &li);
+
+    let with_ceiling = |ms: Option<i64>| ResolverConfigData {
+        resolver_chain: vec![ResolverChainEntry {
+            backend_kind: "local-name".into(),
+            backend_id: PEER.into(),
+            priority: 0,
+            accepted_trust_anchors: vec![],
+            hints: ms.map(|ms| Value::Map(vec![(text("max_ttl"), entity_ecf::integer(ms))])),
+        }],
+        ..Default::default()
+    };
+    async fn ttl_now(h: &RegistryHandler) -> Option<i64> {
+        let r = h
+            .handle(&ctx("resolve", vec![(text("name"), text("reread"))]))
+            .await
+            .unwrap();
+        let map = decode_result(&r);
+        assert_eq!(
+            result_field(&map, "status").unwrap().as_text(),
+            Some("resolved"),
+            "constructibility — the ceiling is unobservable if the name does not resolve"
+        );
+        result_field(&map, "ttl")
+            .and_then(|v| v.as_integer())
+            .map(|i| i64::try_from(i).unwrap())
+    }
+
+    for (ms, want) in [
+        (None, None),
+        (Some(60_000), Some(60_000)),
+        (Some(30_000), Some(30_000)),
+    ] {
+        assert_eq!(
+            handler
+                .handle(&set_config_ctx(&with_ceiling(ms), false))
+                .await
+                .unwrap()
+                .status,
+            200
+        );
+        assert_eq!(
+            ttl_now(&handler).await,
+            want,
+            "the surfaced lifetime MUST track the currently-stored config, \
+             not the one this handler booted with (hints.max_ttl = {ms:?})"
+        );
+    }
+}
+
+/// The params type is checked at the door: `set-resolver-config` takes its own
+/// request type, and a bare `resolver-config` entity is not it.
+#[tokio::test]
+async fn set_resolver_config_refuses_a_bare_config_entity_as_params() {
+    let (cs, li) = stores();
+    let cfg = ResolverConfigData {
+        resolver_chain: vec![chain_entry("local-name", 0)],
+        ..Default::default()
+    };
+    let r = registry(&cs, &li)
+        .handle(&policy_ctx("set-resolver-config", cfg.to_entity().unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(r.status, 400);
+    assert_eq!(err_code(&r).as_deref(), Some("invalid_params"));
 }
