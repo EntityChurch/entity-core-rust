@@ -580,6 +580,25 @@ fn system_network_close_request() -> TypeDefinition {
         .build()
 }
 
+/// `system/network/observe-address-result` — EXTENSION-NETWORK §6.7.1
+/// (Amendment 13), the reflected NAT mapping.
+///
+/// `observed_address` is the transport-layer source the responder saw on the
+/// connection the request arrived on — **never** a value echoed from the request
+/// body, which would make the responder a laundering service for an attacker's
+/// chosen address. The operation declares no input type for the same reason:
+/// the fact rides on the connection, so there is nothing for a caller to supply.
+///
+/// It is also **never persisted** to any durable per-peer address field
+/// (§6.7.1 MUST 2): every other address this spec writes is *dialer-side
+/// dialable-endpoint* state, and an ephemeral source port stored there routes
+/// nowhere while §10 dispatch reads it as dialable.
+fn system_network_observe_address_result() -> TypeDefinition {
+    TypeDefBuilder::new("system/network/observe-address-result")
+        .field("observed_address", t("primitive/string"))
+        .build()
+}
+
 /// `system/peer/published-root` — the signed static anchor for a peer's
 /// current tree root (PROPOSAL-PEER-MANIFEST-STATIC-HANDSHAKE §4,
 /// NORMATIVE-LOCKED). `peer_id` is the Base58 id `system/peer-id`
@@ -2449,6 +2468,7 @@ pub fn all_core_types() -> Vec<TypeDefinition> {
         system_network_status(),
         system_network_peer_summary(),
         system_network_close_request(),
+        system_network_observe_address_result(),
         system_peer_published_root(),
         system_signature(),
         system_handler(),

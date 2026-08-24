@@ -28,6 +28,9 @@ role = ["dep:entity-role"]
 registry = ["dep:entity-registry"]
 discovery = ["dep:entity-discovery"]
 relay = ["dep:entity-relay"]
+# EXTENSION-SIGNALING §7 punch as the §10.3 registered policy. Same shape as
+# `relay`: the extension owns the algorithm, core/peer owns the wiring.
+signaling = ["dep:entity-signaling"]
 type-system = ["dep:entity-type-system"]
 content = ["dep:entity-content"]
 local-files = ["dep:entity-local-files", "content"]
@@ -67,6 +70,7 @@ entity-role = { workspace = true, optional = true }
 entity-registry = { workspace = true, optional = true }
 entity-discovery = { workspace = true, optional = true }
 entity-relay = { workspace = true, optional = true }
+entity-signaling = { workspace = true, optional = true }
 entity-network = { workspace = true, optional = true }
 entity-conformance = { workspace = true, optional = true }
 entity-type-system = { workspace = true, optional = true }

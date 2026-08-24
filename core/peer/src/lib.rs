@@ -20,6 +20,10 @@ pub mod liveness;
 pub mod network_link;
 pub mod peer_status;
 pub mod published_root;
+/// The §7 punch wired behind the §10.3 seam. Opt-in (`signaling`) and native
+/// only — the choreography is substrate-agnostic, but this wiring is TCP.
+#[cfg(all(feature = "signaling", not(target_arch = "wasm32")))]
+pub mod punch_establisher;
 #[cfg(feature = "relay")]
 pub mod relay_forwarder;
 pub mod remote;
@@ -29,6 +33,15 @@ pub mod reuseport;
 pub mod runtime;
 pub mod server;
 pub mod session_entity;
+/// EXTENSION-NETWORK §6.7.1 srflx gathering — the client half that turns a
+/// reflector's observation into the `srflx` candidate a punch fires at. Needs
+/// both extensions: the operation is NETWORK's, the candidate is SIGNALING's.
+#[cfg(all(
+    feature = "signaling",
+    feature = "network",
+    not(target_arch = "wasm32")
+))]
+pub mod srflx;
 pub mod transport;
 pub mod transport_profile;
 

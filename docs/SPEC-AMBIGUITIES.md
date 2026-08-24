@@ -4169,3 +4169,84 @@ at a mapping that a §9 build would then have to unpick.
 unwrapped code for a keyspace-capacity refusal — `rate_limited`, or does `max_keys` have no
 unwrapped expression (in which case the enum needs a member or §5 needs to say the limit is
 unpublishable)?
+
+---
+
+## ~~`EXTENSION-SIGNALING` §7.1 step 4 — who dials and who accepts is unpinned~~ RESOLVED
+
+> **RULED 2026-08-01 — arch `b3ff6ad`, `ROUTING-2026-08-01-punch-dual-hole-ruling-and-rung3`.
+> The interim choice below was WRONG and is retracted.** §7.1 step 4 now carries a
+> `[cross-peer seam — MUST]` note: *"Each peer **MUST** issue an outbound connection attempt at
+> `fire_at`; **listening alone opens no hole**, because only an outbound packet creates the local
+> NAT mapping. A peer that merely accepts (TCP-passive) never opens its own hole, so the
+> counterpart's SYN reaches a closed NAT and the punch **cannot traverse**."* §7.4.1 gains the
+> matching de-conflation: *"'Serves' is a handshake role, not a socket role."*
+>
+> **The three layers, which the retracted shape collapsed into one:**
+>
+> | Layer | Rule | Decided by |
+> |---|---|---|
+> | Hole-opening | **both** peers fire outbound at `fire_at` | *nothing* — always both |
+> | Socket selection | one of the racing sockets survives | peer-id compare (local, MAY) |
+> | Handshake role | initiator speaks HELLO; responder serves | §7.4.1 (signaling role) |
+>
+> **Built in Rust 2026-08-01.** `punch.rs::cross` runs the dial loop and the listener concurrently
+> and unconditionally on both sides; `crossing_role` survives demoted to socket selection
+> (`CrossingRole::{KeepDialed, KeepAccepted}`). Both peers' outbound attempts are asserted
+> explicitly — `punch::tests::initiator_and_responder_meet_and_cross` and
+> `punch_establisher::tests::two_peers_punch_through_a_real_node` via
+> `PeerPunchEstablisher::outbound_attempts` — because that assertion is the *only* part of the MUST
+> loopback can reach. Both were confirmed to fail against a re-injected listen-only build.
+>
+> **Still unproven, and the ruling says so:** every punch to date is loopback. Whether the holes
+> actually open is the §11.5 cross-NAT gate (G3 emulated / G4 real), which has never run anywhere.
+>
+> **One residual, routed rather than filed.** The tiebreak's stated premise — *"two connections can
+> form, each side's dial landing on the other's listener"* (Go's `fire` comment, and this entry
+> below) — does not hold under the punch's own geometry: both peers dial from a fixed local endpoint
+> to the counterpart's fixed advertised endpoint, so there is exactly **one** possible 4-tuple and
+> therefore one connection. Which local socket holds our end of it is the kernel's call and the two
+> peers may answer differently *about the same connection*. Rust therefore takes whichever socket
+> materializes and applies the tiebreak only when both do; insisting on the preferred socket cost
+> `two_peers_punch_through_a_real_node` 1.0 s → 7.7 s waiting for a second connection that cannot
+> exist. Two connections *can* form where a counterpart dials from an endpoint other than the one it
+> advertised, which is what keeps the tiebreak. Carried to Go in the 08-01 routing packet.
+
+*Original entry, retained for the record:*
+
+**Passage.** §7.1 step 4: *"**Simultaneous open.** Each side sends to the other's `srflx`. Each
+side's *outbound* packet punches its own hole; the other's packet, arriving after that hole is
+open, gets through."* (`EXTENSION-SIGNALING.md` v1.0 @ arch `acf3b24`.)
+
+**The ambiguity.** Taken literally — both sides only dial — the crossing completes solely in the
+narrow instant both sockets sit in `SYN_SENT` simultaneously. Outside that window each dial is
+refused, because neither peer is listening. **Both reference implementations therefore also listen
+on the shared `SO_REUSEPORT` port**, which is sound and which §7.2 arguably licenses ("socket
+options... stay local and MAY diverge"). But listening creates a second question the spec does not
+answer: *two* connections can now form — each side's dial landing on the other's listener — and the
+two peers must agree on which one survives, or they keep opposite ends of different connections.
+
+**This is a cross-peer convention wearing the costume of a socket detail.** It is the §7.4.1 shape
+exactly: a rule two peers must share, derived from nothing on the wire, invisible to any
+same-implementation test (both ends of a Go↔Go punch make the same choice), and reported as *"the
+punch didn't land"* — which sends the investigation to the NAT layer, where nothing is wrong.
+
+Concretely, if the two impls pick opposite rules then in **half of all pairings** both peers listen
+and neither dials; in the other half both dial into a closed port. Neither half completes.
+
+**Interim choice.** Rust matches Go: **the lower peer-id dials, the higher listens and accepts**
+(`crossing_role`, `extensions/signaling/src/punch.rs`; Go's `fire`, `ext/signaling/punch.go`).
+Chosen for interop, not on merit — Go built it first and a divergence here is unrecoverable
+without a cohort round trip. Note this is independent of §7.4.1's *handshake* role, which follows
+the signaling role regardless of which end dialed the TCP connection.
+
+**Also unresolved beneath it:** Go's own comment records that the dial/listen split is
+*loopback*-reliable, and that under real NAT the **listening** side must additionally emit an
+outbound packet toward the dialer's `srflx` to open its own mapping before the dial arrives.
+Neither impl has built that dual-hole sequencing, and the §7.5 cross-NAT gate has never run
+anywhere — so the convention above is agreed but **unproven against a real NAT**.
+
+**Question for arch.** Pin the crossing role beside §7.4.1's handshake role — the lower-peer-id
+convention if it stands — and state whether listening on the shared port is conformant with step
+4's "each side sends", since the answer determines whether the dual-hole sequencing is a §7.5
+hardening detail or a correction to step 4 itself.

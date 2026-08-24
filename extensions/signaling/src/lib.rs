@@ -97,6 +97,9 @@ pub mod data;
 pub mod handler;
 pub mod key;
 pub mod pool;
+/// §7 punch choreography — substrate-agnostic, so it builds everywhere the
+/// coordination layer does (§7.3.1).
+pub mod punch;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod client;

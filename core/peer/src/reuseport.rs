@@ -72,7 +72,21 @@ fn bound_reuse_socket(local: SocketAddr) -> io::Result<Socket> {
 /// `local` is the address whose NAT mapping the reflector observed. The punch
 /// MUST reuse it — that is §6.7.3's rule, and it is the reason this function
 /// takes a local address at all rather than letting the OS choose.
-pub async fn dial_reuseport(local: SocketAddr, remote: SocketAddr) -> io::Result<TcpStream> {
+///
+/// `on_connect_issued` fires **exactly when the `connect` syscall has gone out**
+/// and not before — after the bind, after a hard failure has been ruled out, and
+/// regardless of whether the connect then succeeds, is refused, or times out.
+/// That instant is the one §7.1 step 4 legislates ("each peer MUST issue an
+/// outbound connection attempt at `fire_at`"), and it is not observable from
+/// outside this function: a caller that counts before calling counts sockets it
+/// never managed to bind, and one that counts after awaiting misses every dial
+/// that was refused — which opens a NAT mapping exactly as an accepted one does.
+/// See `PeerPunchEstablisher::outbound_attempts`.
+pub async fn dial_reuseport(
+    local: SocketAddr,
+    remote: SocketAddr,
+    on_connect_issued: impl FnOnce(),
+) -> io::Result<TcpStream> {
     let socket = bound_reuse_socket(local)?;
     // `connect` on a non-blocking socket returns EINPROGRESS; hand the fd to
     // tokio and let it drive readiness rather than spinning here.
@@ -80,8 +94,10 @@ pub async fn dial_reuseport(local: SocketAddr, remote: SocketAddr) -> io::Result
         Ok(()) => {}
         Err(e) if e.raw_os_error() == Some(libc_einprogress()) => {}
         Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
+        // Nothing left the host — not an outbound attempt.
         Err(e) => return Err(e),
     }
+    on_connect_issued();
     let std_stream: std::net::TcpStream = socket.into();
     let stream = TcpStream::from_std(std_stream)?;
     // Wait for the connect to resolve. A simultaneous open reports writable
@@ -106,11 +122,11 @@ pub async fn dial_reuseport(local: SocketAddr, remote: SocketAddr) -> io::Result
 /// dialing is still what opens both NAT holes (§7.1 step 4); the listener only
 /// catches whichever direction survives.
 ///
-/// Go does the same (`listenReusePort`). Whether this is conformant with §7.1
-/// step 4's "each side *sends*" is routed to arch — §7.2 licenses socket
-/// options as local, which plausibly covers it, but the asymmetry is
-/// load-bearing to whether a crossing succeeds and both impls should know it is
-/// tolerated on purpose.
+/// Go does the same (`listenReusePort`). **Ruled 2026-08-01** (arch `b3ff6ad`,
+/// §7.1 step 4): listening alongside is fine, and listening *instead* is not —
+/// "listening alone opens no hole, because only an outbound packet creates the
+/// local NAT mapping." So this is a catcher, never a substitute; the dial that
+/// runs beside it is the MUST. See `punch::cross`.
 pub fn listen_reuseport(local: SocketAddr) -> io::Result<TcpListener> {
     let socket = bound_reuse_socket(local)?;
     // A small backlog: this listener exists to catch one counterpart's dial,
@@ -175,14 +191,12 @@ mod tests {
         let _b_listen = listen_reuseport(b_addr).expect("b listen");
 
         let d = std::time::Duration::from_secs(2);
-        let a_dial =
-            tokio::spawn(
-                async move { tokio::time::timeout(d, dial_reuseport(a_addr, b_addr)).await },
-            );
-        let b_dial =
-            tokio::spawn(
-                async move { tokio::time::timeout(d, dial_reuseport(b_addr, a_addr)).await },
-            );
+        let a_dial = tokio::spawn(async move {
+            tokio::time::timeout(d, dial_reuseport(a_addr, b_addr, || {})).await
+        });
+        let b_dial = tokio::spawn(async move {
+            tokio::time::timeout(d, dial_reuseport(b_addr, a_addr, || {})).await
+        });
 
         // At least one direction must come up. Asserting "some direction
         // connected" rather than a specific one keeps this a reachability test
@@ -211,7 +225,9 @@ mod tests {
         drop(probe);
 
         let accept = tokio::spawn(async move { server.accept().await.map(|(_, peer)| peer) });
-        let stream = dial_reuseport(local, server_addr).await.expect("dial");
+        let stream = dial_reuseport(local, server_addr, || {})
+            .await
+            .expect("dial");
 
         assert_eq!(stream.local_addr().unwrap(), local);
         let observed = accept.await.unwrap().expect("accept");

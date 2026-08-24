@@ -67,6 +67,66 @@ pub const TYPE_RELEASE_REQUEST: &str = "system/network/release-request";
 pub const TYPE_RELEASE_RESULT: &str = "system/network/release-result";
 pub const TYPE_NETWORK_STATUS: &str = "system/network/status";
 pub const TYPE_CLOSE_REQUEST: &str = "system/network/close-request";
+pub const TYPE_OBSERVE_ADDRESS_RESULT: &str = "system/network/observe-address-result";
+
+// ---------------------------------------------------------------------------
+// §6.7.1 observed-address reflection — the CLIENT half
+// ---------------------------------------------------------------------------
+
+/// §6.7.1 (Amendment 13). Ask a reflector what source address it sees us at.
+pub const OP_OBSERVE_ADDRESS: &str = "observe-address";
+
+/// Params for [`OP_OBSERVE_ADDRESS`] — **the operation declares no input.**
+///
+/// §6.7.1 MUST 1: the responder returns the transport-layer source of the
+/// connection the request arrived on and *never* a value echoed from the body.
+/// So there is nothing for a caller to supply, and a conformant responder reads
+/// nothing here. This sends the zero-field entity Rust already uses for no-input
+/// EXECUTEs (`primitive/any` over CBOR `0xa0`).
+///
+/// Go sends the same empty map under a `system/network/observe-address-request`
+/// type name. Both interoperate — Go's manifest entry declares no `InputType`
+/// and its handler never touches the body — and this side declines to mint a
+/// type name the spec does not define.
+pub fn observe_address_params() -> Result<Entity, String> {
+    Entity::new("primitive/any", vec![0xa0]).map_err(|e| e.to_string())
+}
+
+/// The §6.7.1 result: this peer's public mapping, as **one** reflector saw it.
+///
+/// # This is advisory, and it is not an address to keep
+///
+/// §6.7.1 is explicit on both counts. *"A single reflector is advisory, never
+/// trusted"* — a lying reflector feeds a peer a wrong mapping, so no security
+/// decision may rest on one observation; agreement across several reflectors is
+/// what makes the fact usable, and disagreement is itself the signal (a mapping
+/// that differs per destination is a symmetric NAT, where a punch will likely
+/// fail and relay is the right answer).
+///
+/// And MUST 2: it **MUST NOT be persisted** to any durable per-peer address
+/// field — not `system/connection.address`, not a `system/peer/transport/*`
+/// profile, not `system/peer/status`. Every durable address in the protocol is
+/// *dialer-side dialable-endpoint* state; this is a *responder-side* observation
+/// of an ephemeral source port, and writing it where §10 reads dialable
+/// addresses corrupts dispatch for every other reader. It is read from the live
+/// connection, turned into a candidate, and dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObserveAddressResult {
+    /// The source `IP:port` the responder observed, e.g. `"203.0.113.7:51820"`.
+    pub observed_address: String,
+}
+
+impl ObserveAddressResult {
+    /// Decode the `data` of a `system/network/observe-address-result` entity.
+    pub fn from_result_data(data: &[u8]) -> Result<Self, String> {
+        let observed_address = decode_text_field(data, "observed_address")
+            .ok_or("observe-address-result: no string `observed_address` field (§6.7.1)")?;
+        if observed_address.is_empty() {
+            return Err("observe-address-result: empty `observed_address` (§6.7.1)".to_string());
+        }
+        Ok(Self { observed_address })
+    }
+}
 
 // ---------------------------------------------------------------------------
 // PeerLink — the imperative seam core/peer injects (§A4: reuse, don't rebuild)

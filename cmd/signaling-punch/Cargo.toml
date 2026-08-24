@@ -1,0 +1,28 @@
+[package]
+name = "signaling-punch"
+version = "0.8.0"
+edition.workspace = true
+description = "Rust's seat in the cross-impl punch (G2) — one role, one punch, one JSON line"
+
+[[bin]]
+name = "signaling-punch"
+path = "src/main.rs"
+
+[dependencies]
+# Direct, and with `signaling` on: the §10.3 punch wiring
+# (`peer::punch_establisher`) is behind that feature, and the `entity-core`
+# facade does not carry it.
+entity-peer = { workspace = true, features = ["signaling"] }
+entity-signaling.workspace = true
+entity-crypto.workspace = true
+entity-capability.workspace = true
+entity-entity.workspace = true
+entity-protocol.workspace = true
+entity-hash.workspace = true
+entity-ecf.workspace = true
+web-time = "1.1"
+async-trait.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true

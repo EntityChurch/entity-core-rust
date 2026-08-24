@@ -43,14 +43,19 @@ members = [
     "extensions/storage-substitute-sources",
     "extensions/storage-substitute-http",
     "extensions/local-files",
-    # The connection node (PROPOSAL-CONNECTION-NODE). Isolated and optional: no
-    # core crate depends on it, so it is off unless `cmd/entity-signaling-node`
-    # is built. Installed through the public `PeerBuilder::handler()` seam.
+    # The connection node + the §7 punch (EXTENSION-SIGNALING). Optional: no core
+    # crate depends on it *by default*. `core/peer` gained an opt-in
+    # `signaling` feature for the §10.3 punch policy (off in `default`), and the
+    # node handler is still installed through the public `PeerBuilder::handler()`
+    # seam.
     "extensions/signaling",
     "cmd/entity-signaling-node",
     # Rust's seat in the cross-impl signaling meet — same CLI/JSON/exit contract
     # as go's cmd/signaling-meet and py's signaling_meet.py.
     "cmd/signaling-meet",
+    # Rust's seat in the cross-impl PUNCH (G2) — the §3.1 driver contract
+    # agreed with Go: same flags, same JSON line, same exit rule.
+    "cmd/signaling-punch",
     "bindings/ffi",
     "bindings/godot",
     "bindings/sdk",
@@ -113,6 +118,7 @@ default-members = [
     "extensions/signaling",
     "cmd/entity-signaling-node",
     "cmd/signaling-meet",
+    "cmd/signaling-punch",
 ]
 
 [workspace.package]
