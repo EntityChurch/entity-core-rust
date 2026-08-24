@@ -33,7 +33,14 @@ pub fn extract_hash_refs(data: &[u8]) -> Vec<(Hash, String)> {
 
 fn collect_hashes(value: &ciborium::Value, field_name: &str, out: &mut Vec<(Hash, String)>) {
     match value {
-        ciborium::Value::Bytes(b) if b.len() == 33 && b[0] == 0x00 => {
+        // A `system/hash` is a bare bstr carrying `format varint || digest`
+        // (V7 §4.5). `from_bytes` is the whole recognizer: it accepts
+        // exactly the length its own leading format byte implies, so the
+        // walker follows a SHA-384 reference as readily as a SHA-256 one.
+        // The former `len() == 33 && b[0] == 0x00` guard pinned a width
+        // (SPECIFICATION-FORMAT §8.4.5) and, on a SHA-384-home peer, made
+        // every hash reference in an entity simply invisible to traversal.
+        ciborium::Value::Bytes(b) => {
             if let Ok(hash) = Hash::from_bytes(b) {
                 out.push((hash, field_name.to_string()));
             }

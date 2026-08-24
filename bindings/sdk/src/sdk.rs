@@ -4102,77 +4102,43 @@ impl PeerContext {
     ///
     /// Returns the remote peer's id on success.
     ///
-    /// **Why this lives on `PeerContext` and not on `Peer`:** the kernel's
-    /// `Peer::connect_to` constructs a new `Arc<PeerShared>` via
-    /// `Peer::shared()` and inserts the connection into THAT throwaway
-    /// shared's pool — which is dropped when the call returns. Cross-peer
-    /// dispatch (`PeerContext::execute` against `entity://` URIs) reads
-    /// from `PeerContext.shared.remote`, the persistent pool. The two
-    /// pools are different `Arc<PeerShared>` instances.
+    /// Dials through the kernel's `remote::connect_and_pool` — the SAME
+    /// primitive `Peer::connect_to` runs — against this context's **persistent**
+    /// `shared` (an owned `Arc<PeerShared>`, so there is no `&Peer`-across-await
+    /// borrow to dodge). `connect_and_pool` writes the four dialer-side
+    /// post-handshake facts a bare `perform_connect_with_dispatch` +
+    /// `remote.insert` used to drop: the R6 held-session cap, the §3.13 `active`
+    /// connection entity, the **Amendment 12 §A3 `system/peer/status=connected`
+    /// liveness surface**, and §5 keepalive. Reusing the hand-roll meant every
+    /// SDK consumer's connections were invisible to the reactive peer-liveness
+    /// read-model.
     ///
-    /// This method dials + handshakes against the **persistent** shared,
-    /// so the resulting `RemoteConnection` lands in the pool that
-    /// `make_execute_fn` actually reads from. Bypasses the substrate
-    /// `Peer::connect_to` bug around peer-shared and transport; once
-    /// that's fixed at source (Shape A — `Peer::shared` returns a long-lived
-    /// `Arc<PeerShared>` field), this method becomes a 1-line forward
-    /// to `self.peer.connect_to(addr)`.
-    ///
-    /// Mirrors `PeerContext::execute`'s architectural position:
-    /// connection setup + cross-peer dispatch belong at the same layer.
+    /// (The former "this lives on `PeerContext` because `Peer::connect_to` pools
+    /// into a throwaway `shared()`" rationale was stale: `PeerShared.remote` is
+    /// `Arc<RemoteState>` — one pool shared across every `shared()` snapshot and
+    /// the `Peer` itself — so the connection was always visible; only the four
+    /// writes were missing. It also authored under a hardcoded SHA-256 home
+    /// format; `connect_and_pool` uses `shared.config.home_hash_format`, which
+    /// defaults to SHA-256 for SDK peers, so the wire advertisement is
+    /// unchanged unless a consumer deliberately configured otherwise.)
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn connect_to(&self, addr: &str) -> Result<String, SdkError> {
-        let conn = self.shared.connector.connect(addr).await.map_err(|e| {
-            SdkError::HandlerError(format!("connect_to({addr}): connector failed: {e}"))
-        })?;
-        // The SDK authors under the SHA-256 floor by design (Ed25519-only
-        // surface); negotiation collapses to a common format with the peer.
-        let remote = entity_peer::remote::perform_connect_with_dispatch(
-            conn,
-            &self.shared.keypair,
-            entity_hash::HASH_ALGORITHM_SHA256,
-            // §6.11(b): receive deliveries the remote pushes back over
-            // this connection (we may run no listener it could dial).
-            Some(self.shared.clone()),
-            // §4.4 (PROPOSAL-SYMMETRIC-REENTRY-MUTUAL-MINTING): dial-by-address,
-            // no §3 rendezvous key mutually brought — so no reciprocal grant.
-            // This is the asymmetric establishment §6.6 describes.
-            false,
-        )
-        .await
-        .map_err(|e| SdkError::HandlerError(format!("connect_to({addr}): handshake: {e}")))?;
-        let remote_pid = remote.remote_peer_id.clone();
-        self.shared.remote.insert(&remote_pid, remote);
-        Ok(remote_pid)
+        let endpoint = entity_peer::remote::connect_and_pool(&self.shared, addr)
+            .await
+            .map_err(|e| SdkError::HandlerError(format!("connect_to({addr}): {e}")))?;
+        Ok(endpoint.remote_peer_id().to_string())
     }
 
     /// WASM variant — same shape, no `Send` bound on the returned
     /// future (matches the cfg-gated pattern used by every other async
-    /// method on `PeerContext`).
+    /// method on `PeerContext`). See the native variant for why this
+    /// routes through `connect_and_pool` (the liveness/keepalive fix).
     #[cfg(target_arch = "wasm32")]
     pub async fn connect_to(&self, addr: &str) -> Result<String, SdkError> {
-        let conn = self.shared.connector.connect(addr).await.map_err(|e| {
-            SdkError::HandlerError(format!("connect_to({addr}): connector failed: {e}"))
-        })?;
-        // The SDK authors under the SHA-256 floor by design (Ed25519-only
-        // surface); negotiation collapses to a common format with the peer.
-        let remote = entity_peer::remote::perform_connect_with_dispatch(
-            conn,
-            &self.shared.keypair,
-            entity_hash::HASH_ALGORITHM_SHA256,
-            // §6.11(b): receive deliveries the remote pushes back over
-            // this connection (we may run no listener it could dial).
-            Some(self.shared.clone()),
-            // §4.4 (PROPOSAL-SYMMETRIC-REENTRY-MUTUAL-MINTING): dial-by-address,
-            // no §3 rendezvous key mutually brought — so no reciprocal grant.
-            // This is the asymmetric establishment §6.6 describes.
-            false,
-        )
-        .await
-        .map_err(|e| SdkError::HandlerError(format!("connect_to({addr}): handshake: {e}")))?;
-        let remote_pid = remote.remote_peer_id.clone();
-        self.shared.remote.insert(&remote_pid, remote);
-        Ok(remote_pid)
+        let endpoint = entity_peer::remote::connect_and_pool(&self.shared, addr)
+            .await
+            .map_err(|e| SdkError::HandlerError(format!("connect_to({addr}): {e}")))?;
+        Ok(endpoint.remote_peer_id().to_string())
     }
 
     // -- Scoped handles --

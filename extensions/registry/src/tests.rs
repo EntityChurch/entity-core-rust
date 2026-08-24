@@ -1119,7 +1119,11 @@ async fn register_proof_signature_not_by_target_rejected() {
         .handle(&register_ctx(req, &attacker))
         .await
         .unwrap();
-    assert_eq!(result.status, 403, "non-target signer must be rejected");
+    // 401, not 403: layer-1 is an authentication result (the requester failed
+    // to prove key control), where 403 is layer-2's `not_entitled` (proof
+    // accepted, policy says no). Was 403 until 2026-08-10; go and py both
+    // answer 401 and the spec pins neither, so rust was the sole outlier.
+    assert_eq!(result.status, 401, "non-target signer must be rejected");
 }
 
 // REG-REGISTER-POLICY-1 — allowlist: a non-listed target → not_entitled; an
@@ -1223,15 +1227,29 @@ async fn register_replay_rejected() {
     );
 }
 
-// `manual` mode (also the default when no policy is installed): a valid request
-// queues as pending_review rather than auto-issuing.
+// `manual` mode: a valid request queues as pending_review rather than
+// auto-issuing.
+//
+// The policy is now installed **explicitly**. This test previously installed
+// none and relied on the handler defaulting to `manual` — §6a.9.2 rules that
+// unset is not a mode, so an unarmed registry answers 404 curated-only
+// instead (see `register_against_an_unarmed_registry_is_curated_only_404`).
+// That is the behaviour change, not a test fix.
 #[tokio::test]
 async fn register_manual_queues_pending_review() {
     let (cs, li) = stores();
     let registry = IdentityKeypair::Ed25519(Keypair::generate());
     let rid = registry.peer_id().as_str().to_string();
     let owner = Keypair::generate();
-    // No policy installed → default `manual`.
+    install_policy(
+        &cs,
+        &li,
+        &rid,
+        &IssuerPolicyData {
+            mode: MODE_MANUAL.into(),
+            ..Default::default()
+        },
+    );
     let result = reg_handler(&cs, &li, &registry)
         .handle(&register_ctx(
             mk_request("billslab.com", owner.peer_id().as_str(), b"nm"),
@@ -1239,7 +1257,9 @@ async fn register_manual_queues_pending_review() {
         ))
         .await
         .unwrap();
-    assert_eq!(result.status, 200);
+    // 202, not 200: nothing was signed, so "done" is the wrong answer. §6a.9
+    // pins the body and names no code; go and py both answer 202.
+    assert_eq!(result.status, 202);
     let map = decode_result(&result);
     assert_eq!(
         result_field(&map, "status").and_then(|v| v.as_text()),
@@ -1388,4 +1408,370 @@ async fn register_then_renew_supersedes() {
     let binding = BindingData::from_entity(&body).unwrap();
     assert_eq!(binding.supersedes, Some(old));
     assert_eq!(binding.ttl, Some(172_800_000));
+}
+
+// ---------------------------------------------------------------------------
+// §6a.9.2 policy management — set-issuer-policy / get-issuer-policy
+// `[RATIFIED 2026-08-10]`
+// ---------------------------------------------------------------------------
+
+/// A ctx whose params IS the given entity (the §6a.9.2 ops take a
+/// `system/registry/issuer-policy` entity, or nothing at all).
+fn policy_ctx(op: &str, params: Entity) -> HandlerContext {
+    let execute = Entity::new(entity_types::TYPE_EXECUTE, to_ecf(&Value::Map(vec![]))).unwrap();
+    HandlerContext::builder(execute, params)
+        .operation(op.to_string())
+        .build()
+}
+
+/// The cohort convention for an input-less op: an empty `primitive/map`. A
+/// zero-value params entity is refused `400 invalid_params` by the envelope
+/// layer before it ever reaches a handler, so `get-issuer-policy` must be
+/// callable this way and not merely "with no params".
+fn no_params_ctx(op: &str) -> HandlerContext {
+    policy_ctx(
+        op,
+        Entity::new("primitive/map", to_ecf(&Value::Map(vec![]))).unwrap(),
+    )
+}
+
+fn err_code(r: &entity_handler::HandlerResult) -> Option<String> {
+    result_field(&decode_result(r), "code")
+        .and_then(|v| v.as_text())
+        .map(|s| s.to_string())
+}
+
+/// §6a.9.2 — set stores the policy and get returns it **as written**.
+#[tokio::test]
+async fn set_issuer_policy_round_trips_through_get() {
+    let (cs, li) = stores();
+    let registry = IdentityKeypair::Ed25519(Keypair::generate());
+    let handler = reg_handler(&cs, &li, &registry);
+
+    let want = IssuerPolicyData {
+        mode: MODE_ALLOWLIST.into(),
+        allowlist: Some(vec!["peer-a".into()]),
+        default_ttl: Some(3_600_000),
+        ..Default::default()
+    };
+
+    // Authored by hand rather than via `want.to_entity()`, and carrying a
+    // field this decoder does not know. That is what makes the byte-fidelity
+    // assertion below discriminating: an entity our own encoder WOULD
+    // reproduce cannot tell "stored verbatim" apart from "decoded and
+    // re-encoded" — both produce identical bytes, so the check passes either
+    // way and proves nothing. A peer written against another impl is the real
+    // source of such an entity; unknown fields are MUST-ignore (ADR-0002),
+    // not license to drop them on the floor by round-tripping through a
+    // struct that has no room for them.
+    let submitted = Entity::new(
+        entity_types::TYPE_REGISTRY_ISSUER_POLICY,
+        to_ecf(&Value::Map(vec![
+            (text("allowlist"), Value::Array(vec![text("peer-a")])),
+            (text("default_ttl"), entity_ecf::integer(3_600_000)),
+            (text("mode"), text(MODE_ALLOWLIST)),
+            (text("zz_unknown_field"), text("must survive")),
+        ])),
+    )
+    .unwrap();
+    assert_ne!(
+        submitted.content_hash,
+        want.to_entity().unwrap().content_hash,
+        "the submitted entity must be one our own encoder would NOT reproduce, \
+         or this test cannot observe a re-encode"
+    );
+
+    let set = handler
+        .handle(&policy_ctx("set-issuer-policy", submitted.clone()))
+        .await
+        .unwrap();
+    assert_eq!(set.status, 200, "set-issuer-policy is a ratified operation");
+    assert_eq!(
+        set.result.content_hash, submitted.content_hash,
+        "§6a.9.2 — the output is `the stored policy, as written`"
+    );
+
+    let got = handler
+        .handle(&no_params_ctx("get-issuer-policy"))
+        .await
+        .unwrap();
+    assert_eq!(got.status, 200);
+    assert_eq!(
+        got.result.content_hash, submitted.content_hash,
+        "get returned different bytes than set was handed — the policy was \
+         decoded and re-encoded somewhere, which drops unknown fields and \
+         changes the entity's identity"
+    );
+    assert_eq!(IssuerPolicyData::from_entity(&got.result).unwrap(), want);
+}
+
+/// §6a.9.2 `[MUST]` — set replaces the policy **whole**. An absent optional
+/// field means *unset*, not *unchanged*: merge semantics would make the
+/// result depend on write order, which two peers cannot reconstruct.
+#[tokio::test]
+async fn set_issuer_policy_replaces_whole() {
+    let (cs, li) = stores();
+    let registry = IdentityKeypair::Ed25519(Keypair::generate());
+    let handler = reg_handler(&cs, &li, &registry);
+
+    // Arm with a policy carrying BOTH optional fields...
+    let full = IssuerPolicyData {
+        mode: MODE_ALLOWLIST.into(),
+        allowlist: Some(vec!["peer-a".into()]),
+        name_constraints: Some("*.lab".into()),
+        default_ttl: Some(3_600_000),
+    };
+    handler
+        .handle(&policy_ctx("set-issuer-policy", full.to_entity().unwrap()))
+        .await
+        .unwrap();
+
+    // ...then write a bare `open` carrying neither.
+    let bare = IssuerPolicyData {
+        mode: MODE_OPEN.into(),
+        ..Default::default()
+    };
+    let set = handler
+        .handle(&policy_ctx("set-issuer-policy", bare.to_entity().unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(set.status, 200);
+
+    let got = handler
+        .handle(&no_params_ctx("get-issuer-policy"))
+        .await
+        .unwrap();
+    let stored = IssuerPolicyData::from_entity(&got.result).unwrap();
+    assert_eq!(stored.mode, MODE_OPEN);
+    assert_eq!(
+        stored.allowlist, None,
+        "allowlist survived a whole-replace — that is merge semantics"
+    );
+    assert_eq!(
+        stored.name_constraints, None,
+        "name_constraints survived a whole-replace — that is merge semantics"
+    );
+    assert_eq!(
+        stored.default_ttl, None,
+        "default_ttl survived a whole-replace — that is merge semantics"
+    );
+}
+
+/// §6a.9.2 — `domain-control` MUST be refused `400 unsupported_mode` and
+/// **not stored**, rather than arming a mode the issuer cannot enforce.
+///
+/// The second assertion is the load-bearing one: a 400 that stored the
+/// policy anyway passes a status-only check.
+#[tokio::test]
+async fn set_issuer_policy_refuses_domain_control_and_does_not_store_it() {
+    let (cs, li) = stores();
+    let registry = IdentityKeypair::Ed25519(Keypair::generate());
+    let handler = reg_handler(&cs, &li, &registry);
+
+    let dc = IssuerPolicyData {
+        mode: MODE_DOMAIN_CONTROL.into(),
+        ..Default::default()
+    };
+    let set = handler
+        .handle(&policy_ctx("set-issuer-policy", dc.to_entity().unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(set.status, 400);
+    assert_eq!(err_code(&set).as_deref(), Some("unsupported_mode"));
+
+    let got = handler
+        .handle(&no_params_ctx("get-issuer-policy"))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.status, 404,
+        "domain-control was refused but stored anyway — the registry is now \
+         armed into a mode it cannot enforce"
+    );
+}
+
+/// §6a.9.2 — the 400 on `set` does not replace the register path's 501 on a
+/// **stored** `domain-control` policy. The two bind different acts: the 400
+/// refuses to arm the mode, and a policy predating that refusal still has to
+/// be answered when a request arrives against it.
+#[tokio::test]
+async fn stored_domain_control_policy_still_answers_501_on_register() {
+    let (cs, li) = stores();
+    let registry = IdentityKeypair::Ed25519(Keypair::generate());
+    let handler = reg_handler(&cs, &li, &registry);
+    // Written directly, as an operator's pre-ratification policy would be —
+    // `set-issuer-policy` would refuse to author it.
+    install_policy(
+        &cs,
+        &li,
+        registry.peer_id().as_str(),
+        &IssuerPolicyData {
+            mode: MODE_DOMAIN_CONTROL.into(),
+            ..Default::default()
+        },
+    );
+
+    let owner = Keypair::generate();
+    let out = handler
+        .handle(&register_ctx(
+            mk_request("billslab.com", owner.peer_id().as_str(), b"n1"),
+            &owner,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(out.status, 501);
+    assert_eq!(err_code(&out).as_deref(), Some("unsupported_mode"));
+}
+
+/// §6a.9.2 — **unset is not a mode.** With no policy stored, `get` answers
+/// 404 and MUST NOT synthesize a default `open`, which would silently turn a
+/// curated registry into a first-come-first-serve one.
+#[tokio::test]
+async fn get_issuer_policy_unset_is_404() {
+    let (cs, li) = stores();
+    let registry = IdentityKeypair::Ed25519(Keypair::generate());
+    let handler = reg_handler(&cs, &li, &registry);
+
+    let got = handler
+        .handle(&no_params_ctx("get-issuer-policy"))
+        .await
+        .unwrap();
+    assert_eq!(got.status, 404);
+    assert_eq!(err_code(&got).as_deref(), Some("not_found"));
+}
+
+/// §6a.9.2 — the same "unset is not a mode" rule on the **register** path: an
+/// unarmed registry is a conformant curated-only registry (§6a.8) and does
+/// not run live registration at all.
+///
+/// This is the negative half that a `get`-only check walks past. The request
+/// below is fully valid — correct layer-1 signature, fresh nonce, free name —
+/// so the ONLY thing that can reject it is the absent policy. Under the
+/// previous default it was admitted and a binding was issued.
+#[tokio::test]
+async fn register_against_an_unarmed_registry_is_curated_only_404() {
+    let (cs, li) = stores();
+    let registry = IdentityKeypair::Ed25519(Keypair::generate());
+    let handler = reg_handler(&cs, &li, &registry);
+
+    let owner = Keypair::generate();
+    let out = handler
+        .handle(&register_ctx(
+            mk_request("billslab.com", owner.peer_id().as_str(), b"n1"),
+            &owner,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        out.status, 404,
+        "an unarmed registry issued a binding — unset was treated as a mode"
+    );
+    assert_eq!(err_code(&out).as_deref(), Some("not_found"));
+
+    // And nothing was published: no by-name pointer for the name.
+    assert!(
+        li.get(&crate::by_name_pointer_path(
+            registry.peer_id().as_str(),
+            "billslab.com"
+        ))
+        .is_none(),
+        "a curated-only refusal still wrote a binding pointer"
+    );
+}
+
+/// §6a.9.2 — `set-issuer-policy` is the wire arming path, so the arm →
+/// register sequence must work end-to-end against a peer that started with no
+/// policy at all. This is what makes the `registry_issuer` conformance
+/// category reachable for an impl with no CLI arming flag.
+#[tokio::test]
+async fn set_issuer_policy_arms_a_registry_that_then_issues() {
+    let (cs, li) = stores();
+    let registry = IdentityKeypair::Ed25519(Keypair::generate());
+    let handler = reg_handler(&cs, &li, &registry);
+
+    let armed = handler
+        .handle(&policy_ctx(
+            "set-issuer-policy",
+            IssuerPolicyData {
+                mode: MODE_OPEN.into(),
+                ..Default::default()
+            }
+            .to_entity()
+            .unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(armed.status, 200);
+
+    let owner = Keypair::generate();
+    let out = handler
+        .handle(&register_ctx(
+            mk_request("billslab.com", owner.peer_id().as_str(), b"n1"),
+            &owner,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(out.status, 200, "wire-armed registry must issue");
+    let bound = binding_hash_of(&out);
+    let binding = BindingData::from_entity(&cs.get(&bound).unwrap()).unwrap();
+    assert_eq!(binding.target_peer_id, owner.peer_id().as_str());
+}
+
+/// §6a.9.2 — a mode the issuer cannot enforce is refused at the door whatever
+/// its spelling, not just the named `domain-control`.
+#[tokio::test]
+async fn set_issuer_policy_refuses_an_unknown_mode() {
+    let (cs, li) = stores();
+    let registry = IdentityKeypair::Ed25519(Keypair::generate());
+    let handler = reg_handler(&cs, &li, &registry);
+
+    let bogus = IssuerPolicyData {
+        mode: "first-come-first-served".into(),
+        ..Default::default()
+    };
+    let set = handler
+        .handle(&policy_ctx("set-issuer-policy", bogus.to_entity().unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(set.status, 400);
+    assert_eq!(err_code(&set).as_deref(), Some("unsupported_mode"));
+
+    // Not stored — the registry stays unarmed rather than armed into a mode
+    // the register path would have to reject on every request.
+    let got = handler
+        .handle(&no_params_ctx("get-issuer-policy"))
+        .await
+        .unwrap();
+    assert_eq!(got.status, 404);
+}
+
+/// §6a.9.2 — the ops are typed. A `set` carrying something that is not a
+/// `system/registry/issuer-policy` entity is refused rather than stored,
+/// which would leave `get` returning a policy that cannot be decoded.
+#[tokio::test]
+async fn set_issuer_policy_rejects_a_foreign_entity_type() {
+    let (cs, li) = stores();
+    let registry = IdentityKeypair::Ed25519(Keypair::generate());
+    let handler = reg_handler(&cs, &li, &registry);
+
+    let wrong = Entity::new(
+        entity_types::TYPE_PROTOCOL_STATUS,
+        to_ecf(&Value::Map(vec![(text("mode"), text(MODE_OPEN))])),
+    )
+    .unwrap();
+    let set = handler
+        .handle(&policy_ctx("set-issuer-policy", wrong))
+        .await
+        .unwrap();
+    assert_eq!(set.status, 400);
+    assert_eq!(err_code(&set).as_deref(), Some("invalid_params"));
+
+    let got = handler
+        .handle(&no_params_ctx("get-issuer-policy"))
+        .await
+        .unwrap();
+    assert_eq!(
+        got.status, 404,
+        "a refused set must not have armed anything"
+    );
 }

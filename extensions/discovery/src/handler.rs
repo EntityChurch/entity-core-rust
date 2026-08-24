@@ -28,6 +28,7 @@ use entity_store::{ContentStore, LocationIndex};
 use crate::backend::{AnnounceParams, DiscoveryBackend, Observation};
 use crate::data::{CandidateData, ScanResult};
 use crate::result::{error, status_result};
+use crate::DiscoveryError;
 use crate::{candidate_path, DEFAULT_SCAN_CEILING};
 
 pub struct DiscoveryHandler {
@@ -205,6 +206,13 @@ impl DiscoveryHandler {
                     entity_ecf::text(&profile_ref),
                 ),
             ]),
+            // §3.3 (Ruling-5 erratum) — an unresolvable `profile_ref` is a
+            // caller error, the same class as the unknown `backend` answered
+            // 400 a few lines above, and NOT a backend failure. A 5xx here
+            // tells the caller to retry something that can never succeed.
+            Err(DiscoveryError::UnknownProfileRef(detail)) => {
+                error(STATUS_BAD_REQUEST, "unknown_profile_ref", &detail)
+            }
             Err(e) => error(
                 entity_handler::STATUS_UNAVAILABLE,
                 "backend_error",

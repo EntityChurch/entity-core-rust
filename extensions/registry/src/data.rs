@@ -223,10 +223,19 @@ pub struct IssuerPolicyData {
 }
 
 impl Default for IssuerPolicyData {
-    /// A registry that runs the handler but has no policy entity defaults to
-    /// `manual` — the conservative posture: requests queue for operator review
-    /// rather than auto-issue. The operator opts into `open`/`allowlist`
-    /// explicitly (spec-problems doc; §6a.9.1 names no default).
+    /// **Not a policy default — a struct-literal convenience** for
+    /// `IssuerPolicyData { mode: …, ..Default::default() }`, where what is
+    /// being defaulted is the three optional fields.
+    ///
+    /// §6a.9.2 is explicit that **unset is not a mode**: a registry with no
+    /// stored policy entity does not run live registration at all, and the
+    /// request path MUST NOT substitute any mode for an absent one. So
+    /// nothing on that path calls this — see
+    /// `registration::RegisterRequestHandler::load_policy`, which returns
+    /// `None` rather than falling back here. `manual` is retained as the
+    /// conservative value for the same reason it was chosen originally: if
+    /// this ever *is* reached, queueing for operator review is the failure
+    /// that does not silently issue.
     fn default() -> Self {
         Self {
             mode: MODE_MANUAL.into(),

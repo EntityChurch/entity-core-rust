@@ -1999,10 +1999,19 @@ async fn handle_connect_peer(
         peer_ctx.peer_shared()
     };
 
-    // Mirrors `Peer::connect_to` (core/peer/src/lib.rs:391) — same four
-    // steps. Kept inline to avoid a `&self` borrow across the await.
-    let conn = match shared.connector.connect(&address).await {
-        Ok(c) => c,
+    // Dial through the SAME primitive `Peer::connect_to` runs —
+    // `remote::connect_and_pool` — taking the owned `Arc<PeerShared>` we lifted
+    // out above (so there is no `&Peer`-across-await borrow to dodge, the reason
+    // this seat used to hand-roll). The hand-roll (bare
+    // `perform_connect_with_dispatch` + `remote.insert`) mirrored only the
+    // handshake and silently dropped the four post-handshake writes
+    // `connect_and_pool` does — most importantly the Amendment 12 §A3
+    // `system/peer/status=connected` write, so the Worker arm produced NO kernel
+    // liveness surface for connections it established, and §5 keepalive never
+    // started. It also keeps the §6.11(b) reentry dispatch (the reach-back MUST a
+    // listener-less browser peer depends on) and rebinds the endpoint.
+    let endpoint = match entity_peer::remote::connect_and_pool(&shared, &address).await {
+        Ok(e) => e,
         Err(e) => {
             return Response::ConnectPeer {
                 request_id,
@@ -2014,43 +2023,7 @@ async fn handle_connect_peer(
             };
         }
     };
-    let remote = match entity_peer::remote::perform_connect_with_dispatch(
-        conn,
-        &shared.keypair,
-        shared.config.home_hash_format,
-        // §6.11(b) dialer-side reentry — the reach-back-serving MUST
-        // (EXTENSION-SIGNALING §6.5 (b), folded 2026-08-05). Without a dispatch
-        // context the reader drops every inbound EXECUTE on a connection we
-        // dialed as an orphan: a subscription notification, a continuation
-        // join, an inbox delivery. This seat is the one where that always
-        // matters — a browser peer runs no listener anyone could dial, so the
-        // connection it opened is the *only* way back to it.
-        //
-        // The two sibling paths doing this same job have always threaded it
-        // (`remote::connect_and_pool` behind `Peer::connect_to`, and
-        // `SdkPeerContext::connect_to` on **both** targets); this one said it
-        // mirrored them and did not. Drift, not a design choice.
-        Some(shared.clone()),
-        // §4.4: dial-by-address — no §3 rendezvous key was mutually brought, so
-        // no reciprocal grant. Same value the two siblings pass.
-        false,
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            return Response::ConnectPeer {
-                request_id,
-                result: Err(WireError {
-                    kind: WireErrorKind::Unknown,
-                    message: format!("handshake with {address}: {e}"),
-                    detail: None,
-                }),
-            };
-        }
-    };
-    let remote_peer_id = remote.remote_peer_id.clone();
-    shared.remote.insert(&remote_peer_id, remote);
+    let remote_peer_id = endpoint.remote_peer_id().to_string();
 
     Response::ConnectPeer {
         request_id,

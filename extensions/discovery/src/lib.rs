@@ -163,4 +163,16 @@ pub enum DiscoveryError {
     /// `:scan(backend=mdns)` on wasm32 where multicast is unavailable (§3.4).
     #[error("unsupported discovery backend: {0}")]
     UnsupportedBackend(String),
+    /// `profile_ref` names a transport profile this backend does not serve
+    /// (§3.3, arch Ruling-5 erratum, added 2026-08-10).
+    ///
+    /// It is a variant of its own so the handler can tell a **caller** error
+    /// from a **backend failure**. Both used to surface as `503
+    /// backend_error`, which is the wrong class: an unrecognized `profile_ref`
+    /// is an unknown parameter VALUE supplied by the caller, and §3.3 maps
+    /// those to `400` — the same rule the handler already applies to an
+    /// unknown `backend` a few lines earlier. A 5xx additionally tells the
+    /// caller to retry something that can never succeed.
+    #[error("unknown profile_ref: {0}")]
+    UnknownProfileRef(String),
 }

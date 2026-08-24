@@ -652,3 +652,106 @@ fn decode_hash(v: &Value) -> entity_hash::Hash {
     assert_eq!(bytes.len(), 33, "system/hash field is a 33-byte bstr");
     entity_hash::Hash::from_bytes(bytes).expect("valid system/hash bstr")
 }
+
+/// §8.3 V4a — `list` through a symlinked **DIRECTORY** escaping the root MUST
+/// be `403 path_traversal_rejected`.
+///
+/// Not a variation on the leaf-symlink test above: there the escape is a file
+/// and the op is `read`/`write`; here the escape is a *directory* and the op is
+/// `list`, which appends a trailing slash to the tree path before resolving.
+/// On Linux a trailing slash makes `lstat` **resolve** the final symlink (the
+/// slash asserts "this is a directory"), so a leaf-symlink defense built on
+/// `symlink_metadata` inspects the TARGET and reports "not a symlink" — the
+/// containment check passes and `read_dir` follows the link out of the sandbox.
+///
+/// The marker file is the load-bearing part of the setup: without it, a failing
+/// impl could return an empty listing that reads like containment.
+#[tokio::test]
+async fn rejects_list_through_symlinked_directory() {
+    let (h, _cs, _li, tmp) = build_handler();
+    let outside = TempDir::new().unwrap();
+    std::fs::write(
+        outside.path().join("outside-marker.txt"),
+        b"outside the sandbox\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(outside.path(), tmp.path().join("escape-dir")).unwrap();
+
+    let res = h
+        .handle(&make_ctx(
+            "list",
+            "local/files/shared/escape-dir",
+            empty_params(),
+        ))
+        .await
+        .unwrap();
+
+    assert_ne!(
+        res.status, 200,
+        "list followed a symlinked directory out of the root"
+    );
+    assert_eq!(
+        res.status, 403,
+        "§8.3/§865 pin 403 path_traversal_rejected; another rejection code means \
+         the containment defense is not what stopped this"
+    );
+    let v: Value = ciborium::from_reader(res.result.data.as_slice()).unwrap();
+    let code = v
+        .into_map()
+        .unwrap()
+        .into_iter()
+        .find(|(k, _)| k.as_text() == Some("code"))
+        .and_then(|(_, val)| val.as_text().map(|s| s.to_string()));
+    assert_eq!(code.as_deref(), Some("path_traversal_rejected"));
+}
+
+/// §8.3 containment — a symlinked directory as an **intermediate** component
+/// must be rejected too, not just as the leaf.
+///
+/// Escaping never required the leaf to be the link. `escape-dir` is the link;
+/// `secret.txt` under it is an ordinary file, so a leaf-only check inspects
+/// the one inode that is not doing the escaping, admits it, and the open walks
+/// out of the sandbox through the component it never looked at. This returned
+/// 200 and the outside file's bytes until the resolver started walking every
+/// component.
+///
+/// The `write`-to-a-not-yet-existing-file assertion at the end is the control:
+/// a containment walk that rejected anything it could not `lstat` would pass
+/// the escape assertion above while breaking every file creation in the
+/// handler. (The new file goes in a directory that already exists — `write`
+/// does not create parent directories, which is pre-existing behaviour and
+/// unrelated to containment.)
+#[tokio::test]
+async fn rejects_read_through_intermediate_symlinked_directory() {
+    let (h, _cs, _li, tmp) = build_handler();
+    let outside = TempDir::new().unwrap();
+    std::fs::write(outside.path().join("secret.txt"), b"outside the sandbox\n").unwrap();
+    std::os::unix::fs::symlink(outside.path(), tmp.path().join("escape-dir")).unwrap();
+
+    let res = h
+        .handle(&make_ctx(
+            "read",
+            "local/files/shared/escape-dir/secret.txt",
+            empty_params(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        res.status, 403,
+        "read walked out of the root through an intermediate symlink"
+    );
+
+    // Control: creating a new file on a clean path is unaffected.
+    let ok = h
+        .handle(&make_ctx(
+            "write",
+            "local/files/shared/not-yet-created.txt",
+            write_params(Some(b"inside\n".to_vec()), None),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        ok.status, 200,
+        "the containment walk must not reject paths that simply do not exist yet"
+    );
+}

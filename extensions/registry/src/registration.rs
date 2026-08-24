@@ -6,12 +6,31 @@
 //! registry is just a peer (§1 position 4); running `system/registry/peer-issued`
 //! is what makes it a *live* registry rather than a curated/static one.
 //!
-//! The handler serves three ops:
+//! The handler serves three registration ops:
 //! - `register-request` — admit (or queue/reject) a publisher's self-signed
 //!   claim, then sign + publish the binding with `K_registry` (§6a.8 act).
 //! - `revoke-request` — emit a registry-signed §3.1 revocation.
 //! - `renew-request` — issue a successor binding (supersedes-chain) with a new
 //!   TTL.
+//!
+//! …and two policy-management ops (§6a.9.2 `[RATIFIED 2026-08-10]`):
+//! - `set-issuer-policy` — replace the stored policy whole.
+//! - `get-issuer-policy` — read it back, or `404` when unset.
+//!
+//! Those two are **operator** surface, gated by
+//! `system/capability/registry-manage-issuer-policy` and never reachable
+//! through the `registry-request-binding` a publisher holds — otherwise a
+//! publisher the policy admits could rewrite the policy admitting it. Before
+//! §6a.9.2 that capability named an act the corpus never defined, so a client
+//! written against the spec had nothing to call, and each impl armed the
+//! policy its own out-of-band way.
+//!
+//! **The policy is resolved store-first and store-only** (§6a.9.2 `[MUST]`).
+//! There is no in-memory fallback and no CLI flag consulted at request time;
+//! out-of-band arming, if it is ever added, must *seed the entity* rather than
+//! shadow it — otherwise a conformance run cannot drive all three modes
+//! against a single peer by writing that entity, and `get-issuer-policy` would
+//! report `not_found` on a registry demonstrably running a mode.
 //!
 //! Two proof layers gate `register-request` (§6a.9.1):
 //! - **Layer 1 — peer-id control (always):** the request carries a
@@ -33,8 +52,8 @@ use async_trait::async_trait;
 use entity_crypto::{IdentityKeypair, Keypair, PeerId};
 use entity_ecf::{text, Value};
 use entity_handler::{
-    Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST, STATUS_CONFLICT,
-    STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_NOT_SUPPORTED,
+    Handler, HandlerContext, HandlerError, HandlerResult, STATUS_ACCEPTED, STATUS_AUTH_FAILED,
+    STATUS_BAD_REQUEST, STATUS_CONFLICT, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_NOT_SUPPORTED,
 };
 use entity_hash::Hash;
 use entity_store::{ContentStore, LocationIndex};
@@ -47,7 +66,7 @@ use crate::data::{
 };
 use crate::log::now_ms;
 use crate::resolver::{find_binding_signature, glob_match, peer_pubkey_from_entity};
-use crate::result::{error, hash_result, status_result};
+use crate::result::{entity_result, error, hash_result, status_result, status_result_with};
 use crate::{
     binding_body_path, by_name_pointer_path, issuer_policy_path, register_nonce_path,
     revocation_by_target_path, revocation_prefix, signature_pointer_path,
@@ -87,13 +106,46 @@ impl RegisterRequestHandler {
         }
     }
 
-    fn load_policy(&self) -> IssuerPolicyData {
+    /// Read the issuer-policy from the local tree. **The store is the only
+    /// source** — §6a.9.2 makes resolution order store-first `[MUST]` and
+    /// bars any parallel source at request time (out-of-band arming is "a
+    /// seed for that entity, never a parallel source consulted at request
+    /// time"). That order is load-bearing beyond tidiness: it is what lets
+    /// a conformance run drive all three modes against a *single* peer by
+    /// writing the entity.
+    ///
+    /// `None` means **unarmed**, and callers MUST NOT substitute a default.
+    /// "Unset is not a mode" (§6a.9.2): a registry with no policy entity is
+    /// a conformant curated-only registry (§6a.8), not an implicitly-`open`
+    /// or implicitly-`manual` one. A decode failure is also `None` — a
+    /// policy we cannot read is not a policy we may guess at.
+    fn load_policy(&self) -> Option<IssuerPolicyData> {
         self.location_index
             .get(&issuer_policy_path(&self.peer_id))
             .and_then(|h| self.content_store.get(&h))
             .and_then(|e| IssuerPolicyData::from_entity(&e).ok())
-            .unwrap_or_default()
     }
+}
+
+/// The answer the live-registration surface gives when no policy entity is
+/// stored. §6a.9.2: with no policy the registry "does not run live
+/// registration at all (§6a.9's handler is unregistered) — it is a
+/// conformant curated-only registry per §6a.8."
+///
+/// We register the handler unconditionally (it is wired at build time,
+/// before there is a store to consult), so the closest conformant behaviour
+/// available is to answer as though the handler were absent: 404. The
+/// distinction is invisible to a client, which is the point.
+fn curated_only(op: &str) -> HandlerResult {
+    error(
+        STATUS_NOT_FOUND,
+        "not_found",
+        &format!(
+            "no issuer-policy is stored — this registry is curated-only (§6a.8) and does not \
+             serve {}. Arm it with set-issuer-policy (§6a.9.2)",
+            op
+        ),
+    )
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
@@ -104,6 +156,8 @@ impl Handler for RegisterRequestHandler {
             "register-request" => Ok(self.handle_register(ctx)),
             "revoke-request" => Ok(self.handle_revoke(ctx)),
             "renew-request" => Ok(self.handle_renew(ctx)),
+            "set-issuer-policy" => Ok(self.handle_set_issuer_policy(ctx)),
+            "get-issuer-policy" => Ok(self.handle_get_issuer_policy()),
             other => Ok(error(
                 STATUS_BAD_REQUEST,
                 "unknown_operation",
@@ -121,7 +175,18 @@ impl Handler for RegisterRequestHandler {
     }
 
     fn operations(&self) -> &[&str] {
-        &["register-request", "revoke-request", "renew-request"]
+        &[
+            "register-request",
+            "revoke-request",
+            "renew-request",
+            // §6a.9.2 `[RATIFIED 2026-08-10]`. Operator surface, gated by
+            // `system/capability/registry-manage-issuer-policy` — never
+            // reachable from the `registry-request-binding` a publisher
+            // holds, or a publisher admitted by the policy could rewrite
+            // the policy that admits it.
+            "set-issuer-policy",
+            "get-issuer-policy",
+        ]
     }
 }
 
@@ -146,8 +211,15 @@ impl RegisterRequestHandler {
         // Layer 1 — peer-id control: a system/signature by `target_peer_id` over
         // the request hash (REG-REGISTER-PROOF-1). Always required.
         if !self.verify_layer1(&request_hash, &req.target_peer_id, &ctx.included) {
+            // 401, not 403. Layer-1 is an *authentication* result — the
+            // requester failed to prove they hold the key they are binding the
+            // name to. 403 is the layer-2 answer (`not_entitled`: proof
+            // accepted, policy says no), and collapsing the two loses the
+            // distinction the two layers exist to draw. The spec pins neither
+            // code; go and py both answer 401 here and each recorded
+            // converging on the other, leaving rust the sole outlier.
             return error(
-                STATUS_FORBIDDEN,
+                STATUS_AUTH_FAILED,
                 "invalid_signature",
                 "request not signed by target_peer_id (layer-1 ownership proof failed)",
             );
@@ -174,8 +246,12 @@ impl RegisterRequestHandler {
             );
         }
 
-        // Layer 2 — issuer-policy admission (§6a.9.1).
-        let policy = self.load_policy();
+        // Layer 2 — issuer-policy admission (§6a.9.1). Store-only, and an
+        // unarmed registry does not run this surface at all (§6a.9.2).
+        let policy = match self.load_policy() {
+            Some(p) => p,
+            None => return curated_only("register-request"),
+        };
         // name_constraints bounds which names the registry will issue, in any mode.
         if let Some(glob) = &policy.name_constraints {
             if !glob_match(glob, &req.name) {
@@ -225,7 +301,17 @@ impl RegisterRequestHandler {
                 // pending request body is content-addressable for review.
                 let _ = self.content_store.put(ctx.params.clone());
                 self.location_index.set(&nonce_path, request_hash);
-                return status_result(vec![(text("status"), text("pending_review"))]);
+                // 202, not 200. §6a.9 pins the BODY (`status: "pending_review"`)
+                // and names no status code; 200 says "done" for an operation
+                // whose entire point is that nothing was signed. go and py both
+                // answer 202 and each recorded converging on the other, so rust
+                // was the sole outlier on a cross-impl-observable answer. Logged
+                // in SPEC-AMBIGUITIES and routed for ratification — this is
+                // cohort convergence on a silent spec, not oracle-following.
+                return status_result_with(
+                    STATUS_ACCEPTED,
+                    vec![(text("status"), text("pending_review"))],
+                );
             }
             MODE_DOMAIN_CONTROL => {
                 // DEFERRED — the DNS-proof challenge format co-designs with the
@@ -359,6 +445,109 @@ impl RegisterRequestHandler {
         ) {
             Ok(h) => hash_result("binding_hash", h),
             Err(result) => result,
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // §6a.9.2 policy management — `set-issuer-policy` / `get-issuer-policy`
+    // -------------------------------------------------------------------
+
+    /// `set-issuer-policy` (§6a.9.2 `[RATIFIED 2026-08-10]`).
+    ///
+    /// **Replace-whole `[MUST]`** — the stored entity becomes exactly the
+    /// submitted policy, with no merge against whatever was there before.
+    /// "An absent optional field means *unset*, not *unchanged*; a merge
+    /// semantics would make the resulting policy depend on write order,
+    /// which two peers cannot reconstruct." Implemented by storing the
+    /// submitted entity verbatim, which is also what makes the response
+    /// "the stored policy, as written" byte-for-byte.
+    fn handle_set_issuer_policy(&self, ctx: &HandlerContext) -> HandlerResult {
+        if ctx.params.entity_type != entity_types::TYPE_REGISTRY_ISSUER_POLICY {
+            return error(
+                STATUS_BAD_REQUEST,
+                "invalid_params",
+                &format!(
+                    "set-issuer-policy expects a {} entity, got {}",
+                    entity_types::TYPE_REGISTRY_ISSUER_POLICY,
+                    ctx.params.entity_type
+                ),
+            );
+        }
+        let policy = match IssuerPolicyData::from_entity(&ctx.params) {
+            Ok(p) => p,
+            Err(e) => {
+                return error(
+                    STATUS_BAD_REQUEST,
+                    "invalid_params",
+                    &format!("decode issuer-policy: {}", e),
+                )
+            }
+        };
+
+        // §6a.9.2 refuses `domain-control` **at the door**, "rather than
+        // storing a policy it cannot enforce". That is a different act from
+        // the 501 the register path gives a *stored* domain-control policy:
+        // the 400 binds `set-issuer-policy`, which declines to arm the mode
+        // at all, while a policy predating that refusal still has to be
+        // answered when a request arrives against it.
+        match policy.mode.as_str() {
+            MODE_OPEN | MODE_ALLOWLIST | MODE_MANUAL => {}
+            MODE_DOMAIN_CONTROL => {
+                return error(
+                    STATUS_BAD_REQUEST,
+                    "unsupported_mode",
+                    "mode \"domain-control\" is deferred to the web-native domain-proof \
+                     co-design (§6a.9.1/§6a.10) and will not be stored",
+                )
+            }
+            other => {
+                return error(
+                    STATUS_BAD_REQUEST,
+                    "unsupported_mode",
+                    &format!(
+                        "unknown issuer-policy mode {:?} (expected open, allowlist or manual)",
+                        other
+                    ),
+                )
+            }
+        }
+
+        // Store the submitted entity as-is. Re-encoding via `to_entity`
+        // would author a second entity with the same fields but its own
+        // identity; writing what arrived is what keeps the round-trip
+        // byte-exact (the §1.7 preserve-bytes discipline).
+        let stored = ctx.params.clone();
+        let hash = stored.content_hash;
+        if let Err(e) = self.content_store.put(stored) {
+            return error(STATUS_BAD_REQUEST, "store_failed", &e.to_string());
+        }
+        self.location_index
+            .set(&issuer_policy_path(&self.peer_id), hash);
+        entity_result(ctx.params.clone())
+    }
+
+    /// `get-issuer-policy` (§6a.9.2) — the stored policy, or `404
+    /// not_found` when unset.
+    ///
+    /// It MUST NOT synthesize a default `open`: that "would silently turn a
+    /// curated registry into a first-come-first-serve one." Takes no input;
+    /// the cohort convention for an input-less op is an empty
+    /// `primitive/map` params entity, because a zero-value params entity is
+    /// refused `400 invalid_params` by the envelope layer before it ever
+    /// reaches a handler.
+    fn handle_get_issuer_policy(&self) -> HandlerResult {
+        let path = issuer_policy_path(&self.peer_id);
+        let stored = self
+            .location_index
+            .get(&path)
+            .and_then(|h| self.content_store.get(&h));
+        match stored {
+            Some(e) => entity_result(e),
+            None => error(
+                STATUS_NOT_FOUND,
+                "not_found",
+                "no issuer-policy is stored (§6a.9.2 — unset is not a mode)",
+            ),
         }
     }
 

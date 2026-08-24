@@ -168,9 +168,20 @@ clean:
 # core/peer (`punch_establisher`, `srflx`, `reuseport`), each already gated
 # `not(target_arch = "wasm32")` with its reason in place. That gap is the
 # browser leg's actual remaining work, not a portability defect.
+#
+# The three `bindings/wasm-worker-*` crates build in the same invocation as of
+# 2026-08-10. They are the browser leg — wasm32-only at their lib root
+# (`#![cfg(target_arch = "wasm32")]`), so a native `make test` compiles them to
+# an empty module and can never see a break in them. AGENTS.md asked for them
+# to be added by hand "when touching the worker crates", which is a convention
+# nothing enforces: a change to core/peer or the SDK can break the worker
+# stack, and whoever makes that change is precisely the person not thinking
+# about workers. CI now holds them instead. They take no feature flags — the
+# feature list applies to `entity-peer` alone.
 WASM_FEATURES := inbox,continuation,subscription,clock,revision,query,history,compute,handlers,identity,role,registry,discovery,type-system,content,signaling,network
+WASM_WORKER_CRATES := -p entity-wasm-worker-host -p entity-wasm-worker-proxy -p entity-wasm-worker-protocol
 wasm: toolchain
-	$(call RUN_TOOLCHAIN,cargo build --target wasm32-unknown-unknown -p entity-peer --no-default-features --features $(WASM_FEATURES))
+	$(call RUN_TOOLCHAIN,cargo build --target wasm32-unknown-unknown -p entity-peer --no-default-features --features $(WASM_FEATURES) $(WASM_WORKER_CRATES))
 
 # ----------------------------------------------------------------------------
 # Browser probes — runtime facts a compile cannot establish

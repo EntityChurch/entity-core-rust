@@ -2129,10 +2129,12 @@ impl PeerBuilder {
             // static registry §6a.8 simply omits it). The external surface
             // (`register-request`) stays gated by `registry-request-binding`,
             // which is NOT auto-seeded — an operator grants it explicitly — and
-            // the default issuer-policy is `manual` (queue, don't auto-issue),
-            // so registering it here is inert until the operator opts in. The
-            // §6.9a owner-self-grant still lets the local operator drive its own
-            // ops. The injected signer is K_registry (the peer's own identity).
+            // **no issuer-policy is stored until one is written**, so the
+            // registration ops answer 404 curated-only (§6a.9.2: unset is not a
+            // mode) and registering the handler here is inert until the operator
+            // arms it. The §6.9a owner-self-grant still lets the local operator
+            // drive its own ops, including the §6a.9.2 arming pair. The injected
+            // signer is K_registry (the peer's own identity).
             let register_handler = Arc::new(entity_registry::RegisterRequestHandler::new(
                 content_store.clone(),
                 notifying_li.clone(),
@@ -2146,7 +2148,13 @@ impl PeerBuilder {
                 &pid,
                 "registry-peer-issued",
                 "system/registry/peer-issued",
-                &["register-request", "revoke-request", "renew-request"],
+                &[
+                    "register-request",
+                    "revoke-request",
+                    "renew-request",
+                    "set-issuer-policy",
+                    "get-issuer-policy",
+                ],
             )?;
         }
 

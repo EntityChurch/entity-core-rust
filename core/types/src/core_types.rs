@@ -1393,7 +1393,7 @@ fn system_config_subscription() -> TypeDefinition {
 // ============================================================================
 
 fn system_inbox_delivery() -> TypeDefinition {
-    TypeDefBuilder::new("system/protocol/inbox/delivery")
+    TypeDefBuilder::new("system/inbox/delivery")
         .field("original_request_id", t("primitive/string"))
         .field("status", t("primitive/uint"))
         .field("result", t("core/entity"))

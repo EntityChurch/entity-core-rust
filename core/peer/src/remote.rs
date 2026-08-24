@@ -754,7 +754,18 @@ impl RemoteState {
 /// dialer-side), then rebinds the endpoint (explicit dial ⇒ this fresh
 /// connection becomes the binding unconditionally — a re-dial after the old
 /// conn died must not leave the corpse pooled) and starts §5 keepalive.
-pub(crate) async fn connect_and_pool(
+///
+/// **Public so owned-`Arc<PeerShared>` callers dial through the SAME primitive
+/// as `Peer::connect_to`.** Every binding that needed to connect from an owned
+/// shared handle (to avoid holding a `&Peer` borrow across the network await) —
+/// the SDK `PeerContext::connect_to`, the wasm worker host, the browser app's
+/// Direct arm — had reimplemented connect as a bare `perform_connect_with_dispatch`
+/// plus `remote.insert`, silently dropping all four post-handshake writes above.
+/// Most consequentially there was no `system/peer/status=connected` write, so the
+/// Amendment 12 §A3 liveness surface was never produced for connections those arms
+/// established. Call THIS instead (it takes `&Arc<PeerShared>`, so there is no
+/// `&Peer`-across-await problem to dodge); do not hand-roll the handshake.
+pub async fn connect_and_pool(
     shared: &Arc<crate::PeerShared>,
     addr: &str,
 ) -> Result<Arc<dyn RemoteEndpoint>, PeerError> {

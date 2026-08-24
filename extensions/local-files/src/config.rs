@@ -78,7 +78,7 @@ pub fn resolve_fs_path(root: &RootMapping, tree_path: &str) -> Result<(PathBuf, 
         return Err(format!("path traversal rejected: {tree_path}"));
     }
     let fs_path = root.fs_root.join(relative);
-    reject_if_leaf_symlink(&fs_path)?;
+    reject_if_symlink_on_path(&root.fs_root, relative)?;
     Ok((fs_path, relative.to_string()))
 }
 
@@ -90,7 +90,7 @@ pub fn resolve_fs_path_relative(root: &RootMapping, relative: &str) -> Result<Pa
         return Err(format!("path traversal rejected: {relative}"));
     }
     let fs_path = root.fs_root.join(relative);
-    reject_if_leaf_symlink(&fs_path)?;
+    reject_if_symlink_on_path(&root.fs_root, relative)?;
     Ok(fs_path)
 }
 
@@ -107,15 +107,84 @@ pub fn resolve_fs_path_relative(root: &RootMapping, relative: &str) -> Result<Pa
 /// interim form (§8.3); `cap-std`'s `openat2(RESOLVE_BENEATH)` is the
 /// kernel-enforced fix scheduled as the second-pass migration.
 pub fn reject_if_leaf_symlink(fs_path: &Path) -> Result<(), String> {
-    match std::fs::symlink_metadata(fs_path) {
+    // Strip trailing separators before the lstat. POSIX gives a trailing
+    // slash the meaning "this component IS a directory", and the kernel
+    // implements that by RESOLVING a final symlink — so `lstat("link/")`
+    // returns the metadata of the target directory and reports
+    // `is_symlink() == false`, while `lstat("link")` reports the link.
+    //
+    // That is not a detail: `list` normalizes its tree path to end in `/`
+    // before resolving, so without this trim the defense inspected the
+    // wrong inode and a symlinked DIRECTORY planted in the root was
+    // enumerated straight through — `read_dir` follows the link and
+    // returns the outside directory's contents at 200. A leaf-symlink
+    // check that only ever saw file leaves passed for exactly as long as
+    // nobody pointed a directory-shaped op at it (§8.3 V4a).
+    let probe = trim_trailing_separators(fs_path);
+    match std::fs::symlink_metadata(&probe) {
         Ok(md) if md.file_type().is_symlink() => Err(format!(
             "path traversal rejected: leaf is a symlink: {}",
-            fs_path.display()
+            probe.display()
         )),
         Ok(_) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(format!("path resolution failed: {e}")),
     }
+}
+
+/// Reject a symlink at **any** component of `relative` beneath `fs_root`, not
+/// only at the leaf (v1.3 §8.3 containment).
+///
+/// A leaf-only check answers "is the thing I am about to open a link?" — but
+/// escaping does not require the leaf to be the link. Plant `escape-dir` as a
+/// symlink to somewhere outside and ask for `escape-dir/secret.txt`: the leaf
+/// is a perfectly ordinary file, so a leaf-only defense admits it, and the
+/// open then walks out of the sandbox through the intermediate component. The
+/// only inode a leaf check never inspects is the one doing the escaping.
+///
+/// So walk down from the root and `lstat` each component. Every path examined
+/// is inside the root by construction (`is_safe_relative` has already rejected
+/// `..`), and the walk stops at the first component that does not exist —
+/// which is the create-a-new-file case, and is why `write` to a fresh path
+/// still works.
+///
+/// This remains the **interim, non-atomic** form §8.3 sanctions: the TOCTOU
+/// window between these `lstat`s and the caller's `open` is unchanged, and
+/// `cap-std` / `openat2(RESOLVE_BENEATH)` is still the kernel-enforced fix
+/// scheduled as the second-pass migration. What changes is which escapes the
+/// interim form actually catches.
+pub fn reject_if_symlink_on_path(fs_root: &Path, relative: &str) -> Result<(), String> {
+    let mut current = fs_root.to_path_buf();
+    for component in relative.split('/').filter(|c| !c.is_empty()) {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(md) if md.file_type().is_symlink() => {
+                return Err(format!(
+                    "path traversal rejected: symlink on path: {}",
+                    current.display()
+                ))
+            }
+            Ok(_) => {}
+            // Nothing here yet — nothing below it either, so there is no
+            // further component that could be a link. `write` creating a new
+            // file lands here.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("path resolution failed: {e}")),
+        }
+    }
+    Ok(())
+}
+
+/// Drop trailing `/` from a path so `lstat` reports the leaf itself rather
+/// than following it. The filesystem root (`/`) is returned unchanged — it
+/// is all separator, and it is never a symlink.
+fn trim_trailing_separators(fs_path: &Path) -> PathBuf {
+    let s = fs_path.as_os_str().to_string_lossy();
+    let trimmed = s.trim_end_matches('/');
+    if trimmed.is_empty() {
+        return fs_path.to_path_buf();
+    }
+    PathBuf::from(trimmed)
 }
 
 /// True if `rel` has no `..` segments and stays within the root logically.

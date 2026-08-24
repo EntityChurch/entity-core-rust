@@ -242,7 +242,9 @@ struct EntityCoreBuffer entity_hash_compute(const uint8_t *type_ptr,
  * Validate that a hash matches the given type + data.
  *
  * # Safety
- * All pointer/length pairs must be valid. `hash_ptr` must point to 33 bytes.
+ * All pointer/length pairs must be valid. `hash_ptr` must point to a
+ * complete wire hash — one format byte plus the digest that byte
+ * implies (33 bytes under `0x00`, 49 under `0x01`).
  */
 enum EntityCoreError entity_hash_validate(const uint8_t *type_ptr,
                                           uintptr_t type_len,
@@ -251,26 +253,29 @@ enum EntityCoreError entity_hash_validate(const uint8_t *type_ptr,
                                           const uint8_t *hash_ptr);
 
 /**
- * Format a 33-byte hash as hex string.
+ * Format a wire hash as a hex string. Length follows the hash's own
+ * format byte.
  *
  * # Safety
- * `hash_ptr` must point to 33 valid bytes.
+ * `hash_ptr` must point to a complete wire hash (format byte + the
+ * digest that byte implies).
  */
 struct EntityCoreBuffer entity_hash_to_hex(const uint8_t *hash_ptr);
 
 /**
- * Parse a hex string back to 33-byte hash.
+ * Parse a hex string back into wire-hash bytes.
  *
  * # Safety
- * `hex_ptr`/`hex_len` must point to a valid hex string (66 chars).
+ * `hex_ptr`/`hex_len` must point to a valid hex string.
  */
 struct EntityCoreBuffer entity_hash_from_hex(const uint8_t *hex_ptr, uintptr_t hex_len);
 
 /**
- * Format a 33-byte hash as the display string ("ecfv1-sha256:...").
+ * Format a wire hash as the display string ("ecfv1-sha256:...").
  *
  * # Safety
- * `hash_ptr` must point to 33 valid bytes.
+ * `hash_ptr` must point to a complete wire hash (format byte + the
+ * digest that byte implies).
  */
 struct EntityCoreBuffer entity_hash_to_display(const uint8_t *hash_ptr);
 

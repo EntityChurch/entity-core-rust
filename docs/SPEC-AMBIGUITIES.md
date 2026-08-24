@@ -4838,3 +4838,132 @@ ran first.
 `check-reachability returned 400 code "unknown_operation"` as a FAIL on the stated grounds that
 *"nothing else is conformant"* besides 200 or 403. §12.3's "or an unimplemented response" says
 otherwise. Routed to core-go in the same routing doc, §3.
+
+---
+
+## REGISTRY §6a.9 — the two status codes on `register-request` that the spec never names
+
+**Spec (`EXTENSION-REGISTRY.md` §6a.9, arch `ed3de7a`):** the handler pseudo-code
+fixes the *outcomes* and, for one of them, the response *body* — but no status
+code for either:
+
+```
+system/registry/peer-issued:register-request(request) → binding_hash | rejection
+  1. verify request signature by target_peer_id          ; layer-1 (always)
+  ...
+  4. on reject:  error (name_taken | not_entitled | policy_rejected)   ; REGISTRY code domain
+  5. on queue:   status "pending_review"                  ; manual mode
+```
+
+Step 4's code domain covers **layer-2** rejections only; a layer-1 signature
+failure appears in no list. Step 5 pins the body (`status: "pending_review"`)
+and says nothing about the code. Both answers are **cross-impl observable** —
+a client written against one registry sees a different code from another.
+
+**The ambiguity, and how the cohort answered it:**
+
+| | rust (until 2026-08-10) | go | py |
+|---|---|---|---|
+| layer-1 proof failure | `403 invalid_signature` | `401 signature_invalid` | `401 proof_failed` |
+| `manual` queue | `200` + status body | `202 pending_review` | `202` + status body |
+
+**Interim choice: converge on 401 / 202** (`registration.rs`), and route the
+pair upstream for ratification.
+
+Two things make this convergence rather than oracle-following, and the
+distinction is the one this repo declined to blur on `published-root.prefix`
+three sessions ago — there the spec *did* say `system/tree/path` and the oracle
+disagreed, so we held. Here:
+
+1. **The spec is silent, not contradicted.** Nothing is being overridden.
+2. **It is 2-of-3, reasoned independently.** go and py each recorded *converging
+   on the other* in their own source comments, and py's reasoning is the one we
+   would give unprompted: layer-1 is an **authentication** result (the requester
+   failed to prove key control) and 403 is layer-2's *answer* (`not_entitled` —
+   proof accepted, policy says no), so collapsing them loses the distinction the
+   two proof layers exist to draw. Likewise 200 says "done" for an operation
+   whose entire point is that **nothing was signed**.
+
+**What is still owed upstream, and why a ruling and not just a convention:**
+arch pinned the adjacent code four days earlier for exactly this reason —
+§6a.9.2's stored-`domain-control` `501`, ratified because *"this is a
+cross-impl-observable answer with four plausible codes, so it is pinned rather
+than left to converge."* These two are the same class and are unpinned by
+accident, not by decision.
+
+**And the code *strings* still diverge three ways** (`signature_invalid` /
+`proof_failed` / `invalid_signature`) on a `register-request` failure that is
+part of `REG-REGISTER-PROOF-1`. No conformance check reads them today — go's
+`layer1_unsigned_request_rejected` asserts the status only — which is precisely
+why it can stay divergent indefinitely. We kept `invalid_signature` rather than
+adopt either sibling's spelling, because picking one of three arbitrarily is not
+convergence and would only obscure that the question is open.
+
+**Found by:** the first `validate-peer -category registry_issuer` run ever made
+against a rust peer (2026-08-10). The category had been unreachable for us — it
+needs a peer armed with an issuer policy, and rust has no CLI arming flag — so
+§6a.9.2's `set-issuer-policy` is what made these two visible. Neither is new;
+both had been shipping since the handler landed, unmeasured.
+
+---
+
+## DISCOVERY §3.3 vs §8.1 — `:announce-stop` cannot be both 400-on-unknown and idempotent
+
+**Spec (`EXTENSION-DISCOVERY.md` §3.3, arch `140a1bf`, added 2026-08-10):**
+
+> When `:announce(backend, profile_ref)` **or `:announce-stop(backend,
+> profile_ref)`** names a `profile_ref` that does not resolve to a
+> `system/peer/transport/{peer}/{profile-id}` entity, the handler MUST likewise
+> return **`400`** (`unknown_profile_ref`) — **not `500`**.
+
+**The ambiguity:** §8.1's symmetric lifecycle makes `:announce-stop` idempotent
+— stopping a session that was never started is a success, not an error — and
+the cohort's own conformance check encodes that. core-go's
+`v7_announce_stop_idempotent` dispatches `:announce-stop` with
+`profile_ref: "validate-peer-never-announced-profile"` and **requires 200**.
+That profile_ref resolves to nothing, so §3.3 read literally requires 400 and
+the check requires 200. They cannot both hold.
+
+**Interim choice:** enforce §3.3 on `:announce` only. Both measured checks pass
+under that reading (`v7b_announce_unknown_profile_ref` → 400,
+`v7_announce_stop_idempotent` → 200), and it is what go ships — their sentinel
+is raised by the announce-side resolver, not the stop path. So the corpus and
+the cohort agree on behaviour and disagree only with §3.3's sentence.
+
+**Suggested resolution:** drop `:announce-stop` from §3.3's rule. The two ops
+are not the same class. `:announce` must resolve the ref because it is going to
+*advertise* it — an unresolvable ref means there is nothing to publish. `:stop`
+only needs to end a session keyed by that ref, and "no such session" is exactly
+the idempotent-success case §8.1 already rules on. §3.3's justification ("a 500
+additionally tells the caller to retry something that can never succeed") argues
+against a 5xx, not for a 4xx over a 200.
+
+---
+
+## DISCOVERY §3.3 — the mechanism it names does not exist in any impl
+
+**Spec:** §3.3 defines an unknown `profile_ref` as one that "does not resolve to
+a `system/peer/transport/{peer}/{profile-id}` entity."
+
+**The ambiguity:** that namespace holds the transport profiles a peer has
+learned for **other** peers. A peer publishes no such entity for **itself**, so
+on `:announce` — where the ref names the announcer's own transport — there is
+nothing in the tree to resolve against. Implemented literally, every announce
+would 400, including the one core-go's `v7a_announce_lifecycle` requires to
+succeed.
+
+Neither shipping impl does what the sentence says. core-go resolves against a
+fixed set driven by its configured listeners (`tcp` / `http-poll`, a `switch`
+in `cmd/entity-peer/main.go`), and rust now matches that set
+(`mdns::MDNS_V1_PROFILE_REFS`). The observable behaviour converges; the stated
+mechanism is what neither implements.
+
+**Interim choice:** match the cohort's effective rule — the backend declares the
+profiles it serves — and record that this is a deliberate divergence from §3.3's
+wording rather than an oversight.
+
+**Suggested resolution:** reword to "a `profile_ref` the backend does not serve",
+which is what both impls mean and what the erratum's own reasoning supports. If
+the entity-resolution reading is intended, it needs a companion rule saying a
+peer MUST publish its own transport profiles, and that is a larger change than
+an erratum.

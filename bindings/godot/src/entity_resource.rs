@@ -38,9 +38,10 @@ impl EntityData {
     #[func]
     fn validate(&self) -> bool {
         let hash_bytes = self.content_hash.to_vec();
-        if hash_bytes.len() != 33 {
-            return false;
-        }
+        // No length pre-check: `from_bytes` rejects any input whose length
+        // disagrees with the length its own format byte implies, which is
+        // stronger than a fixed 33 and does not pin a width
+        // (SPECIFICATION-FORMAT §8.4.5).
         let claimed = match entity_hash::Hash::from_bytes(&hash_bytes) {
             Ok(h) => h,
             Err(_) => return false,

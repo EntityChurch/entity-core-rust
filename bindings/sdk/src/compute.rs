@@ -81,8 +81,8 @@ pub const PROCESSES_PREFIX: &str = "system/compute/processes/";
 /// Decoded compute value per `EXTENSION-COMPUTE §2.3`.
 ///
 /// Primitive variants (`Null` … `Map`) carry the typed value directly;
-/// `Hash` is a 33-byte content hash distinguished by length from a
-/// generic bytes value. The `Entity` and `Closure` variants carry the
+/// `Hash` is a content hash distinguished from a generic bytes value by
+/// parsing as one. The `Entity` and `Closure` variants carry the
 /// raw entity for non-primitive results (e.g. literal entities, value
 /// types unrecognized by this decoder, or `compute/closure` values
 /// the caller will instantiate). `Error` carries a `compute/error`
@@ -97,10 +97,12 @@ pub enum ComputeValue {
     Float(f64),
     Bytes(Vec<u8>),
     Text(String),
-    /// Recognized via 33-byte length (1 tag + 32 digest) when decoding
-    /// CBOR bytes-shaped values, since `system/hash` is a bare bstr
-    /// extension per V7 §4.5. Callers who want raw bytes regardless
-    /// use [`Self::as_raw_bytes`].
+    /// Recognized when a CBOR bytes-shaped value parses as a wire hash
+    /// (format varint + the digest that varint implies — 33 bytes under
+    /// ECFv1-SHA-256, 49 under ECFv1-SHA-384), since `system/hash` is a
+    /// bare bstr extension per V7 §4.5. The width is not pinned
+    /// (SPECIFICATION-FORMAT §8.4.5). Callers who want raw bytes
+    /// regardless use [`Self::as_raw_bytes`].
     Hash(Hash),
     Array(Vec<ComputeValue>),
     Map(Vec<(ComputeValue, ComputeValue)>),
@@ -537,14 +539,14 @@ fn decode_compute_value_from_cbor(v: &Value) -> ComputeValue {
         }
         Value::Float(f) => ComputeValue::Float(*f),
         Value::Bytes(b) => {
-            // V7 §4.5: system/hash is a 33-byte bstr (1 tag + 32 digest).
-            // Promote bytes of that exact length + a valid algorithm
-            // tag to the typed Hash variant. Anything else stays as
-            // raw bytes.
-            if b.len() == 33 {
-                if let Ok(h) = Hash::from_bytes(b) {
-                    return ComputeValue::Hash(h);
-                }
+            // V7 §4.5: system/hash is a bare bstr carrying `format varint
+            // || digest`. Promote bytes that parse as one to the typed
+            // Hash variant; anything else stays raw. `from_bytes` is the
+            // whole test — it accepts exactly the lengths the leading
+            // format byte implies, so this recognizes a SHA-384 hash
+            // without pinning either width (SPECIFICATION-FORMAT §8.4.5).
+            if let Ok(h) = Hash::from_bytes(b) {
+                return ComputeValue::Hash(h);
             }
             ComputeValue::Bytes(b.clone())
         }

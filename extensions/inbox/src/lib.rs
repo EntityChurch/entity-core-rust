@@ -206,7 +206,11 @@ async fn try_advance_continuation_async(
     location_index: &Arc<dyn LocationIndex>,
 ) -> bool {
     // Per INBOX spec §3.2: unwrap InboxDeliveryData before advancing.
-    let (result_bytes, status) = if params_entity.entity_type == "system/protocol/inbox/delivery" {
+    // The type string is `entity_types::TYPE_INBOX_DELIVERY`, spelled literally
+    // here because `entity-types` is a dev-dependency of this crate (extensions
+    // sit below it in the DAG). Renamed from `system/protocol/inbox/delivery`
+    // by EXTENSION-INBOX §2.1 `[RATIFIED 2026-08-10]`.
+    let (result_bytes, status) = if params_entity.entity_type == "system/inbox/delivery" {
         extract_delivery_fields(&params_entity.data)
             .unwrap_or_else(|| (params_entity.data.clone(), STATUS_OK))
     } else {

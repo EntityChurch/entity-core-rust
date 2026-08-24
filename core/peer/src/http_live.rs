@@ -564,7 +564,7 @@ fn strip_prefix_with_boundary<'a>(path: &'a str, prefix: &str) -> Option<&'a str
 ///
 /// **Amendment 5 demux (§6.5.6) — literal-then-peer-id-parse, in
 /// order.** Not a length threshold; the *check* is literal-then-parse:
-///   1. literal `content/{hex33}` → CONTENT_GET
+///   1. literal `content/{hex(H)}` → CONTENT_GET
 ///   2. literal `manifest` (terminal — `/manifest/...` ⇒ 404) → MANIFEST_GET
 ///   3. literal `peers{listing_suffix}` → all-peers universal-tree-root listing
 ///      (bare `peers` ⇒ 404)
@@ -581,7 +581,7 @@ async fn route_poll(
         return method_not_allowed(method, "GET");
     }
 
-    // 1. Literal `content/{hex33}`.
+    // 1. Literal `content/{hex(H)}` — width follows H's format byte (§8.4.5).
     if let Some(hex) = rest.strip_prefix("/content/") {
         return handle_content_get(hex, shared, routes.scope.as_ref()).await;
     }
@@ -807,37 +807,43 @@ async fn handle_content_get(
         })
 }
 
-/// Parse a hex-encoded **33-byte wire hash** (66 chars: 1-byte
-/// algorithm + 32-byte digest) into a [`Hash`]. Per ruling §5 B
-/// the URL path component carries the full wire
-/// representation, NOT the bare digest — so we can reject unknown
-/// algorithm bytes here as 400 instead of silently coercing every
-/// URL to SHA-256. V7 §3.5 + Hash::from_bytes() shape.
+/// Parse a hex-encoded **wire hash** into a [`Hash`]. Per ruling §5 B
+/// the URL path component carries the full wire representation
+/// (`format varint || digest`), NOT the bare digest — so we can reject
+/// unknown algorithm bytes here as 400 instead of silently coercing
+/// every URL to SHA-256. V7 §1.2/§3.5 + Hash::from_bytes() shape.
+///
+/// **The width is not pinned** (SPECIFICATION-FORMAT §8.4.5, and §8.4.6
+/// rules `system/content/{ns}/{hex(H)}` *hold-and-fetch* — format-free,
+/// used verbatim at whatever width its own format byte implies). It is
+/// 66 hex chars under ECFv1-SHA-256 (`0x00`) and 98 under ECFv1-SHA-384
+/// (`0x01`), as worked instances and not as the requirement. The former
+/// fixed-66 was this route's half of EXTENSION-NETWORK §6.5.3.1's width
+/// lock — go and rust answered `400` where python answered `200` on a
+/// SHA-384 `CONTENT_GET`, with 30 of 31 SHA-384 conformance failures
+/// behind that one sentence.
 ///
 /// Returns a human-readable error message on bad length / bad chars
 /// / unknown algorithm. The handler maps that into `400 malformed
 /// hash` — same status whether it's length, charset, or algorithm,
 /// so the route stays uniform.
 fn parse_hex_hash(s: &str) -> Result<Hash, String> {
-    if s.len() != 66 {
+    if s.is_empty() || !s.len().is_multiple_of(2) {
         return Err(format!(
-            "expected 66 hex chars (1-byte algorithm + 32-byte digest, V7 §3.5), got {}",
+            "expected an even-length hex string (format varint || digest, V7 §1.2), got {}",
             s.len()
         ));
     }
     let bytes = hex_decode(s).map_err(|e| format!("hex decode: {}", e))?;
-    let h = Hash::from_bytes(&bytes).map_err(|e| format!("hash from bytes: {:?}", e))?;
-    // V7 currently registers SHA-256 (0x00) only. The serving route
-    // can't verify-by-rehash a hash it doesn't know how to recompute,
-    // so reject unknown algorithms with the same 400 the cohort uses
-    // (ruling §5 B regression-class guard).
-    if h.algorithm != entity_hash::HASH_ALGORITHM_SHA256 {
-        return Err(format!(
-            "unknown hash algorithm 0x{:02x} (only SHA-256/0x00 is registered)",
-            h.algorithm
-        ));
-    }
-    Ok(h)
+    // Width comes from the leading format byte and is never assumed
+    // (SPECIFICATION-FORMAT §8.4.5). `Hash::from_bytes` rejects any input
+    // whose length disagrees with the length its OWN format implies —
+    // which is strictly stronger than a constant, because it also rejects
+    // a 98-char string claiming `00` and a 66-char one claiming `01`. It
+    // likewise rejects the digest-only form, which is the requirement the
+    // old fixed-66 was actually reaching for: dropping the format code
+    // destroys the algorithm discriminator.
+    Hash::from_bytes(&bytes).map_err(|e| format!("hash from bytes: {:?}", e))
 }
 
 /// Encode bytes as lowercase hex. Workspace has no `hex` dep; this is
@@ -961,7 +967,7 @@ async fn handle_tree_get(
 /// `system/hash` 2-key bare pointer — `ECF({type:"system/hash", data:H})`
 /// — where `data` is the CBOR bstr of the 33-byte wire hash. The
 /// consumer reads `H` from `data` and does a second-hop
-/// `CONTENT_GET /content/{hex33(H)}` to fetch the entity bytes.
+/// `CONTENT_GET /content/{hex(H)}` to fetch the entity bytes.
 ///
 /// **Why two-hop, not one-hop (V7 §1.7 dedup invariant).** The
 /// previous Amendment-5 reading inlined the dereferenced entity at
@@ -971,7 +977,7 @@ async fn handle_tree_get(
 /// materializes a separate copy per binding; a static CDN can't
 /// dedup two `.bin` URLs that share bytes. Two-hop preserves the
 /// `path → hash` and `hash → bytes` split: `.bin` answers the first
-/// half; `/content/{hex33}` answers the second.
+/// half; `/content/{hex(H)}` answers the second.
 ///
 /// **Why 2-key not 3-key.** A path-addressed pointer has no useful
 /// self-`content_hash` — its trust flows from the signed root
@@ -1363,8 +1369,7 @@ mod tests {
         // Bad charset at right length.
         assert!(parse_hex_hash(&"zz".repeat(33)).is_err());
 
-        // Unknown algorithm byte (V7 currently defines only 0x00) —
-        // Hash::from_bytes rejects.
+        // Unknown algorithm byte — Hash::from_bytes rejects.
         let mut unknown_algo = [0u8; 33];
         unknown_algo[0] = 0xFE;
         let unknown_hex = hex_encode(&unknown_algo);
@@ -1374,6 +1379,60 @@ mod tests {
             "unknown algorithm byte must error, got {:?}",
             result
         );
+    }
+
+    /// SPECIFICATION-FORMAT §8.4.5 — the route MUST NOT pin a hash width,
+    /// and §8.4.6 rules `system/content/{ns}/{hex(H)}` *hold-and-fetch*:
+    /// H is used verbatim at whatever width its own format byte implies.
+    ///
+    /// The regression this guards is measured, not hypothetical: rust and
+    /// go answered `400` where python answered `200` on a SHA-384
+    /// `CONTENT_GET`, with 30 of 31 SHA-384 conformance failures behind
+    /// EXTENSION-NETWORK §6.5.3.1's fixed-66. The load-bearing assertions
+    /// are the two cross-width rejections — an implementation that widened
+    /// by merely dropping the length check would accept both and pass a
+    /// test that only asserted the SHA-384 happy path.
+    #[test]
+    fn parse_hex_hash_does_not_pin_a_width() {
+        // ECFv1-SHA-384 (0x01) — 49 wire bytes, 98 hex chars.
+        let mut wire384 = [0u8; 49];
+        wire384[0] = entity_hash::HASH_ALGORITHM_SHA384;
+        for b in wire384[1..].iter_mut() {
+            *b = 0xCD;
+        }
+        let hex384 = hex_encode(&wire384);
+        assert_eq!(hex384.len(), 98, "worked instance, not a requirement");
+        let h = parse_hex_hash(&hex384).expect("a SHA-384 wire hash must parse");
+        assert_eq!(h.algorithm, entity_hash::HASH_ALGORITHM_SHA384);
+        assert_eq!(h.digest(), [0xCD; 48]);
+
+        // The width must follow the format byte, so each format MUST
+        // reject the other's width. A 98-char string claiming `00`...
+        let mut wide_sha256 = [0u8; 49];
+        wide_sha256[0] = entity_hash::HASH_ALGORITHM_SHA256;
+        assert!(
+            parse_hex_hash(&hex_encode(&wide_sha256)).is_err(),
+            "98 hex chars claiming format 0x00 must be rejected"
+        );
+        // ...and a 66-char one claiming `01`.
+        let mut narrow_sha384 = [0u8; 33];
+        narrow_sha384[0] = entity_hash::HASH_ALGORITHM_SHA384;
+        assert!(
+            parse_hex_hash(&hex_encode(&narrow_sha384)).is_err(),
+            "66 hex chars claiming format 0x01 must be rejected"
+        );
+
+        // The digest-only form stays rejected at SHA-384's width too —
+        // that is the requirement the old constant was reaching for, and
+        // it survives the generalization: dropping the format code
+        // destroys the algorithm discriminator.
+        assert!(
+            parse_hex_hash(&hex_encode(&[0x00; 48])).is_err(),
+            "96 hex chars (bare SHA-384 digest) must be rejected"
+        );
+        // Odd-length input is not a byte string at all.
+        assert!(parse_hex_hash(&"ab".repeat(24)[..47]).is_err());
+        assert!(parse_hex_hash("").is_err());
     }
 
     #[test]

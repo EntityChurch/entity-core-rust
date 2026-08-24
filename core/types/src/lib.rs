@@ -138,7 +138,13 @@ pub const TYPE_COMPATIBILITY_REPORT: &str = "system/type/compatibility-report";
 
 // Delivery / subscription
 pub const TYPE_DELIVERY_SPEC: &str = "system/delivery-spec";
-pub const TYPE_INBOX_DELIVERY: &str = "system/protocol/inbox/delivery";
+// EXTENSION-INBOX §2.1 `[RATIFIED 2026-08-10]` — renamed from
+// `system/protocol/inbox/delivery`. The `protocol/` prefix mis-homed the type
+// (SPECIFICATION-FORMAT §8.4.2 owner-not-problem-domain); the §8.4.4
+// data-at-rest bar does not block the cut because condition 2 is no — no
+// `delivery` content_hash is referenced anywhere. Cut in one round, no
+// dual-kind acceptance window.
+pub const TYPE_INBOX_DELIVERY: &str = "system/inbox/delivery";
 
 // Durability contract (EXTENSION-DURABILITY v0.1)
 pub const TYPE_DURABILITY_REQUEST: &str = "system/durability-request";

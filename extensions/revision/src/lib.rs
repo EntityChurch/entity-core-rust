@@ -40,9 +40,20 @@ pub fn resolve_prefix(prefix: &str, local_peer_id: &str) -> String {
     }
 }
 
-/// Compute the 66-character hex hash for a prefix subtree (R1).
+/// Compute the hex prefix-hash for a prefix subtree (R1).
 /// Input MUST be an absolute prefix (call `resolve_prefix` first).
 /// Hash = hex(content_hash(type="system/tree/path", data=ecf_encode(prefix))).
+///
+/// **This is the width that is legitimately pinned, and it is not an
+/// exception to SPECIFICATION-FORMAT §8.4.5.** §8.4.6 rules REVISION
+/// §3.1's `prefix_hash` **derive-to-meet**: two peers must independently
+/// compute the same path segment from the same prefix, so it is pinned to
+/// the ECFv1-SHA-256 floor (`0x00`) and MUST NOT follow the deriving
+/// peer's home format. `Hash::compute` is the floor-format constructor
+/// (`compute_format` is the home-format one), so the 66 characters follow
+/// from the pinned *format* — exactly as the rule requires — rather than
+/// being assumed. Do not "fix" the fixed-66 parse in
+/// `engine::is_prefix_config_path`; it is reading a floor-pinned segment.
 pub fn prefix_hash(absolute_prefix: &str) -> String {
     let ecf_data = entity_ecf::to_ecf(&entity_ecf::text(absolute_prefix));
     let hash = Hash::compute("system/tree/path", &ecf_data);

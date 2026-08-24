@@ -311,7 +311,13 @@ mod handler_tests {
         async fn scan(&self, _filter: Option<Value>) -> Result<Vec<Observation>, DiscoveryError> {
             Ok(self.observations.clone())
         }
-        async fn announce(&self, _p: &AnnounceParams) -> Result<(), DiscoveryError> {
+        async fn announce(&self, p: &AnnounceParams) -> Result<(), DiscoveryError> {
+            // Mirrors the v1 mDNS backend's §3.3 admission: a profile_ref the
+            // backend does not serve is a caller error, distinguishable from a
+            // backend failure. `mock-profile` is the one this backend serves.
+            if p.profile_ref != "mock-profile" {
+                return Err(DiscoveryError::UnknownProfileRef(p.profile_ref.clone()));
+            }
             Ok(())
         }
         async fn announce_stop(&self, _p: &str) -> Result<(), DiscoveryError> {
@@ -471,5 +477,67 @@ mod handler_tests {
         );
 
         announcer.announce_stop("tcp-default").await.expect("stop");
+    }
+
+    fn announce_ctx(op: &str, backend: &str, profile_ref: &str) -> HandlerContext {
+        let params = Entity::new(
+            entity_types::TYPE_PROTOCOL_STATUS,
+            to_ecf(&Value::Map(vec![
+                (text("backend"), text(backend)),
+                (text("profile_ref"), text(profile_ref)),
+            ])),
+        )
+        .unwrap();
+        let execute = Entity::new(entity_types::TYPE_EXECUTE, to_ecf(&Value::Map(vec![]))).unwrap();
+        HandlerContext::builder(execute, params)
+            .operation(op.to_string())
+            .build()
+    }
+
+    /// DISCOVERY §3.3 (arch Ruling-5 erratum, added 2026-08-10) — `:announce`
+    /// with a `profile_ref` the backend does not serve MUST answer `400`, not a
+    /// 5xx. An unresolvable parameter VALUE is a caller error, exactly as for an
+    /// unknown `backend`, and a 5xx tells the caller to retry something that can
+    /// never succeed.
+    ///
+    /// The positive arm is the load-bearing half: rust previously answered 200
+    /// here, because the handler passed `profile_ref` through as an opaque
+    /// label and never resolved it at all. A test asserting only "not 5xx"
+    /// would have passed against that.
+    #[tokio::test]
+    async fn announce_unknown_profile_ref_is_400_and_known_one_still_announces() {
+        let (cs, li) = stores();
+        let backend = Arc::new(MockBackend {
+            observations: vec![],
+        });
+        let handler = DiscoveryHandler::new(cs, li, PEER.into(), vec![backend]);
+
+        let unknown = handler
+            .handle(&announce_ctx(
+                "announce",
+                "mock",
+                "no-such-transport-profile",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            unknown.status, 400,
+            "an unresolvable profile_ref is a caller error, not a backend failure"
+        );
+        let m = result_map(&unknown);
+        assert_eq!(
+            m.iter()
+                .find(|(k, _)| k.as_text() == Some("code"))
+                .and_then(|(_, v)| v.as_text()),
+            Some("unknown_profile_ref")
+        );
+
+        // The profile the backend DOES serve still announces — otherwise "400
+        // on everything" would satisfy the assertion above.
+        let known = handler
+            .handle(&announce_ctx("announce", "mock", "mock-profile"))
+            .await
+            .unwrap();
+        assert_eq!(known.status, 200);
     }
 }

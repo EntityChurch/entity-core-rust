@@ -325,12 +325,17 @@ impl SystemContentHandler {
     /// that closes the cohort-wide gap. No-op when no LocationIndex
     /// has been wired (legacy call sites).
     ///
-    /// **Hex format: 66-char (algorithm byte + digest) per ruling §5 B**
-    /// V7 §3.5 defines a hash on the wire as the full
-    /// 33-byte `[algorithm || digest]` payload; the binding leaf MUST
-    /// use the same encoding so cross-impl URL paths / leaf keys /
-    /// ETags all reconcile. Earlier 64-char (digest-only) leaves were
-    /// Rust + Go's regression; Python had it right from the start.
+    /// **Hex format: the full `[format varint || digest]` payload per
+    /// ruling §5 B** — V7 §1.2/§3.5 defines a hash on the wire that way,
+    /// and the binding leaf MUST use the same encoding so cross-impl URL
+    /// paths / leaf keys / ETags all reconcile. Earlier digest-only
+    /// leaves were Rust + Go's regression; Python had it right from the
+    /// start. The requirement is *include the format code*, not a
+    /// character count: §8.4.6 rules `system/content/{ns}/{hex(H)}`
+    /// **hold-and-fetch** — H is used verbatim at whatever width its own
+    /// format implies (66 hex chars under `0x00`, 98 under `0x01`), and
+    /// SPECIFICATION-FORMAT §8.4.5 bars pinning either. `hex_encode_hash`
+    /// encodes the whole wire form, so this leaf is already width-free.
     fn write_namespace_binding(&self, namespace_uri: &str, h: &Hash) {
         if let Some(ref index) = self.location_index {
             let hex_h = hex_encode_hash(h);

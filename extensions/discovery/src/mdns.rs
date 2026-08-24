@@ -26,6 +26,16 @@ use crate::{
 /// query responses before returning (§3.0). Conservative; operator-tunable.
 pub const DEFAULT_SCAN_WINDOW: Duration = Duration::from_millis(1500);
 
+/// The transport `profile_ref`s the **v1** mDNS backend serves (§3.3). Any
+/// other value is a caller error — [`DiscoveryError::UnknownProfileRef`], which
+/// the handler answers `400 unknown_profile_ref`.
+///
+/// These are the two core-go's v1 backend serves, so an announce accepted by
+/// one impl is accepted by the other. Widening this list is a cohort change,
+/// not a local one: a `profile_ref` only means something to a peer that scans
+/// and then dials it.
+pub const MDNS_V1_PROFILE_REFS: &[&str] = &["tcp", "http-poll"];
+
 /// mDNS backend over a [`ServiceDaemon`] (its own background thread + multicast
 /// socket). The daemon is created **lazily** on first scan/announce, so merely
 /// building a peer with discovery enabled costs nothing — the socket opens only
@@ -142,6 +152,28 @@ impl DiscoveryBackend for MdnsBackend {
     }
 
     async fn announce(&self, params: &AnnounceParams) -> Result<(), DiscoveryError> {
+        // §3.3 (arch Ruling-5 erratum) — a `profile_ref` this backend does not
+        // serve is a CALLER error (400), not a backend failure. The v1 mDNS
+        // backend serves the two profiles in [`MDNS_V1_PROFILE_REFS`].
+        //
+        // What this does NOT do, stated because §3.3 words the rule as
+        // "does not resolve to a `system/peer/transport/{peer}/{profile-id}`
+        // entity": a peer does not publish transport-profile entities for
+        // ITSELF — that path namespace holds the profiles it has learned for
+        // OTHER peers — so there is nothing in the tree to resolve against.
+        // core-go words its rule the same way and also resolves against a
+        // fixed profile set driven by its configured listeners
+        // (`cmd/entity-peer/main.go`, `tcp` / `http-poll`). The observable
+        // behaviour converges; the mechanism the spec names does not exist in
+        // either impl. Logged in SPEC-AMBIGUITIES.
+        if !MDNS_V1_PROFILE_REFS.contains(&params.profile_ref.as_str()) {
+            return Err(DiscoveryError::UnknownProfileRef(format!(
+                "{:?} (v1 mDNS backend serves: {})",
+                params.profile_ref,
+                MDNS_V1_PROFILE_REFS.join(", ")
+            )));
+        }
+
         // Instance label: peer-id when known, else the profile-ref. mDNS
         // instance names are human-labels; uniqueness on the LAN is the peer's.
         let instance = params

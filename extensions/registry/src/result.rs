@@ -21,11 +21,31 @@ pub(crate) fn error(status: u32, code: &str, message: &str) -> HandlerResult {
 
 /// Build a `system/protocol/status` result entity from CBOR map fields.
 pub(crate) fn status_result(fields: Vec<(Value, Value)>) -> HandlerResult {
+    status_result_with(entity_handler::STATUS_OK, fields)
+}
+
+/// [`status_result`] at an explicit non-200 success status — REGISTRY §6a.9's
+/// `manual` queue answers `202`, which is a success shape and not an error
+/// entity: the body carries the `pending_review` status the spec pins.
+pub(crate) fn status_result_with(status: u32, fields: Vec<(Value, Value)>) -> HandlerResult {
     let result = Entity::new(
         entity_types::TYPE_PROTOCOL_STATUS,
         to_ecf(&Value::Map(fields)),
     )
     .expect("status entity");
+    HandlerResult {
+        status,
+        result,
+        included: HashMap::new(),
+    }
+}
+
+/// Return an entity verbatim as the 200 result. Used where the spec makes
+/// the response *the stored entity* (REGISTRY §6a.9.2's two policy ops),
+/// so the caller reads back the same bytes that were written — no
+/// decode-and-re-encode, which would author a second entity with a
+/// different `content_hash`.
+pub(crate) fn entity_result(result: Entity) -> HandlerResult {
     HandlerResult {
         status: entity_handler::STATUS_OK,
         result,

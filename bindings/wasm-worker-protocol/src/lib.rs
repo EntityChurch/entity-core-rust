@@ -279,9 +279,11 @@ pub type SubId = u64;
 // proxy_method! invocations land.
 // ---------------------------------------------------------------------------
 
-/// Content hash on the wire: algorithm byte + 32-byte digest, fixed 33 bytes.
-/// Same layout as `entity_hash::Hash::to_bytes()`. Sent as a CBOR byte string
-/// via `serde_bytes` to avoid array-of-int encoding bloat.
+/// Content hash on the wire: `format varint || digest`, at whatever width
+/// that leading format implies (33 bytes under ECFv1-SHA-256, 49 under
+/// ECFv1-SHA-384 — worked instances, not a pin; SPECIFICATION-FORMAT
+/// §8.4.5). Same layout as `entity_hash::Hash::to_bytes()`. Sent as a CBOR
+/// byte string via `serde_bytes` to avoid array-of-int encoding bloat.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireHash(#[serde(with = "serde_bytes")] pub Vec<u8>);
 

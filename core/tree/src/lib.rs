@@ -345,7 +345,29 @@ fn build_partial_result(cr: CascadeResult) -> HandlerResult {
     HandlerResult::error(STATUS_MULTI_STATUS, entity)
 }
 
-/// Decode an inline entity from CBOR {type, data} or raw bytes.
+/// Decode an inline entity from CBOR `{type, data, content_hash?}`.
+///
+/// **The authored `content_hash` is preserved when present** (V7 §1.8 /
+/// v7.69 §4.5a). A reference belongs to whoever authored it and carries
+/// *their* `content_hash_format`; a peer holding it MUST use it verbatim and
+/// MUST NOT re-derive it under its own home format
+/// (SPECIFICATION-FORMAT §8.4.6 calls this disposition *hold-and-fetch*).
+///
+/// Rebuilding via `Entity::new` discarded the field and recomputed under the
+/// local default, so a SHA-384-authored entity `put` to a SHA-256-home peer
+/// came back at a different address than it was published to — and every
+/// reference anyone else held to it stopped resolving. It was invisible while
+/// one format shipped, because then the re-derived hash and the authored one
+/// are the same bytes.
+///
+/// Trusting the caller's hash is not a forgery vector: the put path calls
+/// `Entity::validate` immediately after, which recomputes under the claimed
+/// hash's OWN algorithm and rejects any mismatch. A caller can choose the
+/// format its entity is addressed under — which is exactly the authoring
+/// right §4.5a gives it — but cannot claim a hash its bytes do not produce.
+///
+/// `content_hash` absent stays supported and computes under the local format:
+/// that is an entity being authored here, not one being carried.
 fn decode_entity_from_cbor(raw: &[u8]) -> Result<Entity, String> {
     let value: ciborium::Value =
         ciborium::from_reader(raw).map_err(|e| format!("cbor decode: {}", e))?;
@@ -355,6 +377,7 @@ fn decode_entity_from_cbor(raw: &[u8]) -> Result<Entity, String> {
 
     let mut entity_type = None;
     let mut entity_data = None;
+    let mut authored_hash = None;
 
     for (k, v) in map {
         match k.as_text() {
@@ -365,6 +388,12 @@ fn decode_entity_from_cbor(raw: &[u8]) -> Result<Entity, String> {
                 ciborium::into_writer(v, &mut buf).map_err(|e| format!("re-encode data: {}", e))?;
                 entity_data = Some(buf);
             }
+            Some("content_hash") => {
+                if let Some(bytes) = v.as_bytes() {
+                    authored_hash =
+                        Some(Hash::from_bytes(bytes).map_err(|e| format!("content_hash: {e}"))?);
+                }
+            }
             _ => {}
         }
     }
@@ -372,7 +401,14 @@ fn decode_entity_from_cbor(raw: &[u8]) -> Result<Entity, String> {
     let etype = entity_type.ok_or_else(|| "missing 'type' field".to_string())?;
     let edata = entity_data.ok_or_else(|| "missing 'data' field".to_string())?;
 
-    Entity::new(&etype, edata).map_err(|e| format!("entity new: {}", e))
+    match authored_hash {
+        Some(content_hash) => Ok(Entity {
+            entity_type: etype,
+            data: edata,
+            content_hash,
+        }),
+        None => Entity::new(&etype, edata).map_err(|e| format!("entity new: {}", e)),
+    }
 }
 
 /// Decode bindings from a snapshot entity's data.
@@ -2635,5 +2671,119 @@ mod tests {
         let extract = tree.handle(&extract_ctx).await.unwrap();
         assert_eq!(extract.status, STATUS_OK);
         assert_eq!(extract.result.entity_type, entity_types::TYPE_ENVELOPE);
+    }
+
+    /// V7 §1.8 / v7.69 §4.5a — a `put` of an entity authored under a
+    /// **foreign** `content_hash_format` MUST store and serve it at the
+    /// address its author gave it, not re-derive it under the peer's home
+    /// format. SPECIFICATION-FORMAT §8.4.6 calls this *hold-and-fetch*: the
+    /// reference travelled here, so it is used verbatim.
+    ///
+    /// The test peer's home format is SHA-256; the entity is authored under
+    /// SHA-384. Before this was fixed the put path rebuilt the entity from
+    /// `{type, data}` alone and recomputed the hash, so the entity came back
+    /// at a 33-byte SHA-256 address after being published at a 49-byte
+    /// SHA-384 one — and every reference held to it elsewhere stopped
+    /// resolving. Invisible while a single format ships, because then the
+    /// re-derived hash and the authored one are the same bytes.
+    #[tokio::test]
+    async fn test_handler_put_preserves_a_foreign_format_content_hash() {
+        let tree = make_tree();
+        let data = entity_ecf::to_ecf(&entity_ecf::text("authored elsewhere"));
+        let foreign =
+            Entity::new_with_format("test/type", data, entity_hash::HASH_ALGORITHM_SHA384).unwrap();
+        assert_eq!(
+            foreign.content_hash.algorithm,
+            entity_hash::HASH_ALGORITHM_SHA384
+        );
+        assert_eq!(foreign.content_hash.to_bytes().len(), 49);
+
+        let inner_data_val: ciborium::Value =
+            ciborium::from_reader(foreign.data.as_slice()).unwrap();
+        let params = entity_ecf::Value::Map(vec![(
+            entity_ecf::text("entity"),
+            entity_ecf::Value::Map(vec![
+                (
+                    entity_ecf::text("content_hash"),
+                    entity_ecf::Value::Bytes(foreign.content_hash.to_bytes().to_vec()),
+                ),
+                (entity_ecf::text("data"), inner_data_val),
+                (
+                    entity_ecf::text("type"),
+                    entity_ecf::text(&foreign.entity_type),
+                ),
+            ]),
+        )]);
+        let ctx = make_handler_context("put", Some(params), Some(vec!["foreign/fmt".into()]));
+        let result = tree.handle(&ctx).await.unwrap();
+        assert_eq!(result.status, STATUS_OK);
+
+        let got = tree.get("foreign/fmt").expect("bound");
+        assert_eq!(
+            got.content_hash, foreign.content_hash,
+            "the peer re-derived a reference it did not author"
+        );
+        assert_eq!(
+            got.content_hash.algorithm,
+            entity_hash::HASH_ALGORITHM_SHA384
+        );
+        // And what it serves still verifies against the hash it serves it at.
+        got.validate().expect("served entity must validate");
+    }
+
+    /// The other half: an entity arriving WITHOUT a `content_hash` is being
+    /// authored here, so it is hashed under the local home format. Preserving
+    /// a supplied hash must not turn the field into a requirement.
+    #[tokio::test]
+    async fn test_handler_put_without_content_hash_authors_under_home_format() {
+        let tree = make_tree();
+        let entity = make_entity("test/type", "authored here");
+        let params = put_params_with_expected(Some(&entity), None);
+        let ctx = make_handler_context("put", Some(params), Some(vec!["local/fmt".into()]));
+        let result = tree.handle(&ctx).await.unwrap();
+        assert_eq!(result.status, STATUS_OK);
+        let got = tree.get("local/fmt").expect("bound");
+        assert_eq!(got.content_hash, entity.content_hash);
+        assert_eq!(
+            got.content_hash.algorithm,
+            entity_hash::HASH_ALGORITHM_SHA256
+        );
+    }
+
+    /// Preserving the authored hash is not a forgery vector: `validate` runs
+    /// on the put path and recomputes under the CLAIMED hash's own algorithm,
+    /// so a caller may choose the format its entity is addressed under — the
+    /// authoring right §4.5a gives it — but cannot claim a hash its bytes do
+    /// not produce.
+    #[tokio::test]
+    async fn test_handler_put_rejects_a_claimed_hash_that_does_not_verify() {
+        let tree = make_tree();
+        let data = entity_ecf::to_ecf(&entity_ecf::text("real bytes"));
+        let lie = Entity::new_with_format(
+            "test/type",
+            entity_ecf::to_ecf(&entity_ecf::text("other")),
+            entity_hash::HASH_ALGORITHM_SHA384,
+        )
+        .unwrap();
+
+        let inner_data_val: ciborium::Value = ciborium::from_reader(data.as_slice()).unwrap();
+        let params = entity_ecf::Value::Map(vec![(
+            entity_ecf::text("entity"),
+            entity_ecf::Value::Map(vec![
+                (
+                    entity_ecf::text("content_hash"),
+                    entity_ecf::Value::Bytes(lie.content_hash.to_bytes().to_vec()),
+                ),
+                (entity_ecf::text("data"), inner_data_val),
+                (entity_ecf::text("type"), entity_ecf::text("test/type")),
+            ]),
+        )]);
+        let ctx = make_handler_context("put", Some(params), Some(vec!["forged/fmt".into()]));
+        let result = tree.handle(&ctx).await;
+        assert!(
+            result.is_err() || result.as_ref().unwrap().status >= 400,
+            "a content_hash that does not match the bytes must be refused"
+        );
+        assert!(tree.get("forged/fmt").is_none(), "nothing may be bound");
     }
 }
