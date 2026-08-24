@@ -11,9 +11,25 @@ release. Published numbers are oracle-pinned and reproducible.
 
 ## [Unreleased]
 
-Work since `v0.8.0` (305 commits). Curated by consequence rather than exhaustive —
-`docs/STATUS.md` carries the per-packet narrative and
-`docs/validation/reports/` the measurements.
+Development lands on `dev`; `master` carries the last release.
+
+## [0.9.0] — 2026-08-23
+
+_This number is this implementation's own, not the protocol's_ ([ADR-0002]:
+3-field SemVer per implementation, spec level carried out-of-band). **0.9.0 and
+not 0.8.1** because the changes below are breaking for a consumer — the `log`
+decoder split from `fetch`, optional arrays remodelled from `Option<Vec>` to
+`Vec`, the §10.3 seam returning `Result` where it returned `Option`, a new
+dispatch-ceiling type in the peer's signature — and pre-1.0 SemVer puts breaking
+in MINOR. **0.9.0 and not 0.8.2** because 0.8.2 is `entity-core-protocol`'s
+release number and this repo never chose it. `entity-core-go` and
+`entity-core-py` independently reached 0.9.0 by their own derivations; that is a
+coincidence, not a fleet version.
+
+Work since `v0.8.0` (311 commits on the development line). Curated by consequence
+rather than exhaustive — `docs/STATUS.md` carries the per-packet narrative, and
+every measurement quoted below is stated here in full: the validation reports it
+was drawn from are internal working memory and do not publish.
 
 **Cross-impl state at this entry.** `scripts/validate-complete.sh rust` (core-go's
 release gate) — **`REAL_EXIT=0`, all six passes exit 0**, which had not previously

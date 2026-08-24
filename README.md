@@ -62,7 +62,7 @@ entity-systems/
 Other repos in the ecosystem (e.g. `entity-browser-rust`,
 `entity-core-godot`) consume this workspace's crates via a Cargo
 **git dependency** pinned to a release tag
-(`git = "https://github.com/EntityChurch/entity-core-rust", tag = "v0.8.0"`),
+(`git = "https://github.com/EntityChurch/entity-core-rust", tag = "v0.9.0"`),
 so a lone clone builds standalone. Sibling-folder development is kept as a
 **local, gitignored** `.cargo/config.toml` `paths = [...]` override — never a
 committed `[patch]`/path dependency.
