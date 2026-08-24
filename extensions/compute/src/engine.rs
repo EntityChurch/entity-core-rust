@@ -294,7 +294,22 @@ impl ComputeEngine {
         }
 
         // Convergence check: compare result hash with existing
-        let result_entity = result.to_result_entity(&expression.content_hash);
+        //
+        // §2.4: the result_path write is a materialization site, named in the
+        // same sentence as the SA-9 `store` crossing — so the **SA-1 value
+        // form** of a `compute/error` (an error entity that evaluated
+        // successfully, e.g. a lookup onto a stored error) materializes
+        // code-only here too, exactly as the minted form does above. Without
+        // this it would pass through `to_result_entity` carrying whatever
+        // `message`/`at` its author wrote, and two peers writing the same error
+        // to the same path would diverge on hash — defeating the convergence
+        // check immediately below, and every reactive consumer keyed on it.
+        // (`to_result_entity` itself must NOT strip: it also serves the F10
+        // dispatch-boundary form in `lib.rs`, where `message` is permitted.)
+        let result_entity = match &result {
+            ComputeValue::Entity(e) if e.entity_type == TYPE_ERROR => materialize_error_value(e),
+            _ => result.to_result_entity(&expression.content_hash),
+        };
         let new_hash = result_entity.content_hash;
 
         let qualified_result = qualify_path(&result_path, &self.local_peer_id);
@@ -644,6 +659,124 @@ mod tests {
         // Check that result was written
         let result_path = format!("/{}/app/results/1", TEST_PID);
         assert!(li.get(&result_path).is_some());
+    }
+
+    /// §2.4 — the **SA-1 value form** of a `compute/error` reaching the §7.2
+    /// `result_path` materializes **code-only**, exactly as the minted form
+    /// does. §2.4 names `result_path` and the SA-9 `store` crossing in the same
+    /// sentence, so the boundary ruled for `store` (ROUTING-2026-08-16-f §1)
+    /// governs here too.
+    ///
+    /// Without this, an error entity authored with `message`/`at` flows through
+    /// `to_result_entity` unchanged and is written verbatim — so two conformant
+    /// peers writing the *same* error to the *same* path produce different
+    /// hashes, breaking the convergence check right below the write site and
+    /// every reactive consumer keyed on the result hash. `entity-core-go`
+    /// routes both forms through `ToMaterializedEntity` at this site
+    /// (`reEvaluate`, `ext/compute/engine.go` @ `5190a75`); this test pins the
+    /// same behaviour here.
+    #[test]
+    fn test_value_form_error_at_result_path_materializes_code_only() {
+        let cs: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
+        let li: Arc<dyn LocationIndex> = Arc::new(MemoryLocationIndex::new());
+        let identity_hash = Hash::compute("test", b"identity");
+
+        // An authored compute/error carrying in-flight diagnostics, sitting in
+        // the tree as ordinary data.
+        let authored_data = entity_ecf::cbor_map! {
+            "at" => entity_ecf::text("impl/attribution/point"),
+            "code" => entity_ecf::text("not_found"),
+            "message" => entity_ecf::text("unpinned impl prose")
+        };
+        let authored = Entity::new(TYPE_ERROR, entity_ecf::to_ecf(&authored_data)).unwrap();
+        let authored_h = cs.put(authored).unwrap();
+        li.set(&format!("/{}/app/data/x", TEST_PID), authored_h);
+
+        // The subgraph root reads that path — SA-1 returns the error as a
+        // *value* (compute/error is not a compute expression), so the engine's
+        // minted-error arm never fires and the write goes down the result path.
+        let lookup_h = cs.put(make_tree_lookup("app/data/x")).unwrap();
+        li.set(&format!("/{}/app/expr/1", TEST_PID), lookup_h);
+
+        // A *resolvable* installation grant: an unresolvable hash freezes the
+        // subgraph with `installation_grant_invalid`, and no grant at all means
+        // no capability, so the §7.2 tree read mints `permission_denied` — both
+        // would exercise the minted arm instead of the value-form one.
+        let grant = entity_capability::CapabilityToken {
+            grants: entity_capability::wildcard_handler_grant(),
+            granter: entity_capability::Granter::Single(Hash::compute("test", b"granter")),
+            grantee: Hash::compute("test", b"grantee"),
+            parent: None,
+            created_at: 0,
+            expires_at: None,
+            not_before: None,
+            delegation_caveats: None,
+        };
+        let grant_h = cs.put(grant.to_entity().unwrap()).unwrap();
+
+        let meta_data = entity_ecf::cbor_map! {
+            "installation_grant" => Value::Bytes(grant_h.to_bytes().to_vec()),
+            "installed_by" => Value::Bytes(Hash::compute("test", b"author").to_bytes().to_vec()),
+            "result_path" => entity_ecf::text("app/results/1"),
+            "root_expression" => Value::Bytes(lookup_h.to_bytes().to_vec()),
+            "root_expression_path" => entity_ecf::text("app/expr/1"),
+            "status" => entity_ecf::text("active")
+        };
+        let meta_h = cs
+            .put(Entity::new(TYPE_SUBGRAPH, entity_ecf::to_ecf(&meta_data)).unwrap())
+            .unwrap();
+        li.set(
+            &format!("/{}/system/compute/processes/test1", TEST_PID),
+            meta_h,
+        );
+
+        let engine =
+            ComputeEngine::new(cs.clone(), li.clone(), TEST_PID.to_string(), identity_hash);
+        engine.dependency_index.add(
+            &format!("/{}/app/data/x", TEST_PID),
+            DependencyEntry {
+                expression_uri: "app/expr/1".into(),
+                subgraph_path: "system/compute/processes/test1".into(),
+            },
+        );
+
+        let event = TreeChangeEvent {
+            path: format!("/{}/app/data/x", TEST_PID),
+            hash: authored_h,
+            previous_hash: None,
+            new_hash: Some(authored_h),
+            change_type: entity_store::ChangeType::Modified,
+            context: None,
+        };
+        let mut ctx = ExecutionContext::default();
+        engine.on_tree_change(&event, &mut ctx).unwrap();
+
+        let result_path = format!("/{}/app/results/1", TEST_PID);
+        let written_h = li.get(&result_path).expect("result written");
+        let written = cs.get(&written_h).expect("result entity present");
+
+        assert_eq!(written.entity_type, TYPE_ERROR);
+        let data = decode_data(&written).expect("decodable");
+        match &data {
+            Value::Map(fields) => assert_eq!(
+                fields.len(),
+                1,
+                "§2.4: materialized compute/error is code-only, got {fields:?}"
+            ),
+            other => panic!("error data must be a map, got {other:?}"),
+        }
+        assert_eq!(data_str(&data, "code").as_deref(), Some("not_found"));
+        assert_eq!(
+            written.content_hash,
+            ComputeError::NotFound(String::new())
+                .to_entity()
+                .content_hash,
+            "must converge with the minted code-only form for the same code"
+        );
+        assert_ne!(
+            written_h, authored_h,
+            "the diagnostic-carrying value must not be written verbatim"
+        );
     }
 
     /// PROPOSAL-CROSS-IMPL-STANDARDIZATION-CATCHUP §1 regression — end-to-end

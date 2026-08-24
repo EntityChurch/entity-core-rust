@@ -807,14 +807,26 @@ fn dispatch_store(
         Err(err) => return err,
     };
     let evaluated = eval::evaluate(&value_expr, scope, budget, ctx);
-    if evaluated.is_error() {
-        return evaluated;
-    }
 
     // SA-9: convert the evaluation result to an entity. Bare primitives wrap
     // in primitive/any; entity values pass through; closures serialize via
     // their canonical entity form.
+    //
+    // §2131 worked example (v3.23, ROUTING-2026-08-16-f §1 — RULED): a
+    // `compute/error` reaching store's `value` does **NOT** short-circuit. An
+    // apply short-circuits the operands it *consumes* — `resource`,
+    // `capability`, and closure args bound to params (all in `eval/apply.rs`,
+    // unchanged) — and a builtin's **write payload is not a consumed operand**.
+    // Short-circuit exists so that no expression *reads* an error's fields; a
+    // write payload's fields are never read, they are materialized under §2.4,
+    // which is written to define exactly these bytes. So the error is written
+    // code-only and the store **succeeds**. `is_error` is kind-based (§4.1), so
+    // both in-language forms funnel through the same materialization: minted
+    // (`ComputeValue::Error`) and the SA-1 value form (a `compute/error` entity
+    // that evaluated successfully). One value, one behaviour.
     let to_store = match evaluated {
+        ComputeValue::Error(err) => err.to_entity(),
+        ComputeValue::Entity(e) if e.entity_type == TYPE_ERROR => materialize_error_value(&e),
         ComputeValue::Entity(e) => e,
         ComputeValue::Closure(c) => c.to_entity(),
         ComputeValue::Primitive(v) => {
@@ -841,7 +853,6 @@ fn dispatch_store(
                 }
             }
         }
-        ComputeValue::Error(err) => return err.to_value(),
     };
 
     let qualified = qualify_path(&path, ctx.local_peer_id);
@@ -1177,6 +1188,206 @@ mod tests {
         let stored_entity = cs.get(&stored_hash).expect("entity present");
         // SA-9 wrap target.
         assert_eq!(stored_entity.entity_type, "primitive/any");
+    }
+
+    /// Build the `system/compute/store-args` params entity for a store whose
+    /// `value` is the expression at `value_hash`.
+    fn make_store_args(path: &str, value_hash: Hash) -> Entity {
+        let data = entity_ecf::cbor_map! {
+            "path" => entity_ecf::text(path),
+            "value" => Value::Bytes(value_hash.to_bytes().to_vec())
+        };
+        Entity::new(TYPE_STORE_ARGS, entity_ecf::to_ecf(&data)).unwrap()
+    }
+
+    /// Assert the entity bound at `path` is a code-only `compute/error` with
+    /// `code` — exactly one field, and byte-identical to the minted form.
+    fn assert_code_only_error_at(
+        cs: &MemoryContentStore,
+        li: &MemoryLocationIndex,
+        path: &str,
+        expected_code: &str,
+    ) -> Entity {
+        let stored_hash = li.get(path).unwrap_or_else(|| {
+            panic!("SA-9 store must WRITE the error, but nothing is bound at {path}")
+        });
+        let stored = cs.get(&stored_hash).expect("stored entity present");
+        assert_eq!(stored.entity_type, TYPE_ERROR);
+
+        let data = decode_data(&stored).expect("decodable error data");
+        let fields = match &data {
+            Value::Map(m) => m.clone(),
+            other => panic!("error data must be a map, got {other:?}"),
+        };
+        assert_eq!(
+            fields.len(),
+            1,
+            "§2.4: materialized compute/error is code-only, got {fields:?}"
+        );
+        assert_eq!(data_str(&data, "code").as_deref(), Some(expected_code));
+
+        // The whole point of code-only: the write is content-hash-convergent
+        // with any other peer writing the same code. Compared against a
+        // hand-built bare `{code}` — the shape the cross-impl vector's boundary
+        // is the hash of — rather than against our own materializer, which
+        // would make this test agree with itself.
+        let bare = entity_ecf::cbor_map! {
+            "code" => entity_ecf::text(expected_code)
+        };
+        let expected = Entity::new(TYPE_ERROR, entity_ecf::to_ecf(&bare)).unwrap();
+        assert_eq!(
+            stored.content_hash, expected.content_hash,
+            "stored error must hash byte-identically to the bare {{code}} form"
+        );
+        stored
+    }
+
+    /// EXTENSION-COMPUTE §2131 worked example (v3.23; arch ruling
+    /// ROUTING-2026-08-16-f §1) — **minted form.** A `compute/error` produced by
+    /// evaluating store's `value` does NOT short-circuit: it materializes
+    /// code-only and IS written to the path, and the store succeeds. An apply
+    /// short-circuits the operands it *consumes*; a builtin's write payload is
+    /// not one of them.
+    #[test]
+    fn test_store_error_value_writes_code_only_minted_form() {
+        let cs = MemoryContentStore::new();
+        let li = MemoryLocationIndex::new();
+        let included = HashMap::new();
+
+        // value expression = 1 / 0 → a minted division_by_zero.
+        let lh = cs.put(make_literal_int(1)).unwrap();
+        let rh = cs.put(make_literal_int(0)).unwrap();
+        let div_data = entity_ecf::cbor_map! {
+            "left" => Value::Bytes(lh.to_bytes().to_vec()),
+            "op" => entity_ecf::text("div"),
+            "right" => Value::Bytes(rh.to_bytes().to_vec())
+        };
+        let div = Entity::new(TYPE_ARITHMETIC, entity_ecf::to_ecf(&div_data)).unwrap();
+        let div_hash = cs.put(div).unwrap();
+
+        let params = make_store_args("app/error/minted", div_hash);
+        let mut budget = Budget::default_budget();
+        let mut ctx = EvalContext::new(&cs, &li, &included, TEST_PID);
+        let result = dispatch_builtin(
+            BUILTIN_STORE,
+            "eval",
+            &params,
+            &Scope::new(),
+            &mut budget,
+            &mut ctx,
+        )
+        .unwrap();
+
+        // The store SUCCEEDS — it does not propagate the error as its result.
+        assert!(
+            !result.is_error(),
+            "store(path, <error>) must succeed, not propagate: {result:?}"
+        );
+        assert!(result.is_truthy());
+
+        assert_code_only_error_at(
+            &cs,
+            &li,
+            &format!("/{}/app/error/minted", TEST_PID),
+            ComputeError::DivisionByZero.code(),
+        );
+    }
+
+    /// §2131 worked example — **SA-1 value form.** An authored `compute/error`
+    /// entity evaluates *successfully* as a value (SA-1), and `is_error` is
+    /// kind-based (§4.1), so it must behave identically to the minted form: the
+    /// store succeeds and writes code-only. The diagnostic `message`/`at` the
+    /// literal carries are stripped — the written entity is NOT the value's own
+    /// entity, which is what makes two peers writing the same error converge.
+    #[test]
+    fn test_store_error_value_writes_code_only_sa1_value_form() {
+        let cs = MemoryContentStore::new();
+        let li = MemoryLocationIndex::new();
+        let included = HashMap::new();
+
+        // An authored compute/error literal carrying in-flight diagnostics.
+        // `stored_before_write` is deliberately NOT a `ComputeError` variant —
+        // it is the code the cross-impl vector
+        // `worked/error/store-materializes-code-only-value-form` carries. A
+        // value-form error's code is whatever its author wrote; routing it
+        // through our own error enum would silently rewrite it to
+        // `invalid_expression` and diverge the boundary hash.
+        let authored_data = entity_ecf::cbor_map! {
+            "at" => entity_ecf::text("some/impl/attribution/point"),
+            "code" => entity_ecf::text("stored_before_write"),
+            "message" => entity_ecf::text("unpinned impl prose")
+        };
+        let authored =
+            Entity::new(TYPE_ERROR, entity_ecf::to_ecf(&authored_data)).expect("error entity");
+        let authored_hash = cs.put(authored).unwrap();
+
+        let params = make_store_args("app/error/value-form", authored_hash);
+        let mut budget = Budget::default_budget();
+        let mut ctx = EvalContext::new(&cs, &li, &included, TEST_PID);
+        let result = dispatch_builtin(
+            BUILTIN_STORE,
+            "eval",
+            &params,
+            &Scope::new(),
+            &mut budget,
+            &mut ctx,
+        )
+        .unwrap();
+
+        assert!(
+            !result.is_error(),
+            "value-form error must behave identically to minted: {result:?}"
+        );
+        assert!(result.is_truthy());
+
+        let stored = assert_code_only_error_at(
+            &cs,
+            &li,
+            &format!("/{}/app/error/value-form", TEST_PID),
+            "stored_before_write",
+        );
+
+        // Re-canonicalization actually happened — the value's own entity (with
+        // message/at in its bytes) is NOT what got written.
+        assert_ne!(
+            stored.content_hash, authored_hash,
+            "the diagnostic-carrying value form must not be written as-is"
+        );
+    }
+
+    /// The boundary the ruling pins, from the other side: an error in an operand
+    /// the apply **consumes** still short-circuits, unchanged. Here the store's
+    /// own `path` operand is a consumed value — it is read, not written — so a
+    /// non-string there fails the store rather than writing anything.
+    #[test]
+    fn test_store_consumed_operand_still_fails_without_writing() {
+        let cs = MemoryContentStore::new();
+        let li = MemoryLocationIndex::new();
+        let included = HashMap::new();
+
+        let lit_hash = cs.put(make_literal_int(42)).unwrap();
+        // store-args with no `path` at all — the consumed side, not the payload.
+        let data = entity_ecf::cbor_map! {
+            "value" => Value::Bytes(lit_hash.to_bytes().to_vec())
+        };
+        let params = Entity::new(TYPE_STORE_ARGS, entity_ecf::to_ecf(&data)).unwrap();
+
+        let mut budget = Budget::default_budget();
+        let mut ctx = EvalContext::new(&cs, &li, &included, TEST_PID);
+        let result = dispatch_builtin(
+            BUILTIN_STORE,
+            "eval",
+            &params,
+            &Scope::new(),
+            &mut budget,
+            &mut ctx,
+        )
+        .unwrap();
+
+        assert!(
+            result.is_error(),
+            "a bad consumed operand must fail the store"
+        );
     }
 
     #[test]

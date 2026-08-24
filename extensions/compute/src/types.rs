@@ -487,6 +487,40 @@ impl ComputeError {
     }
 }
 
+/// §2.4 materialized form of a `compute/error` carried as a **value** — the
+/// SA-1 form, an error entity that evaluated *successfully* (an authored
+/// literal, or a lookup onto a stored error), as opposed to a minted
+/// `ComputeValue::Error`. Re-canonicalizes to `code` alone.
+///
+/// A value-form error may carry the diagnostic `message`/`at`/`expression`
+/// fields, which MUST NOT enter the content hash at a write site: `message` is
+/// unpinned prose and `at`/`expression` are impl-dependent attribution, so if
+/// any of them were content-addressed, two conformant peers writing the *same*
+/// error to the *same* path would produce different entity hashes.
+///
+/// This is the value-form counterpart to [`ComputeError::to_entity`], so both
+/// in-language error forms materialize identically — `is_error` is kind-based
+/// (§4.1), one value, one behaviour (§2131 worked example, v3.23). An error
+/// that is already code-only re-canonicalizes to itself, byte-for-byte.
+///
+/// A `compute/error` whose `code` cannot be read is malformed rather than
+/// absent; it materializes as `invalid_expression` instead of writing bytes we
+/// cannot vouch for.
+pub fn materialize_error_value(entity: &Entity) -> Entity {
+    let code = decode_data(entity)
+        .as_ref()
+        .and_then(|data| data_str(data, "code"))
+        .unwrap_or_else(|| {
+            ComputeError::InvalidExpression(String::new())
+                .code()
+                .to_string()
+        });
+    let data = entity_ecf::cbor_map! {
+        "code" => Value::Text(code)
+    };
+    Entity::new(TYPE_ERROR, entity_ecf::to_ecf(&data)).expect("error entity")
+}
+
 impl std::fmt::Display for ComputeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}: {}", self.code(), self.message())

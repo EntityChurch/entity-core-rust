@@ -3646,6 +3646,149 @@ fn test_apply_to_unknown_builtin_falls_through() {
     assert!(result.is_error());
 }
 
+/// Build a handler-mode `compute/apply` with optional `capability`/`resource`
+/// fields — the shapes §2.1 Q23 rejects on a builtin path.
+fn make_apply_with_optional_cap_resource(
+    path: &str,
+    operation: &str,
+    args: &[(&str, Hash)],
+    capability: Option<Hash>,
+    resource: Option<Hash>,
+) -> Entity {
+    let args_map: Vec<(Value, Value)> = args
+        .iter()
+        .map(|(name, hash)| {
+            (
+                Value::Text(name.to_string()),
+                Value::Bytes(hash.to_bytes().to_vec()),
+            )
+        })
+        .collect();
+    let mut fields = vec![
+        (Value::Text("args".into()), Value::Map(args_map)),
+        (Value::Text("operation".into()), entity_ecf::text(operation)),
+        (Value::Text("path".into()), entity_ecf::text(path)),
+    ];
+    if let Some(c) = capability {
+        fields.push((
+            Value::Text("capability".into()),
+            Value::Bytes(c.to_bytes().to_vec()),
+        ));
+    }
+    if let Some(r) = resource {
+        fields.push((
+            Value::Text("resource".into()),
+            Value::Bytes(r.to_bytes().to_vec()),
+        ));
+    }
+    fields.sort_by(|(a, _), (b, _)| {
+        let a_bytes = entity_ecf::to_ecf(a);
+        let b_bytes = entity_ecf::to_ecf(b);
+        a_bytes
+            .len()
+            .cmp(&b_bytes.len())
+            .then(a_bytes.cmp(&b_bytes))
+    });
+    Entity::new(TYPE_APPLY, entity_ecf::to_ecf(&Value::Map(fields))).unwrap()
+}
+
+/// EXTENSION-COMPUTE §2.1 [MUST] — Q23 (arch `7fdeea7`,
+/// ROUTING-2026-08-16-i). A `compute/apply` on a `system/compute/builtins/*`
+/// path carrying `capability` or `resource` is `invalid_expression`. Both
+/// fields are defined only as parameters of the dispatched EXECUTE, and a
+/// builtin evaluates inline and dispatches none — so they have no referent.
+///
+/// **Rejected, never ignored.** The F2 dual-check only ever narrows, so a
+/// caller supplying a capability is asking for *less* authority than ambient;
+/// dropping it silently would run the operation wider than asked, and the
+/// builtin where that has teeth is `store`. Go's prior fall-through to handler
+/// dispatch also broke §3.5's inline/apply hash-identity — which is why go
+/// changed here too rather than rust and py adopting go's shape.
+///
+/// The capability/resource hashes deliberately resolve to **nothing**. That is
+/// the ordering assertion: rejection is structural and happens *before* any
+/// field is resolved or evaluated, so these produce `invalid_expression` and
+/// not `not_found`. §4.1's pseudocode places the block after resource
+/// evaluation (filed as go spec-issue `2026-08-16-d`); go, rust and py all
+/// reject early, and this test pins us to the seats rather than to the text
+/// under correction.
+#[test]
+fn test_builtin_apply_rejects_capability_or_resource() {
+    let cs = MemoryContentStore::new();
+    let li = MemoryLocationIndex::new();
+
+    let left = cs.put(make_literal_int(3)).unwrap();
+    let right = cs.put(make_literal_int(4)).unwrap();
+    let op = cs.put(make_literal_str("add")).unwrap();
+    let args = [("left", left), ("op", op), ("right", right)];
+
+    // Never stored — resolving either would be `not_found`, not the code below.
+    let dangling_cap = Hash::compute("test", b"capability-never-stored");
+    let dangling_res = Hash::compute("test", b"resource-never-stored");
+
+    for (label, cap, res) in [
+        (
+            "capability + resource",
+            Some(dangling_cap),
+            Some(dangling_res),
+        ),
+        ("resource only", None, Some(dangling_res)),
+        // The F5 shape (capability without resource). On a builtin path this is
+        // rejected *here*, which subsumes F5 — it never reaches the F5 check on
+        // the handler-dispatch path.
+        ("capability only", Some(dangling_cap), None),
+    ] {
+        let apply = make_apply_with_optional_cap_resource(
+            "system/compute/builtins/arithmetic",
+            "eval",
+            &args,
+            cap,
+            res,
+        );
+        match eval_entity(&cs, &li, &apply) {
+            ComputeValue::Error(ComputeError::InvalidExpression(_)) => {}
+            other => {
+                panic!("builtin apply carrying {label} must be invalid_expression, got {other:?}")
+            }
+        }
+    }
+
+    // The clean builtin apply is untouched — the intercept still evaluates it
+    // inline, and rejection must not cost the legal shape its alias path.
+    let clean = make_apply_with_optional_cap_resource(
+        "system/compute/builtins/arithmetic",
+        "eval",
+        &args,
+        None,
+        None,
+    );
+    assert_eq!(eval_entity(&cs, &li, &clean).as_i128(), Some(7));
+}
+
+/// The rejection is keyed on the **path**, not on the builtin name resolving.
+/// An unrecognized name under `system/compute/builtins/` is still "a
+/// `system/compute/builtins/*` path" in §2.1's terms, so it must be rejected
+/// rather than falling through to external dispatch carrying fields that would
+/// then be honored as a real handler dispatch — the exact hole the ruling
+/// closes, reachable through the fall-through arm.
+#[test]
+fn test_unknown_builtin_apply_with_capability_is_also_rejected() {
+    let cs = MemoryContentStore::new();
+    let li = MemoryLocationIndex::new();
+    let arg = cs.put(make_literal_int(0)).unwrap();
+    let apply = make_apply_with_optional_cap_resource(
+        "system/compute/builtins/does-not-exist",
+        "eval",
+        &[("x", arg)],
+        Some(Hash::compute("test", b"capability-never-stored")),
+        Some(Hash::compute("test", b"resource-never-stored")),
+    );
+    match eval_entity(&cs, &li, &apply) {
+        ComputeValue::Error(ComputeError::InvalidExpression(_)) => {}
+        other => panic!("unrecognized builtin name is still a builtin path, got {other:?}"),
+    }
+}
+
 #[test]
 fn test_apply_to_map_builtin_uses_canonical_input_type() {
     // The map builtin has no inline form; verify the params entity built by

@@ -180,11 +180,62 @@ fn eval_apply_handler(
 
     // Builtin inline-alias intercept (EXTENSION-COMPUTE §3.5 + SA-COMPUTE-V314-2).
     // For paths under system/compute/builtins/*, reconstruct the equivalent
-    // inline expression entity from the raw args and evaluate it directly.
-    // This mirrors Go's `builtinViaInline` and bypasses both args pre-evaluation
-    // and the external dispatcher round-trip. Pure builtins ignore cap_override
-    // and resource; `store` reads ctx.capability internally per §6.2.
+    // inline expression entity from the raw args and evaluate it directly,
+    // bypassing both args pre-evaluation and the external dispatcher round-trip.
+    //
+    // The intercept is unconditional on a builtin path. (It does *not* mirror
+    // Go's gating: Go took its shortcut only when `capability`/`resource` were
+    // both absent and otherwise fell through to handler dispatch — the
+    // divergence that produced this ruling. Go's fall-through is gone too; both
+    // seats now reject.)
     if crate::builtins::is_builtin_path(&path) {
+        // §2.1 [MUST] (Q23 — arch `7fdeea7`, ROUTING-2026-08-16-i): a builtin
+        // path is evaluated **inline** and dispatches **no EXECUTE**, and both
+        // fields are defined solely as parameters of that dispatched EXECUTE —
+        // `capability` "replaces ctx.capability when present in handler mode",
+        // `resource` "carries the resource target for the dispatched EXECUTE".
+        // On a builtin they have no referent, so the expression is malformed.
+        //
+        // **Reject, never ignore — this is the fail-closed direction.** The F2
+        // dual-check can only ever NARROW (a provided capability is honored
+        // *and* `ctx.capability` must still cover the target), so a caller
+        // supplying one is asking for *less* authority than ambient. Silently
+        // dropping it would run the operation WIDER than asked — and the
+        // builtin where that has teeth is `store`, the one impure builtin,
+        // writing to a caller-specified path. Nothing legitimate is lost: §6.2
+        // fixes `store`'s authority as `ctx.capability` checked with
+        // `check_permission`, never a field on the expression (see
+        // `builtins::dispatch_store`); a caller wanting an attenuated `store`
+        // attenuates the capability it evaluates under. Rejecting also keeps
+        // §3.5's alias result hash-identical to the inline form.
+        //
+        // Checked **structurally, before evaluating anything** — before args,
+        // before `resource`, before `capability`. §4.1's pseudocode places this
+        // block *after* resource evaluation, which would return a resource-value
+        // error instead of `invalid_expression` for the degenerate
+        // "builtin apply whose resource is itself an error" case. All three
+        // per-seat actions in ROUTING-i reject early, and go, rust and py agree
+        // here today; the pseudocode ordering is filed as go spec-issue
+        // `2026-08-16-d` (recommending arch move the block early). **Do not
+        // "fix" this toward the pseudocode** — that would diverge us from the
+        // other two seats to match text that is itself under correction.
+        //
+        // This also subsumes F5 (`capability` requires `resource`) for builtin
+        // paths: the capability-only shape is rejected here and never reaches
+        // the F5 check on the handler-dispatch path below. ROUTING-i §4 asked
+        // each seat to confirm F5 before remediating it — **there was no F5
+        // hole here to begin with**: `walker.rs`'s F5 structural check is
+        // path-agnostic and runs at install time from `handle_install`, so a
+        // builtin-path apply carrying `capability` without `resource` was
+        // already refused before install. No F5 fix was written, by design.
+        if data_hash(data, "capability").is_some() || data_hash(data, "resource").is_some() {
+            return EvalResult::Value(
+                ComputeError::InvalidExpression(
+                    "compute/apply on a builtin path MUST NOT carry capability or resource".into(),
+                )
+                .to_value(),
+            );
+        }
         if let Some(result) =
             crate::builtins::dispatch_builtin_alias(&path, &operation, &args, scope, budget, ctx)
         {

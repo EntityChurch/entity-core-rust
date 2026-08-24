@@ -124,12 +124,34 @@ fn walk_recursive(
             if let Some(path) = data_str(&data, "path") {
                 let operation = data_str(&data, "operation").unwrap_or_default();
 
+                let capability_hash = data_hash(&data, "capability");
+                let resource_hash = data_hash(&data, "resource");
+
+                // §2.1 [MUST] (Q23 — arch `67708b1`): a builtin path evaluates
+                // inline and dispatches no EXECUTE, so `capability`/`resource`
+                // — defined solely as parameters of that dispatched EXECUTE —
+                // have no referent and the expression is malformed. The apply's
+                // `path` here IS a static literal, so the shape is decidable at
+                // install and MUST be rejected then; a dynamic path is left
+                // entirely to the runtime rejection in `eval::apply`.
+                //
+                // A SHAPE check: it keys on the path and on field *presence*,
+                // never on either field's value — nothing is resolved.
+                //
+                // Runs BEFORE F5 and subsumes it for builtin paths, so the
+                // capability-only shape reports this rule rather than F5's
+                // (matching the runtime, which rejects before F5 can apply).
+                if crate::builtins::is_builtin_path(&path)
+                    && (capability_hash.is_some() || resource_hash.is_some())
+                {
+                    visitor.visit_structural_error(
+                        "compute/apply on a builtin path MUST NOT carry capability or resource",
+                    );
+                }
                 // F5 (v3.10): static structural check — capability without resource
                 // is a category error. Detected at install so the failure surfaces
                 // before the subgraph is committed.
-                let capability_hash = data_hash(&data, "capability");
-                let resource_hash = data_hash(&data, "resource");
-                if capability_hash.is_some() && resource_hash.is_none() {
+                else if capability_hash.is_some() && resource_hash.is_none() {
                     visitor.visit_structural_error(
                         "compute/apply with capability field MUST also have resource field",
                     );
@@ -594,6 +616,113 @@ mod tests {
         assert!(
             auditor.static_literal_capabilities.is_empty(),
             "dynamic capability must not be collected as static-literal"
+        );
+    }
+
+    /// Build a `compute/apply` with optional `capability`/`resource` fields —
+    /// the shapes §2.1 Q23 rejects on a builtin path. Both are given
+    /// unresolvable hashes: the install-time check is structural, so it must
+    /// bite on presence alone, without resolving either field.
+    fn make_apply_with_optional_cap_resource(
+        path: &str,
+        capability: Option<Hash>,
+        resource: Option<Hash>,
+    ) -> Entity {
+        let mut fields = vec![
+            (Value::Text("operation".into()), entity_ecf::text("eval")),
+            (Value::Text("path".into()), entity_ecf::text(path)),
+        ];
+        if let Some(c) = capability {
+            fields.push((
+                Value::Text("capability".into()),
+                Value::Bytes(c.to_bytes().to_vec()),
+            ));
+        }
+        if let Some(r) = resource {
+            fields.push((
+                Value::Text("resource".into()),
+                Value::Bytes(r.to_bytes().to_vec()),
+            ));
+        }
+        fields.sort_by(|(a, _), (b, _)| {
+            let a_bytes = entity_ecf::to_ecf(a);
+            let b_bytes = entity_ecf::to_ecf(b);
+            a_bytes
+                .len()
+                .cmp(&b_bytes.len())
+                .then(a_bytes.cmp(&b_bytes))
+        });
+        Entity::new(TYPE_APPLY, entity_ecf::to_ecf(&Value::Map(fields))).unwrap()
+    }
+
+    /// EXTENSION-COMPUTE §2.1 [MUST] — Q23 (arch `67708b1`). The install-time
+    /// audit rejects a `compute/apply` whose static-literal `path` is under
+    /// `system/compute/builtins/` and which carries `capability` or `resource`.
+    /// The runtime half already rejects; this closes the install half, so the
+    /// malformed subgraph never gets committed.
+    #[test]
+    fn test_audit_rejects_builtin_apply_carrying_capability_or_resource() {
+        let cs = MemoryContentStore::new();
+        let included = HashMap::new();
+        let cap = Hash::compute("test", b"unresolvable-capability");
+        let res = Hash::compute("test", b"unresolvable-resource");
+        const BUILTIN_MSG: &str =
+            "compute/apply on a builtin path MUST NOT carry capability or resource";
+
+        // Both fields present on a builtin path → rejected.
+        let both = make_apply_with_optional_cap_resource(
+            "system/compute/builtins/arithmetic",
+            Some(cap),
+            Some(res),
+        );
+        let auditor = audit_subgraph(&both, &cs, &included, None);
+        assert_eq!(
+            auditor.structural_errors,
+            vec![BUILTIN_MSG.to_string()],
+            "builtin path + capability + resource must fail the install audit"
+        );
+
+        // `resource` alone on a builtin path → rejected. This is the shape F5
+        // never saw (F5 only fires on capability-without-resource), so it
+        // installed clean before Q23.
+        let resource_only =
+            make_apply_with_optional_cap_resource("system/compute/builtins/store", None, Some(res));
+        let auditor = audit_subgraph(&resource_only, &cs, &included, None);
+        assert_eq!(
+            auditor.structural_errors,
+            vec![BUILTIN_MSG.to_string()],
+            "builtin path + resource alone must fail the install audit"
+        );
+
+        // `capability` alone on a builtin path → rejected under THIS rule, not
+        // F5's message: the builtin check subsumes F5 for builtin paths.
+        let capability_only =
+            make_apply_with_optional_cap_resource("system/compute/builtins/store", Some(cap), None);
+        let auditor = audit_subgraph(&capability_only, &cs, &included, None);
+        assert_eq!(
+            auditor.structural_errors,
+            vec![BUILTIN_MSG.to_string()],
+            "the builtin rule subsumes F5 on a builtin path"
+        );
+
+        // Builtin path carrying neither field → accepted (the ordinary alias).
+        let clean =
+            make_apply_with_optional_cap_resource("system/compute/builtins/arithmetic", None, None);
+        let auditor = audit_subgraph(&clean, &cs, &included, None);
+        assert!(
+            auditor.structural_errors.is_empty(),
+            "a builtin apply carrying neither field is well-formed"
+        );
+
+        // Negative control: a NON-builtin path carrying both fields is the
+        // legitimate handler-dispatch shape and stays accepted — the check must
+        // not be over-broad.
+        let handler_mode =
+            make_apply_with_optional_cap_resource("system/tree", Some(cap), Some(res));
+        let auditor = audit_subgraph(&handler_mode, &cs, &included, None);
+        assert!(
+            auditor.structural_errors.is_empty(),
+            "handler-mode apply with capability + resource must still install"
         );
     }
 
