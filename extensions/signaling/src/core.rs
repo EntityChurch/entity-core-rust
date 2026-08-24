@@ -189,10 +189,11 @@ pub enum OfferOutcome {
 pub const LOBBY_DEFAULT: &str = "lobby:default";
 
 /// What `advertise` returns — `system/signaling/advertise-result` (§4.5): where
-/// the node is, and what it will accept.
+/// the node is, what it will accept, and — since v1.1 — whether it also serves
+/// reflection.
 ///
-/// **Exactly two fields.** The `lobby` override lives inside
-/// [`Limits::lobby_constant`], not beside `endpoint` — §4.5 puts it there, and a
+/// **Three top-level fields, and the `lobby` override is not one of them.** It
+/// lives inside [`Limits::lobby_constant`] because §4.5 puts it there, and a
 /// peer reading the published contract reads one map, not two.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Advertisement {
@@ -200,6 +201,20 @@ pub struct Advertisement {
     pub endpoint: String,
     /// The operating limits above, including the `lobby` override.
     pub limits: Limits,
+    /// This node's **own** §9.3 STUN listener(s) (§4.5.1, added v1.1), each an
+    /// RFC 7064 `stun:`/`stuns:` URI in the pinned non-hierarchical form.
+    ///
+    /// **Empty is the whole of "absent."** §4.5.1 makes absent and empty the
+    /// same fact — this node serves no reflection — so the decoded shape is a
+    /// `Vec` and not an `Option<Vec>`: there is no third state to represent, and
+    /// giving one a name would invite an emitter to publish `[]` where the wire
+    /// contract is an omitted key. [`crate::data::advertisement_to_entity`] omits
+    /// the key entirely when this is empty.
+    ///
+    /// **Never another node's.** A node publishes here only what it itself
+    /// serves; a deployment-wide reflector set is `EXTENSION-REGISTRY` §3b's
+    /// job, and a peer MUST NOT read this field as one.
+    pub reflection_endpoints: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -246,6 +261,7 @@ pub struct SignalingCore {
     buckets: RwLock<HashMap<RendezvousKey, Vec<Deposit>>>,
     limits: Limits,
     endpoint: String,
+    reflection_endpoints: Vec<String>,
 }
 
 impl SignalingCore {
@@ -259,6 +275,7 @@ impl SignalingCore {
             buckets: RwLock::new(HashMap::new()),
             limits,
             endpoint: endpoint.into(),
+            reflection_endpoints: Vec::new(),
         }
     }
 
@@ -277,8 +294,42 @@ impl SignalingCore {
         self
     }
 
+    /// Declare this node's **own** §9.3 STUN listener(s), published in
+    /// `advertise`'s top-level `reflection_endpoints` (§4.5.1, added v1.1).
+    ///
+    /// Set these **only if this deployment actually serves reflection.**
+    /// Advertising a reflector the node does not run is non-conformant (§11.5),
+    /// and so is the converse as of v1.1 — serving reflection while advertising
+    /// nothing is the exact state that made a reflector undiscoverable. The
+    /// reference deployment co-locates reflector and relay on one VM
+    /// (`GUIDE-REFERENCE-DEPLOYMENT` §3.2/§5), so there the advertising node
+    /// *is* the reflector.
+    ///
+    /// Each entry MUST be an RFC 7064 `stun:`/`stuns:` URI in the pinned
+    /// non-hierarchical form; **validate with
+    /// [`validate_reflection_endpoint`](crate::validate_reflection_endpoint)
+    /// first**, because [`advertise`](Self::advertise) publishes what it is
+    /// given, unchanged. That is the contract, not laxness: §4.5.1 pins the wire
+    /// form precisely so that no emitter and no consumer runs a transform.
+    ///
+    /// Empty (the default) advertises no reflection — the already-legal state
+    /// every pre-v1.1 node was in, and an absent key on the wire.
+    pub fn with_reflection_endpoints<S: Into<String>>(
+        mut self,
+        endpoints: impl IntoIterator<Item = S>,
+    ) -> Self {
+        self.reflection_endpoints = endpoints.into_iter().map(Into::into).collect();
+        self
+    }
+
     pub fn limits(&self) -> &Limits {
         &self.limits
+    }
+
+    /// The §9.3 listeners this node publishes, in configured order. Empty means
+    /// it serves no reflection.
+    pub fn reflection_endpoints(&self) -> &[String] {
+        &self.reflection_endpoints
     }
 
     /// The `lobby` constant peers should derive with at this node — the
@@ -423,6 +474,12 @@ impl SignalingCore {
         Advertisement {
             endpoint: self.endpoint.clone(),
             limits: self.limits.clone(),
+            // Verbatim (§4.5.1): the configured strings, in configured order, no
+            // normalization and no default. There is deliberately no
+            // public-STUN fallback — a node must never enrol a third-party
+            // reflector it does not run, so empty stays empty and means
+            // host-candidates-only to the peer that reads it.
+            reflection_endpoints: self.reflection_endpoints.clone(),
         }
     }
 

@@ -79,8 +79,10 @@ pub struct ExecuteOptions {
     /// envelope `included` set (the §6.13(b) seam). Use this when the chain
     /// rides **in-band** (e.g. GUIDE-CONFORMANCE §7a.2a, where the granter
     /// identity + capability signature arrive nested in params) rather than
-    /// in the local store — `collect_chain_bundle` walks the store and so
-    /// cannot find an in-band chain. This is the Rust analog of Go's
+    /// in the local store. The dispatcher resolves the §4.3 bundle against
+    /// these entities *before* its own content store, so an in-band chain
+    /// satisfies the bundle-completeness MUST it would otherwise fail
+    /// (`chain_unreachable`). This is the Rust analog of Go's
     /// `WithIncludedChain`. Default empty: ordinary dispatch is unchanged.
     pub included: Vec<Entity>,
     /// Marks this dispatch as a **reactive delivery trigger**

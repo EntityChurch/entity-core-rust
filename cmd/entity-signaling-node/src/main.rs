@@ -81,6 +81,30 @@ struct Args {
     #[arg(long)]
     ttl_seconds: Option<u64>,
 
+    /// Publish a §9.3 STUN listener **this deployment runs**, in `advertise`'s
+    /// top-level `reflection_endpoints` (§4.5.1, added v1.1). Repeatable.
+    ///
+    /// Each value is an RFC 7064 STUN URI in the pinned **non-hierarchical**
+    /// form — `stun:host[:port]` or `stuns:…`, with no `//`. A malformed value
+    /// fails at startup rather than being dropped or repaired: a browser hands
+    /// this string to `RTCIceServer.urls` verbatim, where a bad entry throws at
+    /// `RTCPeerConnection` construction instead of degrading, so the node
+    /// publishes exactly what is configured here.
+    ///
+    /// Omit it unless this deployment actually serves reflection — this field is
+    /// the node describing **its own** listener, never a directory of public
+    /// STUN servers (that would be advertising infrastructure it does not run;
+    /// deployment-wide sets are `EXTENSION-REGISTRY` §3b's job). Omitted means
+    /// no reflection, which is the state every pre-v1.1 node was in.
+    ///
+    /// **This binary does not itself serve §9.3** — reflection is the unwrapped
+    /// listener's UDP socket (§9.1), and this is the wrapped surface. The flag
+    /// is for the reference deployment's shape, where the reflector is a
+    /// separate process on the same VM (`GUIDE-REFERENCE-DEPLOYMENT` §3.2/§5)
+    /// and this node is the thing peers can ask.
+    #[arg(long = "reflection-endpoint", value_name = "STUN_URI")]
+    reflection_endpoints: Vec<String>,
+
     /// Override the pool's `lobby` key constant (§2.2). Omit to use
     /// `lobby:default` — which every peer already assumes, so an override only
     /// makes sense for a pool that wants its own "anyone here right now" space,
@@ -167,7 +191,16 @@ async fn main() -> anyhow::Result<()> {
         ttl_seconds: args.ttl_seconds.unwrap_or(Limits::default().ttl_seconds),
         ..Limits::default()
     };
-    let mut core = SignalingCore::with_limits(&endpoint, limits.clone());
+    // Validate before the node is built, so a mistyped URI is a startup failure
+    // and not a value published to every peer that advertises. The node emits
+    // verbatim (§4.5.1) — this is the only place the form is checked.
+    for uri in &args.reflection_endpoints {
+        entity_signaling::validate_reflection_endpoint(uri)
+            .map_err(|e| anyhow::anyhow!("--reflection-endpoint: {}", e))?;
+    }
+
+    let mut core = SignalingCore::with_limits(&endpoint, limits.clone())
+        .with_reflection_endpoints(args.reflection_endpoints.clone());
     if let Some(lobby) = args.lobby.as_deref() {
         core = core.with_lobby(lobby);
     }
@@ -220,6 +253,17 @@ async fn main() -> anyhow::Result<()> {
         limits.ttl_seconds, limits.max_blob_bytes, limits.max_bucket_blobs, limits.max_keys
     );
     println!("  lobby:     {}", lobby_constant);
+    // Print it either way. "Which STUN am I telling browsers about?" is exactly
+    // the question a node that silently advertises nothing answers wrongly and
+    // invisibly — the shape of the gap §4.5.1 exists to close.
+    match args.reflection_endpoints.as_slice() {
+        [] => println!(
+            "  reflection: none advertised — peers learn no STUN from this node \
+             (§4.5.1). Pass --reflection-endpoint stun:<host>[:<port>] if this \
+             deployment serves §9.3 reflection."
+        ),
+        uris => println!("  reflection: {}", uris.join(", ")),
+    }
     println!("  surface:   wrapped (cross-peer execute) — offer/collect/advertise");
     println!("  reflect:   not served here; unwrapped listener's verb (§1.4, Stage 2)");
     // Print the admission posture, always. A node that serves nobody looks

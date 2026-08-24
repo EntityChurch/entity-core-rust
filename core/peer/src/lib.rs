@@ -315,6 +315,20 @@ pub struct PeerShared {
     /// decode_envelope, Send before pushing into the response channel) per
     /// GUIDE-INSPECTABILITY v1.2 §2.1 #5.
     pub wire_hooks: Vec<(String, WireHookFn)>,
+    /// CONTINUATION v1.23 §3.4 A.1: throttle stamp (unix ms) for the
+    /// dispatcher's own §3.10 marker sweep. `0` until the first sweep.
+    ///
+    /// The dispatcher is a marker **binder** — every chain-scoped 403 mints
+    /// a `rejected` marker (`try_bind_rejected_marker`) — so by §3.4 A.1 it
+    /// is also a collector. It cannot lean on the continuation handler's
+    /// sweep: that one only runs when a continuation *advances*, and a peer
+    /// being hammered with denied chain dispatches may never advance one.
+    /// That is the unbounded case here, and it is caller-driven.
+    ///
+    /// `Arc<AtomicU64>` so every `Peer::shared()` snapshot throttles against
+    /// the same stamp — per-peer state, not per-snapshot (same reason the
+    /// pool and the dedup map are shared).
+    pub last_marker_collect_ms: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// A running peer instance.
@@ -394,6 +408,9 @@ pub struct Peer {
     /// Cloned into every `PeerShared` snapshot so the connection task can fire
     /// them at frame boundaries.
     wire_hooks: Vec<(String, WireHookFn)>,
+    /// CONTINUATION v1.23 §3.4 A.1 marker-sweep throttle stamp, shared into
+    /// every `shared()` snapshot so the dispatcher throttles per peer.
+    last_marker_collect_ms: Arc<std::sync::atomic::AtomicU64>,
     /// Shared write-behind checkpoint handle, present only when the peer was
     /// built with `.idb()`. The SDK/app calls `idb_checkpoint().checkpoint()`
     /// to await durability before acknowledging identity/destructive ops.
@@ -481,6 +498,7 @@ impl Peer {
             minted_reentry_grants: self.minted_reentry_grants.clone(),
             dispatch_hooks: self.dispatch_hooks.clone(),
             wire_hooks: self.wire_hooks.clone(),
+            last_marker_collect_ms: self.last_marker_collect_ms.clone(),
         })
     }
 
@@ -2848,6 +2866,7 @@ impl PeerBuilder {
             local_files_handler,
             dispatch_hooks: self.dispatch_hooks,
             wire_hooks: self.wire_hooks,
+            last_marker_collect_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             #[cfg(all(target_arch = "wasm32", feature = "wasm-idb-persist"))]
             idb_checkpoint: self.idb_checkpoint,
         })
@@ -9540,6 +9559,176 @@ mod tests {
             escalated.failing_since, opened.failing_since,
             "the escalation is the same episode — failing_since must not re-stamp"
         );
+    }
+
+    /// CONTINUATION v1.23 §3.4 A.1 — **the dispatcher collects the markers
+    /// the dispatcher binds.**
+    ///
+    /// Every chain-scoped 403 mints a `rejected` marker
+    /// (`connection::try_bind_rejected_marker`), so a peer under a stream of
+    /// denied chain dispatches accretes marker nodes at the caller's chosen
+    /// rate. Leaning on the continuation handler's sweep would not cover it:
+    /// that sweep runs when a continuation *advances*, which this peer may
+    /// never do.
+    ///
+    /// The sweep is root-wide, so it also collects the `lost` markers the
+    /// subscription engine binds — which cannot call the collector itself,
+    /// since `subscription → continuation` is an extension-to-extension edge
+    /// the crate DAG forbids.
+    #[tokio::test]
+    async fn v123_the_dispatcher_collects_expired_chain_error_markers() {
+        let peer = PeerBuilder::new()
+            .keypair(Keypair::from_seed([0x5c; 32]))
+            .build()
+            .unwrap();
+        let shared = peer.shared();
+        let pid = shared.peer_id.as_str().to_string();
+
+        let marker = |ts: u64| {
+            entity_entity::Entity::new(
+                "system/runtime/chain-error-lost",
+                entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+                    (entity_ecf::text("chain_id"), entity_ecf::text("c1")),
+                    (
+                        entity_ecf::text("reason"),
+                        entity_ecf::text("capability_denied"),
+                    ),
+                    (
+                        entity_ecf::text("timestamp"),
+                        entity_ecf::integer(ts as i64),
+                    ),
+                ])),
+            )
+            .unwrap()
+        };
+        let bind = |e: entity_entity::Entity| -> String {
+            let path = format!(
+                "/{}/system/runtime/chain-errors/rejected/c1/r1/capability_denied/{}",
+                pid,
+                e.content_hash.to_hex()
+            );
+            let h = shared.content_store.put(e).unwrap();
+            shared.location_index.set(&path, h);
+            path
+        };
+
+        let now_ms = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let expired = bind(marker(now_ms - 30 * 60 * 60 * 1000));
+        let fresh = bind(marker(now_ms - 60 * 1000));
+
+        connection::maybe_collect_chain_error_markers(&shared);
+
+        assert!(
+            shared.location_index.get(&expired).is_none(),
+            "§3.4 A.1: a marker past the 24h default window must be collected \
+             by the peer that bound it"
+        );
+        assert!(
+            shared.location_index.get(&fresh).is_some(),
+            "a marker inside the window must survive"
+        );
+
+        // Throttled: the next denial in the same minute must not pay for
+        // another scan of the tree.
+        let expired_again = bind(marker(now_ms - 40 * 60 * 60 * 1000));
+        connection::maybe_collect_chain_error_markers(&shared);
+        assert!(
+            shared.location_index.get(&expired_again).is_some(),
+            "the sweep must be throttled off the dispatch path"
+        );
+    }
+
+    /// EXTENSION-NETWORK §5.4.1 `[MUST]` — **`system/peer/status` is
+    /// transition-written; a successful keepalive tick MUST NOT produce a
+    /// tree write.**
+    ///
+    /// The shape of the rule was already right here (`recover_connected`
+    /// early-returns when the entity already says `connected`); what was
+    /// missing was the *negative* — nothing failed if the guard were
+    /// deleted. Cross-impl review flagged exactly that: Go verified this
+    /// and Rust had it "shaped right, unverified."
+    ///
+    /// **Why the assertion is on the content hash rather than the decoded
+    /// status.** A per-tick write would still say `connected`, so reading
+    /// the status back proves nothing. It would, however, re-stamp
+    /// `last_seen` to the tick's own clock — a different body, a different
+    /// `content_hash`, a new entity in the store, and a subscription event
+    /// delivered to every lifecycle consumer bound to this path. Hash
+    /// equality across a dozen healthy ticks is the observable form of
+    /// "no write happened."
+    ///
+    /// The connection is deliberately left idle: with no application
+    /// traffic every interval takes the ping branch, so this exercises the
+    /// success path (pong received → `recover_connected`) repeatedly,
+    /// which is the branch §5.4.1 is about.
+    ///
+    /// **Mutation it is verified against:** delete the
+    /// `existing.status == PEER_STATUS_CONNECTED` early return in
+    /// `keepalive::recover_connected` — this test must fail (the hash
+    /// moves on the first tick) while the demotion/escalation vectors
+    /// above still pass.
+    #[tokio::test]
+    async fn a12_5_4_1_a_successful_keepalive_tick_writes_no_status() {
+        let short = keepalive::KeepaliveConfig {
+            interval_ms: 40,
+            timeout_ms: 300,
+            max_missed: 3,
+            enabled: true,
+        };
+        let (
+            _ss,
+            server_handle,
+            _client,
+            client_shared,
+            _server_pid,
+            server_hash,
+            _home_format_guard,
+        ) = a12_keepalive_pair(0x7a, short).await;
+
+        let path = format!(
+            "/{}/{}",
+            client_shared.peer_id.as_str(),
+            crate::peer_status::PeerStatusData::relative_path(&server_hash)
+        );
+        let baseline_hash = client_shared
+            .location_index
+            .get(&path)
+            .expect("§6.2: establish writes `connected`");
+        let baseline =
+            liveness_status_of(&client_shared, &server_hash).expect("connected baseline missing");
+        assert_eq!(baseline.status, crate::peer_status::PEER_STATUS_CONNECTED);
+
+        // ~12 keepalive intervals of a healthy, idle connection. Every one
+        // of them pings, gets a pong, and calls the transition guard.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let after = liveness_status_of(&client_shared, &server_hash)
+            .expect("status entity vanished on a healthy connection");
+        assert_eq!(
+            after.status,
+            crate::peer_status::PEER_STATUS_CONNECTED,
+            "precondition: the connection stayed healthy for the whole window"
+        );
+        let after_hash = client_shared
+            .location_index
+            .get(&path)
+            .expect("status binding vanished on a healthy connection");
+        assert_eq!(
+            after_hash, baseline_hash,
+            "§5.4.1 [MUST]: a successful keepalive tick must not write \
+             `system/peer/status` — the binding moved, so ticks are \
+             re-stamping the entity every lifecycle consumer subscribes to"
+        );
+        assert_eq!(
+            after.last_seen, baseline.last_seen,
+            "§5.4.1: `last_seen` is a transition snapshot, not a heartbeat \
+             — per-tick freshness is implementation-internal (§A4)"
+        );
+
+        server_handle.abort();
     }
 
     /// EXTENSION-NETWORK §5.4a —

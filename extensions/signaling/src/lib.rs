@@ -103,6 +103,9 @@ pub mod pool;
 /// §7 punch choreography — substrate-agnostic, so it builds everywhere the
 /// coordination layer does (§7.3.1).
 pub mod punch;
+/// `EXTENSION-SIGNALING.md` §4.5.1 — the pinned RFC 7064 form of an advertised
+/// §9.3 reflection endpoint, checked where an operator configures one.
+pub mod reflection;
 /// `EXTENSION-SIGNALING.md` §6.5 — the WebRTC substrate's SDP/ICE
 /// coordination (the browser leg). Rides the same carrier as §6.1.
 pub mod webrtc;
@@ -126,6 +129,7 @@ pub use envelope::{open, open_claimed, parse, seal, SignedBlob, TYPE_SIGNED_BLOB
 pub use handler::SignalingHandler;
 pub use key::{lobby_key, pair_key, secret_key, tag_key};
 pub use pool::{PoolMember, SKEW_FANOUT};
+pub use reflection::{validate_reflection_endpoint, ReflectionEndpointError};
 
 #[cfg(not(target_arch = "wasm32"))]
 pub use client::{ClientError, SignalingClient};

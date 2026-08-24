@@ -218,6 +218,18 @@ enum PeerAction {
         /// binary's `--endpoint` for any real deployment.
         #[arg(long)]
         signaling_node: bool,
+        /// EXTENSION-SIGNALING §4.5.1: publish a §9.3 STUN listener **this
+        /// deployment runs** in the node's `advertise`. Repeatable; requires
+        /// `--signaling-node`.
+        ///
+        /// RFC 7064 non-hierarchical form — `stun:host[:port]` / `stuns:…`, no
+        /// `//` — validated at startup, because a browser hands the value to
+        /// `RTCIceServer.urls` verbatim and a malformed one throws at
+        /// `RTCPeerConnection` construction rather than degrading. Publish only
+        /// a reflector you actually run; this field is never a directory of
+        /// public STUN servers.
+        #[arg(long = "reflection-endpoint", value_name = "STUN_URI")]
+        reflection_endpoints: Vec<String>,
         /// PROPOSAL-PEER-ISSUED-REGISTRY-BACKEND: pin a remote registry as a
         /// `peer-issued` resolver-chain backend, as `<peer_id>@<url>`.
         ///
@@ -385,6 +397,7 @@ async fn main() -> anyhow::Result<()> {
                     validate,
                     publish_root,
                     signaling_node,
+                    reflection_endpoints,
                     peer_issued_registry,
                     publish_descriptors,
                     keepalive_interval_ms,
@@ -411,6 +424,7 @@ async fn main() -> anyhow::Result<()> {
                         validate,
                         publish_root,
                         signaling_node,
+                        &reflection_endpoints,
                         &peer_issued_registry,
                         publish_descriptors,
                         commands::peer::KeepaliveOverrides {

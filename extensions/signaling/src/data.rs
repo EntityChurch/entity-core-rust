@@ -187,10 +187,27 @@ pub fn advertisement_to_entity(a: &Advertisement) -> Result<Entity, SignalingErr
     }
     // `max_keys` is deliberately absent — a node-internal backstop, not one of
     // §4.5's four published limits (see `Limits::max_keys`).
-    let fields = vec![
+    let mut fields = vec![
         (text("endpoint"), text(&a.endpoint)),
         (text("limits"), Value::Map(limits)),
     ];
+    // §4.5.1 (v1.1): the node's own §9.3 STUN listener(s), **top-level** — a
+    // sibling of `endpoint` and `limits`, not a member of `limits`. Absent and
+    // empty are the same fact (this node serves no reflection), and absent is
+    // the encoding of it: a `[]` on the wire is a second shape for a state that
+    // already has one, and the pre-v1.1 no-reflection node emitted no key at all.
+    // Same absent-never-null discipline as `lobby_constant` above.
+    //
+    // **Emitted verbatim.** A browser hands each entry to `RTCIceServer.urls`
+    // unchanged and a malformed one throws at `RTCPeerConnection` construction
+    // rather than degrading, so the form is pinned at §4.5.1 and validated where
+    // the operator configures it (`crate::validate_reflection_endpoint`) — never
+    // repaired here, because a codec that "fixes" a URI publishes a form its
+    // operator never wrote.
+    if !a.reflection_endpoints.is_empty() {
+        let uris: Vec<Value> = a.reflection_endpoints.iter().map(text).collect();
+        fields.push((text("reflection_endpoints"), array(uris)));
+    }
     let data = to_ecf(&Value::Map(fields));
     Entity::new(TYPE_ADVERTISE_RESULT, data).map_err(|e| SignalingError::Encode(e.to_string()))
 }
@@ -203,6 +220,26 @@ pub fn advertisement_from_params(data: &[u8]) -> Result<Advertisement, Signaling
         .ok_or_else(|| SignalingError::Decode("missing/invalid map field limits".into()))?;
     Ok(Advertisement {
         endpoint: field_text(&map, "endpoint")?,
+        // §4.5.1: OPTIONAL and top-level. Absent ⇒ empty, which is the
+        // already-legal no-reflection state — so a pre-v1.1 node decodes exactly
+        // as it did before and needs no flag day ([ADR-0002] MUST-ignore).
+        //
+        // A field of the wrong shape is skipped rather than fatal, matching
+        // `lobby_constant` below: MUST-ignore says skip the field, not the
+        // message, and refusing an entire advertisement over an optional field
+        // would take the endpoint and limits down with it. **Entries are taken
+        // verbatim** — no trimming, no case-folding, no default-port
+        // canonicalization: §4.5.1's consumer-side dedup is defined over the
+        // published bytes, so normalizing here would silently break it.
+        reflection_endpoints: get_field(&map, "reflection_endpoints")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_text().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default(),
         limits: Limits {
             max_blob_bytes: field_i64(limits_map, "max_blob_bytes")? as u64,
             max_bucket_blobs: field_i64(limits_map, "max_bucket_blobs")? as u64,

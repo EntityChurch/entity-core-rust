@@ -2865,10 +2865,40 @@ pub fn make_execute_fn(
                     // places only the leaf). Ordinary internal dispatch (no
                     // opts.capability) is unchanged: None + empty bundle.
                     let empty_bundle = std::collections::HashMap::new();
+                    // Chain resolution reads the **in-band** authority first,
+                    // then the local store. §3.2 step 5 persists an installed
+                    // chain locally, and a store-only resolver serves every
+                    // such dispatch correctly — but GUIDE-CONFORMANCE §7a.2a
+                    // hands the chain to the dispatcher *in params* (cap +
+                    // granter identity + signature), and those entities are
+                    // deliberately not in this peer's store. Resolving only
+                    // against the store made §4.3's MUST unsatisfiable on that
+                    // path: the bundler could not reach a chain it was
+                    // physically holding, and every reentrant dispatch-outbound
+                    // died at `chain_unreachable` → 502 (core-go's
+                    // `origination.dispatch_outbound_reentry`, established
+                    // 2026-08-14-e; ours, introduced with the §4.3 fail-closed
+                    // at deb5127).
+                    //
+                    // Reading them here is transport assembly, not an authority
+                    // decision: `included` is exactly what would have travelled
+                    // to B anyway (it is merged into `chain_bundle` below), and
+                    // B verifies every signature and link itself (V7 §5.5).
+                    let resolve_chain = |h: &entity_hash::Hash| -> Option<entity_entity::Entity> {
+                        if let Some(cap) = opts.capability.as_ref() {
+                            if &cap.content_hash == h {
+                                return Some(cap.clone());
+                            }
+                        }
+                        included
+                            .get(h)
+                            .cloned()
+                            .or_else(|| shared.content_store.get(h))
+                    };
                     let (dispatch_cap, mut chain_bundle) = match opts.capability.as_ref() {
                         Some(cap) => match entity_protocol::collect_chain_bundle(
                             &cap.content_hash,
-                            |h| shared.content_store.get(h),
+                            resolve_chain,
                             |p| shared.location_index.get(p),
                         ) {
                             Ok(bundle) => (Some(cap), bundle),
@@ -3534,6 +3564,70 @@ fn build_capability_denied_response(
     .unwrap_or_else(|_| Envelope::new(envelope.root.clone()))
 }
 
+/// CONTINUATION v1.23 §3.4 A.1 self-collection, run from the dispatcher's
+/// marker-bind path and throttled to once a minute per peer.
+///
+/// Best-effort and non-reactive: it removes observations out of this peer's own
+/// tree under its own authority, and can never affect a dispatch.
+///
+/// Feature-gated on `continuation`, which is where the sweep lives — a build
+/// without it still binds `rejected` markers and has no collector for them.
+/// That is a real gap and it is stated rather than hidden: the sweep cannot be
+/// lifted into a shared crate without adding an extension-to-extension edge the
+/// crate DAG forbids (`AGENTS.md` — only four such edges are permitted), and
+/// `network`, which is what pulls the reactive stack in, already implies
+/// `continuation`. A `--no-default-features` peer that dispatches chains and
+/// denies caps is the exposed configuration.
+pub(crate) fn maybe_collect_chain_error_markers(shared: &PeerShared) {
+    #[cfg(feature = "continuation")]
+    {
+        use std::sync::atomic::Ordering;
+
+        let now_ms = web_time::SystemTime::now()
+            .duration_since(web_time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        const THROTTLE_MS: u64 = 60_000;
+
+        // Claim the window before sweeping, so concurrent denials on different
+        // connections do not each pay for a scan.
+        let last = shared.last_marker_collect_ms.load(Ordering::Relaxed);
+        if last != 0 && now_ms.saturating_sub(last) < THROTTLE_MS {
+            return;
+        }
+        if shared
+            .last_marker_collect_ms
+            .compare_exchange(last, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+        {
+            return; // another dispatch took this window
+        }
+
+        let retention = entity_continuation::retention_from_config(
+            &shared.content_store,
+            &shared.location_index,
+            shared.peer_id.as_str(),
+        )
+        .unwrap_or(entity_continuation::DEFAULT_MARKER_RETENTION_MS);
+        let collected = entity_continuation::collect_expired_markers(
+            &shared.content_store,
+            &shared.location_index,
+            shared.peer_id.as_str(),
+            retention,
+            now_ms,
+        );
+        if collected > 0 {
+            tracing::debug!(
+                collected,
+                retention_ms = retention,
+                "v1.23 §3.4 A.1: dispatcher collected expired chain-error marker(s)"
+            );
+        }
+    }
+    #[cfg(not(feature = "continuation"))]
+    let _ = shared;
+}
+
 /// Bind a rejected-variant marker when the rejected EXECUTE is a chain
 /// dispatch. Returns `None` when the EXECUTE doesn't carry a `chain_id`
 /// (per §3.10.3 scope — ordinary 403s have no marker) or when the bind
@@ -3550,6 +3644,16 @@ fn try_bind_rejected_marker(
     if chain_id.is_empty() {
         return None;
     }
+    // CONTINUATION v1.23 §3.4 A.1: the binder is the collector, and this is a
+    // binder. Before the bind, for the reason the continuation handler sweeps
+    // before its own (a marker whose ORIGINATION timestamp already predates the
+    // window must not be removed by the call that wrote it).
+    //
+    // Not deferrable to the continuation handler's sweep: that one runs on
+    // continuation *advance*, and the peer this matters most for is one being
+    // hammered with denied chain dispatches — caller-driven, unbounded, and
+    // quite possibly never advancing a continuation of its own.
+    maybe_collect_chain_error_markers(shared);
     // §3.10.6 timestamp-capture discipline: captured at failure-origination
     // (here — the dispatcher's cap-rejection IS the failure observation).
     let timestamp = web_time::SystemTime::now()

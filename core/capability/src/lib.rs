@@ -1726,10 +1726,12 @@ mod tests {
     // the installer's peer-id, and the only place it can learn it is the
     // granter's `system/peer` entity riding in `envelope.included`.
     //
-    // `collect_chain_bundle` gathers those identities **best-effort** — an
-    // identity the bundler cannot resolve locally is silently omitted. So the
-    // dispatcher decides whether B can authorize at all, and B has no way to
-    // ask for what is missing.
+    // `collect_chain_bundle` gathered those identities best-effort when these
+    // tests were written; v1.22 §4.3 made them a MUST, so a bundler that
+    // cannot resolve one now fails at bundle time rather than dispatching an
+    // incomplete bundle (resolving in-band authority first — §7a.2a — before
+    // its own store). B's side is unchanged and is what these pin: whatever
+    // reaches it, it authorizes only on identities actually present.
 
     #[test]
     fn granter_identity_absent_from_included_denies_fail_closed() {

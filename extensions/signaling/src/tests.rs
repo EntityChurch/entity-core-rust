@@ -598,6 +598,266 @@ fn explicitly_setting_the_default_lobby_is_normalized_to_absent() {
 }
 
 // ---------------------------------------------------------------------------
+// reflection_endpoints (§4.5.1, v1.1) — the node describing its own §9.3
+// listener. `entity-browser-rust` reads this decode directly; until it existed,
+// a node could serve reflection and no browser could learn of it.
+// ---------------------------------------------------------------------------
+
+/// The pinned form is published **verbatim** — no re-prefixing, no port
+/// canonicalization, no reordering. A browser hands each entry to
+/// `RTCIceServer.urls` unchanged, so any transform on this path is a value the
+/// operator never wrote.
+#[test]
+fn advertisement_carries_reflection_endpoints_verbatim() {
+    let want = ["stun:relay.example:3478", "stuns:[2001:db8::1]:5349"];
+    let core = SignalingCore::new("signal.example:4040").with_reflection_endpoints(want);
+    let ad = core.advertise();
+    assert_eq!(ad.reflection_endpoints, want);
+
+    let entity = crate::data::advertisement_to_entity(&ad).unwrap();
+    let decoded = advertisement_from_params(&entity.data).unwrap();
+    assert_eq!(
+        decoded.reflection_endpoints, want,
+        "byte-for-byte, in order"
+    );
+    assert_eq!(decoded, ad);
+}
+
+/// §4.5.1: the field is **top-level**, a sibling of `endpoint` and `limits` —
+/// not a member of `limits`. A same-side round-trip passes either way, so the
+/// position is asserted against the encoded map directly.
+#[test]
+fn reflection_endpoints_is_a_top_level_field_of_text_strings() {
+    let core =
+        SignalingCore::new("signal.example:4040").with_reflection_endpoints(["stun:r.example"]);
+    let entity = crate::data::advertisement_to_entity(&core.advertise()).unwrap();
+    let decoded: entity_ecf::Value = ciborium::from_reader(entity.data.as_slice()).unwrap();
+    let map = decoded.into_map().unwrap();
+
+    let limits = map
+        .iter()
+        .find(|(k, _)| k.as_text() == Some("limits"))
+        .expect("limits map")
+        .1
+        .clone();
+    assert!(
+        !limits
+            .into_map()
+            .unwrap()
+            .iter()
+            .any(|(k, _)| k.as_text() == Some("reflection_endpoints")),
+        "must be top-level, not nested inside limits"
+    );
+
+    let uris = map
+        .iter()
+        .find(|(k, _)| k.as_text() == Some("reflection_endpoints"))
+        .expect("top-level reflection_endpoints")
+        .1
+        .as_array()
+        .expect("an array")
+        .to_vec();
+    assert_eq!(
+        uris.iter().map(|v| v.as_text()).collect::<Vec<_>>(),
+        vec![Some("stun:r.example")],
+        "an array of primitive/string, not bytes and not a map"
+    );
+}
+
+/// **Absent, never null or `[]`** (§4.5.1, the `lobby_constant` precedent). A
+/// node serving no reflection emits no key at all, which is exactly what a
+/// pre-v1.1 node emitted — that identity is what makes v1.1 additive with no
+/// flag day.
+#[test]
+fn a_node_serving_no_reflection_omits_the_key_entirely() {
+    for core in [
+        SignalingCore::new("signal.example:4040"),
+        // Configured explicitly empty is the same fact, so it must not become a
+        // second wire shape for it.
+        SignalingCore::new("signal.example:4040").with_reflection_endpoints(Vec::<String>::new()),
+    ] {
+        let ad = core.advertise();
+        assert!(ad.reflection_endpoints.is_empty());
+        let entity = crate::data::advertisement_to_entity(&ad).unwrap();
+        let decoded: entity_ecf::Value = ciborium::from_reader(entity.data.as_slice()).unwrap();
+        assert!(
+            !decoded
+                .into_map()
+                .unwrap()
+                .iter()
+                .any(|(k, _)| k.as_text() == Some("reflection_endpoints")),
+            "the key must be absent, not present-and-empty"
+        );
+        // And absent decodes back to the no-reflection state, not an error.
+        assert_eq!(
+            advertisement_from_params(&entity.data)
+                .unwrap()
+                .reflection_endpoints,
+            Vec::<String>::new()
+        );
+    }
+}
+
+/// A wrong-shaped optional field is skipped, not fatal ([ADR-0002] MUST-ignore
+/// says skip the field, not the message). Refusing the whole advertisement would
+/// take `endpoint` and `limits` down with it — the peer would lose the node over
+/// a field it did not need.
+#[test]
+fn a_malformed_reflection_field_is_skipped_not_fatal() {
+    let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+        (
+            entity_ecf::text("endpoint"),
+            entity_ecf::text("signal.example:4040"),
+        ),
+        (
+            entity_ecf::text("limits"),
+            entity_ecf::Value::Map(vec![
+                (
+                    entity_ecf::text("max_blob_bytes"),
+                    entity_ecf::integer(8192),
+                ),
+                (
+                    entity_ecf::text("max_bucket_blobs"),
+                    entity_ecf::integer(32),
+                ),
+                (entity_ecf::text("ttl_seconds"), entity_ecf::integer(60)),
+            ]),
+        ),
+        (
+            entity_ecf::text("reflection_endpoints"),
+            entity_ecf::text("stun:not-an-array.example"),
+        ),
+    ]));
+    let ad = advertisement_from_params(&data).expect("the advertisement still decodes");
+    assert_eq!(ad.endpoint, "signal.example:4040");
+    assert!(ad.reflection_endpoints.is_empty());
+}
+
+/// **Cross-impl, not same-side.** Every other test above passes with the wrong
+/// shape too, because this file's encoder and decoder agree with each other —
+/// only bytes from another implementation can catch a shape both halves of one
+/// impl got wrong together, and `validate-peer` has no `signaling` category to
+/// carry this one live.
+///
+/// These are the `advertise-result` `data` bytes emitted by the **Go** node
+/// (`ext/signaling/node.advertise`, `entity-core-go` @ `c9f2fe0`, which leads
+/// this field), for a node configured with two reflection endpoints and for one
+/// configured with none. Regenerating them means running Go's node at a named
+/// commit — so if this test fails, the question is which impl moved, not which
+/// literal to update.
+#[test]
+fn go_encoded_advertise_result_decodes_here_byte_for_byte() {
+    // endpoint=signal.example:4040, reflection={stun:relay.example:3478,
+    // stuns:[2001:db8::1]:5349}, default limits.
+    let with_reflection = hex_bytes(
+        "a3666c696d697473a36b74746c5f7365636f6e6473183c6e6d61785f626c6f625f62797465731920007\
+         06d61785f6275636b65745f626c6f6273182068656e64706f696e74737369676e616c2e6578616d706c\
+         653a34303430747265666c656374696f6e5f656e64706f696e747382777374756e3a72656c61792e657\
+         8616d706c653a3334373878187374756e733a5b323030313a6462383a3a315d3a35333439",
+    );
+    let ad = advertisement_from_params(&with_reflection).expect("Go's advertise-result decodes");
+    assert_eq!(ad.endpoint, "signal.example:4040");
+    assert_eq!(
+        ad.reflection_endpoints,
+        ["stun:relay.example:3478", "stuns:[2001:db8::1]:5349"],
+        "verbatim, and in the order Go published them"
+    );
+
+    // And the same node configured here re-encodes to Go's exact bytes — ECF is
+    // deterministic (RFC 8949 §4.2), so a difference is a shape difference, not
+    // a formatting one.
+    let ours = crate::data::advertisement_to_entity(
+        &SignalingCore::new("signal.example:4040")
+            .with_reflection_endpoints(["stun:relay.example:3478", "stuns:[2001:db8::1]:5349"])
+            .advertise(),
+    )
+    .unwrap();
+    assert_eq!(
+        ours.data, with_reflection,
+        "byte-identical to Go's encoding"
+    );
+
+    // A Go node serving no reflection: the key is absent, and both impls agree
+    // that absent is the encoding — Go's `omitempty` and our omit-when-empty
+    // produce the same map. (Go emits these same bytes whether the option is
+    // unset or set to an empty list.)
+    let no_reflection = hex_bytes(
+        "a2666c696d697473a36b74746c5f7365636f6e6473183c6e6d61785f626c6f625f62797465731920007\
+         06d61785f6275636b65745f626c6f6273182068656e64706f696e74737369676e616c2e6578616d706c\
+         653a34303430",
+    );
+    let ad = advertisement_from_params(&no_reflection).expect("pre-v1.1 shape still decodes");
+    assert!(ad.reflection_endpoints.is_empty());
+    let ours = crate::data::advertisement_to_entity(
+        &SignalingCore::new("signal.example:4040").advertise(),
+    )
+    .unwrap();
+    assert_eq!(ours.data, no_reflection, "byte-identical to Go's encoding");
+}
+
+fn hex_bytes(s: &str) -> Vec<u8> {
+    let digits: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
+    digits
+        .chunks(2)
+        .map(|pair| {
+            u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).expect("hex digit pair")
+        })
+        .collect()
+}
+
+/// The §4.5.1 form, pinned 2026-08-14 and identical to `EXTENSION-REGISTRY`
+/// §3b.0. Checked where an operator configures a node, because the emit path
+/// publishes verbatim and a browser throws on a malformed entry rather than
+/// degrading to host-candidates-only.
+#[test]
+fn the_reflection_uri_form_is_rfc_7064() {
+    for ok in [
+        "stun:relay.example",
+        "stun:relay.example:3478",
+        "stuns:relay.example:5349",
+        "stun:1.2.3.4:3478",
+        "stun:[2001:db8::1]",
+        "stuns:[2001:db8::1]:5349",
+        "stun:relay.example:65535",
+    ] {
+        assert!(
+            crate::validate_reflection_endpoint(ok).is_ok(),
+            "{ok} is the pinned form"
+        );
+    }
+    for bad in [
+        // Non-hierarchical: the mistake most likely to be made by hand.
+        "stun://relay.example:3478",
+        "stuns://relay.example",
+        // A bare host:port is what a consumer would have to guess a scheme for
+        // — the guess §4.5.1 exists to remove.
+        "relay.example:3478",
+        "1.2.3.4",
+        "",
+        "stun:",
+        "stuns:",
+        "stun::3478",
+        "stun:relay.example:0",
+        "stun:relay.example:65536",
+        "stun:relay.example:http",
+        "stun:relay.example:",
+        "stun:[2001:db8::1",
+        "stun:[]:3478",
+        // An IPv6 literal MUST be bracketed, or its own colons are
+        // indistinguishable from a port separator.
+        "stun:2001:db8::1",
+        "stun:[2001:db8::1]x",
+        // A prepending consumer's output, fed back in.
+        "stun:stun:relay.example:3478",
+    ] {
+        assert!(
+            crate::validate_reflection_endpoint(bad).is_err(),
+            "{bad:?} must be refused at configuration time"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // The handler — dispatch over the core, reimplementing nothing
 // ---------------------------------------------------------------------------
 

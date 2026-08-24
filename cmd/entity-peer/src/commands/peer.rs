@@ -113,6 +113,7 @@ pub async fn start(
     validate: bool,
     publish_root: bool,
     signaling_node: bool,
+    reflection_endpoints: &[String],
     peer_issued_registries: &[String],
     publish_descriptors: bool,
     keepalive_overrides: KeepaliveOverrides,
@@ -120,6 +121,16 @@ pub async fn start(
     // A serving scope is either a content namespace or closure-of-signed-root
     // (NETWORK §6.5.6 Amendment 10). Exactly one may be selected (clap enforces
     // mutual exclusivity of the flags).
+    // A reflection endpoint with no node to publish it is a silent no-op — the
+    // operator believes they told peers about a STUN server and nobody can ask.
+    // Refuse rather than accept-and-ignore.
+    if !reflection_endpoints.is_empty() && !signaling_node {
+        anyhow::bail!(
+            "--reflection-endpoint requires --signaling-node (it is published by \
+             the node's `advertise`, EXTENSION-SIGNALING §4.5.1; without the node \
+             there is nothing to publish it)"
+        );
+    }
     let scope_selected = serve_namespace.is_some() || serve_closure_root;
     if publish_root && !scope_selected {
         anyhow::bail!(
@@ -295,11 +306,24 @@ pub async fn start(
     // all six behind `request_returns_grant` 403. Narrow-and-additive on one
     // path is narrow-and-subtractive on the other.
     if signaling_node {
-        let core = std::sync::Arc::new(entity_signaling::SignalingCore::new(addr));
+        // §4.5.1: validated here, published verbatim there. A browser reads
+        // these straight into `RTCIceServer.urls`, so a mistyped URI has to
+        // fail at startup rather than reach a peer.
+        for uri in reflection_endpoints {
+            entity_signaling::validate_reflection_endpoint(uri)
+                .map_err(|e| anyhow::anyhow!("--reflection-endpoint: {}", e))?;
+        }
+        let core = std::sync::Arc::new(
+            entity_signaling::SignalingCore::new(addr)
+                .with_reflection_endpoints(reflection_endpoints.to_vec()),
+        );
         builder = builder.handler(std::sync::Arc::new(
             entity_signaling::SignalingHandler::new(core, peer_id.as_str()),
         ));
         println!("  signaling: system/signaling node (advertise → {})", addr);
+        if !reflection_endpoints.is_empty() {
+            println!("  reflection: {}", reflection_endpoints.join(", "));
+        }
         if !debug_grants {
             tracing::warn!(
                 "--signaling-node without --debug-grants: an unknown peer gets the \

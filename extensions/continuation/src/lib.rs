@@ -17,6 +17,14 @@ use entity_hash::Hash;
 use entity_store::{CasError, ContentStore, LocationIndex};
 use web_time::Instant;
 
+/// v1.23 §3.4 A.1 — the collect half of the §3.10 marker obligation.
+pub mod marker_collect;
+
+pub use marker_collect::{
+    collect_expired_markers, retention_from_config, DEFAULT_MARKER_RETENTION_MS,
+    MARKER_RETENTION_CONFIG_PATH, MARKER_RETENTION_FIELD, RETAIN_MARKERS_FOREVER,
+};
+
 // ---------------------------------------------------------------------------
 // Continuation engine error codes (EXTENSION-CONTINUATION v1.20 Appendix A).
 // Canonical home for engine-emitted `code` values; same string is used for
@@ -205,11 +213,11 @@ pub struct ContinuationHandler {
     /// Per-join-path mutex for serializing concurrent slot arrivals.
     join_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     qualified_pattern: String,
-    /// Retained for API stability and constructor signature.
-    /// Path resolution now flows from peer-qualified resource targets;
+    /// Path resolution flows from peer-qualified resource targets;
     /// PROPOSAL-PATH-AS-RESOURCE-HYGIENE removed the install-time `path`
-    /// param that previously needed local-peer-id qualification.
-    #[allow(dead_code)]
+    /// param that previously needed local-peer-id qualification. Still
+    /// load-bearing: it roots the §3.10 marker subtree this peer binds into
+    /// and — as of v1.23 §3.4 A.1 — collects out of.
     local_peer_id: String,
     /// STANDING-MODEL §4 O5: paths of deadline-carrying joins tracked for the
     /// completion sweep (`maybe_sweep_joins`). Filled from install and touch
@@ -218,7 +226,19 @@ pub struct ContinuationHandler {
     /// Throttle state for the sweep: `None` until the first sweep runs.
     /// Mirrors Go's `lastJoinSweep`.
     last_join_sweep: tokio::sync::Mutex<Option<Instant>>,
+    /// v1.23 §3.4 A.1: the deploy-time default retention window for §3.10
+    /// chain-error markers, overridden at runtime by the operator's
+    /// `system/config/chain-errors` entity. Mirrors Go's `markerRetentionMs`.
+    marker_retention_ms: u64,
+    /// Throttle state for the marker sweep. A `std` mutex, not a tokio one:
+    /// the sweep hangs off [`Self::write_lost_error_marker_ext`], which is a
+    /// sync fn on the bind path and has nothing to await.
+    last_marker_collect: std::sync::Mutex<Option<Instant>>,
 }
+
+/// v1.23 §3.4 A.1 marker collection: how often a bind pays for a sweep.
+/// Matches Go's `collectThrottle` and the join sweep's floor above.
+const MARKER_COLLECT_THROTTLE_MS: u128 = 60_000;
 
 /// STANDING-MODEL §4 O5: sweep throttle floor, matching Go's
 /// `joinSweepThrottle` — bounds a full pass over tracked joins to once per
@@ -333,7 +353,25 @@ impl ContinuationHandler {
             local_peer_id,
             join_paths: tokio::sync::Mutex::new(HashSet::new()),
             last_join_sweep: tokio::sync::Mutex::new(None),
+            marker_retention_ms: marker_collect::DEFAULT_MARKER_RETENTION_MS,
+            last_marker_collect: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Override the deploy-time default retention window for §3.10 chain-error
+    /// markers (v1.23 §3.4 A.1). Mirrors Go's `WithMarkerRetention`.
+    ///
+    /// Precedence, highest first: the operator's `system/config/chain-errors`
+    /// → `retention_ms` in this peer's own tree, then this value, then
+    /// [`marker_collect::DEFAULT_MARKER_RETENTION_MS`] (24 h). The tree config
+    /// is the *runtime* knob and wins whenever it resolves — including an
+    /// explicit `0`, the operator turning collection off.
+    ///
+    /// [`marker_collect::RETAIN_MARKERS_FOREVER`] here disables collection by
+    /// default for this peer.
+    pub fn with_marker_retention_ms(mut self, retention_ms: u64) -> Self {
+        self.marker_retention_ms = retention_ms;
+        self
     }
 
     async fn get_join_lock(&self, path: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -358,6 +396,71 @@ impl ContinuationHandler {
 
     async fn forget_join_path(&self, path: &str) {
         self.join_paths.lock().await.remove(path);
+    }
+
+    /// v1.23 §3.4 A.1: a throttled sweep of this peer's own §3.10 markers,
+    /// run from the marker-**bind** path.
+    ///
+    /// Bind-time rather than a background task, deliberately, and for the same
+    /// reason the join sweep is: this crate owns no task and no lifecycle, and
+    /// adding a reaper loop would introduce start/stop/leak-on-drop to solve a
+    /// problem that only exists **while markers are being produced**. Binding is
+    /// precisely when the tree grows, so it is precisely when a bounded sweep is
+    /// worth paying for; a peer that has stopped failing has nothing to collect.
+    /// The throttle keeps the amortized cost off the dispatch path.
+    ///
+    /// The consequence, stated plainly: on a peer that stops binding, the last
+    /// batch outlives the window until something binds again. That is conformant
+    /// — §3.4 A.1's window is an eligibility threshold, not a deadline — and it
+    /// is bounded by one window's worth of markers. Same shape as Go's
+    /// `maybeCollectMarkers`, and the same stated cost.
+    fn maybe_collect_markers(&self) {
+        let now = Instant::now();
+        {
+            // Throttle first: both the config lookup and the sweep stay off the
+            // bind path except once per window. A poisoned lock is not a reason
+            // to skip collection — recover and sweep.
+            let mut last = self
+                .last_marker_collect
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(prev) = *last {
+                if now.duration_since(prev).as_millis() < MARKER_COLLECT_THROTTLE_MS {
+                    return;
+                }
+            }
+            *last = Some(now);
+        }
+        self.collect_markers_at(capture_failure_timestamp_ms());
+    }
+
+    /// The sweep at a caller-supplied `now_ms`, with the effective window
+    /// resolved. Split from the throttle so a test can drive it at a fixed
+    /// clock (mirrors Go's `maybeCollectMarkersAt`).
+    fn collect_markers_at(&self, now_ms: u64) {
+        let retention = marker_collect::retention_from_config(
+            &self.content_store,
+            &self.location_index,
+            &self.local_peer_id,
+        )
+        .unwrap_or(self.marker_retention_ms);
+        if retention == marker_collect::RETAIN_MARKERS_FOREVER {
+            return;
+        }
+        let collected = marker_collect::collect_expired_markers(
+            &self.content_store,
+            &self.location_index,
+            &self.local_peer_id,
+            retention,
+            now_ms,
+        );
+        if collected > 0 {
+            tracing::debug!(
+                collected,
+                retention_ms = retention,
+                "v1.23 §3.4 A.1: collected expired chain-error marker(s)"
+            );
+        }
     }
 
     /// STANDING-MODEL §4 O5: throttled pass over every tracked deadline-
@@ -723,6 +826,16 @@ impl ContinuationHandler {
         join_path: Option<&str>,
         join_slots: &[String],
     ) {
+        // v1.23 §3.4 A.1 self-collection: the binder is the collector, and the
+        // sweep runs **before** this bind, not after. Sweeping afterwards would
+        // let a marker whose ORIGINATION timestamp is already older than the
+        // window — a redelivery of an old failure, legitimate under §3.10.6 —
+        // be removed by the very call that wrote it, which reads from outside
+        // as the write having silently failed. Throttled, so the dispatch path
+        // does not carry a scan. (Same ordering and the same reason as Go's
+        // `maybeCollectMarkers` in `advance.go`.)
+        self.maybe_collect_markers();
+
         let safe_reason = sanitize_reason_segment(reason);
         // Both coordinates originate on the wire (`bounds.chain_id` and the
         // request id), so neither may name a path segment unvetted (§1.4 /
@@ -7472,5 +7585,324 @@ mod tests {
             vec!["b".to_string(), "c".to_string()],
             "missing slots in expected order"
         );
+    }
+    // -----------------------------------------------------------------------
+    // v1.23 §3.4 A.1 — marker COLLECTION. The bind half shipped long ago; this
+    // is the half that was missing, and its absence was a leak by construction:
+    // a retry loop with no `on_error` mints ~1,440 markers a day into a tree
+    // nothing reaped.
+    // -----------------------------------------------------------------------
+
+    const HOUR_MS: u64 = 60 * 60 * 1000;
+
+    /// Bind a §3.10 marker directly at `kind`/`reason` with a chosen
+    /// origination timestamp, bypassing the failure path so a test can place a
+    /// marker at any age. Returns the bound path.
+    fn bind_marker_at(
+        h: &ContinuationHandler,
+        kind: &str,
+        reason: &str,
+        timestamp_ms: u64,
+    ) -> String {
+        let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+            (entity_ecf::text("chain_id"), entity_ecf::text("chain-xyz")),
+            (entity_ecf::text("reason"), entity_ecf::text(reason)),
+            (entity_ecf::text("step_index"), entity_ecf::text("req-1")),
+            (
+                entity_ecf::text("timestamp"),
+                entity_ecf::integer(timestamp_ms as i64),
+            ),
+        ]));
+        let entity = Entity::new("system/runtime/chain-error-lost", data).unwrap();
+        let path = format!(
+            "/{}/system/runtime/chain-errors/{}/chain-xyz/req-1/{}/{}",
+            test_peer_id(),
+            kind,
+            reason,
+            entity.content_hash.to_hex(),
+        );
+        let hash = h.content_store.put(entity).unwrap();
+        h.location_index.set(&path, hash);
+        path
+    }
+
+    fn marker_count(h: &ContinuationHandler) -> usize {
+        h.location_index
+            .list(&marker_collect::marker_root(&test_peer_id()))
+            .len()
+    }
+
+    /// Write the operator's v1.23 knob into this peer's own tree.
+    fn set_retention_config(h: &ContinuationHandler, retention_ms: u64) {
+        let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+            entity_ecf::text("retention_ms"),
+            entity_ecf::integer(retention_ms as i64),
+        )]));
+        let entity = Entity::new("system/config/chain-errors", data).unwrap();
+        let hash = h.content_store.put(entity).unwrap();
+        h.location_index.set(
+            &format!(
+                "/{}/{}",
+                test_peer_id(),
+                marker_collect::MARKER_RETENTION_CONFIG_PATH
+            ),
+            hash,
+        );
+    }
+
+    /// The window is measured against the **origination** timestamp (§3.10.6),
+    /// and it is an eligibility threshold: older goes, younger stays.
+    #[test]
+    fn expired_markers_are_collected_and_fresh_ones_are_kept() {
+        let h = make_handler();
+        let now = 100 * HOUR_MS;
+        let old = bind_marker_at(&h, "lost", "capability_denied", now - 25 * HOUR_MS);
+        let fresh = bind_marker_at(&h, "lost", "capability_denied", now - HOUR_MS);
+        assert_eq!(marker_count(&h), 2);
+
+        h.collect_markers_at(now);
+
+        assert!(
+            h.location_index.get(&old).is_none(),
+            "a marker older than the 24h default must be collected"
+        );
+        assert!(
+            h.location_index.get(&fresh).is_some(),
+            "a marker inside the window must survive"
+        );
+    }
+
+    /// §5: the collect obligation "applies to both kinds". `lost` is bound by
+    /// the continuation and subscription engines, `rejected` by the dispatcher
+    /// — all three into this peer's own tree, all three carrying the same
+    /// entity type, so one sweep is the whole obligation.
+    #[test]
+    fn both_marker_kinds_are_collected() {
+        let h = make_handler();
+        let now = 100 * HOUR_MS;
+        let lost = bind_marker_at(&h, "lost", "on_error_dispatch_failed", now - 30 * HOUR_MS);
+        let rejected = bind_marker_at(&h, "rejected", "capability_denied", now - 30 * HOUR_MS);
+
+        h.collect_markers_at(now);
+
+        assert!(h.location_index.get(&lost).is_none(), "lost kind collected");
+        assert!(
+            h.location_index.get(&rejected).is_none(),
+            "rejected kind collected — the dispatcher binds these into the same tree"
+        );
+    }
+
+    /// A binding under the marker root that is **not** a marker is left alone.
+    /// Removing a binding the sweep could not identify is how a reaper becomes
+    /// a data-loss bug.
+    #[test]
+    fn a_non_marker_binding_under_the_root_is_never_removed() {
+        let h = make_handler();
+        let now = 100 * HOUR_MS;
+        let entity = Entity::new(
+            "system/some-other-thing",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+                entity_ecf::text("timestamp"),
+                entity_ecf::integer((now - 99 * HOUR_MS) as i64),
+            )])),
+        )
+        .unwrap();
+        let path = format!(
+            "/{}/system/runtime/chain-errors/lost/chain-xyz/req-1/notes/x",
+            test_peer_id()
+        );
+        let hash = h.content_store.put(entity).unwrap();
+        h.location_index.set(&path, hash);
+
+        h.collect_markers_at(now);
+
+        assert!(
+            h.location_index.get(&path).is_some(),
+            "an unidentified binding under the root must survive the sweep"
+        );
+    }
+
+    /// Absent evidence is not evidence of age. A marker whose body carries no
+    /// usable timestamp is never aged out — it would otherwise be collected on
+    /// the first sweep, which is the opposite of the retention contract.
+    #[test]
+    fn a_marker_without_a_usable_timestamp_is_never_aged_out() {
+        let h = make_handler();
+        let now = 100 * HOUR_MS;
+        let zero = bind_marker_at(&h, "lost", "capability_denied", 0);
+
+        let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+            entity_ecf::text("reason"),
+            entity_ecf::text("capability_denied"),
+        )]));
+        let entity = Entity::new("system/runtime/chain-error-lost", data).unwrap();
+        let missing = format!(
+            "/{}/system/runtime/chain-errors/lost/chain-xyz/req-1/capability_denied/{}",
+            test_peer_id(),
+            entity.content_hash.to_hex(),
+        );
+        let hash = h.content_store.put(entity).unwrap();
+        h.location_index.set(&missing, hash);
+
+        h.collect_markers_at(now);
+
+        assert!(h.location_index.get(&zero).is_some(), "timestamp 0 is kept");
+        assert!(
+            h.location_index.get(&missing).is_some(),
+            "a marker with no timestamp field is kept"
+        );
+    }
+
+    /// The operator's tree config is the RUNTIME knob and outranks the
+    /// deploy-time default — proven in the direction that cannot pass by
+    /// accident: a handler built to retain forever still collects when the tree
+    /// says 1000ms, which is only possible if the sweep actually reads the tree.
+    /// (Mirrors Go's `TestTreeConfigOverridesBuilderRetention`.)
+    #[test]
+    fn tree_config_overrides_the_builder_default() {
+        let h = make_handler().with_marker_retention_ms(marker_collect::RETAIN_MARKERS_FOREVER);
+        let now = 100 * HOUR_MS;
+        let path = bind_marker_at(&h, "lost", "capability_denied", now - 5000);
+
+        h.collect_markers_at(now);
+        assert!(
+            h.location_index.get(&path).is_some(),
+            "retain-forever builder default: nothing collected yet"
+        );
+
+        set_retention_config(&h, 1000);
+        h.collect_markers_at(now);
+        assert!(
+            h.location_index.get(&path).is_none(),
+            "the tree config must override the builder default"
+        );
+    }
+
+    /// An explicit `0` in the tree is the operator choosing to keep everything,
+    /// and it must beat a bounded builder default — the same precedence rule in
+    /// the other direction, which is what distinguishes "operator set 0" from
+    /// "operator set nothing".
+    #[test]
+    fn an_explicit_zero_in_the_tree_turns_collection_off() {
+        let h = make_handler().with_marker_retention_ms(1000);
+        let now = 100 * HOUR_MS;
+        let path = bind_marker_at(&h, "lost", "capability_denied", now - 50 * HOUR_MS);
+
+        set_retention_config(&h, marker_collect::RETAIN_MARKERS_FOREVER);
+        h.collect_markers_at(now);
+
+        assert!(
+            h.location_index.get(&path).is_some(),
+            "explicit retain-forever must be honored over a bounded default"
+        );
+    }
+
+    /// A malformed config must not turn collection off — that would silently
+    /// restore the leak v1.23 closed. Unreadable config ⇒ fall back to the
+    /// default, never to "keep everything".
+    #[test]
+    fn a_malformed_retention_config_falls_back_to_the_default() {
+        let h = make_handler();
+        let now = 100 * HOUR_MS;
+        let path = bind_marker_at(&h, "lost", "capability_denied", now - 30 * HOUR_MS);
+
+        let entity = Entity::new(
+            "system/config/chain-errors",
+            entity_ecf::to_ecf(&entity_ecf::text("not a map")),
+        )
+        .unwrap();
+        let hash = h.content_store.put(entity).unwrap();
+        h.location_index.set(
+            &format!(
+                "/{}/{}",
+                test_peer_id(),
+                marker_collect::MARKER_RETENTION_CONFIG_PATH
+            ),
+            hash,
+        );
+
+        h.collect_markers_at(now);
+
+        assert!(
+            h.location_index.get(&path).is_none(),
+            "an undecodable config means 'operator set nothing', not 'retain forever'"
+        );
+    }
+
+    /// A clock before epoch+window collects nothing. Without the guard the
+    /// unsigned subtraction wraps and the cutoff swallows the whole tree.
+    #[test]
+    fn a_clock_inside_the_first_window_collects_nothing() {
+        let h = make_handler();
+        let path = bind_marker_at(&h, "lost", "capability_denied", 1);
+        h.collect_markers_at(HOUR_MS);
+        assert!(h.location_index.get(&path).is_some());
+    }
+
+    /// **The wiring, not just the function.** Binding a marker through the real
+    /// failure path runs the sweep — this is what makes "the collector is the
+    /// binder" true of this build rather than of a helper nobody calls.
+    #[tokio::test]
+    async fn binding_a_marker_collects_the_expired_ones() {
+        let h = make_handler();
+        let now = capture_failure_timestamp_ms();
+        let old = bind_marker_at(&h, "lost", "capability_denied", now - 30 * HOUR_MS);
+
+        h.write_lost_error_marker(
+            &marker_chainerr(),
+            "entity://peerB/system/tree",
+            403,
+            CODE_CAPABILITY_DENIED,
+            now,
+            None,
+        );
+
+        assert!(
+            h.location_index.get(&old).is_none(),
+            "the bind path must sweep: an expired marker is gone after a new bind"
+        );
+        assert_eq!(
+            marker_count(&h),
+            1,
+            "and the marker just bound is not swept by its own sweep"
+        );
+    }
+
+    /// The sweep is throttled off the bind path: a second bind inside the
+    /// window does not pay for another pass. Asserted through the throttle's
+    /// observable consequence, since a peer binding at high rate is exactly the
+    /// case the throttle exists for.
+    #[tokio::test]
+    async fn the_bind_time_sweep_is_throttled() {
+        let h = make_handler();
+        let now = capture_failure_timestamp_ms();
+
+        h.write_lost_error_marker(
+            &marker_chainerr(),
+            "entity://peerB/system/tree",
+            403,
+            CODE_CAPABILITY_DENIED,
+            now,
+            None,
+        );
+        // Placed AFTER the first sweep has already run and taken the throttle.
+        let old = bind_marker_at(&h, "lost", "internal", now - 30 * HOUR_MS);
+
+        h.write_lost_error_marker(
+            &marker_chainerr(),
+            "entity://peerB/system/tree",
+            500,
+            "internal",
+            now,
+            None,
+        );
+
+        assert!(
+            h.location_index.get(&old).is_some(),
+            "the second bind is inside the throttle window and must not sweep"
+        );
+        // ...and the sweep is not lost, only deferred: driven directly, it goes.
+        h.collect_markers_at(now);
+        assert!(h.location_index.get(&old).is_none());
     }
 }
