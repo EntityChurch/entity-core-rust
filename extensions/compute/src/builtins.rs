@@ -17,6 +17,11 @@ pub const BUILTIN_MAP: &str = "system/compute/builtins/map";
 pub const BUILTIN_FILTER: &str = "system/compute/builtins/filter";
 pub const BUILTIN_FOLD: &str = "system/compute/builtins/fold";
 pub const BUILTIN_STORE: &str = "system/compute/builtins/store";
+// The v3.24 collection primitives (§3.5) — all pure, all MUST-given-COMPUTE.
+pub const BUILTIN_RANGE: &str = "system/compute/builtins/range";
+pub const BUILTIN_GROUP_BY: &str = "system/compute/builtins/group-by";
+pub const BUILTIN_CONCAT: &str = "system/compute/builtins/concat";
+pub const BUILTIN_ASSOC: &str = "system/compute/builtins/assoc";
 
 pub const ALL_BUILTINS: &[&str] = &[
     BUILTIN_ARITHMETIC,
@@ -28,6 +33,10 @@ pub const ALL_BUILTINS: &[&str] = &[
     BUILTIN_FILTER,
     BUILTIN_FOLD,
     BUILTIN_STORE,
+    BUILTIN_RANGE,
+    BUILTIN_GROUP_BY,
+    BUILTIN_CONCAT,
+    BUILTIN_ASSOC,
 ];
 
 /// Check if a path is a builtin handler path.
@@ -56,6 +65,10 @@ pub fn builtin_input_type(path: &str, operation: &str) -> Option<&'static str> {
         "filter" => TYPE_FILTER_ARGS,
         "fold" => TYPE_FOLD_ARGS,
         "store" => TYPE_STORE_ARGS,
+        "range" => TYPE_RANGE_ARGS,
+        "group-by" => TYPE_GROUP_BY_ARGS,
+        "concat" => TYPE_CONCAT_ARGS,
+        "assoc" => TYPE_ASSOC_ARGS,
         _ => return None,
     })
 }
@@ -103,8 +116,11 @@ pub fn dispatch_builtin_alias(
         // `value` per SA-9.
         "store" => alias_store(args, scope, budget, ctx),
         // Collection builtins' input types are all `system/hash`, so the
-        // generic "every arg is hash bytes" build is correct here.
-        "map" | "filter" | "fold" => {
+        // generic "every arg is hash bytes" build is correct here. The v3.24
+        // four join it: `range-args.n`, `group-by-args.{collection,fn}`,
+        // `assoc-args.{collection,index,value}` and `concat-args.collections`
+        // all arrive through the apply args map as a single hash per name.
+        "map" | "filter" | "fold" | "range" | "group-by" | "concat" | "assoc" => {
             let input_type = builtin_input_type(path, operation)?;
             let params = match build_typed_args_entity(input_type, args) {
                 Ok(e) => e,
@@ -142,25 +158,48 @@ fn build_typed_args_entity(
 }
 
 /// Resolve a hash to a string value by evaluating the referenced expression.
-/// Returns `""` (empty) on missing/non-string — the downstream inline
-/// evaluator's validation will reject the empty/unknown op.
+///
+/// Returns `Err(error_value)` when the referenced expression **evaluates to a
+/// `compute/error`** — every caller of this helper is reading a *steering*
+/// value (an op name, a field name, an entity type, a write path), which makes
+/// it a consumed operand under §7.2's *"all expression types that consume
+/// values"* `[MUST]`. Returns `Ok("")` for missing/unresolvable/non-string, as
+/// before; the callers' own validation rejects that.
+///
+/// **C-12 (go's sweep, confirmed here).** This helper previously swallowed an
+/// error into `""` via `unwrap_or_default()`, so a `compute/error` in `store`'s
+/// `path` was reported as `invalid_expression: missing or non-string 'path'` —
+/// go's seat answered `type_mismatch` for the same reason, one branch over.
+/// Either way the caller learns nothing about the real failure and §7.2's
+/// short-circuit does not happen.
+///
+/// **The boundary is the helper, not the routed field.** C-12 named `store`'s
+/// `path`, which is where go measured it; the sentence binds every *consumed*
+/// operand, and in this tree all six of them share this one function —
+/// `arithmetic`/`compare`/`logic`'s `op`, `field`'s `name`, `construct`'s
+/// `entity_type`, and `store`'s `path`. Fixing only the routed field would have
+/// left five siblings with the identical defect behind a green gate.
 fn resolve_string_arg(
     args: &[(String, entity_hash::Hash)],
     key: &str,
     scope: &Scope,
     budget: &mut Budget,
     ctx: &mut EvalContext<'_>,
-) -> String {
+) -> Result<String, ComputeValue> {
     let hash = match args.iter().find(|(k, _)| k == key) {
         Some((_, h)) => *h,
-        None => return String::new(),
+        None => return Ok(String::new()),
     };
     let target = match ctx.resolve_or_error(&hash, key) {
         Ok(e) => e,
-        Err(_) => return String::new(),
+        Err(_) => return Ok(String::new()),
     };
     let v = eval::evaluate(&target, scope, budget, ctx);
-    v.as_str_val().map(|s| s.to_string()).unwrap_or_default()
+    // Kind-based, so the minted and SA-1 value forms short-circuit alike (§2.4).
+    if v.is_error() {
+        return Err(v);
+    }
+    Ok(v.as_str_val().map(|s| s.to_string()).unwrap_or_default())
 }
 
 fn args_hash<'a>(
@@ -176,7 +215,10 @@ fn alias_arithmetic(
     budget: &mut Budget,
     ctx: &mut EvalContext<'_>,
 ) -> ComputeValue {
-    let op = resolve_string_arg(args, "op", scope, budget, ctx);
+    let op = match resolve_string_arg(args, "op", scope, budget, ctx) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     let left = match args_hash(args, "left") {
         Some(h) => *h,
         None => {
@@ -211,7 +253,10 @@ fn alias_compare(
     budget: &mut Budget,
     ctx: &mut EvalContext<'_>,
 ) -> ComputeValue {
-    let op = resolve_string_arg(args, "op", scope, budget, ctx);
+    let op = match resolve_string_arg(args, "op", scope, budget, ctx) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     let left = match args_hash(args, "left") {
         Some(h) => *h,
         None => {
@@ -244,7 +289,10 @@ fn alias_logic(
     budget: &mut Budget,
     ctx: &mut EvalContext<'_>,
 ) -> ComputeValue {
-    let op = resolve_string_arg(args, "op", scope, budget, ctx);
+    let op = match resolve_string_arg(args, "op", scope, budget, ctx) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     let left = match args_hash(args, "left") {
         Some(h) => *h,
         None => {
@@ -286,7 +334,10 @@ fn alias_field(
     budget: &mut Budget,
     ctx: &mut EvalContext<'_>,
 ) -> ComputeValue {
-    let name = resolve_string_arg(args, "name", scope, budget, ctx);
+    let name = match resolve_string_arg(args, "name", scope, budget, ctx) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     let entity_h = match args_hash(args, "entity") {
         Some(h) => *h,
         None => {
@@ -315,7 +366,10 @@ fn alias_store(
     //   - path  (system/tree/path / primitive-like) → resolve+evaluate to string
     //   - value (system/hash)                       → keep hash bytes; the
     //     store builtin's body evaluates it per SA-9
-    let path = resolve_string_arg(args, "path", scope, budget, ctx);
+    let path = match resolve_string_arg(args, "path", scope, budget, ctx) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     if path.is_empty() {
         return ComputeError::InvalidExpression("store alias: missing or non-string 'path'".into())
             .to_value();
@@ -350,7 +404,10 @@ fn alias_construct(
     budget: &mut Budget,
     ctx: &mut EvalContext<'_>,
 ) -> ComputeValue {
-    let entity_type = resolve_string_arg(args, "entity_type", scope, budget, ctx);
+    let entity_type = match resolve_string_arg(args, "entity_type", scope, budget, ctx) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
     if entity_type.is_empty() {
         return ComputeError::InvalidExpression(
             "construct alias: missing or empty 'entity_type'".into(),
@@ -418,6 +475,11 @@ pub fn dispatch_builtin(
         "filter" => dispatch_filter(&data, scope, budget, ctx),
         "fold" => dispatch_fold(&data, scope, budget, ctx),
         "store" => dispatch_store(&data, scope, budget, ctx),
+        // The v3.24 collection primitives (§3.5) — see `builtins_v324`.
+        "range" => crate::builtins_v324::dispatch_range(&data, scope, budget, ctx),
+        "group-by" => crate::builtins_v324::dispatch_group_by(&data, scope, budget, ctx),
+        "concat" => crate::builtins_v324::dispatch_concat(&data, scope, budget, ctx),
+        "assoc" => crate::builtins_v324::dispatch_assoc(&data, scope, budget, ctx),
         _ => return None,
     };
 
@@ -640,13 +702,34 @@ fn dispatch_map(
         None => return ComputeError::TypeMismatch("map: fn must be a closure".into()).to_value(),
     };
 
+    // C-11 Corner 1 (ruled 2026-08-21): **map's output element CONTAINS.**
+    //
+    // `map` never reads the closure's result — it places it — so by the rule
+    // that replaced the "exactly three positions" count (*places without
+    // reading = contain; reads to decide = consume*) this is structurally the
+    // same position as `concat`'s element and `assoc`'s `value`, and it goes
+    // through the same single v3.26 site: `contained_element`, which
+    // re-canonicalizes both in-language error forms to code-only bytes and
+    // makes the referent resident.
+    //
+    // It is also what §1.5's model requires. "The same model as NaN propagation
+    // in IEEE 754" is **element-wise**: `map(f, [1,2,3])` where `f` fails only
+    // on element 2 is `[a, E, c]`. Aborting the whole array is exception
+    // semantics, which §1.5 explicitly declined.
+    //
+    // This seat previously short-circuited here. That was a *symmetric* wrong
+    // answer rather than the §2.4 provenance asymmetry the ruling names — our
+    // `is_error` is kind-based, so both forms aborted alike — but it was the
+    // wrong disposition either way.
     let mut results = Vec::new();
     for item in &items {
         let val = apply_closure_to_value(&closure, item, scope, budget, ctx);
-        if val.is_error() {
+        // The one carve-out, and it is about a *shared* resource rather than
+        // about limit codes — see `ComputeValue::is_shared_resource_error`.
+        if val.is_shared_resource_error() {
             return val;
         }
-        results.push(compute_value_to_cbor(&val));
+        results.push(crate::builtins_v324::contained_element(&val, ctx));
     }
 
     ComputeValue::Primitive(Value::Array(results))
@@ -682,6 +765,20 @@ fn dispatch_filter(
         }
     };
 
+    // C-11 Corner 1 (ruled 2026-08-21): **filter's predicate result
+    // SHORT-CIRCUITS**, and this seat was already right — pinned here so the
+    // symmetry with `map` two functions up is not "tidied" into agreement.
+    //
+    // The predicate result is *read for truthiness* (§4.5) to decide inclusion,
+    // which makes it a consumed operand by §7.2's plain terms — the identical
+    // case to `group-by`'s derived key. Containing it would be the worse bug of
+    // the two: an error has no truth value, so coercing it to false **silently
+    // drops the element** and yields a well-formed wrong answer carrying no
+    // error at all. That is the exact failure §3.5 refused when it declined to
+    // clamp a negative `range(n)` to `[]`.
+    //
+    // `is_error` is kind-based, so the minted and SA-1 value forms short-circuit
+    // alike (§2.4). Teeth: `filter_predicate_error_short_circuits_in_both_forms`.
     let mut results = Vec::new();
     for item in &items {
         let val = apply_closure_to_value(&closure, item, scope, budget, ctx);
@@ -710,8 +807,15 @@ fn dispatch_fold(
     if fn_val.is_error() {
         return fn_val;
     }
+    // C-11 Corner 1 (ruled 2026-08-21): the accumulator is **bound, not
+    // consumed** — so an error `initial` is NOT short-circuited here. It is
+    // handed to the closure like any other value, and a closure that ignores
+    // its accumulator **recovers**. Arch flagged this as the position of the
+    // three with the widest blast radius, because it is the only one where the
+    // alternative reading produces a different *value* rather than a different
+    // cost; CV-8d is built to be exactly that shape.
     let initial = eval_ref(data, "initial", "fold initial", scope, budget, ctx);
-    if initial.is_error() {
+    if initial.is_shared_resource_error() {
         return initial;
     }
 
@@ -735,11 +839,20 @@ fn dispatch_fold(
         .to_value();
     }
 
+    // Each `fn` result becomes the next invocation's bound accumulator, error
+    // or not — `fold` never reads it. The final accumulator is the fold's
+    // result and is **returned**, not inspected: it is a contained position,
+    // and whether an error there surfaces as a value or as the expression's
+    // error outcome is the top level's call, not this loop's.
+    //
+    // Only the shared-resource carve-out still stops the loop: continuing to
+    // iterate past an exhausted budget charges for work that cannot run and
+    // reports success for an aborted evaluation.
     let mut acc = initial;
     for item in &items {
         let item_val = ComputeValue::Primitive(item.clone());
         acc = apply_closure_to_two_values(&closure, &acc, &item_val, scope, budget, ctx);
-        if acc.is_error() {
+        if acc.is_shared_resource_error() {
             return acc;
         }
     }
@@ -874,7 +987,7 @@ fn dispatch_store(
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn eval_ref(
+pub(crate) fn eval_ref(
     data: &Value,
     key: &str,
     label: &str,
@@ -910,17 +1023,7 @@ fn canonical_sorted_pairs(pairs: &[(String, Hash)]) -> Vec<(String, Hash)> {
     sorted
 }
 
-fn compute_value_to_cbor(value: &ComputeValue) -> Value {
-    match value {
-        ComputeValue::Primitive(v) => v.clone(),
-        ComputeValue::Entity(e) => Value::Bytes(e.content_hash.to_bytes().to_vec()),
-        ComputeValue::Closure(c) => Value::Bytes(c.to_entity().content_hash.to_bytes().to_vec()),
-        ComputeValue::Error(err) => Value::Bytes(err.to_entity().content_hash.to_bytes().to_vec()),
-        ComputeValue::Uint(u) => Value::Integer(ciborium::value::Integer::from(*u)),
-    }
-}
-
-fn extract_closure(val: &ComputeValue) -> Option<ClosureValue> {
+pub(crate) fn extract_closure(val: &ComputeValue) -> Option<ClosureValue> {
     match val {
         ComputeValue::Closure(c) => Some(c.clone()),
         ComputeValue::Entity(e) if e.entity_type == TYPE_CLOSURE => {
@@ -934,7 +1037,7 @@ fn extract_closure(val: &ComputeValue) -> Option<ClosureValue> {
     }
 }
 
-fn apply_closure_to_value(
+pub(crate) fn apply_closure_to_value(
     closure: &ClosureValue,
     item: &Value,
     _scope: &Scope,
@@ -1388,6 +1491,86 @@ mod tests {
             result.is_error(),
             "a bad consumed operand must fail the store"
         );
+    }
+
+    /// **C-12 — a `compute/error` in a CONSUMED alias operand short-circuits**,
+    /// and the assertion is swept across all six of them, not just the routed
+    /// one.
+    ///
+    /// core-go found this by running the enforcement grep their own
+    /// collection-operand fix earned, and routed `store`'s `path` because that
+    /// is where they measured it. The binding sentence is §7.2's — *"all
+    /// expression types that consume values"* — and in this tree every consumed
+    /// string operand funnels through one helper, `resolve_string_arg`, which
+    /// swallowed an error into `""` via `unwrap_or_default()`. So the defect was
+    /// never `store`'s: `path` reported `invalid_expression`, and `op` / `name` /
+    /// `entity_type` each reported their own local complaint, all for the same
+    /// reason and all losing the real error.
+    ///
+    /// Mutation: restore `unwrap_or_default()` in `resolve_string_arg` and every
+    /// row below goes red with a *different* wrong code, which is what makes the
+    /// table worth more than the one row that was routed.
+    #[test]
+    fn consumed_alias_operands_short_circuit_an_error_value_in_every_position() {
+        let cs = MemoryContentStore::new();
+        let li = MemoryLocationIndex::new();
+        let included = HashMap::new();
+
+        // The SA-1 value form: a stored `compute/error` an operand resolves to.
+        let err = Entity::new(
+            TYPE_ERROR,
+            entity_ecf::to_ecf(&entity_ecf::cbor_map! {
+                "code" => entity_ecf::text("seeded_error"),
+                "message" => entity_ecf::text("consumed-operand seed")
+            }),
+        )
+        .unwrap();
+        let eh = cs.put(err).unwrap();
+        let lit = cs.put(make_literal_int(1)).unwrap();
+
+        for (builtin, key, extra) in [
+            (BUILTIN_STORE, "path", &["value"][..]),
+            (BUILTIN_ARITHMETIC, "op", &["left", "right"][..]),
+            (BUILTIN_COMPARE, "op", &["left", "right"][..]),
+            (BUILTIN_LOGIC, "op", &["left", "right"][..]),
+            (BUILTIN_FIELD, "name", &["entity"][..]),
+            (BUILTIN_CONSTRUCT, "entity_type", &[][..]),
+        ] {
+            let mut args: Vec<(String, Hash)> = vec![(key.to_string(), eh)];
+            for name in extra {
+                args.push((name.to_string(), lit));
+            }
+
+            let mut budget = Budget::default_budget();
+            let mut ctx = EvalContext::new(&cs, &li, &included, TEST_PID);
+            let got = dispatch_builtin_alias(
+                builtin,
+                "eval",
+                &args,
+                &Scope::new(),
+                &mut budget,
+                &mut ctx,
+            )
+            .unwrap_or_else(|| panic!("{} is a builtin", builtin));
+
+            let code = match &got {
+                ComputeValue::Error(e) => e.code().to_string(),
+                ComputeValue::Entity(e) if e.entity_type == TYPE_ERROR => decode_data(e)
+                    .as_ref()
+                    .and_then(|d| data_str(d, "code"))
+                    .unwrap_or_default(),
+                other => panic!(
+                    "{}'s '{}' must short-circuit, got {:?}",
+                    builtin, key, other
+                ),
+            };
+            assert_eq!(
+                code, "seeded_error",
+                "{}'s consumed operand '{}' must short-circuit to the operand's own error, \
+                 not to a local complaint about its type",
+                builtin, key
+            );
+        }
     }
 
     #[test]

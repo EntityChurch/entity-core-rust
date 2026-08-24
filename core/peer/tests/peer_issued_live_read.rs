@@ -194,7 +194,13 @@ fn publish_binding_at(
         name: name.into(),
         kind: "peer-issued".into(),
         target_peer_id: target.into(),
-        transports: vec![entity_ecf::Value::Text("tcp://billslab.com:9000".into())],
+        // REGISTRY §3 `transports` is `[system/hash]` (ruled 2026-08-21, D8) —
+        // a reference to a `system/peer/transport/*` entity, not an endpoint
+        // string. Nothing in this test resolves it; it just has to be a hash.
+        transports: vec![Hash::compute(
+            "system/peer/transport/tcp",
+            b"tcp://billslab.com:9000",
+        )],
         issued_at,
         ttl,
         supersedes: None,

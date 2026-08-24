@@ -14,6 +14,17 @@ use crate::log::ResolutionLog;
 use crate::registration::name_constraints_match;
 use crate::resolver::{dispatch_match, RegistryHandler};
 
+/// A stand-in `system/peer/transport/*` reference.
+///
+/// REGISTRY §3 `transports` is `[system/hash]` (ruled 2026-08-21, D8), so a
+/// fixture cannot carry an endpoint string any more — these used to be
+/// `Value::Text("tcp://…")`, which is exactly the untyped passthrough the
+/// ruling removed. The hash is derived from the endpoint text only so each
+/// fixture keeps a distinct, stable value; nothing here resolves it.
+fn transport_ref(endpoint: &str) -> Hash {
+    Hash::compute("system/peer/transport/tcp", endpoint.as_bytes())
+}
+
 const PEER: &str = "z6MkTestPeerIdForRegistry";
 
 fn stores() -> (Arc<dyn ContentStore>, Arc<dyn LocationIndex>) {
@@ -70,7 +81,7 @@ fn binding_round_trip() {
         name: "alice".into(),
         kind: KIND_LOCAL_NAME.into(),
         target_peer_id: "z6MkAlice".into(),
-        transports: vec![Value::Text("tcp://host:9000".into())],
+        transports: vec![transport_ref("tcp://host:9000")],
         issued_at: 1_700_000_000_000,
         ttl: None,
         supersedes: Some(Hash::compute("x", b"a")),
@@ -1174,7 +1185,7 @@ fn publish_binding(
         name: name.into(),
         kind: KIND_PEER_ISSUED.into(),
         target_peer_id: target.into(),
-        transports: vec![Value::Text("tcp://billslab.com:9000".into())],
+        transports: vec![transport_ref("tcp://billslab.com:9000")],
         issued_at,
         ttl,
         supersedes: None,
@@ -1688,7 +1699,7 @@ fn mk_request(name: &str, target: &str, nonce: &[u8]) -> Entity {
     RegisterRequestData {
         name: name.into(),
         target_peer_id: target.into(),
-        transports: vec![Value::Text("tcp://billslab.com:9000".into())],
+        transports: vec![transport_ref("tcp://billslab.com:9000")],
         requested_ttl: Some(86_400_000),
         nonce: nonce.to_vec(),
         issued_at: crate::log::now_ms(),
@@ -2121,7 +2132,7 @@ async fn queue_one_ttl(
     let req = RegisterRequestData {
         name: name.into(),
         target_peer_id: owner.peer_id().as_str().to_string(),
-        transports: vec![Value::Text("tcp://billslab.com:9000".into())],
+        transports: vec![transport_ref("tcp://billslab.com:9000")],
         requested_ttl: Some(ttl),
         nonce: nonce.to_vec(),
         issued_at: crate::log::now_ms(),
@@ -3127,7 +3138,7 @@ async fn out_of_band_null_default_ttl_policy_refuses_at_register() {
     let no_ttl = RegisterRequestData {
         name: "billslab.com".into(),
         target_peer_id: owner.peer_id().as_str().into(),
-        transports: vec![Value::Text("tcp://billslab.com:9000".into())],
+        transports: vec![transport_ref("tcp://billslab.com:9000")],
         requested_ttl: None,
         nonce: b"n1".to_vec(),
         issued_at: crate::log::now_ms(),
@@ -3500,7 +3511,7 @@ async fn reg_ttl_clamp_1() {
     let mut req = RegisterRequestData {
         name: "billslab.com".into(),
         target_peer_id: owner.peer_id().as_str().to_string(),
-        transports: vec![Value::Text("tcp://billslab.com:9000".into())],
+        transports: vec![transport_ref("tcp://billslab.com:9000")],
         requested_ttl: Some(31_536_000_000),
         nonce: b"clamp-reg".to_vec(),
         issued_at: crate::log::now_ms(),
@@ -3579,7 +3590,7 @@ async fn curated_with_one_binding(
     let req = RegisterRequestData {
         name: "billslab.com".into(),
         target_peer_id: owner.peer_id().as_str().to_string(),
-        transports: vec![Value::Text("tcp://billslab.com:9000".into())],
+        transports: vec![transport_ref("tcp://billslab.com:9000")],
         requested_ttl,
         nonce: b"seed".to_vec(),
         issued_at: crate::log::now_ms(),
@@ -4046,7 +4057,7 @@ async fn approve_request_applies_the_ceiling_live_not_as_queued() {
     let req = RegisterRequestData {
         name: "billslab.com".into(),
         target_peer_id: owner.peer_id().as_str().to_string(),
-        transports: vec![Value::Text("tcp://billslab.com:9000".into())],
+        transports: vec![transport_ref("tcp://billslab.com:9000")],
         requested_ttl: Some(31_536_000_000),
         nonce: b"queued".to_vec(),
         issued_at: crate::log::now_ms(),
@@ -5317,4 +5328,77 @@ async fn set_resolver_config_refuses_a_bare_config_entity_as_params() {
         .unwrap();
     assert_eq!(r.status, 400);
     assert_eq!(err_code(&r).as_deref(), Some("invalid_params"));
+}
+
+/// `REG-BINDING-TRANSPORTS-SHAPE-1`, both rows — and row (b) is the one that
+/// measures anything.
+///
+/// REGISTRY §3 `transports` is `[system/hash]` (ruled 2026-08-21, D8). Arch's
+/// finding against this seat was *not* that we picked the wrong shape — it was
+/// that `Vec<Value>` **picked nothing**: an untyped field passes through
+/// whatever an application hands it, so a divergence became wire-visible
+/// without any seat deciding it should. The author of the inline bytes was
+/// `entity-browser-rust`'s `http_poll_profile()`; our defect was declining to
+/// type the field.
+///
+/// Row (b) fails closed because NETWORK §6.5.1a D5 makes the entity *type*
+/// authoritative for a transport's kind and explicitly demotes the
+/// `transport_type` field — an inline profile map is type-stripped, so it
+/// destroys D5's authoritative source and leaves only the field D5 demotes.
+///
+/// A decoder liberal in both directions passes (a) and fails (b), which is why
+/// (b) is the discriminator. Mutation: relax `field_hash_array` back to
+/// `field_array` and (b) goes green while (a) never moves.
+#[test]
+fn binding_transports_is_an_array_of_bare_hashes_and_refuses_an_inline_profile() {
+    // (a) the ruled shape round-trips.
+    let refs = vec![
+        transport_ref("tcp://billslab.com:9000"),
+        transport_ref("http-poll://billslab.com/"),
+    ];
+    let binding = BindingData {
+        name: "billslab.com".into(),
+        kind: KIND_LOCAL_NAME.into(),
+        target_peer_id: "z6MkTransportShape".into(),
+        transports: refs.clone(),
+        issued_at: 1_700_000_000_000,
+        ttl: None,
+        supersedes: None,
+        issuer_attestation: None,
+        metadata: None,
+    };
+    let entity = binding.to_entity().expect("encode");
+    let back = BindingData::from_entity(&entity).expect("row (a): bare hashes decode");
+    assert_eq!(back.transports, refs);
+
+    // (b) the inline profile map is refused, not passed through.
+    let map = decode_map(&entity.data).expect("decode");
+    let mut fields: Vec<(Value, Value)> = map
+        .iter()
+        .filter(|(k, _)| k.as_text() != Some("transports"))
+        .cloned()
+        .collect();
+    fields.push((
+        Value::Text("transports".into()),
+        Value::Array(vec![Value::Map(vec![(
+            Value::Text("tree_url_prefix".into()),
+            Value::Text("https://billslab.com/".into()),
+        )])]),
+    ));
+    fields.sort_by(|(a, _), (b, _)| {
+        let (a, b) = (a.as_text().unwrap_or(""), b.as_text().unwrap_or(""));
+        a.len().cmp(&b.len()).then_with(|| a.cmp(b))
+    });
+    let inline = Entity::new(
+        entity_types::TYPE_REGISTRY_BINDING,
+        to_ecf(&Value::Map(fields)),
+    )
+    .expect("build inline-form binding");
+
+    let err = BindingData::from_entity(&inline)
+        .expect_err("row (b): an inline profile map is not a transport reference");
+    assert!(
+        format!("{err}").contains("transports"),
+        "the refusal must name the field it is about, got: {err}"
+    );
 }

@@ -29,7 +29,9 @@
 //!
 //! ## entities.log payload (record version 1)
 //! ```text
-//! [hash: 33 bytes]               // algorithm byte + 32-byte digest
+//! [hash: wire form]               // format varint + digest; width follows the
+//!                                // format byte (33 under SHA-256, 49 under
+//!                                // SHA-384) — never a constant, §8.4.5
 //! [entity_type_len: u16 BE]
 //! [entity_type: utf-8 bytes]
 //! [data: remaining bytes]        // CBOR-encoded entity body
@@ -48,7 +50,8 @@
 //! [op: u8]                       // 0 = set, 1 = remove
 //! [path_len: u16 BE]
 //! [path: utf-8 bytes]
-//! [hash: 33 bytes]               // only when op == 0
+//! [hash: wire form]               // only when op == 0; width follows the
+//!                                // format byte, never a constant (§8.4.5)
 //! ```
 //!
 //! Locations are mutable — `locations.log` accumulates set/remove
@@ -685,14 +688,34 @@ fn read_frame(bytes: &[u8], cursor: usize) -> FrameResult {
     }
 }
 
+/// Wire length of the hash at the head of `payload`, read from its own leading
+/// format byte.
+///
+/// **Never assume a width** (`SPECIFICATION-FORMAT` §8.4.5): the writer emits
+/// `Hash::to_bytes`, which is 33 bytes under ECFv1-SHA-256 (`0x00`) and 49
+/// under ECFv1-SHA-384 (`0x01`). A fixed 33 here framed every subsequent field
+/// from the wrong offset the moment a peer's home format was not SHA-256 — a
+/// write-shape/read-shape asymmetry inside one file, silent while one algorithm
+/// ships. Single-byte format codes only, as everywhere else in this tree: no
+/// multi-byte LEB128 code is allocated (v7.67 §5.4).
+fn head_hash_len(payload: &[u8]) -> Result<usize, OpfsError> {
+    let code = *payload
+        .first()
+        .ok_or_else(|| OpfsError::Decode("payload carries no hash".into()))?;
+    entity_hash::digest_len_for_format(code)
+        .map(|digest| 1 + digest)
+        .ok_or_else(|| OpfsError::Decode(format!("unsupported content_hash_format {code:#04x}")))
+}
+
 fn apply_entity_record(payload: &[u8], memory: &MemoryContentStore) -> Result<(), OpfsError> {
-    if payload.len() < 33 + 2 {
+    let hash_len = head_hash_len(payload)?;
+    if payload.len() < hash_len + 2 {
         return Err(OpfsError::Decode("entity payload too short".into()));
     }
-    let hash =
-        Hash::from_bytes(&payload[0..33]).map_err(|e| OpfsError::Decode(format!("hash: {e}")))?;
-    let type_len = u16::from_be_bytes([payload[33], payload[34]]) as usize;
-    let body_start = 35;
+    let hash = Hash::from_bytes(&payload[0..hash_len])
+        .map_err(|e| OpfsError::Decode(format!("hash: {e}")))?;
+    let type_len = u16::from_be_bytes([payload[hash_len], payload[hash_len + 1]]) as usize;
+    let body_start = hash_len + 2;
     let body_end = body_start + type_len;
     if body_end > payload.len() {
         return Err(OpfsError::Decode("entity_type truncated".into()));
@@ -729,7 +752,8 @@ fn apply_location_record(payload: &[u8], memory: &MemoryLocationIndex) -> Result
     match op {
         LOC_OP_SET => {
             let hash_start = path_end;
-            let hash_end = hash_start + 33;
+            // Width follows the hash's own format byte, never a constant (§8.4.5).
+            let hash_end = hash_start + head_hash_len(&payload[hash_start..])?;
             if hash_end > payload.len() {
                 return Err(OpfsError::Decode("location hash truncated".into()));
             }

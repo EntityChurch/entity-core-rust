@@ -1263,7 +1263,7 @@ impl RegisterRequestHandler {
         &self,
         name_norm: &str,
         target_peer_id: &str,
-        transports: Vec<Value>,
+        transports: Vec<Hash>,
         ttl: Option<u64>,
         supersedes: Option<Hash>,
     ) -> Result<Hash, HandlerResult> {

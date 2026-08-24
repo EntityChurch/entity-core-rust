@@ -79,6 +79,31 @@ pub struct LocalNameHandler {
     qualified_pattern: String,
 }
 
+/// `transports` on a `:bind` / `:update-transports` request is `[system/hash]`
+/// (REGISTRY §3, ruled 2026-08-21 D8) — the same fail-closed shape
+/// `BindingData` decodes, applied at the *request* boundary so a caller cannot
+/// get an inline profile map into a binding body this handler mints.
+fn decode_transport_refs(map: &[(Value, Value)]) -> Result<Vec<Hash>, String> {
+    let Some(v) = get_field(map, "transports") else {
+        return Ok(Vec::new());
+    };
+    if matches!(v, Value::Null) {
+        return Ok(Vec::new());
+    }
+    let items = v
+        .as_array()
+        .ok_or_else(|| "transports must be an array of system/hash".to_string())?;
+    items
+        .iter()
+        .map(|item| {
+            let b = item.as_bytes().ok_or_else(|| {
+                "transports entries are bare system/hash, not inline profile maps".to_string()
+            })?;
+            Hash::from_bytes(b).map_err(|e| e.to_string())
+        })
+        .collect()
+}
+
 impl LocalNameHandler {
     pub fn new(
         content_store: Arc<dyn ContentStore>,
@@ -159,10 +184,10 @@ impl LocalNameHandler {
         let config = self.config();
         let key = normalize_name(&name, &config.case_normalization);
 
-        let transports = get_field(&map, "transports")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
+        let transports = match decode_transport_refs(&map) {
+            Ok(t) => t,
+            Err(e) => return error(STATUS_BAD_REQUEST, "invalid_params", &e),
+        };
         let notes = get_field(&map, "notes")
             .and_then(|v| v.as_text())
             .map(|s| s.to_string());
@@ -256,10 +281,10 @@ impl LocalNameHandler {
             Some(n) => n.to_string(),
             None => return error(STATUS_BAD_REQUEST, "invalid_params", "name required"),
         };
-        let transports = get_field(&map, "transports")
-            .and_then(|v| v.as_array())
-            .cloned()
-            .unwrap_or_default();
+        let transports = match decode_transport_refs(&map) {
+            Ok(t) => t,
+            Err(e) => return error(STATUS_BAD_REQUEST, "invalid_params", &e),
+        };
         let key = normalize_name(&name, &self.config().case_normalization);
         let pointer_path = local_name_pointer_path(&self.peer_id, &key);
         let existing = match self.location_index.get(&pointer_path) {
@@ -287,7 +312,7 @@ impl LocalNameHandler {
         &self,
         key: &str,
         target_peer_id: String,
-        transports: Vec<Value>,
+        transports: Vec<Hash>,
         notes: Option<String>,
         supersedes: Option<Hash>,
         pinned: bool,

@@ -819,6 +819,20 @@ fn publish_self_tcp_profile(
 /// body + invariant-pointer signature + by-name pointer into the peer's tree —
 /// the artifacts the `peer-issued` resolve backend reads + verifies. Serve the
 /// result as a coral-reef (`peer start … --serve-namespace system/registry`).
+/// Decode lowercase/uppercase hex. Deliberately does **not** check a length:
+/// `Hash::from_bytes` rejects any hex whose length disagrees with its own
+/// format byte, which is strictly stronger than a `== 66` gate and is the rule
+/// SPECIFICATION-FORMAT §8.4.5 exists to enforce.
+fn decode_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) || s.is_empty() {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok())
+        .collect()
+}
+
 pub fn issue_binding(
     name: &str,
     bind_name: &str,
@@ -911,12 +925,41 @@ pub fn issue_binding(
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
 
+    // REGISTRY §3 `transports` is `[system/hash]` (ruled 2026-08-21, D8): each
+    // entry references a `system/peer/transport/*` entity that carries its own
+    // type, which is what NETWORK §6.5.1a D5 makes authoritative.
+    //
+    // So `--transport` takes the **hash** of an already-published transport
+    // entity, not a URL. Minting one from a URL string would mean this CLI
+    // choosing a profile shape NETWORK owns — the precise thing that got us
+    // here: arch's finding was that a field left untyped passes through whatever
+    // an application hands it, so a divergence became wire-visible without any
+    // seat deciding it should. We decline to be the seat that decides it here.
+    let transport_refs = {
+        let mut refs = Vec::with_capacity(transports.len());
+        for t in transports {
+            let bytes = decode_hex(t).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--transport takes the hex content-hash of a published \
+                     system/peer/transport/* entity, not an endpoint URL (got {:?}). \
+                     REGISTRY §3 transports is [system/hash].",
+                    t
+                )
+            })?;
+            refs.push(
+                entity_core::hash::Hash::from_bytes(&bytes)
+                    .map_err(|e| anyhow::anyhow!("--transport {:?}: {e}", t))?,
+            );
+        }
+        refs
+    };
+
     // 1. binding body.
     let binding = BindingData {
         name: norm.clone(),
         kind: KIND_PEER_ISSUED.to_string(),
         target_peer_id: target_peer_id.to_string(),
-        transports: transports.iter().map(entity_core::ecf::text).collect(),
+        transports: transport_refs,
         issued_at: now_ms,
         ttl: ttl_ms,
         supersedes: None,

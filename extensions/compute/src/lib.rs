@@ -5,6 +5,7 @@
 #![allow(clippy::result_large_err)]
 
 pub mod builtins;
+pub mod builtins_v324;
 pub mod engine;
 pub mod eval;
 pub mod memo;

@@ -823,6 +823,61 @@ mod tests {
         );
     }
 
+    /// EXTENSION-NETWORK §6.5.3 hex-strictness: the content-hash hex on the
+    /// `http-poll` routes is the **full wire form, format-code byte included**
+    /// — never the digest-only form — and **its length is the one the leading
+    /// format byte implies and is NEVER hardcoded** (`SPECIFICATION-FORMAT`
+    /// §8.4.5): 66 chars beginning `00` under ECFv1-SHA-256, 98 beginning `01`
+    /// under ECFv1-SHA-384.
+    ///
+    /// This asserts the PROPERTY, not a round-trip. `content_url(..) ==
+    /// format!("…/{}", h.to_hex())` is a tautology — it compares the builder
+    /// against the very function the builder calls, so it stays green under a
+    /// digest-only builder too, which is how core-go's `BuildContentURL` shipped
+    /// `EffectiveDigest()` past its own test. What separates the two is the
+    /// leading byte and the byte-implied width, checked at two formats: a
+    /// hardcoded 66 passes the SHA-256 row and fails the SHA-384 one, and that
+    /// is the 2026-08-10 cohort defect that `400`'d a valid SHA-384 hash.
+    #[test]
+    fn content_url_hex_is_the_full_wire_form_at_every_format_width() {
+        for (code, digest_len) in [
+            (entity_hash::HASH_ALGORITHM_SHA256, 32usize),
+            (entity_hash::HASH_ALGORITHM_SHA384, 48usize),
+        ] {
+            let h = Hash::compute_format("t", b"x", code).expect("allocated format");
+            let url = content_url("http://host:9", &h);
+            let hex = url
+                .strip_prefix("http://host:9/content/")
+                .expect("flat content route");
+
+            // The format-code byte leads — `[0:2]` is the algorithm partition
+            // the sharded CDN layouts key on. A digest-only hex silently slices
+            // the first DIGEST byte instead and that property dies.
+            assert_eq!(
+                &hex[0..2],
+                &format!("{:02x}", code),
+                "the content-URL hex must begin with the content_hash_format byte"
+            );
+            // Length is byte-implied, not a constant.
+            assert_eq!(
+                hex.len(),
+                2 + digest_len * 2,
+                "format {:#04x} implies {} hex chars",
+                code,
+                2 + digest_len * 2
+            );
+            // And it round-trips through the strict parser the serve side uses.
+            assert_eq!(Hash::from_bytes(&hex_to_bytes(hex)).unwrap(), h);
+        }
+    }
+
+    fn hex_to_bytes(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+            .collect()
+    }
+
     #[test]
     fn publisher_increments_seq_and_chains() {
         let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());

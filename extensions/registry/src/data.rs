@@ -55,8 +55,13 @@ pub struct BindingData {
     pub kind: String,
     /// Base58 peer-id (V7 §1.5) — an identity, NOT a content-hash.
     pub target_peer_id: String,
-    /// Opaque endpoint descriptors per NETWORK §6.5 (substrate passes through).
-    pub transports: Vec<Value>,
+    /// References to `system/peer/transport/*` entities — `[system/hash]`, ruled
+    /// 2026-08-21 (REGISTRY §3, D8). **Not** inline endpoint descriptors: a hash
+    /// names an entity that carries its own type, which is the source NETWORK
+    /// §6.5.1a D5 makes authoritative for a transport's kind. §6.3 calls these
+    /// *"a cached hint, not the binding's substance"*, and a reference is the
+    /// right encoding for a hint that points into another layer.
+    pub transports: Vec<Hash>,
     pub issued_at: u64,
     pub ttl: Option<u64>,
     pub supersedes: Option<Hash>,
@@ -77,7 +82,7 @@ impl BindingData {
             name: field_text(&map, "name")?,
             kind: field_text(&map, "kind")?,
             target_peer_id: field_text(&map, "target_peer_id")?,
-            transports: field_array(&map, "transports"),
+            transports: field_hash_array(&map, "transports")?,
             issued_at: field_u64(&map, "issued_at")?,
             ttl: field_u64_opt(&map, "ttl")?,
             supersedes: field_hash_opt(&map, "supersedes")?,
@@ -105,7 +110,10 @@ impl BindingData {
             fields.push((text("supersedes"), bytes(s)));
         }
         if !self.transports.is_empty() {
-            fields.push((text("transports"), Value::Array(self.transports.clone())));
+            fields.push((
+                text("transports"),
+                Value::Array(self.transports.iter().map(bytes).collect()),
+            ));
         }
         if let Some(t) = self.ttl {
             fields.push((text("ttl"), integer(t as i64)));
@@ -166,7 +174,7 @@ pub struct RegisterRequestData {
     pub name: String,
     /// Base58 peer-id the name resolves to AND whose key must sign the request.
     pub target_peer_id: String,
-    pub transports: Vec<Value>,
+    pub transports: Vec<Hash>,
     pub requested_ttl: Option<u64>,
     pub nonce: Vec<u8>,
     pub issued_at: u64,
@@ -184,7 +192,7 @@ impl RegisterRequestData {
         Ok(Self {
             name: field_text(&map, "name")?,
             target_peer_id: field_text(&map, "target_peer_id")?,
-            transports: field_array(&map, "transports"),
+            transports: field_hash_array(&map, "transports")?,
             requested_ttl: field_u64_opt(&map, "requested_ttl")?,
             nonce: field_bytes(&map, "nonce")?,
             issued_at: field_u64(&map, "issued_at")?,
@@ -202,7 +210,10 @@ impl RegisterRequestData {
             fields.push((text("requested_ttl"), integer(t as i64)));
         }
         if !self.transports.is_empty() {
-            fields.push((text("transports"), Value::Array(self.transports.clone())));
+            fields.push((
+                text("transports"),
+                Value::Array(self.transports.iter().map(bytes).collect()),
+            ));
         }
         encode(TYPE_REGISTRY_REGISTER_REQUEST, fields)
     }
@@ -233,7 +244,7 @@ pub const PENDING_STATUS_DENIED: &str = "denied";
 pub struct PendingBindingData {
     pub name: String,
     pub target_peer_id: String,
-    pub transports: Vec<Value>,
+    pub transports: Vec<Hash>,
     pub requested_ttl: Option<u64>,
     pub queued_at: u64,
     pub status: String,
@@ -291,7 +302,7 @@ impl PendingBindingData {
         Ok(Self {
             name: field_text(&map, "name")?,
             target_peer_id: field_text(&map, "target_peer_id")?,
-            transports: field_array(&map, "transports"),
+            transports: field_hash_array(&map, "transports")?,
             requested_ttl: field_u64_opt(&map, "requested_ttl")?,
             queued_at: field_u64(&map, "queued_at")?,
             status: field_text(&map, "status")?,
@@ -317,7 +328,10 @@ impl PendingBindingData {
             fields.push((text("requested_ttl"), integer(t as i64)));
         }
         if !self.transports.is_empty() {
-            fields.push((text("transports"), Value::Array(self.transports.clone())));
+            fields.push((
+                text("transports"),
+                Value::Array(self.transports.iter().map(bytes).collect()),
+            ));
         }
         encode(TYPE_REGISTRY_PENDING_BINDING, fields)
     }
@@ -727,7 +741,7 @@ pub struct ResolutionResult {
     pub status: String,
     pub binding: Option<Hash>,
     pub peer_id: Option<String>,
-    pub transports: Vec<Value>,
+    pub transports: Vec<Hash>,
     pub attestations: Vec<Hash>,
     pub trust_anchor: Option<String>,
     pub ttl: Option<u64>,
@@ -773,7 +787,10 @@ impl ResolutionResult {
     pub fn to_result_value(&self) -> Value {
         let mut fields: Vec<(Value, Value)> = vec![
             (text("status"), text(&self.status)),
-            (text("transports"), Value::Array(self.transports.clone())),
+            (
+                text("transports"),
+                Value::Array(self.transports.iter().map(bytes).collect()),
+            ),
             (
                 text("attestations"),
                 Value::Array(self.attestations.iter().map(bytes).collect()),
@@ -937,6 +954,47 @@ fn field_bytes(map: &[(Value, Value)], key: &str) -> Result<Vec<u8>, RegistryErr
         .and_then(|v| v.as_bytes())
         .map(|b| b.to_vec())
         .ok_or_else(|| RegistryError::Decode(format!("missing/invalid byte field {}", key)))
+}
+
+/// Decode `transports` as REGISTRY §3's `[system/hash]` (ruled 2026-08-21, D8).
+///
+/// **Fail closed on any element that is not a bare `system/hash`.** That is not
+/// strictness for its own sake: NETWORK §6.5.1a D5 makes the *entity type* the
+/// authoritative source of a transport's kind and explicitly demotes the
+/// `transport_type` field, so an inline profile map — which is type-stripped —
+/// destroys the only authoritative source and leaves the demoted field. A hash
+/// names an entity that carries its own type, so D5 stays checkable.
+///
+/// This is also the discriminating half of the `REG-BINDING-TRANSPORTS-SHAPE-1`
+/// vector: a decoder liberal in *both* directions passes row (a) and fails row
+/// (b). Accepting the inline form "for compatibility" is exactly what row (b)
+/// is built to catch, so the leniency this seat used to have is the defect.
+///
+/// Absent decodes to empty, per the optional-array convention (absent and empty
+/// are the same fact, so absent is the encoding).
+fn field_hash_array(map: &[(Value, Value)], key: &str) -> Result<Vec<Hash>, RegistryError> {
+    let Some(v) = get_field(map, key) else {
+        return Ok(Vec::new());
+    };
+    if matches!(v, Value::Null) {
+        return Ok(Vec::new());
+    }
+    let items = v
+        .as_array()
+        .ok_or_else(|| RegistryError::Decode(format!("{} must be an array of system/hash", key)))?;
+    items
+        .iter()
+        .map(|item| {
+            let b = item.as_bytes().ok_or_else(|| {
+                RegistryError::Decode(format!(
+                    "{} entries are bare system/hash; an inline profile map is not a transport \
+                     reference (NETWORK §6.5.1a D5 — the entity type is authoritative)",
+                    key
+                ))
+            })?;
+            Hash::from_bytes(b).map_err(|e| RegistryError::Decode(e.to_string()))
+        })
+        .collect()
 }
 
 fn field_hash(map: &[(Value, Value)], key: &str) -> Result<Hash, RegistryError> {

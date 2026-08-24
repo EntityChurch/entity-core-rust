@@ -321,6 +321,62 @@ mod tests {
         assert!(url.starts_with("https://cdn.example.com/content/00/00/00"));
     }
 
+    /// EXTENSION-NETWORK §6.5.3 hex-strictness at the substitute-CDN builder.
+    ///
+    /// Exercised at TWO formats, because a hardcoded 66 passes the SHA-256 row
+    /// and fails the SHA-384 one — the flat-layout test above pins 66 as a
+    /// literal, so on its own it cannot tell a byte-implied width from a
+    /// constant. `[0:2]` of the hex is the **format-code byte = the algorithm
+    /// partition** the sharded layouts key on; under a digest-only hex the shard
+    /// silently slices the first DIGEST byte instead and that property dies,
+    /// which is what this asserts rather than a `to_hex` round-trip.
+    #[test]
+    fn content_url_hex_width_follows_the_format_byte_at_every_layout() {
+        for (code, digest_len) in [
+            (entity_hash::HASH_ALGORITHM_SHA256, 32usize),
+            (entity_hash::HASH_ALGORITHM_SHA384, 48usize),
+        ] {
+            let h = Hash::new(code, vec![0xABu8; digest_len]);
+            let lead = format!("{:02x}", code);
+            let base = "https://cdn.example.com/content";
+
+            for (layout, expected_prefix) in [
+                (ContentLayout::Flat, format!("{base}/{lead}")),
+                (ContentLayout::Sharded2Flat, format!("{base}/{lead}/{lead}")),
+                // `sharded-2-4` is `{prefix}/{hex[0:2]}/{hex[2:4]}/{hex}` —
+                // the first segment is the FORMAT-CODE byte (the algorithm
+                // partition), the second the first digest byte.
+                (
+                    ContentLayout::Sharded2_4,
+                    format!("{base}/{lead}/ab/{lead}"),
+                ),
+            ] {
+                let cfg = EndpointConfig {
+                    tree_url_prefix: None,
+                    content_url_prefix: base.to_string(),
+                    content_layout: layout,
+                    tree_leaf_suffix: ".bin".to_string(),
+                };
+                let url = build_content_url(&cfg, &h).unwrap();
+                assert!(
+                    url.starts_with(&expected_prefix),
+                    "format {:#04x}: expected {} to start with {}",
+                    code,
+                    url,
+                    expected_prefix
+                );
+                let hex = url.rsplit('/').next().unwrap();
+                assert_eq!(
+                    hex.len(),
+                    2 + digest_len * 2,
+                    "format {:#04x} implies {} hex chars, never a constant",
+                    code,
+                    2 + digest_len * 2
+                );
+            }
+        }
+    }
+
     #[test]
     fn sharded_2_2_aliases_sharded_2_4() {
         assert_eq!(

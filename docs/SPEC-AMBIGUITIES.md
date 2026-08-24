@@ -5991,3 +5991,174 @@ silent divergence.
 
 Name the pin-authority discriminator in §4.3/§5 — one sentence — **or** declare it
 implementation-defined and scope row 8 to in-process per seat. Either makes the vector honest.
+
+---
+
+## COMPUTE v3.26 §3.5 — `map`'s output element is a fourth data position the "exactly three" sentence excludes — **RULED 2026-08-21 (C-11 Corner 1); we were wrong**
+
+**Passage.** §3.5, *"How a CONTAINED error materializes `[MUST, v3.26]`"*: *"**The contained set is
+exactly three positions** — `assoc`'s `value`, `concat`'s elements, `group-by`'s `members`. An error
+reaching materialization from anywhere else remains the §4.1 defect it has always been."* And §2.3
+N1's v3.26 note: *"`assoc`'s `value`, `concat`'s elements, `group-by`'s `members`, and **only** those
+three."*
+
+**The ambiguity.** `map` applies a caller-provided closure per element and places each **result**
+into the output array. That is a data position by the same argument the three named ones are: the
+value is *placed into* the output, not *consumed*. §7.2's short-circuit binds the closure's
+**arguments** (the input element), and says nothing about its return. So the enumeration and the
+argument disagree, and core-go's own routing calls map's output element *"the pre-existing precedent
+the ruling generalizes"* — i.e. reads it as contained — while the ruling's sentence says the set is
+exactly three.
+
+**And the two seats behave differently, in one form only.** core-go's `builtinMap`
+(`ext/compute/builtins.go`, `f14cc2c`) propagates a **minted** error through `invokeClosure`'s
+`error` return — short-circuit — but appends an **SA-1 `compute/error` value** to the output array —
+contain. Same program, two answers, decided by which in-language form the error arrived in. §4.1's
+`is_error` is kind-based precisely so that cannot happen (*"one value, one behaviour"*, the §2131
+worked example), so go's split looks like an artifact of Go's `(value, error)` return shape rather
+than a reading anyone chose.
+
+**Interim choice (ours).** `map`'s output element **short-circuits**, both forms, on the ruling's
+own sentence: the set is exactly three, and an error materializing from a fourth position is the
+§4.1 defect. Pinned by `map_output_element_is_outside_the_contained_set_and_short_circuits`
+(`extensions/compute/src/builtins_v324/tests.rs`).
+
+**The argument against our reading, stated.** `map` is the container primitive `group-by`'s
+`members` clause is modelled on. If the three contain *because they are data positions*, a mapped
+closure's result is a data position by the same argument and the ruling simply did not enumerate
+it — in which case "exactly three" is an under-count, not a boundary.
+
+**Ask.** Rule the fourth position in or out — and either way say whether the minted and SA-1 forms
+must agree there, since that half is a §4.1 question independent of the enumeration. This is
+**not** currently a scored divergence: no corpus vector drives an error out of a mapped closure
+(the corner set covers `assoc`, `concat` and `group-by` only), so both seats cross-bless green
+today. It is filed before a vector exists rather than after one reddens.
+
+### RULED 2026-08-21 — arch `172589e`, `PROPOSAL-COMPUTE-CLOSURE-RESULT-POSITIONS-AND-CONCAT-ARGS-SHAPE`
+
+**Both halves went against our interim choice, and the second half is the one that mattered.**
+
+1. **The `[MUST]` is provenance-independence, and it is a restatement of §2.4, not new spec** — *"a
+   `compute/error` behaves identically regardless of how it was produced."* Minted vs value-form is
+   an in-flight representation, which §2.4 already declares implementation-private, so the seats
+   exhibiting the asymmetry are **non-conformant against v3.26**. That is why the fix was not gated
+   on the proposal landing.
+2. **The count sentence is REPLACED, not incremented** — *"a position is contained when the
+   primitive places the value without reading it, and consumed when it reads it to decide control
+   flow, ordering, membership, or a write location"*, with five positions as its current extension
+   (`map`'s output element and `fold`'s final accumulator join the three). Our reading treated
+   "exactly three" as a closed structural claim; it was an enumeration taken over one table, and
+   `map`/`filter`/`fold` predate that table.
+
+**Which way each of the three went:** `map`'s output element **contains** (§1.5's NaN model is
+element-wise — `[a, E, c]`, not a whole-array abort); `filter`'s predicate result **short-circuits**
+(it is *read* for truthiness, and containing it silently drops the element); `fold`'s accumulator is
+**bound**, so a closure that ignores it **recovers**.
+
+**Landed here 2026-08-21.** Our seat was wrong on `map` and on `fold` and already right on `filter`
+— but note that our defect was *not* the asymmetry the ruling names: `is_error` is kind-based here,
+so both forms aborted alike. A symmetric wrong answer, not a provenance-dependent one. Wire-verified
+at corpus 358/358 LOCKED (CV-8a/b/c), and the bisect at `145cd1c` measured `cv8a` plus `sweep/0281`
+— a vector no routing named — going two-way before the fix.
+
+**One sub-decision is still open and is a named divergence**, kept out of the frozen corpus at both
+seats: which error codes are carved out of "contains". See the `AGENTS.md` entry — core-go
+propagates all three evaluation-limit codes; we propagate only the two that are a **shared** resource
+(`budget_exhausted`, `cascade_limit`) and contain `depth_exceeded`, which is per-branch and restored
+on unwind.
+
+---
+
+## COMPUTE §3.5 — `concat-args.collections` is declared `array_of: system/hash` but arrives as one hash — **RULED 2026-08-21 (C-11 Corner 2); HELD until the v3.27 fold**
+
+**Passage.** §3.5: `system/compute/concat-args := { fields: { collections: {array_of: {type_ref:
+"system/hash"}} } }` — *"Hashes of array expressions"*, plural.
+
+**The ambiguity.** `compute/apply`'s `args` map is `name → system/hash` (one hash per name), and
+that is how the args entity is built for every other collection builtin. So a `concat` reached
+through `apply` has a **single** hash under `collections`, naming an expression that evaluates to an
+array of arrays — which is what core-go implements (`evalControlArg(d.Args, "collections", …)` then
+`collsVal.([]interface{})`) and what the corpus vector `worked/v325-corner/cv5-concat-error-transparent`
+carries. The declared type describes the other shape: a CBOR array of hash byte-strings.
+
+**Interim choice (ours).** Both are accepted; the CBOR kind of the field distinguishes them with no
+ambiguity (`Bytes` = one hash naming an array-of-arrays, `Array` = many hashes each naming an array).
+Rejecting either would be a guess, and accepting both cannot fail a vector in either shape. See
+`resolve_concat_collections` (`extensions/compute/src/builtins_v324.rs`), pinned at both shapes by
+`concat_joins_one_level_and_preserves_order` and
+`concat_accepts_the_spec_declared_array_of_hashes_form`.
+
+**Ask.** Either correct `concat-args` to `collections: {type_ref: "system/hash"}` (matching every
+other builtin's args shape and the corpus), or state that the args-entity form differs from the
+apply-args form for this one builtin. A peer that implemented only the declared type would fail
+CV-5 today.
+
+### RULED 2026-08-21 (D3) — the evaluated shape wins, **and the reason is not the convergence**
+
+`collections` becomes a **scalar** `{type_ref: "system/hash"}`. Arch was explicit that three seats
+agreeing is cohort-consistency and not the argument: the derivation is **§7.1**, whose reactive
+`walk` recurses on exactly one condition (`if field_value is system/hash`) and therefore descends
+into scalar hash fields and **does not enter arrays**. Under the declared array shape every
+`compute/lookup/tree` inside every `concat` sub-collection goes unregistered, so a reactive
+expression containing a `concat` evaluates correctly once and is **never woken again**. If all three
+seats had built the declared shape, the ruling would be identical.
+
+`concat-args` was the only array-of-hashes in the entire expression grammar. **D5 is filed
+unresolved:** the walk stays array-blind for any *future* array-valued reference field, so removing
+the only current instance is not a fix for the traversal.
+
+### HELD at this seat, and the hold is a measurement rather than caution
+
+The proposal is `Status: DRAFT` targeting **v3.27**, and the standard is to implement the landed
+spec. We implemented D3 anyway to see what it cost: green `test` / `clippy` / `features`, and
+`validate-peer -category type_system` **1F** on `type_system_compute_concat_args_match` (446 · 439P ·
+6W · 1F), because that check compares our *published* descriptor against **the sibling's local type
+table**. A type descriptor is a published contract, so **the first seat to land D3 is red against
+every seat that has not.** Backed out; `type_system` is 446 · 440P · 6W · **0F**.
+
+**Ask, now narrower:** land D3 in the v3.27 fold and cut it cohort-wide in one step. Our evaluator
+already reads the ruled shape; the corpus is unaffected either way (CV-5 and CV-7c both carry the
+single-hash form), so the only moving part is the declaration — which is exactly the part that
+cannot move one seat at a time. Both encodings stay accepted here until then, pinned by
+`concat_reads_the_array_of_hashes_shape_the_landed_spec_declares`, which is the test that flips.
+
+---
+
+## COMPUTE §3.5 — `group-by` key equality when the derived key is an ENTITY — **RULED 2026-08-21 (C-11 Corner 3); go is right, no change owed here yet**
+
+**Passage.** §3.5: *"Key **equality** is byte-identity over the canonical ECF encoding of the
+derived key."*
+
+**The ambiguity.** For a primitive key the two seats agree trivially. For an **entity-valued** key
+"the canonical ECF encoding of the derived key" has two readings: the encoding of the entity itself,
+or the encoding of the value **as it appears in a data position**, which per §2.3 N1 / V7 §1.4 is a
+bare `system/hash`. core-go encodes the materialized entity (`canonicalKeyBytes` → `materialize` →
+`ecf.Encode`); we encode the bare hash, because that is the byte form the key actually takes in the
+`system/compute/group.key` field we are about to write.
+
+**Why it matters and why it is low-urgency.** The two agree on which elements land in which group
+(both are injective over the same value) but disagree on nothing *observable* — the emitted `key`
+field is the bare hash in **both** seats, since §4.1's materialization rule governs the field
+independently. So this is a latent divergence only if a future rule makes the equality bytes
+themselves observable. No corpus vector groups by an entity key.
+
+**Interim choice (ours).** Encode the key in its data-position form (bare `system/hash`), so the
+bytes compared are the bytes written. `dispatch_group_by` (`extensions/compute/src/builtins_v324.rs`).
+
+**Ask.** One clause naming which encoding the equality is over. Low priority — filed so it is not
+re-derived from scratch by whoever hits it first.
+
+### RULED 2026-08-21 (D4) — byte-identity over the **materialized** form
+
+core-go's `canonicalKeyBytes` (`materialize(key) → ecf.Encode`) is the rule. The derivation is the
+one we would not have reached from the field we were looking at: the alternative encodes the
+**in-flight** value, which for compute is kind-tagged (§2.3 N1 confines kind-tagging to
+`compute/scope`), and that would make an implementation-private representation **byte-load-bearing
+in a group's identity** — the exact thing §2.4 forbids, and the same ruling as C-9 reached from the
+key side instead of the value side.
+
+**Still latent, and still unobservable, so no code moved.** As filed above, the emitted `key` field
+is the bare hash in both seats regardless, and no corpus vector groups by an entity key — so our
+equality bytes and go's cannot currently produce a different grouping that anything can see.
+Recorded as owed rather than done: this becomes a real edit the moment a vector groups by an entity
+key, and it is written down here so that vector does not arrive as a surprise.

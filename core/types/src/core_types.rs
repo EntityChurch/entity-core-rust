@@ -1986,6 +1986,66 @@ fn system_compute_fold_args() -> TypeDefinition {
         .build()
 }
 
+// EXTENSION-COMPUTE v3.24 §3.5 — args types for the four collection primitives.
+// Spec-pinned, not implementation-owned: a transferable IR requires every peer
+// to agree on their shape, so §3.5's override-prohibition determinism guarantee
+// extends to them. Registering the descriptor is a THIRD registration site
+// beyond the dispatch table and `builtin_input_type` — the `type_system`
+// category fetches each of these from `system/type/` and a peer that evaluates
+// an operation whose args type it does not publish is inconsistent with its own
+// published type surface.
+fn system_compute_range_args() -> TypeDefinition {
+    TypeDefBuilder::new("system/compute/range-args")
+        .field("n", t("system/hash"))
+        .build()
+}
+
+fn system_compute_group_by_args() -> TypeDefinition {
+    TypeDefBuilder::new("system/compute/group-by-args")
+        .field("collection", t("system/hash"))
+        .field("fn", t("system/hash"))
+        .build()
+}
+
+// `collections` is `array_of system/hash`, which is what the **landed** §3.5
+// type block declares — note that the evaluator ALSO accepts the single-hash
+// form the `compute/apply` args map produces, which is what the corpus carries
+// and what every seat's evaluator reads.
+//
+// **C-11 Corner 2 rules this to a scalar `system/hash` (D3) — and it is NOT
+// landed here, deliberately.** The ruling lives in a DRAFT proposal targeting
+// v3.27; the standard is to implement the landed spec, not an in-flight
+// proposal, and arch's own packet says outright *"do not implement from this
+// packet's prose."*
+//
+// We tried it anyway and measured the cost, which is the part worth keeping:
+// a type descriptor is a **published contract**, and `validate-peer`'s
+// `type_system_compute_concat_args_match` compares our published descriptor
+// against the *sibling's local type table*. So the first seat to land D3 goes
+// red against every seat that has not — we scored 446 · 439P · 6W · **1F** on
+// exactly that check. **D3 is not landable seat-by-seat; it needs a
+// synchronized cut with the v3.27 fold.** Routed to the tier lead.
+fn system_compute_concat_args() -> TypeDefinition {
+    TypeDefBuilder::new("system/compute/concat-args")
+        .field("collections", arr(t("system/hash")))
+        .build()
+}
+
+fn system_compute_assoc_args() -> TypeDefinition {
+    TypeDefBuilder::new("system/compute/assoc-args")
+        .field("collection", t("system/hash"))
+        .field("index", t("system/hash"))
+        .field("value", t("system/hash"))
+        .build()
+}
+
+// `system/compute/group` — group-by's RESULT element — is deliberately NOT
+// registered. §3.5: it is "a pinned type *name*, not a type-extension
+// registration"; a constructed entity is encoded by the runtime kind of the
+// evaluated value, never by the constructed type's declared schema, so a peer
+// with no type extension produces byte-identical groups. core-go pins the same
+// constant and likewise registers no descriptor.
+
 // ============================================================================
 // Attestation substrate — EXTENSION-ATTESTATION v1.0 §3.1
 // ============================================================================
@@ -2765,6 +2825,10 @@ pub fn all_core_types() -> Vec<TypeDefinition> {
         compute_numeric_cast(),
         // EXTENSION-COMPUTE v3.14 N.2 — collection builtin args types.
         system_compute_map_args(),
+        system_compute_range_args(),
+        system_compute_group_by_args(),
+        system_compute_concat_args(),
+        system_compute_assoc_args(),
         system_compute_filter_args(),
         system_compute_fold_args(),
         // Attestation substrate (EXTENSION-ATTESTATION v1.1 — 1 entity + 8 op types)

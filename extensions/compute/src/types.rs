@@ -40,6 +40,24 @@ pub const TYPE_FILTER_ARGS: &str = "system/compute/filter-args";
 pub const TYPE_FOLD_ARGS: &str = "system/compute/fold-args";
 pub const TYPE_STORE_ARGS: &str = "system/compute/store-args";
 
+// Args types for the v3.24 collection primitives (§3.5). Pinned in the spec,
+// not implementation-owned — a transferable IR requires every peer to agree
+// on their shape, so the §3.5 override-prohibition determinism guarantee
+// extends to them.
+pub const TYPE_RANGE_ARGS: &str = "system/compute/range-args";
+pub const TYPE_GROUP_BY_ARGS: &str = "system/compute/group-by-args";
+pub const TYPE_CONCAT_ARGS: &str = "system/compute/concat-args";
+pub const TYPE_ASSOC_ARGS: &str = "system/compute/assoc-args";
+
+/// `group-by`'s RESULT element type (§3.5, v3.25 C-1): `{key, members}`.
+///
+/// **A pinned type *name*, not a type-extension registration.** Per §2.3 N1
+/// and §4.1's materialization rule a constructed entity is encoded by the
+/// runtime kind of the evaluated value, never by the constructed type's
+/// declared schema — so a peer with no type extension produces byte-identical
+/// groups. The cost of the key-carrying shape is one agreed string.
+pub const TYPE_GROUP: &str = "system/compute/group";
+
 // Numeric primitive type names targeted by compute/numeric-cast `to_type` (§2.2)
 pub const TYPE_PRIMITIVE_INT: &str = "primitive/int";
 pub const TYPE_PRIMITIVE_UINT: &str = "primitive/uint";
@@ -165,6 +183,55 @@ impl ComputeValue {
             ComputeValue::Entity(e) => e.entity_type == TYPE_ERROR,
             _ => false,
         }
+    }
+
+    /// The §9.1 `code` of an error value, in **either** in-language form.
+    ///
+    /// Kind-based like [`ComputeValue::is_error`]: a minted `ComputeError` and
+    /// an SA-1 `compute/error` entity answer the same code, so nothing keyed on
+    /// this can become provenance-dependent (§2.4).
+    pub fn error_code(&self) -> Option<String> {
+        match self {
+            ComputeValue::Error(e) => Some(e.code().to_string()),
+            ComputeValue::Entity(e) if e.entity_type == TYPE_ERROR => {
+                decode_data(e).as_ref().and_then(|d| data_str(d, "code"))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether this error is a property of **the evaluation as a whole** rather
+    /// than of the element that produced it.
+    ///
+    /// This is the one carve-out in the C-11 Corner 1 ruling's *"places without
+    /// reading = contain"* rule, and the criterion is **a resource shared across
+    /// the elements**, not *"it is a limit code"*:
+    ///
+    /// - `budget_exhausted` — `budget.operations` is one counter for the whole
+    ///   evaluation and `saturating_sub` pins it at 0, so once it trips *every*
+    ///   later element trips too. Containing it yields `[v1, v2, E, E, E, …]`
+    ///   whose split point is a function of cost accounting rather than of the
+    ///   data, and the expression then reports **success** for an evaluation
+    ///   that was aborted — an abort turned into an unbounded fill.
+    /// - `cascade_limit` — engine-global for the same reason (`freeze_subgraph`).
+    /// - `depth_exceeded` is **NOT** in the set, and that is the point of stating
+    ///   the criterion as sharing rather than as limit-ness: `budget.depth` is
+    ///   restored on unwind (`evaluate_trampoline`), so it is per-branch and
+    ///   element-wise. `map(λx. <too deep>, [1,2])` fails identically on every
+    ///   element for a structural reason, exactly like `map(λx. div(x,0), …)`,
+    ///   and contains under the plain rule.
+    ///
+    /// **Keyed on the code, never on the variant.** Keying on
+    /// `ComputeValue::Error(_)` would make the minted form abort where the SA-1
+    /// value form contains — reinstating the precise §2.4 provenance-dependence
+    /// Corner 1 was ruled to remove. The consequence is worth naming: an
+    /// *authored* `compute/error{code: budget_exhausted}` also aborts a `map`.
+    /// That is a real cost of the carve-out and it is routed, not hidden.
+    pub fn is_shared_resource_error(&self) -> bool {
+        matches!(
+            self.error_code().as_deref(),
+            Some("budget_exhausted") | Some("cascade_limit")
+        )
     }
 
     /// Truthiness per §4.5.
@@ -402,6 +469,13 @@ pub enum ComputeError {
     InstallationGrantInvalid(String),
     IndexOutOfRange(String),
     CastOutOfRange(String),
+    /// v3.25 C-3 (§9.1): `range`'s `n` is negative or exceeds the maximum
+    /// representable array length. Its own code, following `cast_out_of_range`'s
+    /// precedent rather than overloading either neighbour — and deliberately
+    /// **not** `type_mismatch`, per §2.2's cross-impl ruling that `int`/`uint`
+    /// are annotations rather than distinct value types, so an out-of-domain
+    /// *magnitude* is a domain error and not a type error.
+    CountOutOfRange(String),
     /// v3.19b N8: a `kind:"entity"` scope binding's hash resolves in neither the
     /// local content store nor the envelope `included`. Error-as-value at
     /// status 200 (F10), not transport failure.
@@ -424,6 +498,7 @@ impl ComputeError {
             ComputeError::InstallationGrantInvalid(_) => "installation_grant_invalid",
             ComputeError::IndexOutOfRange(_) => "index_out_of_range",
             ComputeError::CastOutOfRange(_) => "cast_out_of_range",
+            ComputeError::CountOutOfRange(_) => "count_out_of_range",
             ComputeError::ScopeUnreachable(_) => "scope_unreachable",
         }
     }
@@ -445,6 +520,7 @@ impl ComputeError {
             ComputeError::InstallationGrantInvalid(msg) => msg.clone(),
             ComputeError::IndexOutOfRange(msg) => msg.clone(),
             ComputeError::CastOutOfRange(msg) => msg.clone(),
+            ComputeError::CountOutOfRange(msg) => msg.clone(),
             ComputeError::ScopeUnreachable(msg) => msg.clone(),
         }
     }

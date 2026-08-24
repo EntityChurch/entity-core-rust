@@ -297,7 +297,8 @@ enum PeerAction {
         bind_name: String,
         /// Target peer-id the name resolves to (Base58, V7 §1.5)
         target_peer_id: String,
-        /// Dial-able transport endpoint (repeatable), e.g. tcp://billslab.com:9000
+        /// Content-hash (hex) of a published `system/peer/transport/*` entity
+        /// (repeatable). REGISTRY §3 `transports` is `[system/hash]`, not URLs.
         #[arg(long = "transport")]
         transports: Vec<String>,
         /// Time-to-live in milliseconds (omit for no expiry)

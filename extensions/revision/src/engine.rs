@@ -414,18 +414,45 @@ pub(crate) fn valid_exclude_pattern(pattern: &str) -> bool {
 
 /// Test whether `path` is a hash-addressed prefix config entry under
 /// `revision_prefix` (= `/{pid}/system/revision/`). The expected shape is
-/// `{revision_prefix}{66hex}/config`.
+/// `{revision_prefix}{hex(H)}/config`.
+///
+/// **The hex width follows the hash's own leading format byte and is never a
+/// constant** (`SPECIFICATION-FORMAT` §8.4.5): 66 chars under ECFv1-SHA-256
+/// (`00`), 98 under ECFv1-SHA-384 (`01`). The former fixed-66 was silent while
+/// one algorithm shipped and stopped recognising the peer's *own* prefix-config
+/// entries the moment its home format was SHA-384 — the writer emits
+/// `Hash::to_hex`, which is format-relative, so this reader disagreed with its
+/// own writer. Checking the declared format's implied length is strictly
+/// stronger than a constant: it also rejects a 98-char string claiming `00`.
 fn is_prefix_config_path(path: &str, revision_prefix: &str) -> bool {
     let rest = match path.strip_prefix(revision_prefix) {
         Some(r) => r,
         None => return false,
     };
-    // rest should be "{66hex}/config" → 66 + 1 + 6 = 73 chars
-    if rest.len() != 66 + "/config".len() {
+    let hash_part = match rest.strip_suffix("/config") {
+        Some(h) => h,
+        None => return false,
+    };
+    if !hash_part.chars().all(|c| c.is_ascii_hexdigit()) {
         return false;
     }
-    let (hash_part, suffix) = rest.split_at(66);
-    suffix == "/config" && hash_part.chars().all(|c| c.is_ascii_hexdigit())
+    hex_width_matches_its_format_byte(hash_part)
+}
+
+/// Whether `hex` is a full-wire-form content-hash hex whose character count is
+/// the one its own leading format byte implies (§8.4.5). Single-byte format
+/// codes only — no multi-byte LEB128 code is allocated (v7.67 §5.4).
+fn hex_width_matches_its_format_byte(hex: &str) -> bool {
+    if hex.len() < 2 {
+        return false;
+    }
+    let Ok(code) = u8::from_str_radix(&hex[0..2], 16) else {
+        return false;
+    };
+    match entity_hash::digest_len_for_format(code) {
+        Some(digest) => hex.len() == 2 + digest * 2,
+        None => false,
+    }
 }
 
 fn decode_active_branch_name(entity: &Entity) -> Option<String> {
@@ -945,6 +972,60 @@ mod tests {
     /// Compute the prefix hash for a bare prefix resolved against a peer ID.
     fn test_ph(peer_id: &str, prefix: &str) -> String {
         crate::prefix_hash(&crate::resolve_prefix(prefix, peer_id))
+    }
+
+    /// §8.4.5: the prefix-config reader must accept whatever width the hash's
+    /// OWN format byte implies — 66 chars under `00`, 98 under `01` — and
+    /// reject a width that disagrees with the byte it declares.
+    ///
+    /// Mutation run: restoring the former `rest.len() != 66 + "/config".len()`
+    /// gate fails the SHA-384 row (a peer whose home format is `01` stopped
+    /// recognising its own entries) and *passes* the two mismatch rows only by
+    /// accident, since they are the wrong length for 66 as well — which is why
+    /// the mismatch rows carry the width the OTHER format implies.
+    #[test]
+    fn prefix_config_hex_width_follows_its_own_format_byte() {
+        let prefix = "/peer/system/revision/";
+        let sha256 = format!("00{}", "ab".repeat(32)); // 66 chars
+        let sha384 = format!("01{}", "cd".repeat(48)); // 98 chars
+
+        for hex in [&sha256, &sha384] {
+            assert!(
+                is_prefix_config_path(&format!("{prefix}{hex}/config"), prefix),
+                "{} hex chars beginning {} must be accepted",
+                hex.len(),
+                &hex[0..2]
+            );
+        }
+
+        // A width that disagrees with its own declared format byte is rejected
+        // — strictly stronger than a constant, and the half a fixed gate misses.
+        let wide_sha256 = format!("00{}", "ab".repeat(48)); // 98 chars claiming 00
+        let narrow_sha384 = format!("01{}", "cd".repeat(32)); // 66 chars claiming 01
+        for hex in [&wide_sha256, &narrow_sha384] {
+            assert!(
+                !is_prefix_config_path(&format!("{prefix}{hex}/config"), prefix),
+                "hex of {} chars declaring {} must be rejected",
+                hex.len(),
+                &hex[0..2]
+            );
+        }
+
+        // An unallocated format code is rejected rather than length-guessed.
+        let unknown = format!("7f{}", "ab".repeat(32));
+        assert!(!is_prefix_config_path(
+            &format!("{prefix}{unknown}/config"),
+            prefix
+        ));
+        // Non-hex and missing suffix still fail.
+        assert!(!is_prefix_config_path(
+            &format!("{prefix}{sha256}/other"),
+            prefix
+        ));
+        assert!(!is_prefix_config_path(
+            &format!("{prefix}zz{}/config", "ab".repeat(32)),
+            prefix
+        ));
     }
 
     // ConfigCoordinationHook tests --------------------------------------
