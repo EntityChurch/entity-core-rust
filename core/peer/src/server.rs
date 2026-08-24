@@ -14,7 +14,11 @@ use std::sync::Arc;
 use crate::connection::handle_connection;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::transport::TcpTransportListener;
-use crate::transport::{Listener, TransportError};
+use crate::transport::Listener;
+// Native `run` now matches on the accept error inline (log + continue);
+// only the wasm `run` still annotates the closure error type.
+#[cfg(target_arch = "wasm32")]
+use crate::transport::TransportError;
 use crate::{runtime, PeerError, PeerShared};
 
 /// Bind a TCP listener on the given address (convenience wrapper).
@@ -59,10 +63,20 @@ pub async fn run(
     let mut guard = ConnectionGuard { handles: Vec::new() };
 
     loop {
-        let conn = listener
-            .accept()
-            .await
-            .map_err(|e: TransportError| PeerError::ConnectionError(e.to_string()))?;
+        // A single bad connection must NOT kill the listener. A non-WebSocket
+        // dial (e.g. a health-check `GET` with no `Connection: upgrade`) fails
+        // inside `accept()` (the WS upgrade happens there); propagating that
+        // error with `?` used to tear down the whole accept loop, taking the
+        // backend peer offline until restart. Log, back off briefly, and keep
+        // accepting — the same policy `run_multi` already uses.
+        let conn = match listener.accept().await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(error = %e, "accept error; continuing to listen");
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                continue;
+            }
+        };
 
         tracing::info!(
             transport = conn.transport_type,

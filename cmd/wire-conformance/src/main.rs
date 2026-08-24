@@ -600,6 +600,134 @@ mod tests {
         assert!(rejected, "tag_reject.1 must be rejected");
     }
 
+    fn bytes_to_hex(b: &[u8]) -> String {
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    // -----------------------------------------------------------------------
+    // Cohort corroboration — F30 + F29 (architecture handoff 2026-07-12).
+    // Drives the REAL production encoder (`to_ecf`) and the REAL decoder-
+    // rejection check (`is_canonical_ecf`) against the exact vectors in
+    // HANDOFF-2026-07-12-cohort-F29-F30-corpus.md. Run with `-- --nocapture`
+    // to print the cross-bless bytes for the report-back.
+    // NB: F29 (nested.5/6) is PRE-LOCK — this asserts our encoder reproduces
+    // Go's candidate bytes (our cross-bless vote); the vector locks only when
+    // Go × Rust × Python agree (Appendix E.4).
+    // -----------------------------------------------------------------------
+
+    /// F30 — all five regenerated `tag_reject` vectors MUST reject; the §6.3
+    /// tag is the sole trigger (structure is otherwise canonical).
+    #[test]
+    fn f30_tag_reject_all_reject() {
+        let vectors = [
+            ("tag_reject.1", "a26464617461a1627473c074323032362d30362d30365431323a30303a30305a647479706567746573742f7631"),
+            ("tag_reject.2", "a26464617461a1627473c11a661fa680647479706567746573742f7631"),
+            ("tag_reject.3", "a26464617461a1626964d82550112233445566778899aabbccddeeff00647479706567746573742f7631"),
+            ("tag_reject.4", "d9d9f7a0"),
+            ("tag_reject.5", "a264726f6f74a26464617461a0647479706567746573742f763168696e636c75646564a15821000000000000000000000000000000000000000000000000000000000000000001a26464617461a1627473c074323032362d30362d30365431323a30303a30305a647479706567746573742f7631"),
+        ];
+        for (id, hex) in vectors {
+            let rejected = !is_canonical_ecf(&hex_to_bytes(hex));
+            println!("F30 {id}: rejected={rejected} (expect true) -> non_canonical_ecf");
+            assert!(rejected, "{id} MUST reject (major-type-6 tag present)");
+        }
+    }
+
+    /// F30 extra-rigor — feeding the tag-stripped structure through OUR
+    /// encoder MUST reproduce the exact stripped bytes (proves the rejection
+    /// above is the tag, not the structure).
+    #[test]
+    fn f30_stripped_structures_reproduce() {
+        // 33-byte content-hash key for .5: 0x00*32 || 0x01.
+        let mut hash_key = vec![0u8; 33];
+        hash_key[32] = 0x01;
+
+        let cases: Vec<(&str, Value, &str)> = vec![
+            (
+                ".1",
+                Value::Map(vec![
+                    (Value::Text("data".into()), Value::Map(vec![
+                        (Value::Text("ts".into()), Value::Text("2026-06-06T12:00:00Z".into())),
+                    ])),
+                    (Value::Text("type".into()), Value::Text("test/v1".into())),
+                ]),
+                "a26464617461a162747374323032362d30362d30365431323a30303a30305a647479706567746573742f7631",
+            ),
+            (
+                ".2",
+                Value::Map(vec![
+                    (Value::Text("data".into()), Value::Map(vec![
+                        (Value::Text("ts".into()), Value::Integer(1_713_350_272u64.into())),
+                    ])),
+                    (Value::Text("type".into()), Value::Text("test/v1".into())),
+                ]),
+                "a26464617461a16274731a661fa680647479706567746573742f7631",
+            ),
+            (
+                ".3",
+                Value::Map(vec![
+                    (Value::Text("data".into()), Value::Map(vec![
+                        (Value::Text("id".into()), Value::Bytes(hex_to_bytes("112233445566778899aabbccddeeff00"))),
+                    ])),
+                    (Value::Text("type".into()), Value::Text("test/v1".into())),
+                ]),
+                "a26464617461a162696450112233445566778899aabbccddeeff00647479706567746573742f7631",
+            ),
+            (
+                ".5",
+                Value::Map(vec![
+                    (Value::Text("root".into()), Value::Map(vec![
+                        (Value::Text("data".into()), Value::Map(vec![])),
+                        (Value::Text("type".into()), Value::Text("test/v1".into())),
+                    ])),
+                    (Value::Text("included".into()), Value::Map(vec![
+                        (Value::Bytes(hash_key), Value::Map(vec![
+                            (Value::Text("data".into()), Value::Map(vec![
+                                (Value::Text("ts".into()), Value::Text("2026-06-06T12:00:00Z".into())),
+                            ])),
+                            (Value::Text("type".into()), Value::Text("test/v1".into())),
+                        ])),
+                    ])),
+                ]),
+                "a264726f6f74a26464617461a0647479706567746573742f763168696e636c75646564a15821000000000000000000000000000000000000000000000000000000000000000001a26464617461a162747374323032362d30362d30365431323a30303a30305a647479706567746573742f7631",
+            ),
+        ];
+
+        for (id, input, expected_hex) in cases {
+            let got = to_ecf(&input);
+            println!("F30 stripped{id}: {}", bytes_to_hex(&got));
+            assert_eq!(bytes_to_hex(&got), expected_hex, "stripped{id} must reproduce canonical bytes");
+        }
+    }
+
+    /// F29 cross-bless (PRE-LOCK) — our canonical encoder MUST emit the
+    /// candidate bytes for the text-head boundary inside an array element.
+    #[test]
+    fn f29_nested_text_head_boundary() {
+        // nested.5 — [{"k": 24×'a'}, {"k": 30×'b'}] : inner heads 0x78 0x18 / 0x78 0x1e
+        let n5 = Value::Array(vec![
+            Value::Map(vec![(Value::Text("k".into()), Value::Text("a".repeat(24)))]),
+            Value::Map(vec![(Value::Text("k".into()), Value::Text("b".repeat(30)))]),
+        ]);
+        let mut exp5 = hex_to_bytes("82a1616b7818");
+        exp5.extend(std::iter::repeat(0x61).take(24));
+        exp5.extend(hex_to_bytes("a1616b781e"));
+        exp5.extend(std::iter::repeat(0x62).take(30));
+        let got5 = to_ecf(&n5);
+        println!("F29 nested.5: {}", bytes_to_hex(&got5));
+        assert_eq!(got5, exp5, "nested.5 must match Go candidate");
+
+        // nested.6 — [{"k": 256×'c'}] : inner head 0x79 0x0100
+        let n6 = Value::Array(vec![
+            Value::Map(vec![(Value::Text("k".into()), Value::Text("c".repeat(256)))]),
+        ]);
+        let mut exp6 = hex_to_bytes("81a1616b790100");
+        exp6.extend(std::iter::repeat(0x63).take(256));
+        let got6 = to_ecf(&n6);
+        println!("F29 nested.6: {}", bytes_to_hex(&got6));
+        assert_eq!(got6, exp6, "nested.6 must match Go candidate");
+    }
+
     #[test]
     fn is_canonical_ecf_accepts_simple_values() {
         // empty map

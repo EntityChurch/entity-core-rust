@@ -399,9 +399,22 @@ fn flush_pending(
         let qualified = format!("/{}/{}", local_peer_id, bare_path);
 
         if event == FsEvent::Deleted {
-            location_index.remove(&qualified);
-            stat_cache.forget(&fs_path);
-            continue;
+            // A rename INTO the watched dir surfaces on Linux as inotify
+            // IN_MOVED_TO → notify `Modify(Name(To))`, which `classify` maps to
+            // `Deleted` even though the file just APPEARED. The handler writes
+            // every file via `atomic_write` (temp file + rename into place), so
+            // honoring such a "delete" blindly makes the handler's own writes
+            // self-destruct one debounce window later — the "upload vanishes"
+            // bug (a cross-peer write lands, then the watcher deletes it). Only
+            // honor the delete when the file is genuinely gone; if it still
+            // exists this was a rename-into-place (or an unrelated concurrent
+            // recreate), so fall through and ingest it as a write instead.
+            if !fs_path.exists() {
+                location_index.remove(&qualified);
+                stat_cache.forget(&fs_path);
+                continue;
+            }
+            // else: file present — treat as an arrival, fall through to ingest.
         }
 
         // v1.3 §8.3 callsite MUST: watcher flush also routes through the
