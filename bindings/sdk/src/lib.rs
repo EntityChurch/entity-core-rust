@@ -32,6 +32,12 @@ pub mod register_handler;
 pub mod sdk;
 pub mod subscription;
 
+/// `PeerContext::follow` — a packaged remote-subtree mirror composing
+/// subscribe (+ payload) or a continuation chain into the poll+fetch+cache
+/// loop consumers otherwise hand-roll. Rust analog of workbench-go's
+/// `InstallRevisionFollowChain`. Reached via `PeerContext::follow()`.
+pub mod follow;
+
 /// Typed wrapper for `system/attestation` extension ops. Per
 /// `EXTENSION-ATTESTATION.md §6` and `SDK-IDENTITY-INFRASTRUCTURE.md
 /// §5.1` — signed-graph substrate ops. Reached via
@@ -112,7 +118,10 @@ pub use sdk::{
     InspectWireDirection, InspectWireEvent, PeerContext, PeerContextBuilder, PeerMetadata,
     QueryMatch, QueryResults, SdkError, TreeChangeEvent, TypeInfo,
 };
-pub use subscription::{SubscribeLimits, SubscribeOptions, SubscriptionInfo, SubscriptionOps};
+pub use subscription::{
+    RawSubscriptionHandle, SubscribeLimits, SubscribeOptions, SubscriptionInfo, SubscriptionOps,
+};
+pub use follow::{FollowHandle, FollowMode, FollowOptions};
 
 #[cfg(feature = "attestation")]
 pub use attestation::{
@@ -130,7 +139,7 @@ pub use compute::{
 };
 
 #[cfg(feature = "continuation")]
-pub use continuation::ContinuationOps;
+pub use continuation::{ContinuationOps, ContinuationSpec, DeliverySpec};
 
 #[cfg(feature = "identity")]
 pub use identity::{

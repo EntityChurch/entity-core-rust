@@ -8,7 +8,22 @@ description = "Main-thread proxy for an entity-core peer hosted in a Web Worker.
 
 [dependencies]
 entity-wasm-worker-protocol = { path = "../wasm-worker-protocol", features = ["conversions"] }
-entity-peer = { path = "../../core/peer", default-features = false }
+# `signaling` is required for the §6.5 Direct-arm establisher: it gates
+# `entity_peer::carrier::PeerCarrier` (and pulls `entity-signaling`). The worker
+# arm reaches the same choreography from `wasm-worker-host`; this arm owns it
+# in-crate (`main_thread_establish.rs`) because `WebRtcSession` is `pub(crate)`.
+entity-peer = { path = "../../core/peer", default-features = false, features = ["signaling"] }
+# The §6.5 negotiation choreography, native-tested in `extensions/signaling`.
+# Reused verbatim by the Direct-arm establisher — `negotiate`, `WebRtcParty`,
+# `WebRtcIo`, `pair_key`, `SessionId`, candidate types, `VerificationPolicy`.
+entity-signaling = { workspace = true }
+# `EntityUri::is_peer_id` — the same anti-mismatch guard the Worker arm keeps.
+entity-entity = { workspace = true }
+# The `LiveEstablish` / `WebRtcIo` traits are `async_trait`.
+async-trait = { workspace = true }
+# Monotonic clock for `WebRtcIo::now_ms`, never placed on the wire — same choice
+# the Worker arm makes over `Date.now()`.
+web-time = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 thiserror.workspace = true
 futures = "0.3"

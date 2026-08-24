@@ -549,6 +549,20 @@ impl RemoteEndpoint for InboundReentryEndpoint {
 pub struct RemoteState {
     conns: Mutex<HashMap<String, Arc<dyn RemoteEndpoint>>>,
     inbound: Mutex<HashMap<String, Arc<dyn RemoteEndpoint>>>,
+    /// EXTENSION-NETWORK §10.3 obligation 5 — the per-peer establishment
+    /// single-flight gate map. Keyed by target `peer_id`; the value is a
+    /// `tokio::sync::Mutex` a caller holds (async) across its `establish_live`
+    /// so concurrent/repeated pool-misses for the same peer serialise onto ONE
+    /// negotiation instead of each spawning a fresh one. Without it, N misses
+    /// each mint a fresh `RTCPeerConnection` / `session_id` / offer → N deposits
+    /// pile into the rendezvous bucket and the channel opens only on lucky
+    /// overlap — the fan-in face of the obligation-4 discipline.
+    ///
+    /// The (sync) `Mutex` guards only the cheap get-or-insert of the gate `Arc`;
+    /// the gate itself is held async across the establishment. Entries are GC'd
+    /// by [`DialGuard`] when the last holder drops, so a hub dialing many peers
+    /// does not leak gates (bounded memory).
+    dialing: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Default for RemoteState {
@@ -556,6 +570,42 @@ impl Default for RemoteState {
         Self {
             conns: Mutex::new(HashMap::new()),
             inbound: Mutex::new(HashMap::new()),
+            dialing: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+/// RAII holder for the per-peer establishment single-flight gate (§10.3
+/// obligation 5), returned by [`RemoteState::dial_gate`]. Holds the async gate
+/// lock for the caller's whole establishment; on drop it releases the lock and
+/// GCs the map entry if no other caller still references the gate — so the
+/// `dialing` map stays bounded (no leaked gate per distinct peer ever dialed).
+pub struct DialGuard<'a> {
+    pool: &'a RemoteState,
+    peer_id: String,
+    gate: Arc<tokio::sync::Mutex<()>>,
+    held: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for DialGuard<'_> {
+    fn drop(&mut self) {
+        // Release the async gate FIRST: the `OwnedMutexGuard` holds its own
+        // `Arc` clone of `gate`, which must be gone before we count references
+        // or the GC decision below would never fire.
+        self.held.take();
+        // GC under the `dialing` sync lock. `dial_gate` clones the gate `Arc`
+        // while holding this same lock, so no caller can be mid-clone here and
+        // the strong-count reading is stable for the removal decision. When we
+        // are the only holder the refs are exactly: this `self.gate` (1) + the
+        // map entry (1) == 2; remove then. A blocked waiter (still inside
+        // `dial_gate`'s `lock_owned().await`, holding ≥1 extra ref) pushes the
+        // count above 2 and keeps the entry alive. A concurrent fresh dial that
+        // arrives after removal simply mints a new gate and — because the
+        // winner pooled its connection before returning — finds it via the
+        // post-gate `get` double-check rather than re-establishing.
+        let mut map = self.pool.dialing.lock().unwrap();
+        if Arc::strong_count(&self.gate) == 2 {
+            map.remove(&self.peer_id);
         }
     }
 }
@@ -568,6 +618,39 @@ impl RemoteState {
     /// Get an existing pooled endpoint, or None.
     pub fn get(&self, peer_id: &str) -> Option<Arc<dyn RemoteEndpoint>> {
         self.conns.lock().unwrap().get(peer_id).cloned()
+    }
+
+    /// Acquire the per-peer single-flight establishment gate (§10.3
+    /// obligation 5). The returned [`DialGuard`] is held (async) by the caller
+    /// across its establishment so only one `establish_live` is in flight per
+    /// peer; concurrent callers await the gate, then reuse the pooled result
+    /// (double-checked by the caller via [`get`](Self::get)). A per-peer gate —
+    /// distinct peers establish concurrently. The map entry is GC'd when the
+    /// last holder drops the guard, so the map does not grow unboundedly.
+    ///
+    /// Held across the *whole* remainder of `get_or_connect` (dial or traversal
+    /// arm), not just the WebRTC arm, so concurrent dials to the same peer also
+    /// coalesce. No re-entrancy deadlock: the establish seam negotiates
+    /// transport through a *carrier* peer (a different `peer_id` ⇒ a different
+    /// gate), never by re-dialing the same target through `get_or_connect`.
+    pub async fn dial_gate(&self, peer_id: &str) -> DialGuard<'_> {
+        let gate = self
+            .dialing
+            .lock()
+            .unwrap()
+            .entry(peer_id.to_string())
+            .or_default()
+            .clone();
+        // Hold the async gate across establishment. `lock_owned` keeps its own
+        // `Arc` clone alive inside the guard — `DialGuard::drop` releases it
+        // *before* counting references so the GC decision is not skewed by it.
+        let held = gate.clone().lock_owned().await;
+        DialGuard {
+            pool: self,
+            peer_id: peer_id.to_string(),
+            gate,
+            held: Some(held),
+        }
     }
 
     /// Insert a `RemoteConnection` (stream transport) into the pool.
@@ -775,6 +858,21 @@ pub async fn get_or_connect(
     // Check pool first
     if let Some(conn) = pool.get(peer_id) {
         tracing::debug!(remote_peer = %peer_id, "reusing pooled connection");
+        return Ok(conn);
+    }
+
+    // §10.3 obligation 5 — single-flight establishment per peer. Hold the
+    // per-peer gate across the dial/traversal below so only ONE `establish_live`
+    // (fresh RTCPeerConnection / session_id / offer over WebRTC) is ever in
+    // flight per peer. Without it, N pool-misses each spawn a fresh negotiation
+    // → N deposits pile into the rendezvous bucket and the channel opens only on
+    // lucky overlap — brute force that hammers the shared carrier (the fan-in
+    // face of the obligation-4 discipline). Held to the end of the function.
+    let _dial_gate = pool.dial_gate(peer_id).await;
+    // Double-check: another caller may have established while we awaited the
+    // gate — reuse its pooled connection rather than dial a second time.
+    if let Some(conn) = pool.get(peer_id) {
+        tracing::debug!(remote_peer = %peer_id, "reusing pooled connection (post-gate)");
         return Ok(conn);
     }
 

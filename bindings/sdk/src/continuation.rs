@@ -36,6 +36,221 @@ use crate::sdk::{PeerContext, SdkError};
 use entity_capability::ResourceTarget;
 use entity_entity::Entity;
 use entity_handler::ExecuteOptions;
+use entity_hash::Hash;
+
+/// A `{uri, operation}` delivery spec — where a continuation delivers its
+/// result (`deliver_to`) or routes a non-2xx response (`on_error`). Per
+/// EXTENSION-CONTINUATION §3.5 (`system/delivery-spec`).
+#[derive(Debug, Clone)]
+pub struct DeliverySpec {
+    pub uri: String,
+    pub operation: String,
+}
+
+impl DeliverySpec {
+    pub fn new(uri: impl Into<String>, operation: impl Into<String>) -> Self {
+        Self {
+            uri: uri.into(),
+            operation: operation.into(),
+        }
+    }
+
+    /// The common `{uri, operation: "receive"}` case (inbox delivery).
+    pub fn receive(uri: impl Into<String>) -> Self {
+        Self::new(uri, "receive")
+    }
+}
+
+/// Builder for a **forward** `system/continuation` entity — the install body
+/// for [`ContinuationOps::install`]. The Rust analog of Go's
+/// `core/types.ContinuationData` (`ToEntity`): it assembles the deferred
+/// dispatch (`target` / `operation` / `resource` / `params`), the single
+/// dynamic field threaded from the trigger result (`result_extract` navigates
+/// the delivered result, `result_field` names where to inject it), delivery
+/// routing (`deliver_to` / `on_error`), the standing-vs-bounded count
+/// (`remaining_executions`; `None` = standing, fire forever), and the
+/// `dispatch_capability` the handler dispatches the next link under.
+///
+/// This is the primitive a continuation *chain* is built from — e.g. the
+/// revision-free `tree:extract → tree:merge` follow chain
+/// ([`crate::follow::FollowMode::Continuation`]). Nothing here assumes a
+/// revisioned subtree; the `target`/`operation` are whatever the step
+/// dispatches (`tree:extract`, `tree:merge`, `tree:get`, …).
+///
+/// The richer transform surface (`select`, `transform_ops`, the other
+/// `*_extract` fields) is intentionally omitted; `result_extract` covers the
+/// single-dynamic-field chain recipe. Add the rest when a consumer needs it.
+#[derive(Debug, Clone, Default)]
+pub struct ContinuationSpec {
+    /// Handler URI the deferred dispatch targets (e.g. `system/tree` or
+    /// `entity://{remote}/system/tree`).
+    pub target: String,
+    /// Operation on `target` (e.g. `merge`, `extract`, `get`).
+    pub operation: String,
+    /// Resource target for the deferred dispatch (path-as-resource).
+    pub resource: Option<ResourceTarget>,
+    /// Static params as raw CBOR (`primitive/any`, spliced inline per
+    /// EXTENSION-CONTINUATION §2.1 — NOT wrapped as a byte string).
+    pub params: Option<Vec<u8>>,
+    /// Field the extracted dynamic value is injected into before dispatch.
+    pub result_field: Option<String>,
+    /// Dotted path extracted from the delivered trigger result and threaded
+    /// on (`result_transform.extract`).
+    pub result_extract: Option<String>,
+    /// Where a successful result is delivered (the next chain link).
+    pub deliver_to: Option<DeliverySpec>,
+    /// Where a non-2xx response is routed (a chain-error inbox) instead of
+    /// silently cascading.
+    pub on_error: Option<DeliverySpec>,
+    /// `None` = standing (fire forever); `Some(n)` = fire n times then expire.
+    pub remaining_executions: Option<u64>,
+    /// Capability hash the continuation dispatches the next link under
+    /// (required to dispatch; validated against the writer's authority chain
+    /// at install per §3.1a). Typically the owner cap hash for a local step
+    /// or a cross-peer chain cap for a remote step.
+    pub dispatch_capability: Option<Hash>,
+}
+
+impl ContinuationSpec {
+    /// A forward continuation dispatching `operation` on `target`.
+    pub fn new(target: impl Into<String>, operation: impl Into<String>) -> Self {
+        Self {
+            target: target.into(),
+            operation: operation.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn resource(mut self, rt: ResourceTarget) -> Self {
+        self.resource = Some(rt);
+        self
+    }
+
+    /// Set static params from a raw CBOR encoding (`primitive/any`).
+    pub fn params(mut self, cbor: Vec<u8>) -> Self {
+        self.params = Some(cbor);
+        self
+    }
+
+    pub fn result_field(mut self, field: impl Into<String>) -> Self {
+        self.result_field = Some(field.into());
+        self
+    }
+
+    pub fn result_extract(mut self, path: impl Into<String>) -> Self {
+        self.result_extract = Some(path.into());
+        self
+    }
+
+    pub fn deliver_to(mut self, spec: DeliverySpec) -> Self {
+        self.deliver_to = Some(spec);
+        self
+    }
+
+    pub fn on_error(mut self, spec: DeliverySpec) -> Self {
+        self.on_error = Some(spec);
+        self
+    }
+
+    pub fn remaining_executions(mut self, n: u64) -> Self {
+        self.remaining_executions = Some(n);
+        self
+    }
+
+    pub fn dispatch_capability(mut self, hash: Hash) -> Self {
+        self.dispatch_capability = Some(hash);
+        self
+    }
+
+    /// Encode as a `system/continuation` entity — the body passed to
+    /// [`ContinuationOps::install`]. The wire shape matches the handler's
+    /// decoder (EXTENSION-CONTINUATION §2.1); ECF canonicalizes key order,
+    /// so field insertion order here is irrelevant.
+    pub fn to_entity(&self) -> Result<Entity, SdkError> {
+        let mut fields: Vec<(entity_ecf::Value, entity_ecf::Value)> = vec![
+            (
+                entity_ecf::text("operation"),
+                entity_ecf::text(&self.operation),
+            ),
+            (entity_ecf::text("target"), entity_ecf::text(&self.target)),
+        ];
+        if let Some(dt) = &self.deliver_to {
+            fields.push((entity_ecf::text("deliver_to"), delivery_spec_value(dt)));
+        }
+        if let Some(cap) = self.dispatch_capability {
+            fields.push((
+                entity_ecf::text("dispatch_capability"),
+                entity_ecf::Value::Bytes(cap.to_bytes().to_vec()),
+            ));
+        }
+        if let Some(oe) = &self.on_error {
+            fields.push((entity_ecf::text("on_error"), delivery_spec_value(oe)));
+        }
+        if let Some(p) = &self.params {
+            // `params` is `primitive/any` — splice the raw CBOR inline (NOT
+            // wrapped as Value::Bytes, which would mis-encode as
+            // primitive/bytes and break the handler + Go interop).
+            let v: ciborium::Value = ciborium::from_reader(p.as_slice()).map_err(|e| {
+                SdkError::HandlerError(format!("continuation params not valid CBOR: {e}"))
+            })?;
+            fields.push((entity_ecf::text("params"), v));
+        }
+        if let Some(n) = self.remaining_executions {
+            fields.push((
+                entity_ecf::text("remaining_executions"),
+                entity_ecf::integer(n as i64),
+            ));
+        }
+        if let Some(res) = &self.resource {
+            fields.push((
+                entity_ecf::text("resource"),
+                encode_resource_target(res),
+            ));
+        }
+        if let Some(rf) = &self.result_field {
+            fields.push((entity_ecf::text("result_field"), entity_ecf::text(rf)));
+        }
+        if let Some(ex) = &self.result_extract {
+            fields.push((
+                entity_ecf::text("result_transform"),
+                entity_ecf::Value::Map(vec![(
+                    entity_ecf::text("extract"),
+                    entity_ecf::text(ex),
+                )]),
+            ));
+        }
+        Entity::new(
+            "system/continuation",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(fields)),
+        )
+        .map_err(|e| SdkError::HandlerError(format!("build continuation entity: {e}")))
+    }
+}
+
+/// Encode a `DeliverySpec` as the `{operation, uri}` map the handler decodes.
+fn delivery_spec_value(d: &DeliverySpec) -> entity_ecf::Value {
+    entity_ecf::Value::Map(vec![
+        (entity_ecf::text("operation"), entity_ecf::text(&d.operation)),
+        (entity_ecf::text("uri"), entity_ecf::text(&d.uri)),
+    ])
+}
+
+/// Encode a `ResourceTarget` as `{targets: [...], exclude?: [...]}`, matching
+/// the continuation handler's `encode_resource_target`.
+fn encode_resource_target(rt: &ResourceTarget) -> entity_ecf::Value {
+    let mut fields: Vec<(entity_ecf::Value, entity_ecf::Value)> = Vec::new();
+    if !rt.exclude.is_empty() {
+        fields.push((
+            entity_ecf::text("exclude"),
+            entity_ecf::Value::Array(rt.exclude.iter().map(entity_ecf::text).collect()),
+        ));
+    }
+    fields.push((
+        entity_ecf::text("targets"),
+        entity_ecf::Value::Array(rt.targets.iter().map(entity_ecf::text).collect()),
+    ));
+    entity_ecf::Value::Map(fields)
+}
 
 /// Typed accessor for `system/continuation` operations.
 ///
@@ -555,5 +770,47 @@ mod tests {
         assert!(check_install_body_type(&forward).is_ok());
         assert!(check_install_body_type(&join).is_ok());
         assert!(check_install_body_type(&bogus).is_err());
+    }
+
+    /// A `ContinuationSpec` builds a `system/continuation` entity the handler
+    /// accepts on install — proving the builder's wire shape matches the
+    /// decoder. Uses the revision-free follow chain's extract step shape
+    /// (cross-peer `tree:extract`, one dynamic field, deliver to a merge
+    /// inbox, on-error routed) with the owner cap as the dispatch capability
+    /// so the §3.1a authority-chain check passes. No revisioned subtree
+    /// involved.
+    #[tokio::test(flavor = "current_thread")]
+    async fn continuation_spec_builds_handler_accepted_entity() {
+        let ctx = make_ctx();
+        let pid = ctx.peer_id().to_string();
+        let prefix = format!("/{pid}/app/x/");
+        let params = entity_ecf::to_ecf(&ciborium::Value::Map(vec![(
+            entity_ecf::text("source_prefix"),
+            entity_ecf::text(&prefix),
+        )]));
+        let spec = ContinuationSpec::new(format!("entity://{pid}/system/tree"), "extract")
+            .resource(ResourceTarget {
+                targets: vec![prefix.clone()],
+                exclude: vec![],
+            })
+            .params(params)
+            .result_extract("uri")
+            .result_field("source_prefix")
+            .deliver_to(DeliverySpec::receive(format!(
+                "entity://{pid}/system/inbox/follow/merge"
+            )))
+            .on_error(DeliverySpec::receive(format!(
+                "entity://{pid}/system/inbox/follow/extract-errors"
+            )))
+            .dispatch_capability(ctx.owner_capability_hash());
+
+        let body = spec.to_entity().expect("build continuation entity");
+        assert_eq!(body.entity_type, "system/continuation");
+
+        let path = format!("/{pid}/system/inbox/follow/extract");
+        ctx.continuation()
+            .install(path, body)
+            .await
+            .expect("handler accepts the ContinuationSpec-built wire shape");
     }
 }

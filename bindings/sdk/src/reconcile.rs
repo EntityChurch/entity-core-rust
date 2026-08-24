@@ -16,19 +16,21 @@
 //! 3. Periodic reconciliation: belt-and-suspenders for long-lived
 //!    collaborative workspaces.
 //!
-//! ## Cross-peer fetch-diff (D4 caveat)
+//! ## Cross-peer fetch-diff (D4 — now permitted)
 //!
 //! This wrapper dispatches `system/revision:fetch-diff` against the
 //! remote peer's URI (`entity://{remote}/system/revision`) — the
-//! intentional cross-peer use case. The Rust handler in
-//! `extensions/revision/src/lib.rs:2484` currently enforces
-//! `PROPOSAL-CONVERGENT-MIRRORING §2.3 D4` strictly and rejects all
-//! cross-peer fetch-diff with `400 invalid_dispatch`. Until the D4
-//! enforcement relaxes to permit explicit cross-peer use (logged in
-//! `docs/SPEC-AMBIGUITIES.md`), this wrapper will return that 400 to
-//! the caller when targeting a Rust peer. **Go SDK parity is the
-//! convergence target** (Go has heavily tested two-peer reconcile);
-//! the wire shape and SDK surface match
+//! intentional cross-peer use case. **EXTENSION-REVISION v3.6 §4.4.19
+//! rescinded the earlier D4 gate:** `fetch-diff` is unambiguously
+//! executor-local under any dispatch shape, and the handler now
+//! explicitly accepts cross-peer dispatch (see `handle_fetch_diff` and
+//! the `test_fetch_diff_accepts_cross_peer_dispatch` regression guard in
+//! `extensions/revision/src/lib.rs`). The old defensive
+//! `400 invalid_dispatch` rejection — inherited framing from the deferred
+//! `PROPOSAL-REVISION-DIFF-SINCE-LOCAL-HEAD` — is gone, so this wrapper
+//! reconciles Rust↔Rust as well as against the Go convergence target.
+//! **Go SDK parity is the convergence target** (Go has heavily tested
+//! two-peer reconcile); the wire shape and SDK surface match
 //! `workbench-go/entitysdk/reconcile.go`.
 
 use crate::sdk::{PeerContext, SdkError};
@@ -376,9 +378,9 @@ mod tests {
     /// failure path is well-behaved when the underlying transport
     /// can't reach the remote.
     ///
-    /// (A real cross-peer reconcile test requires two connected
-    /// peers + the D4 spec divergence resolved — see
-    /// `docs/SPEC-AMBIGUITIES.md` "EXTENSION-REVISION fetch-diff D4".)
+    /// (A real cross-peer reconcile test requires two connected peers;
+    /// the D4 gate that once also blocked it was rescinded in
+    /// EXTENSION-REVISION v3.6 — see the module docs.)
     #[tokio::test(flavor = "current_thread")]
     async fn reconcile_unknown_remote_surfaces_error() {
         let ctx = make_ctx();

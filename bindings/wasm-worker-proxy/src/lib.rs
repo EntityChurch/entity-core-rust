@@ -69,12 +69,20 @@
 //!    not "drop cache updates." Q4 of the Phase 1 protocol review.
 
 mod broker;
+/// The Direct-arm §10.3 establisher — a main-thread peer driving
+/// [`webrtc_session::WebRtcSession`] in-thread, no broker, no `ControlMessage`.
+mod main_thread_establish;
 mod web_transport;
 /// The main-thread half of the §6.5 negotiation — one `RTCPeerConnection` per
 /// negotiation, driven on behalf of a worker that cannot reach the API.
 mod webrtc_session;
 pub use broker::MessagePortBroker;
+pub use main_thread_establish::MainThreadWebRtcEstablisher;
 pub use web_transport::WebTransport;
+/// Re-exported so a caller installing [`MainThreadWebRtcEstablisher`] can name
+/// its required verification posture without depending on `entity-signaling`
+/// directly — the same courtesy `worker_webrtc` extends for the Worker arm.
+pub use entity_signaling::webrtc::VerificationPolicy;
 
 use entity_wasm_worker_protocol::{
     CasFailure, ConnectPeerOk, CreatePeerOk, Event, InitParams, Request, RequestId, Response,

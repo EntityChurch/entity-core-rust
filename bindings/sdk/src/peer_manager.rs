@@ -116,7 +116,30 @@ impl PeerManager {
     /// WASM + `wasm-idb-persist` only.
     #[cfg(all(target_arch = "wasm32", feature = "wasm-idb-persist"))]
     pub async fn with_keypair_idb(keypair: Keypair, db_name: &str) -> Result<Self, SdkError> {
-        let sdk = EntitySDK::builder()
+        Self::with_keypair_idb_and_establish(keypair, db_name, None).await
+    }
+
+    /// Like [`with_keypair_idb`](Self::with_keypair_idb), but also installs the
+    /// EXTENSION-NETWORK §10.3 live-establishment seam on the primary peer.
+    ///
+    /// This is the **Direct-arm WebRTC** install point: the browser app's
+    /// main-thread peer has no worker/broker, so it drives
+    /// `RTCPeerConnection` in-thread via
+    /// `entity_wasm_worker_proxy::MainThreadWebRtcEstablisher`, handed in here.
+    ///
+    /// The seam is a **constructor argument, not a post-build setter**, on
+    /// purpose: [`PeerContextBuilder::with_live_establish`] MUST land before the
+    /// peer's `PeerShared` clones capture it, and this arm exposes no
+    /// `&mut Peer` to set it afterward. `None` is byte-identical to
+    /// [`with_keypair_idb`](Self::with_keypair_idb) — the additive property the
+    /// §10.3 seam guarantees.
+    #[cfg(all(target_arch = "wasm32", feature = "wasm-idb-persist"))]
+    pub async fn with_keypair_idb_and_establish(
+        keypair: Keypair,
+        db_name: &str,
+        live_establish: Option<Arc<dyn entity_peer::live_establish::LiveEstablish>>,
+    ) -> Result<Self, SdkError> {
+        let mut builder = EntitySDK::builder()
             .config(PeerConfig {
                 debug_open_grants: true,
                 ..PeerConfig::default()
@@ -124,9 +147,11 @@ impl PeerManager {
             .with_inspect_routing()
             .keypair(keypair)
             .connector(Arc::new(entity_peer::transport::BrowserWebSocketConnector))
-            .idb(db_name)
-            .build_async()
-            .await?;
+            .idb(db_name);
+        if let Some(seam) = live_establish {
+            builder = builder.with_live_establish(seam);
+        }
+        let sdk = builder.build_async().await?;
         Ok(Self {
             sdk,
             connector_override: None,

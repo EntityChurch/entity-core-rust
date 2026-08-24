@@ -1775,7 +1775,7 @@ pub struct PeerContext {
     pub(crate) shared: Arc<PeerShared>,
     peer_id_string: String,
     /// Shared with the event bridge so remote mutations also increment it.
-    generation: Arc<AtomicU64>,
+    pub(crate) generation: Arc<AtomicU64>,
     #[allow(dead_code)] // Used by event_bridge; the field read warning is spurious
     wake_fn: WakeFn,
     /// Default grant scope applied to this peer's capability operations.
@@ -4301,7 +4301,7 @@ fn empty_params() -> Entity {
 }
 
 /// Build put params: `{"entity": {"type": ..., "data": ...}}`.
-fn build_put_params(entity: &Entity) -> Result<Entity, SdkError> {
+pub(crate) fn build_put_params(entity: &Entity) -> Result<Entity, SdkError> {
     // The `data` field must be sent as a decoded ciborium Value, NOT
     // wrapped as Value::Bytes. entity-core-rust's `system/tree` put
     // handler re-encodes whatever Value it extracts — if we send
@@ -4324,7 +4324,7 @@ fn build_put_params(entity: &Entity) -> Result<Entity, SdkError> {
 }
 
 /// Build remove params: `{"entity": null}` (null entity signals removal).
-fn build_remove_params() -> Result<Entity, SdkError> {
+pub(crate) fn build_remove_params() -> Result<Entity, SdkError> {
     let params_map =
         entity_ecf::Value::Map(vec![(entity_ecf::text("entity"), entity_ecf::Value::Null)]);
     Entity::new("system/tree/put/params", entity_ecf::to_ecf(&params_map))

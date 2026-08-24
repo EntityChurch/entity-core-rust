@@ -125,6 +125,19 @@ pub struct L1SubscriptionEvent {
     pub new_hash: Option<Hash>,
     /// Pre-write hash. `None` for create; `Some` for update/delete.
     pub previous_hash: Option<Hash>,
+    /// The changed entity itself, bundled in-band with the notification
+    /// when the subscription opted into payload delivery via
+    /// [`SubscribeOptions::with_payload`] (EXTENSION-SUBSCRIPTION §2.2,
+    /// PROPOSAL-CONVERGENT-MIRRORING §2). `Some` on create/update when the
+    /// source resolved the entity; `None` when payload bundling was off,
+    /// on a delete, or on a source-side resolution miss (in which case the
+    /// subscriber may `tree:get` the `path` to materialize it).
+    ///
+    /// This is the field that lets a subscriber mirror a remote subtree
+    /// with **no fetch round-trip** — the changed entity arrives with the
+    /// notification. Without it, [`L1SubscriptionEvent`] carries only
+    /// hashes and every mirror write forces a `tree:get` first.
+    pub included: Option<Entity>,
 }
 
 /// Handle returned by [`PeerContext::subscribe`]. Drop to cancel:
@@ -240,6 +253,85 @@ impl Drop for L1SubscriptionHandle {
                 tracing::debug!(
                     subscription_id = %self.subscription_id,
                     "L1 unsubscribe: no tokio runtime; skipping RPC"
+                );
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(task);
+    }
+}
+
+/// Handle for a **raw** subscription created by
+/// [`PeerContext::subscribe_raw_at`] — delivery goes to a caller-specified
+/// URI (e.g. a continuation inbox), so there is no SDK delivery handler to
+/// close, only the subscription to cancel. Drop to unsubscribe (dispatches
+/// `system/subscription:unsubscribe` to whichever engine owns it — remote for
+/// cross-peer, local otherwise).
+#[must_use = "dropping this handle cancels the raw subscription"]
+pub struct RawSubscriptionHandle {
+    subscription_id: String,
+    shared: Arc<PeerShared>,
+    remote_pid: Option<String>,
+}
+
+impl RawSubscriptionHandle {
+    /// The subscription id assigned by the owning engine.
+    pub fn subscription_id(&self) -> &str {
+        &self.subscription_id
+    }
+}
+
+impl std::fmt::Debug for RawSubscriptionHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RawSubscriptionHandle")
+            .field("subscription_id", &self.subscription_id)
+            .field("remote_pid", &self.remote_pid)
+            .finish()
+    }
+}
+
+impl Drop for RawSubscriptionHandle {
+    fn drop(&mut self) {
+        // Fire-and-forget unsubscribe to the owning engine (remote for
+        // cross-peer, local otherwise). No delivery handler to close — the
+        // deliver_uri is a caller-owned handler, not an SDK-internal one.
+        let shared = self.shared.clone();
+        let subscription_id = self.subscription_id.clone();
+        let unsub_target = match &self.remote_pid {
+            Some(pid) => format!("entity://{}/system/subscription", pid),
+            None => "system/subscription".to_string(),
+        };
+        let task = async move {
+            let params_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+                entity_ecf::text("subscription_id"),
+                entity_ecf::text(&subscription_id),
+            )]));
+            let params = match Entity::new("system/subscription/cancel-params", params_data) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!(error = %e, "raw unsubscribe: build params failed");
+                    return;
+                }
+            };
+            let local_identity = shared.identity_hash;
+            let execute_fn = entity_peer::connection::make_execute_fn(
+                shared,
+                Some(local_identity),
+                std::collections::HashMap::new(),
+                None,
+                None,
+            );
+            let _ = execute_fn(unsub_target, "unsubscribe".into(), params, ExecuteOptions::default())
+                .await;
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(task);
+            } else {
+                tracing::debug!(
+                    subscription_id = %self.subscription_id,
+                    "raw unsubscribe: no tokio runtime; skipping RPC"
                 );
             }
         }
@@ -435,6 +527,118 @@ impl PeerContext {
         )
     }
 
+    /// Cross-peer subscribe with explicit [`SubscribeOptions`] — the
+    /// options-carrying counterpart to [`subscribe_at`](Self::subscribe_at)
+    /// (which always uses defaults) and the cross-peer counterpart to
+    /// [`subscribe_with_options`](Self::subscribe_with_options) (which is
+    /// local-only). Without this, `include_payload` was unreachable for a
+    /// remote subscription, so a subscriber could not receive a remote
+    /// peer's changed entities in-band and was forced to `tree:get` each
+    /// one — the exact fetch round-trip the convergent-mirror recipe
+    /// removes. Used by [`PeerContext::follow`].
+    ///
+    /// **Payload authorization (cross-peer):** the *remote* engine
+    /// enforces `include_payload` (EXTENSION-SUBSCRIPTION §2.3) against the
+    /// capability this dispatch presents — the same authorization surface
+    /// as a direct cross-peer `tree:get`. The subscribe is dispatched with
+    /// the receiver-rooted connection grant (no local-rooted cap forced
+    /// on), so whatever grant already authorizes the caller's cross-peer
+    /// reads of `pattern` authorizes payload bundling too.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn subscribe_at_with_options<F>(
+        &self,
+        peer_id: impl Into<String>,
+        pattern: impl Into<String>,
+        options: SubscribeOptions,
+        callback: F,
+    ) -> impl std::future::Future<Output = Result<L1SubscriptionHandle, SdkError>> + Send + 'static
+    where
+        F: Fn(L1SubscriptionEvent) + Send + Sync + 'static,
+    {
+        let target = peer_id.into();
+        let remote = if target == self.peer_id() {
+            None
+        } else {
+            Some(target)
+        };
+        self.subscribe_internal(pattern.into(), options, Arc::new(callback), remote)
+    }
+
+    /// WASM variant of [`PeerContext::subscribe_at_with_options`].
+    #[cfg(target_arch = "wasm32")]
+    pub fn subscribe_at_with_options<F>(
+        &self,
+        peer_id: impl Into<String>,
+        pattern: impl Into<String>,
+        options: SubscribeOptions,
+        callback: F,
+    ) -> impl std::future::Future<Output = Result<L1SubscriptionHandle, SdkError>> + 'static
+    where
+        F: Fn(L1SubscriptionEvent) + Send + Sync + 'static,
+    {
+        let target = peer_id.into();
+        let remote = if target == self.peer_id() {
+            None
+        } else {
+            Some(target)
+        };
+        self.subscribe_internal(pattern.into(), options, Arc::new(callback), remote)
+    }
+
+    /// **Raw** cross-peer subscribe: deliver matching change notifications to
+    /// a caller-specified `deliver_uri` (operation `receive`), with NO
+    /// SDK-internal callback handler. The Rust analog of Go's
+    /// `AppPeer.SubscribeRawAt`.
+    ///
+    /// Where [`subscribe_at`](Self::subscribe_at) registers an SDK delivery
+    /// handler and fires a Rust closure, this binds the subscription's
+    /// delivery straight to an existing on-tree handler — typically a
+    /// **continuation inbox** — so the notification drives a substrate-side
+    /// dispatch chain instead of app code. This is the trigger edge of the
+    /// server-side follow chain ([`crate::follow::FollowMode::Continuation`]).
+    ///
+    /// `deliver_uri` is the full delivery URI the remote engine dispatches
+    /// `receive` to — for cross-peer delivery back to this peer, the
+    /// `entity://{local_pid}/...` form (e.g. an inbox path). A self-grant
+    /// authorizing `system/inbox:receive` at that URI is minted and bundled.
+    ///
+    /// Drop the returned [`RawSubscriptionHandle`] to unsubscribe.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn subscribe_raw_at(
+        &self,
+        peer_id: impl Into<String>,
+        pattern: impl Into<String>,
+        deliver_uri: impl Into<String>,
+        events: Vec<String>,
+    ) -> impl std::future::Future<Output = Result<RawSubscriptionHandle, SdkError>> + Send + 'static
+    {
+        let target = peer_id.into();
+        let remote = if target == self.peer_id() {
+            None
+        } else {
+            Some(target)
+        };
+        self.subscribe_raw_internal(pattern.into(), deliver_uri.into(), events, remote)
+    }
+
+    /// WASM variant of [`PeerContext::subscribe_raw_at`].
+    #[cfg(target_arch = "wasm32")]
+    pub fn subscribe_raw_at(
+        &self,
+        peer_id: impl Into<String>,
+        pattern: impl Into<String>,
+        deliver_uri: impl Into<String>,
+        events: Vec<String>,
+    ) -> impl std::future::Future<Output = Result<RawSubscriptionHandle, SdkError>> + 'static {
+        let target = peer_id.into();
+        let remote = if target == self.peer_id() {
+            None
+        } else {
+            Some(target)
+        };
+        self.subscribe_raw_internal(pattern.into(), deliver_uri.into(), events, remote)
+    }
+
     /// Shared implementation for native + WASM. Does the synchronous
     /// setup (engine start, handler registration, grant mint) inline so
     /// that if any of those fail we haven't yet forked work into a
@@ -464,6 +668,9 @@ impl PeerContext {
         peer.start_engines(&self.peer_shared());
 
         let shared = self.peer_shared();
+        // Captured synchronously (can't borrow &self across the await): used
+        // as the caller capability for local include_payload authorization.
+        let owner_cap = self.owner_self_cap.clone();
 
         // Mint a bare delivery pattern unique to this subscription. The
         // SDK-internal namespace is `system/sdk/{purpose}/{identifier}`
@@ -626,12 +833,31 @@ impl PeerContext {
                 ..Default::default()
             };
             let local_identity = shared.identity_hash;
+            // Present the peer's owner self-cap as the caller capability for
+            // LOCAL subscriptions. The subscription handler's include_payload
+            // authorization (EXTENSION-SUBSCRIPTION §2.3) verifies the caller's
+            // cap covers `tree:get` on the subscribed resource before it will
+            // bundle entity content; with no cap presented, even a peer
+            // subscribing to its own tree gets `403 payload_unauthorized`.
+            // The owner self-cap covers the peer's own tree, so local
+            // payload subscriptions work out of the box.
+            //
+            // Cross-peer stays `None`: the local owner cap is local-rooted and
+            // the remote would reject it for the `subscribe` op (breaking the
+            // receiver-rooted connection-grant fallback). Cross-peer
+            // include_payload needs a remote-honored `tree:get` grant supplied
+            // by the caller — the follow-helper capability path.
+            let caller_cap = if remote_pid.is_none() {
+                Some(owner_cap)
+            } else {
+                None
+            };
             let execute_fn = entity_peer::connection::make_execute_fn(
                 shared.clone(),
                 Some(local_identity),
                 included,
                 None,
-                None,
+                caller_cap,
             );
             // Local: dispatch to bare `system/subscription` (local engine).
             // Cross-peer: dispatch to `entity://{remote}/system/subscription`
@@ -676,6 +902,111 @@ impl PeerContext {
                 subscription_id,
                 shared,
                 registered,
+                remote_pid,
+            })
+        }
+    }
+
+    /// Shared implementation for [`subscribe_raw_at`](Self::subscribe_raw_at):
+    /// mint a self-grant for `deliver_uri`, dispatch `subscribe` with that URI
+    /// as the `deliver_to`, and return a lean [`RawSubscriptionHandle`]. No
+    /// SDK delivery handler is registered — the caller's `deliver_uri` is the
+    /// real handler (e.g. a continuation inbox).
+    fn subscribe_raw_internal(
+        &self,
+        pattern: String,
+        deliver_uri: String,
+        events: Vec<String>,
+        remote_pid: Option<String>,
+    ) -> impl std::future::Future<Output = Result<RawSubscriptionHandle, SdkError>> + 'static {
+        let peer = self.peer();
+        peer.start_engines(&self.peer_shared());
+        let shared = self.peer_shared();
+
+        // Mint a delivery grant authorizing `system/inbox:receive` at
+        // `deliver_uri` (synchronous — avoids capturing &Keypair across await).
+        let mint_result = mint_delivery_grant(
+            peer.keypair()
+                .as_ed25519()
+                .expect("entity-sdk peers are Ed25519-only"),
+            &deliver_uri,
+            peer.content_store(),
+        );
+
+        async move {
+            let (token_entity, token_hash) = mint_result?;
+
+            let events_values: Vec<ciborium::Value> = if events.is_empty() {
+                vec![
+                    entity_ecf::text("created"),
+                    entity_ecf::text("updated"),
+                    entity_ecf::text("deleted"),
+                ]
+            } else {
+                events.iter().map(entity_ecf::text).collect()
+            };
+            let params_map: Vec<(ciborium::Value, ciborium::Value)> = vec![
+                (
+                    entity_ecf::text("deliver_to"),
+                    entity_ecf::Value::Map(vec![
+                        (entity_ecf::text("operation"), entity_ecf::text("receive")),
+                        (entity_ecf::text("uri"), entity_ecf::text(&deliver_uri)),
+                    ]),
+                ),
+                (
+                    entity_ecf::text("deliver_token"),
+                    entity_ecf::Value::Bytes(token_hash.to_bytes().to_vec()),
+                ),
+                (
+                    entity_ecf::text("events"),
+                    entity_ecf::Value::Array(events_values),
+                ),
+            ];
+            let params_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(params_map));
+            let params = Entity::new("system/subscription/subscribe-params", params_data)
+                .map_err(|e| SdkError::HandlerError(format!("build subscribe params: {e}")))?;
+
+            let mut included = std::collections::HashMap::new();
+            included.insert(token_hash, token_entity);
+            let opts = ExecuteOptions {
+                resource: Some(ResourceTarget {
+                    targets: vec![pattern.clone()],
+                    exclude: vec![],
+                }),
+                ..Default::default()
+            };
+            let local_identity = shared.identity_hash;
+            let execute_fn = entity_peer::connection::make_execute_fn(
+                shared.clone(),
+                Some(local_identity),
+                included,
+                None,
+                None,
+            );
+            let subscribe_target = match &remote_pid {
+                Some(pid) => format!("entity://{}/system/subscription", pid),
+                None => "system/subscription".to_string(),
+            };
+            let result = execute_fn(subscribe_target, "subscribe".into(), params, opts).await;
+            let result = match result {
+                Ok(r) if r.status == 200 => r,
+                Ok(r) => {
+                    return Err(SdkError::from_handler_result(
+                        &r,
+                        format!("subscribe_raw: {pattern}"),
+                    )
+                    .unwrap_or_else(|| {
+                        SdkError::HandlerError(format!("unexpected status {}", r.status))
+                    }));
+                }
+                Err(e) => return Err(SdkError::HandlerError(e.to_string())),
+            };
+            let subscription_id = parse_subscription_id(&result.result).ok_or_else(|| {
+                SdkError::HandlerError("subscribe_raw result missing subscription_id".into())
+            })?;
+            Ok(RawSubscriptionHandle {
+                subscription_id,
+                shared,
                 remote_pid,
             })
         }
@@ -931,7 +1262,22 @@ fn build_delivery_body(
         // future owns its captured state, so we can't borrow across await.
         let operation_is_receive = ctx.operation == "receive";
         let maybe_event = if operation_is_receive {
-            decode_notification(&ctx.params)
+            // Enrich the decoded event with the changed entity when the
+            // subscription opted into include_payload: the engine bundles
+            // it into the delivery envelope's `included` map keyed by the
+            // new hash (EXTENSION-SUBSCRIPTION §2.2), and the peer's deliver
+            // closure threads that map through to this dispatch, so it
+            // arrives here as `ctx.included`. Resolving it now hands the
+            // subscriber the entity in-band — the convergent-mirror recipe,
+            // no `tree:get` round-trip. A source-side resolution miss (or a
+            // hashes-only subscription) leaves `included: None` and the
+            // subscriber may fall back to a fetch.
+            decode_notification(&ctx.params).map(|mut ev| {
+                if let Some(h) = ev.new_hash {
+                    ev.included = ctx.included.get(&h).cloned();
+                }
+                ev
+            })
         } else {
             None
         };
@@ -1014,6 +1360,10 @@ fn decode_notification(entity: &Entity) -> Option<L1SubscriptionEvent> {
         path: path?,
         new_hash,
         previous_hash,
+        // Populated by the caller (`build_delivery_body`) from the dispatch
+        // envelope's `included` map — this decoder only sees the
+        // notification entity, not the bundled payload.
+        included: None,
     })
 }
 
@@ -1157,6 +1507,64 @@ mod tests {
         assert_eq!(ev.path, target);
         assert!(ev.new_hash.is_some());
         assert!(!handle.subscription_id().is_empty());
+        // Default subscribe is hashes-only: no payload bundled.
+        assert!(
+            ev.included.is_none(),
+            "default subscribe must not bundle the entity"
+        );
+    }
+
+    /// A subscription that opts into `include_payload` receives the changed
+    /// entity in-band on `L1SubscriptionEvent.included` — the
+    /// convergent-mirror recipe, no `tree:get` round-trip. Exercises the
+    /// full engine → deliver-closure → decode chain: the engine bundles the
+    /// entity into the delivery envelope's `included` map, the peer's
+    /// deliver closure threads it to the receive dispatch, and
+    /// `build_delivery_body` resolves it by `new_hash` from `ctx.included`.
+    #[tokio::test]
+    async fn l1_subscribe_with_payload_bundles_the_changed_entity() {
+        let ctx = make_peer_context();
+        let pid = ctx.peer_id().to_string();
+
+        let received: Arc<Mutex<Vec<L1SubscriptionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = received.clone();
+
+        let prefix = format!("/{}/app/test/l1subs_payload/", pid);
+        let _handle = ctx
+            .subscribe_with_options(
+                format!("{}*", prefix),
+                SubscribeOptions::with_payload(),
+                move |ev| {
+                    sink.lock().unwrap().push(ev);
+                },
+            )
+            .await
+            .expect("subscribe_with_options should succeed");
+
+        let target = format!("{}one", prefix);
+        ctx.store()
+            .put(&target, make_entity("t", "payload-body"))
+            .unwrap();
+        pump().await;
+
+        let events = received.lock().unwrap().clone();
+        assert_eq!(events.len(), 1, "exactly one event delivered");
+        let ev = &events[0];
+        assert_eq!(ev.event, "created");
+        assert_eq!(ev.path, target);
+        let bundled = ev
+            .included
+            .as_ref()
+            .expect("include_payload must deliver the changed entity in-band");
+        assert_eq!(
+            bundled.content_hash,
+            ev.new_hash.expect("create carries new_hash"),
+            "bundled entity's hash matches the event's new_hash"
+        );
+        assert_eq!(
+            bundled, &make_entity("t", "payload-body"),
+            "bundled entity is the one that was written"
+        );
     }
 
     /// A delete must arrive as `new_hash: None`, honoring the documented
@@ -1329,10 +1737,12 @@ mod tests {
     // pattern), the handle carries a remote_pid so its Drop will
     // unsubscribe at B.
     //
-    // Full delivery round-trip (B writes → A's callback fires) is
-    // covered by Godot's cross-peer subscription integration smoke
-    // (`test_subscription_smoke_cross_peer.gd`); here we exercise the
-    // SDK API surface end-to-end against the existing memory transport.
+    // Full delivery round-trip (B writes → A's callback fires) over the
+    // memory transport is proven in-process by
+    // `follow::tests::follow_payload_delivers_reactively_cross_peer` — it needs
+    // a symmetric (rendezvous) establishment so the acceptor holds the §6.5(b)
+    // reciprocal reentry grant, plus B's engines started. This test asserts
+    // only the subscribe/unsubscribe surface, so it uses a plain dial.
 
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
