@@ -1136,8 +1136,9 @@ async fn client_reads_the_advertisement() {
 // ---------------------------------------------------------------------------
 
 use crate::coordination::{
-    self, Candidate, CollectedMessage, ConnectRequest, ConnectResponse, Nonce, PunchSync,
-    CANDIDATE_HOST, CANDIDATE_RELAY, CANDIDATE_SRFLX, SUBSTRATE_TCP,
+    self, punch_delay, Candidate, CollectedMessage, ConnectRequest, ConnectResponse, Nonce,
+    PunchSync, CANDIDATE_HOST, CANDIDATE_RELAY, CANDIDATE_SRFLX, PUNCH_DELAY_FLOOR_MS,
+    SUBSTRATE_TCP,
 };
 
 fn candidates_for(who: &str) -> Vec<Candidate> {
@@ -1175,14 +1176,127 @@ fn coordination_messages_round_trip() {
         resp
     );
 
+    // A *delay*, not an instant (§4.1) — 250 ms from receipt, not a moment in
+    // 2023. The old vector here was `1_700_000_000_500`, and that it round-tripped
+    // is exactly the point: a same-side test cannot tell the two apart.
     let sync = PunchSync {
         nonce,
-        fire_at: 1_700_000_000_500,
+        fire_at: 250,
     };
     assert_eq!(
         PunchSync::from_entity_bytes(&sync.to_entity().unwrap().data).unwrap(),
         sync
     );
+}
+
+// ---------------------------------------------------------------------------
+// §4.1 `fire_at` — the clock domain and encoding (pinned 2026-07-28, MUST;
+// §9 conformance MUST #5)
+//
+// This block exists because §4.1 says the failure it prevents "passes every
+// same-host test": both peers read the same clock, so a wall-clock encoding
+// round-trips perfectly and connects perfectly — until the two peers are on
+// different machines, where the clock skew is silently added to a window
+// measured in milliseconds. Nothing above catches it, so these test the
+// *representation* rather than the behavior.
+// ---------------------------------------------------------------------------
+
+/// `fire_at` is a CBOR **uint** (major type 0). Asserted on the bytes, not
+/// through the decoder, because the decoder agrees with whatever the encoder
+/// wrote — the same-side blindness the whole §2.2/§4.1 family of pins is about.
+///
+/// This is the check that fails the moment someone widens the field back to a
+/// signed type to hold "the agreed instant".
+#[test]
+fn fire_at_encodes_as_a_cbor_uint() {
+    let data = PunchSync {
+        nonce: Nonce(vec![3u8; 16]),
+        fire_at: 250,
+    }
+    .to_entity()
+    .unwrap()
+    .data;
+
+    assert_eq!(data[0], 0xa2, "expected a 2-entry map");
+
+    // ECF sorts map keys length-first (RFC 8949 §4.2.1), so `nonce` precedes
+    // `fire_at` — located rather than offset-indexed so the assertion survives a
+    // nonce of a different length.
+    let key = [&[0x67u8][..], b"fire_at"].concat();
+    let at = data
+        .windows(key.len())
+        .position(|w| w == key)
+        .expect("fire_at key present");
+    let value = &data[at + key.len()..];
+
+    // 0x18 = major 0 (unsigned), 1-byte argument. Major 1 (negative) would be
+    // 0x38 here, which is what a peer encoding a signed delta emits; a signed
+    // encoder handed a *positive* 250 still emits 0x18, so the
+    // negative-rejection test below covers the half this one cannot.
+    assert_eq!(value[0], 0x18, "fire_at must be a CBOR uint (major 0)");
+    assert_eq!(value[1], 250);
+}
+
+/// A negative `fire_at` is refused at decode, not clamped.
+///
+/// The realistic source is not malice but a peer computing `target - now` with a
+/// clock that disagrees, or subtracting in the wrong direction — both produce a
+/// delay that has already elapsed. §4.1's floor (`d ≥ rtt/2`) exists to stop
+/// that window from having passed on arrival; a negative value is the degenerate
+/// case, and there is no reading of it that is safe to act on.
+#[test]
+fn a_negative_fire_at_is_refused_not_clamped() {
+    let hostile = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+        (entity_ecf::text("fire_at"), entity_ecf::integer(-250)),
+        (
+            entity_ecf::text("nonce"),
+            entity_ecf::Value::Bytes(vec![3u8; 16]),
+        ),
+    ]));
+    // Named in the assertion so the test cannot pass because some *other* field
+    // failed to decode — the failure has to be about `fire_at`.
+    match PunchSync::from_entity_bytes(&hostile) {
+        Err(crate::SignalingError::Decode(m)) => assert!(m.contains("fire_at"), "wrong field: {m}"),
+        other => panic!("a negative fire_at must be refused, got {other:?}"),
+    }
+}
+
+/// The §4.1 MUST: `d ≥ rtt/2`, the one-way carrier latency.
+///
+/// Below it, B's fire time has already elapsed when the sync lands and the two
+/// sides never overlap — the punch fails while every individual step reports
+/// success. Held across the whole range rather than at the default, because the
+/// `d` value is an explicitly local tunable (§4.1, §9): the property has to
+/// survive someone changing the floor, which is sanctioned, without changing the
+/// derivation, which is not.
+#[test]
+fn punch_delay_never_falls_below_one_way_carrier_latency() {
+    for rtt in [0u64, 1, 60, 250, 251, 500, 4_000, 60_000] {
+        let d = punch_delay(rtt);
+        assert!(d >= rtt / 2, "rtt {rtt}: d {d} < one-way {}", rtt / 2);
+        assert!(
+            d >= rtt,
+            "rtt {rtt}: d {d} — max(rtt, floor) implies d >= rtt"
+        );
+        assert!(
+            d >= PUNCH_DELAY_FLOOR_MS,
+            "rtt {rtt}: d {d} below the floor"
+        );
+    }
+}
+
+/// The floor governs a fast carrier; the RTT governs a slow one. Two peers on a
+/// LAN-fast carrier both land on the floor, which is what keeps `d` from
+/// collapsing toward zero and leaving no room for the sync to arrive.
+#[test]
+fn punch_delay_is_the_floor_when_the_carrier_is_fast() {
+    assert_eq!(punch_delay(0), PUNCH_DELAY_FLOOR_MS);
+    assert_eq!(punch_delay(PUNCH_DELAY_FLOOR_MS - 1), PUNCH_DELAY_FLOOR_MS);
+    assert_eq!(
+        punch_delay(PUNCH_DELAY_FLOOR_MS + 1),
+        PUNCH_DELAY_FLOOR_MS + 1
+    );
+    assert_eq!(punch_delay(4_000), 4_000);
 }
 
 /// The blob carries the type, so a mixed bucket is dispatchable. Without this a

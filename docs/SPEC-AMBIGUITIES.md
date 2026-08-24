@@ -3923,3 +3923,193 @@ inspection, or a deliberate two-node pool added to a later gate. Flagging the
 -written clients hitting the server from outside is a real convergence signal" —
 does **not** reach this one: the clients converge trivially here no matter what
 they implement.
+
+---
+
+## PROPOSAL-CONNECTIVITY-SIGNALING-AND-PUNCH §3 — the message table still calls `fire_at` an *instant*, which §4.1 pins as the one thing it MUST NOT be
+
+**Date:** 2026-07-29. **Status:** built to §4.1 (the pin); **the §3 table's wording routed
+to arch as a one-line strike.** Surfaced implementing the §4.1 pin
+(`extensions/signaling/src/coordination.rs`, `feat/signaling-connection-node`).
+
+**Spec:** §4.1 (`fire_at` derivation, pinned 2026-07-28) read against §3 (the
+coordination-message table) and §9 conformance MUST #5.
+
+**Passage.** §4.1 pins the clock domain as a MUST, and names the failure:
+
+> **Clock domain — relative, never absolute (MUST).** `fire_at` is a **delay from the
+> receiving peer's moment of receipt** of the `punch-sync` entity, encoded as
+> **unsigned integer milliseconds**. It is *not* a timestamp.
+
+§9 carries the same thing as conformance MUST #5. But §3's message table — the part an
+implementer reads to build the wire shape — still says:
+
+> `data: { nonce: <echo>, fire_at: <carrier-RTT-derived instant> }`
+
+**The contradiction.** "Carrier-RTT-derived" is right and is the half that survived; the
+noun is wrong. An implementer building from the table encodes an instant, which is
+precisely what §4.1 forbids, and §3 is the section a wire shape is naturally built from.
+
+**Why this is worth a strike rather than a note.** It is the same class as §10's
+`SEP`/mode-tag bullet (closed 2026-07-28), but with more teeth, and this repo is the
+existence proof: **Rust built `fire_at` as a signed `i64` holding milliseconds since
+epoch, with a test vector of `1_700_000_000_500`** — a wall-clock instant, from the
+pre-pin text, and it round-tripped green. §4.1 says why that is not caught: the failure
+"passes every same-host test", because both peers read the same clock. Two facts make it
+urgent rather than cosmetic:
+
+- **Every impl in the cohort is about to build this field.** The go/py packet is issued;
+  §3 is where its message shapes come from.
+- **The error is silent and terminal.** Skew between two machines' wall clocks is
+  routinely larger than the entire punch window, so the punch simply never lands while
+  each side reports every step succeeding.
+
+**Rust delta (landed, no interim needed — §4.1 is pinned):** `PunchSync.fire_at` is `u64`
+milliseconds-from-receipt, encoded as a CBOR uint (major 0) and refused at decode if
+negative. `punch_delay(rtt) = max(rtt, 250)` implements §4.1's default with its `d ≥ rtt/2`
+MUST held as a property test across the range, so the guarantee survives someone retuning
+the floor — which §4.1 and §9 explicitly sanction — without touching the derivation, which
+they do not. The encoding is asserted **on the bytes**, not through the decoder, since a
+same-side round trip agrees with whatever the encoder wrote.
+
+**Question for arch.** Strike or reword the §3 table's `<carrier-RTT-derived instant>` to
+name the delay — e.g. `<uint ms, delay from receipt (§4.1)>` — **before go/py build item 1**.
+One line, and it closes the last place in the corpus that still describes the field the way
+the trap wants it described.
+
+---
+
+## ~~PROPOSAL-NETWORK-REACHABILITY-FACTS §2.1(b) — how the observed address reaches the handler serving `observe-address` is unspecified, and in Rust there is no path~~ RESOLVED
+
+> **RESOLVED 2026-07-29 — folded as `EXTENSION-NETWORK` §6.7.1** (v1.5, Amendment 13). The
+> question this entry asked is answered in the landed spec, in the passage *"What it costs to
+> implement, stated plainly"*: the general handler context is deliberately **not** widened, and
+> **"a narrow, NETWORK-scoped accept-side path from the connection to this operation is the
+> intended shape,"** with where it sits in a given impl's layering left explicitly to that impl.
+> The cost is now in the spec rather than attached to a ruling — *"that it is a real addition,
+> and not free, is not in dispute."*
+>
+> **Correction — one claim in this entry was wrong, and it was ours.** This entry asserted:
+> *"No `peer_id → remote_addr` registry exists — searched for specifically."* **There is one.**
+> `system/connection/{peer_id}` (ENTITY-CORE-PROTOCOL.md §3.13) is keyed by peer, carries an
+> `address` field, and is already reachable from a handler — it lives in this very tree at
+> `core/peer/src/connection_state.rs` (`ConnectionData::address`). Our search looked for
+> Rust-level `HashMap`-shaped registries in three files and never looked for the entity-level
+> connection-state record, then stated the absence as proven. That is exactly the failure
+> `AGENTS-STANDARD` names: *"an absence claim from a partial grep is how false spec gaps get
+> filed."* Ours was stated more strongly than it had been earned.
+>
+> **The conclusion survived, for a better reason than we gave — and arch found the better
+> reason.** `system/connection` is the wrong record *twice*: its `address` means *the endpoint I
+> dial to reach this peer* and is written **dialer-side** (this tree's own module doc says the
+> responder "holds no dialable address for the remote and records nothing"), and one record per
+> peer cannot express §6.7.3's **per-socket** mapping. So there is still no path to an observed
+> source — but because the nearest record is semantically wrong, not because no record exists.
+>
+> **That correction produced a MUST.** §6.7.1 MUST #2 now forbids persisting `observed_address`
+> to `system/connection.address`, a transport profile, or `system/peer/status`, naming
+> `system/connection/{peer_id}` as *"the record an implementer reaches for first."* An ephemeral
+> source port written there is a routable-**looking** value that routes nowhere, in the field §10
+> and `system/peer/status` both consume as dialable. The cheap fix for the missing plumbing
+> would have corrupted dispatch for every other reader.
+>
+> **Rust status: buildable, unbuilt, and not on this branch.** §6.7 is OPTIONAL as a whole
+> (§12.3); every rule inside it is a MUST when offered (§12.1). It is NETWORK-scoped work with a
+> core/peer accept-side seam, and it must not land on `feat/signaling-connection-node`, whose
+> distinguishing property is `install.rs` asserting zero core edits.
+
+**Date:** 2026-07-29. **Status:** ~~**not built** — arch ruled 2026-07-29 that (b) is the v1
+path but `REACHABILITY-FACTS` is still DRAFT, so nothing is implementable yet.~~ **Superseded:
+landed as `EXTENSION-NETWORK` §6.7.1 the same day.** Logged as an
+input to the fold. Surfaced verifying that ruling's cost claim against this tree.
+
+**Spec:** §2.1(b) (`system/network:observe-address() → {observed_address}`), read with §5's
+`system/capability/network-reflect`.
+
+**Passage.** §2.1(b) defines the op and its result, and the ruling that selected it states:
+
+> an ordinary NETWORK extension op … no core edit, no handshake change, no shared-core file
+> touched in any impl.
+
+**The ambiguity.** §2.1(b) specifies *what the op returns* and never *where the responder gets
+it*. That is normally an impl detail and would not be logged — except that in this
+implementation there is currently **no path at all**, which makes it a shape the fold should
+pin rather than leave to three impls independently.
+
+**Evidence (Rust).** `system/network` is an ordinary handler pattern (`HANDLER_PATTERN`,
+`extensions/network/src/lib.rs`), so the op dispatches through `dispatch_request` →
+`HandlerContext`:
+
+- `dispatch_inbound` (`core/peer/src/connection.rs`) extracts **only** `remote_peer_id`.
+  `conn.remote_addr` is on the same struct at the same expression and is dropped; its only
+  other use in the file is a `tracing::instrument` field.
+- **No `peer_id → remote_addr` registry exists** — searched for specifically, since a lookup
+  keyed on `ctx.session_peer_id` would have made the op free. `remote_addr` never escapes
+  `core/peer`.
+- `HandlerContext` carries no address, and its doc forecloses the easy fix: *"Reject
+  convenience additions; if an extension needs more, find a side channel."*
+
+**This is the same blocker as the deleted wrapped `reflect`** (the entry above,
+*"§1 `reflect` cannot be served on the wrapped surface"*), which was RESOLVED by **moving the
+verb**, not by building the plumbing. Mechanism (b) is an entity-protocol op over an
+established connection, so it returns to that surface and meets the same wall.
+
+**Question for arch.** At fold, say once how the observed source address reaches the handler —
+a context field or the side channel this repo's ceiling doc prefers — so the three impls do
+not each invent one. **No interim choice is recorded because nothing is built:** the op is
+ruled but not landed, and `AGENTS-STANDARD`'s implement-against-the-landed-spec rule applies
+to (b) exactly as it did to (a).
+
+---
+
+## PROPOSAL-NETWORK-REACHABILITY-FACTS §4.2 — the same-local-endpoint MUST implies a socket-options requirement on the v1 TCP substrate that is not stated
+
+> **ACCEPTED 2026-07-29 — recorded by arch as signaling §5.1 + an open item.** The MUST itself
+> folded as `EXTENSION-NETWORK` §6.7.3; the **TCP port-reuse cost** this entry identified is
+> recorded against the substrate choice rather than the fact. Arch's read: it is a **G1 input,
+> not a G1 reversal** — leaning that TCP-simopen-first stands, since "our-QUIC doesn't exist
+> yet" remains the dominant term and the socket options are bounded work. **That is the
+> operator's call, not arch's, and nothing is blocked on it.** Kept open here because the Rust
+> position below is unchanged and unbuilt.
+
+**Date:** 2026-07-29. **Status:** **not built** (Stage 2); routed as an input to the fold,
+**accepted** and recorded against signaling §5.1. Surfaced tracing §4.2 against the 2026-07-29
+gate-2 ruling.
+
+**Spec:** `REACHABILITY-FACTS` §4.2 (added 2026-07-29), read with §2.1(b) and
+`PROPOSAL-CONNECTIVITY-SIGNALING-AND-PUNCH` §5.
+
+**Passage.** §4.2:
+
+> A peer publishing a `srflx` candidate MUST punch from the **same local endpoint** whose
+> mapping was observed. One gathered on one ephemeral socket and punched from another is not
+> the peer's address — it describes a hole that will never open.
+
+**The unstated consequence.** Three decisions now compose: §2.1(b) observes the mapping on an
+**established entity-protocol connection** (so it is that connection's socket), §5 sequences
+**TCP simultaneous-open** as the v1 substrate, and §4.2 requires the punch to leave from that
+same local endpoint. On TCP that is **not satisfiable by discipline** — it requires
+`SO_REUSEADDR`/`SO_REUSEPORT` plus an explicit local bind, the standard TCP hole-punch
+technique, because a NAT allocates a mapping per local socket and a fresh ephemeral socket
+gets a different external port (which is §4.2's own reasoning).
+
+On UDP/QUIC the requirement is trivial — one socket, many destinations — which is why standard
+STUN over UDP is clean, and §5 already notes NATs punch UDP better. §5 chose TCP first
+*because it reuses what ships*; this is the one thing it does not reuse.
+
+**Rust position.** Unbuilt and correctly so — Stage 1 does not punch. The dial path is
+`TcpStream::connect(host_port)` (`TcpTransport::connect`, `core/peer/src/transport.rs`) with an
+OS-assigned ephemeral local port: no `socket2`, no bind control, no reuse. Noted here because
+it is a Stage-2 cost that is currently invisible, not because it is wrong today.
+**Narrower than our first read:** `handle_connection` is public and documented as accepting any
+transport's `Connection`, so *adopting* a punched connection needs no new seam — only the dial
+side is missing.
+
+**Why it wants stating rather than discovering.** It is §4.2's own failure costume one layer
+down: the symptom is "the punch didn't land", indistinguishable from a `fire_at` miss, and
+§4.2's instruction to bisect endpoint identity before timing does not reach an implementer who
+does not know a socket-options requirement exists.
+
+**Question for arch.** Make the socket requirement explicit in §4.2 (or in §5's TCP-simopen
+row) — that same-local-endpoint on TCP means binding the punch socket to the reflector
+connection's local port with address/port reuse.

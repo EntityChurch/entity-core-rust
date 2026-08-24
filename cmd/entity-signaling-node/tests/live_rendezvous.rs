@@ -319,12 +319,19 @@ async fn different_keys_do_not_meet() {
 ///
 /// This test previously asserted a 501 and was described as "the thing that
 /// flips when arch rules." Arch ruled, and it flipped: from *blocked pending
-/// plumbing* to *not served here, ever*. The wrapped surface could only have
-/// reported the TCP/WS mapping of an already-established entity connection while
-/// the punch needs the UDP one, so it answers the wrong question — plumbing it
-/// would have produced a plausible-but-wrong address, and a peer concludes its
-/// NAT type from agreement across reflectors, so a plausible lie gets concluded
-/// on rather than discarded.
+/// plumbing* to *not served here, ever*.
+///
+/// **The rationale was corrected 2026-07-28 and the ruling stands on better
+/// ground.** The original reason given — that the wrapped surface could report
+/// only a TCP/WS mapping while the punch needs a UDP one — is wrong for v1:
+/// `PROPOSAL-CONNECTIVITY-SIGNALING-AND-PUNCH` §5 sequences **TCP
+/// simultaneous-open first**, so the TCP mapping is precisely the one the v1
+/// punch needs. The real reason is ownership: `PROPOSAL-NETWORK-REACHABILITY-FACTS`
+/// §2.1(a) already owns "how a peer learns its observed address" — an optional
+/// `observed_address` field the responder fills on the NETWORK §6.3 HELLO
+/// handshake, from any peer, no node involved — so a wrapped `reflect` would be
+/// a **second mechanism for a fact that has a canonical home**, which is the
+/// defect regardless of which transport it reported.
 ///
 /// The 400 rather than a 501 is the load-bearing part. A 501 would tell a client
 /// "this verb exists and this node can't do it *yet*", which invites it to keep
@@ -486,8 +493,11 @@ fn empty_chain() -> std::collections::HashMap<entity_hash::Hash, entity_entity::
 /// over real TCP, through a node that decoded none of it.
 ///
 /// This is the last Stage-1 link. What follows it is §4 steps 3–5 — measure the
-/// carrier RTT, agree a `fire_at`, both sides fire at that instant — which is
-/// socket work and Stage 2.
+/// carrier RTT, agree a `fire_at`, both sides fire — which is socket work and
+/// Stage 2. Note "both sides fire" and *not* "at that instant": §4.1 pins
+/// `fire_at` as a **delay from receipt**, not a shared moment, because V7
+/// assumes no synchronized clocks. The derivation and encoding ship here
+/// (`coordination::punch_delay`); only the firing waits.
 #[tokio::test]
 async fn candidate_exchange_completes_over_tcp() {
     use entity_signaling::coordination::{

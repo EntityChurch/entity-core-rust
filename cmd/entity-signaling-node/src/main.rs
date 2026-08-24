@@ -23,10 +23,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
+use entity_capability::GrantEntry;
 use entity_core::crypto::{IdentityKeypair, Keypair};
 use entity_core::peer::transport::Listener;
 use entity_core::peer::{PeerBuilder, PeerConfig};
-use entity_signaling::{Limits, SignalingCore, SignalingHandler};
+use entity_signaling::{signaling_seed_grants, Limits, SignalingCore, SignalingHandler};
 
 #[derive(Parser)]
 #[command(
@@ -71,6 +72,52 @@ struct Args {
     /// observes.
     #[arg(long, default_value_t = 30)]
     reap_interval_secs: u64,
+
+    /// Serve **any** peer that connects: seed the signaling grant under the
+    /// `default` policy key.
+    ///
+    /// This is the public-introducer posture. It grants exactly
+    /// `system/signaling:{offer,collect,advertise}` and nothing else — not a
+    /// wildcard — but it does grant it to strangers, which is why it is opt-in
+    /// rather than the default. Required to run the `PROPOSAL-CONNECTION-NODE`
+    /// §6 cross-impl gate, since the go and py clients connect as unknown peers.
+    #[arg(long)]
+    open: bool,
+
+    /// Serve a **named** peer: seed the signaling grant for this grantee only.
+    /// Repeatable. Takes a Base58 PeerID (the pre-contact affordance) or a
+    /// v7.64 hex identity-hash.
+    ///
+    /// This is the private-device-mesh posture (§2.1) — the case the wrapped
+    /// surface exists for, where the capability grant *is* the admission
+    /// control and naming your own peers is the point.
+    #[arg(long = "grant", value_name = "PEER")]
+    grants: Vec<String>,
+}
+
+/// Assemble the seed policy from the admission flags.
+///
+/// Empty means **closed**: a connecting peer receives only the §4.4 floor
+/// (`system/tree:get` + `system/capability:request`) and every signaling call is
+/// refused 403 before reaching a verb. That was this binary's behavior with no
+/// way to change it until the go and py clients hit it — see
+/// `entity_signaling::signaling_seed_grants`.
+///
+/// Closed is kept as the default deliberately. The wrapped surface's admission
+/// control *is* the capability grant (§2.1), and the surface exists for the
+/// private mesh; the open-to-strangers posture belongs to the unwrapped listener,
+/// whose protocol (§5.1) is unwritten. A binary that served everyone by default
+/// would quietly pre-empt that design. So the operator says which one they meant,
+/// and the startup banner prints the answer back.
+fn seed_policy(open: bool, grants: &[String]) -> Vec<(String, Vec<GrantEntry>)> {
+    let mut entries = Vec::new();
+    if open {
+        entries.push(("default".to_string(), signaling_seed_grants()));
+    }
+    for grantee in grants {
+        entries.push((grantee.clone(), signaling_seed_grants()));
+    }
+    entries
 }
 
 #[tokio::main]
@@ -119,6 +166,7 @@ async fn main() -> anyhow::Result<()> {
             listen_addr: args.listen.clone(),
             ..PeerConfig::default()
         })
+        .with_seed_policy(seed_policy(args.open, &args.grants))
         .handler(handler)
         .build()?;
 
@@ -137,6 +185,20 @@ async fn main() -> anyhow::Result<()> {
     println!("  lobby:     {}", lobby_constant);
     println!("  surface:   wrapped (cross-peer execute) — offer/collect/advertise");
     println!("  reflect:   not served here; unwrapped listener's verb (§1.4, Stage 2)");
+    // Print the admission posture, always. A node that serves nobody looks
+    // identical to a working one until the first 403, and that is exactly how
+    // this gap survived Stage 1 — the in-process tests seed a wildcard, so no
+    // Rust-side run ever saw the closed default.
+    match (args.open, args.grants.len()) {
+        (true, 0) => println!("  admission: OPEN — any peer may offer/collect/advertise"),
+        (true, n) => println!("  admission: OPEN + {} named grantee(s)", n),
+        (false, 0) => println!(
+            "  admission: CLOSED — no peer holds signaling authority; every call \
+             will be refused 403.\n             Pass --open (serve anyone) or \
+             --grant <peer-id> (serve named peers)."
+        ),
+        (false, n) => println!("  admission: {} named grantee(s) only", n),
+    }
 
     // The reaper. Deliberately a plain task owned by this binary rather than a
     // handler-owned background service: the lifecycle contract that would let a
@@ -184,4 +246,60 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use entity_signaling::{OPERATIONS, PATTERN};
+
+    /// The default is **closed**, and that has to be asserted here rather than
+    /// inferred: the whole defect the go and py clients found was that this
+    /// binary's admission posture was invisible from inside the repo, because
+    /// nothing in Rust ever exercised the shipped construction path.
+    #[test]
+    fn no_flags_seeds_nothing() {
+        assert!(seed_policy(false, &[]).is_empty());
+    }
+
+    #[test]
+    fn open_seeds_the_default_key() {
+        let policy = seed_policy(true, &[]);
+        assert_eq!(policy.len(), 1);
+        assert_eq!(policy[0].0, "default");
+        assert_eq!(policy[0].1, signaling_seed_grants());
+    }
+
+    #[test]
+    fn grants_are_keyed_per_named_peer() {
+        let policy = seed_policy(false, &["peer-a".to_string(), "peer-b".to_string()]);
+        let keys: Vec<&str> = policy.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["peer-a", "peer-b"]);
+        assert!(policy.iter().all(|(_, g)| *g == signaling_seed_grants()));
+    }
+
+    /// `--open` and `--grant` compose rather than one overriding the other: an
+    /// operator may serve strangers *and* hold a named entry for their own
+    /// peers.
+    #[test]
+    fn open_and_named_grants_compose() {
+        let policy = seed_policy(true, &["peer-a".to_string()]);
+        let keys: Vec<&str> = policy.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["default", "peer-a"]);
+    }
+
+    /// The seeded grant must stay **narrow**. A wildcard here would hand every
+    /// caller every handler on the node — which is what the live-test harness
+    /// does, and precisely why that harness could not have caught the closed
+    /// default.
+    #[test]
+    fn the_seeded_grant_is_signaling_only() {
+        let grants = signaling_seed_grants();
+        assert_eq!(grants.len(), 1);
+        assert_eq!(grants[0].handlers.include, vec![PATTERN.to_string()]);
+        assert!(!grants[0].operations.include.contains(&"*".to_string()));
+        for op in OPERATIONS {
+            assert!(grants[0].operations.include.contains(&(*op).to_string()));
+        }
+    }
 }

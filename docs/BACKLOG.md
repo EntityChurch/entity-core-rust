@@ -223,7 +223,10 @@ Several handlers store `local_peer_id` but never use it (tree, inbox, continuati
 `persist` feature and module are deprecated in favor of SQLite (`SqliteStore`). Module marked `#[deprecated(since = "0.2.0")]`. Remove when no external users remain.
 
 ### entity-continuation fails `clippy -D warnings`
-`extensions/continuation/src/lib.rs:5015` — `assert!(DEFAULT_CHAIN_TTL > MAX_CHAIN_DEPTH, ...)` trips `clippy::assertions_on_constants` (both operands are compile-time consts; clippy wants a `const { assert!(..) }` block). Predates the 2026-07-28 STANDING-MODEL §3 AT-1..AT-4 work (reproduced identically via `git stash` before that change landed) — flagged, not fixed, to keep that change minimal-diff.
+`extensions/continuation/src/lib.rs`, the `DEFAULT_CHAIN_TTL > MAX_CHAIN_DEPTH` assertion in the
+depth-brake tests (was cited as `:5015`; the Python client's 2026-07-30 review found it now
+reports at `:5672` — the line-number drift `AGENTS-STANDARD.md` warns about, so it is pinned by
+symbol here instead) — `assert!(DEFAULT_CHAIN_TTL > MAX_CHAIN_DEPTH, ...)` trips `clippy::assertions_on_constants` (both operands are compile-time consts; clippy wants a `const { assert!(..) }` block). Predates the 2026-07-28 STANDING-MODEL §3 AT-1..AT-4 work (reproduced identically via `git stash` before that change landed) — flagged, not fixed, to keep that change minimal-diff.
 
 ---
 

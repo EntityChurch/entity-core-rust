@@ -105,7 +105,8 @@ pub mod client;
 mod tests;
 
 pub use coordination::{
-    Candidate, CollectedMessage, ConnectRequest, ConnectResponse, Nonce, PunchSync,
+    punch_delay, Candidate, CollectedMessage, ConnectRequest, ConnectResponse, Nonce, PunchSync,
+    PUNCH_DELAY_FLOOR_MS,
 };
 pub use core::{
     Advertisement, CoreError, Limits, OfferOutcome, RendezvousKey, SignalingCore, LOBBY_DEFAULT,
@@ -173,6 +174,45 @@ pub const SIGNALING_SEED_CAPS: &[&str] = &[
     CAP_SIGNALING_COLLECT,
     CAP_SIGNALING_ADVERTISE,
 ];
+
+/// The seed-policy grant that lets a peer *use* this node's wrapped surface —
+/// [`SIGNALING_SEED_CAPS`] expressed in the shape `PeerBuilder::with_seed_policy`
+/// actually consumes.
+///
+/// **Why this exists as a function.** The constants above name the caps
+/// declaratively, the way every extension names its capability surface; nothing
+/// enforces a name. What the dispatch layer checks is a `GrantEntry`, and until
+/// this function there was no wired path from one to the other. The shipped
+/// `entity-signaling-node` therefore granted a connecting peer **nothing** on
+/// `system/signaling` — the §4.4 floor is `system/tree:get` + `system/capability:request`,
+/// and `request` is pure attenuation, so a caller holding no signaling authority
+/// could not mint any. Every foreign call got a 403 before reaching a verb.
+/// **Found by the go and py clients independently**, on the first attempt to run
+/// the §6 gate against a real node; the in-process live tests missed it because
+/// they seed a wildcard, which authorizes everything and so proves nothing about
+/// admission.
+///
+/// **Narrow on purpose.** Exactly [`OPERATIONS`] on exactly [`PATTERN`], with an
+/// **empty** resource scope — a signaling EXECUTE carries no resource target
+/// (`ExecuteOptions::default()`), so resources are never consulted, and the same
+/// shape as the `system/capability:request` entry in `default_connection_grants`
+/// is the honest one. A wildcard here would hand every caller every handler on
+/// the node, which is what the test harness does and what an operator must not.
+///
+/// `peers: None` resolves to the local peer, which is this node — the target of
+/// every inbound call to it.
+pub fn signaling_seed_grants() -> Vec<entity_capability::GrantEntry> {
+    vec![entity_capability::GrantEntry {
+        handlers: entity_capability::PathScope::new(vec![PATTERN.into()]),
+        resources: entity_capability::PathScope::new(vec![]),
+        operations: entity_capability::IdScope::new(
+            OPERATIONS.iter().map(|op| (*op).to_string()).collect(),
+        ),
+        peers: None,
+        constraints: None,
+        allowances: None,
+    }]
+}
 
 // ---------------------------------------------------------------------------
 // Error codes — signaling's own code domain (V7 §3.3)

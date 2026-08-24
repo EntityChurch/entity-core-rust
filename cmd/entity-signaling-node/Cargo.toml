@@ -11,6 +11,8 @@ path = "src/main.rs"
 [dependencies]
 entity-core.workspace = true
 entity-signaling.workspace = true
+# The admission flags' seed policy is a Vec<(String, Vec<GrantEntry>)>.
+entity-capability.workspace = true
 clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true

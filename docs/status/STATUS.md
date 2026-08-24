@@ -1,6 +1,6 @@
 # entity-core-rust — status
 
-_Updated: 2026-07-27 · public: v0.8.0 (master)_
+_Updated: 2026-07-30 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -34,6 +34,66 @@ and tree semantics are interop-validated against the Go and Python peers, not
 just self-tested.
 
 ## Where we left off
+
+_2026-07-30 — signaling Stage 1 merged to `dev`; the go/py client brief is issued_
+(`docs/status/HANDOFF-2026-07-30-signaling-go-py-client-brief.md`, following
+`HANDOFF-2026-07-29-signaling-merged-cross-impl-next.md`). The connection node's Stage 1 —
+`extensions/signaling/` (the three verbs, the §2.2 key derivation, §3.1.1 pool selection, the
+§3 coordination messages) plus `cmd/entity-signaling-node/` — is on `dev` at `7f76321`,
+fast-forward, **zero edits to `core/` or `bindings/`**. Verified 2026-07-30: `cargo test
+--workspace` **2260 passed / 0 failed / 12 ignored**, 72 of them signaling; `cargo fmt --check`
+clean; clippy clean but for the already-logged pre-existing `assertions_on_constants` in
+`extensions/continuation/`.
+
+_2026-07-30 (same day) — the go and py clients landed, and both found the same Rust defect:_
+**the shipped `entity-signaling-node` granted a connecting peer no signaling authority.** The
+§4.4 floor is `system/tree:get` + `system/capability:request`, and `request` is pure
+attenuation, so there was no path from the floor to `system/signaling` and no flag, config, or
+file to add one — every foreign call was 403 before reaching a verb. Invisible from inside this
+repo because the only Rust tests that connect to a node seed a **wildcard**, which authorizes
+everything and so proves nothing about admission. The class of thing a second implementation
+finds first.
+
+Fixed: `entity_signaling::signaling_seed_grants()` (the caps in the shape
+`with_seed_policy` consumes, narrow — exactly the three verbs, empty resource scope) wired to
+`--open` (serve anyone; the posture the §6 gate needs) and `--grant <peer>` (serve named peers;
+the private-mesh posture), which compose. **Closed stays the default** — §2.1 makes the grant
+*the* admission control on the wrapped surface, and the open-to-strangers posture belongs to
+the unwrapped listener whose protocol is unwritten — but the node now prints its posture at
+startup instead of failing silently. New `cmd/entity-signaling-node/tests/admission.rs` (5) +
+5 flag unit tests assert what the wildcard harness structurally cannot: a stranger admitted
+under the narrow grant, refused without it, no spill onto other handlers, and a named grant
+admitting only its peer. Suite **2270 passed / 0 failed / 12 ignored**, 82 signaling.
+
+Go then ran its client against two live `--open` nodes: **`validate-peer -category signaling`
+5/5 PASS**, PASS again on a rerun inside the TTL, and the two-instance pool discriminating
+across all four modes. Go and Python also derive **byte-identical keys** for all four modes
+over fixed inputs and make identical §3.1.1 selections — the highest-risk unknown, closed. The
+caveat is theirs and it is the right one: both built against *this brief*, not the committed
+spec, so that is **cohort-consistent agreement, not independent convergence**, and the live
+go↔py meet through one node is still owed.
+
+Their report also named a "resource-target trap", now pinned here empirically: the identical
+`advertise` call is 200 without a resource target and **403 with one**, because signaling
+addresses no tree resource and the seeded grant's resource scope is empty by design. Kept
+narrow rather than widened to `*`; recorded as a client rule in the brief's §5.1.
+
+One behaviour change that reached the brief: **`reflect` is a 403 against an `--open` node**,
+not the 400 the wildcard harness sees — the capability check runs before dispatch, so an
+enumerated grant refuses an operation it does not name. Both are correct; clients must not
+treat 400 as the only signal that `reflect` is unserved. Also recorded from Python: a
+responder that answers the first request in a `pair`/`lobby` bucket adopts a **stale** one on
+any rerun inside the 60 s TTL, since those keys are stable by construction.
+
+**Rust's part is done and the next move is not ours.** Stage 1 proves mechanism, not
+connectivity — it does *not* connect two NAT'd peers, which is Stage 2. And nothing in this
+repo can validate the two things most likely to be wrong: every peer in every test is the
+same Rust, so a wrong-but-self-consistent §2.2 derivation or §3.1.1 weight function passes
+exactly as a correct one does. **go/py clients + `validate-peer -category signaling` (go as
+oracle, two-instance Rust pool) are the first real evidence.** One blocker sits ahead of
+that, routed and unactioned: the signaling spec corpus is uncommitted/untracked in the arch
+working tree, so the packet's "build against the spec, not the Rust" is currently
+unexecutable from a clone — see the brief's §1.
 
 _2026-07-28 — STANDING-MODEL §4 O5 (sweep-all) landed — the last Rust-side §4 residual_
 (`docs/status/ROUTING-2026-07-28-standing-model-4-o5-sweep-all-rust.md`; answers
@@ -380,7 +440,18 @@ up only if a future profile shows `verify_request` back on the hot path.
 
 ## Waiting on
 
-- **Nothing is blocked on architecture.** Rounds 1 and 2 are both absorbed.
+- **Signaling — three arch-owned items, none blocking Rust's Stage 1** (merged and
+  verified), all blocking what comes after it. (a) **The signaling spec corpus is
+  uncommitted upstream** — `PROPOSAL-CONNECTION-NODE` is untracked and the §2.2/§3.1/§3.2/
+  §3.3/§4.1 and §3.1.1 pins are uncommitted modifications, so go/py cannot build against the
+  spec from a clone; verified read-only 2026-07-30 against arch HEAD `46ef024`. (b)
+  **`PROPOSAL-CONNECTION-NODE` §5.1**, the public listener's wire protocol — unwritten, gates
+  the unwrapped surface in all three languages. (c) **`HANDLER-OWNED-SERVICES` §6 open item
+  1**, the manifest declaration's field shape — DRAFT, no cohort review, gates the
+  service-owning half of Stage 2. Detail and the ask in
+  `docs/status/HANDOFF-2026-07-30-signaling-go-py-client-brief.md` §1 and §9.
+- **On the standing-model / network rounds, nothing is blocked on architecture.** Rounds 1
+  and 2 are both absorbed.
   The `{reason}` sentinel-vs-hash divergence is **closed** — round-2 ruling 1
   ruled sentinel everywhere, which is the shape Rust already held; all three
   coordinates now use it and Go has converged. Two questions stay routed and

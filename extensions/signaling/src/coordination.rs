@@ -27,6 +27,14 @@
 //! `PROPOSAL-CONNECTION-NODE` §3.1 it needs a service-owning lifecycle that does
 //! not yet exist.
 //!
+//! One piece of step 3 *is* here, and deliberately: [`punch_delay`] and
+//! `fire_at`'s clock domain (§4.1, pinned 2026-07-28). Both are pure
+//! computation — no socket, no lifecycle — and both are cross-peer-observable,
+//! so they belong with the wire shapes rather than with the socket work that
+//! consumes them. It is the same split [`key`](crate::key) already makes: the
+//! §2.2 derivation ships in Stage 1 because getting it wrong is a silent
+//! never-meet, even though only Stage 2 dials.
+//!
 //! # The Stage-1 gap, stated: these messages are not signed
 //!
 //! §3.3 pins that a coordination blob is **self-contained** — the entity plus a
@@ -277,24 +285,45 @@ impl ConnectResponse {
     }
 }
 
-/// Either direction — aligns the instant both sides fire.
+/// Either direction — aligns the moment both sides fire.
 ///
-/// **Shape only in Stage 1.** `fire_at` is derived from the measured
-/// carrier round-trip so both sides start sending at ≈ the same moment (A fires
-/// after sending sync; B fires on receipt, ~½ RTT later, so they cross in the
-/// middle). §4 step 3: "getting `fire_at` right is what makes the holes line
-/// up." Measuring the RTT and firing are Stage 2.
+/// **`fire_at` is a delay, not a timestamp** (§4.1, pinned 2026-07-28, MUST).
+/// It is **unsigned integer milliseconds measured from the receiving peer's
+/// moment of receipt** of this entity. V7 assumes no synchronized clocks, and
+/// two peers' wall clocks can differ by far more than the whole punch window, so
+/// a wall-clock instant on the wire is a silent never-meet. §9's conformance
+/// list carries it as MUST #5 for exactly that reason.
+///
+/// **Why this shape needs a test rather than care.** The failure is invisible to
+/// every same-host test — both peers read the same clock, so a wall-clock
+/// encoding passes — which is the same masking shape §2.2's home-format trap
+/// has. It is also the *plausible* implementation: "the agreed instant" reads
+/// like a timestamp, and this build encoded one (a signed `i64` holding ms since
+/// epoch) until §4.1 pinned the clock domain.
+///
+/// Who fires when (§4.1): **A fires `d` after *sending*, B fires `d` after
+/// *receiving*.** The sync crosses roughly half the carrier round trip, so the
+/// two firings meet near the middle. Deriving `d` is [`punch_delay`]; measuring
+/// the RTT and actually firing are Stage 2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PunchSync {
     pub nonce: Nonce,
-    /// The agreed instant, ms since epoch.
-    pub fire_at: i64,
+    /// Milliseconds from **receipt**, never an absolute instant. See the type
+    /// doc — the clock domain and the unsigned encoding are the interoperable
+    /// surface; the *value* is a local tunable (§4.1, §9).
+    pub fire_at: u64,
 }
 
 impl PunchSync {
     pub fn to_entity(&self) -> Result<Entity, SignalingError> {
         let data = to_ecf(&Value::Map(vec![
-            (text("fire_at"), integer(self.fire_at)),
+            // A CBOR uint (major 0), not a signed integer: §4.1 pins the
+            // encoding alongside the clock domain, and `u64` is what makes a
+            // negative delay unrepresentable rather than merely unwise.
+            (
+                text("fire_at"),
+                Value::Integer(ciborium::value::Integer::from(self.fire_at)),
+            ),
             (text("nonce"), bytes(self.nonce.0.clone())),
         ]));
         Entity::new(TYPE_PUNCH_SYNC, data).map_err(|e| SignalingError::Encode(e.to_string()))
@@ -304,9 +333,32 @@ impl PunchSync {
         let map = decode_map(data)?;
         Ok(Self {
             nonce: Nonce(field_bytes(&map, "nonce")?),
-            fire_at: field_i64(&map, "fire_at")?,
+            fire_at: field_u64(&map, "fire_at")?,
         })
     }
+}
+
+/// The default `d` in §4.1's derivation: `d = max(rtt, 250 ms)`.
+///
+/// `[K]` industry-typical, **not** measured here — §4.1 pins the shape and
+/// leaves the number to the live gate, so this is a tunable default rather than
+/// a wire constant. Two peers may hold different floors without failing to meet;
+/// they may not differ on the clock domain or the encoding.
+pub const PUNCH_DELAY_FLOOR_MS: u64 = 250;
+
+/// Derive the `fire_at` delay from the measured carrier round-trip (§4.1).
+///
+/// `rtt_ms` is the round trip **through the carrier** — A's `offer` to the
+/// `collect` that returns B's response. That is the only latency estimate either
+/// peer has, since by construction neither can yet reach the other directly.
+///
+/// The MUST this enforces: **`d` ≥ the one-way carrier latency (`rtt/2`)**.
+/// Below that floor B's fire time has already elapsed when the sync lands and
+/// the two sides never overlap. `max(rtt, 250)` satisfies it with margin —
+/// `d ≥ rtt` implies `d ≥ rtt/2` — so the guarantee holds for any floor, not
+/// just this default. Retry counts and probe pacing stay local (§4.1).
+pub fn punch_delay(rtt_ms: u64) -> u64 {
+    rtt_ms.max(PUNCH_DELAY_FLOOR_MS)
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +470,15 @@ pub fn find_response<'a>(
 /// Returns the first match in bucket order. A `lobby` bucket may hold several,
 /// and which one to answer is a **peer policy** question (answer all, answer
 /// one, prefer a known peer) that this layer deliberately does not decide.
+///
+/// **The trap that policy leaves to the caller** (found by the Python client,
+/// 2026-07-30, and it will bite any repeated run): `pair` and `lobby` keys are
+/// **stable by construction**, so their buckets still hold *earlier* exchanges
+/// until the 60 s TTL reaps them. A responder that answers the first hit on a
+/// rerun adopts a **stale** request — echoing a nonce nobody is waiting on — and
+/// leaves the live request unanswered, while every step reports success. Track
+/// the nonces you have already answered and skip them; the bucket is a set with
+/// history, not a queue.
 pub fn find_request<'a>(
     messages: impl IntoIterator<Item = &'a CollectedMessage>,
     my_peer_id: &str,
@@ -464,11 +525,17 @@ fn field_bytes(map: &[(Value, Value)], key: &str) -> Result<Vec<u8>, SignalingEr
         .ok_or_else(|| SignalingError::Decode(format!("missing/invalid bstr field {}", key)))
 }
 
-fn field_i64(map: &[(Value, Value)], key: &str) -> Result<i64, SignalingError> {
+/// Read an unsigned integer field. A negative value fails here rather than
+/// being clamped or widened: `fire_at` is a delay (§4.1), so a negative one is
+/// not a small mistake to tolerate — it is the wall-clock reading of a field
+/// that has none, and acting on it means firing into a window that has passed.
+fn field_u64(map: &[(Value, Value)], key: &str) -> Result<u64, SignalingError> {
     get_field(map, key)
         .and_then(|v| v.as_integer())
-        .and_then(|i| i64::try_from(i).ok())
-        .ok_or_else(|| SignalingError::Decode(format!("missing/invalid integer field {}", key)))
+        .and_then(|i| u64::try_from(i).ok())
+        .ok_or_else(|| {
+            SignalingError::Decode(format!("missing/invalid unsigned integer field {}", key))
+        })
 }
 
 fn field_u32(map: &[(Value, Value)], key: &str) -> Option<u32> {
