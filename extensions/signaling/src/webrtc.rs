@@ -819,6 +819,7 @@ pub enum WebRtcError {
     #[error(
         "§6.5 negotiation window closed with no open data channel \
          (role={}, sdp_exchange={}, last counterpart bucket={counterpart_msgs} msg(s), \
+         candidates posted={candidates_posted}/fed={candidates_fed}, \
          channel wait: {})",
         if *offered { "offerer" } else { "answerer" },
         if *answered { "complete" } else { "INCOMPLETE" },
@@ -837,6 +838,12 @@ pub enum WebRtcError {
         /// many messages the counterpart actually contributed. Zero here is the
         /// genuine "nobody came" case.
         counterpart_msgs: usize,
+        /// Local candidates trickled out to the bucket (§6.5 / RFC 8838).
+        candidates_posted: usize,
+        /// Counterpart candidates actually handed to `add_remote_candidate`.
+        /// Zero with a non-empty bucket is a correlation bug; non-zero with
+        /// `ice=failed` means they landed and ICE still nominated no pair.
+        candidates_fed: usize,
         /// Last reason the data channel wait failed, if it was ever reached.
         channel_wait: Option<String>,
     },
@@ -980,11 +987,41 @@ fn release_answer_sdp(
 /// With no `peer_id` in these payloads, the negotiation tracks the exact blobs
 /// it posted and skips them — §6.4's MUST, applied the only way this schema
 /// allows. [`find_counterpart_offer`] adds the session-based half.
+/// A completed §6.5 negotiation: the open channel, plus which signaling role
+/// this peer ended up in.
+///
+/// **`offered` is not a diagnostic — it decides the handshake role.** §6.5's
+/// offerer-determination pin ends with *"It chains with §7.4.1: the peer that
+/// ends up the offerer is the §7.4.1 initiator, so the post-establishment HELLO
+/// client role follows it — one role assignment, not two."* §7.4.1 then makes
+/// that a `[cross-peer seam — MUST]`: the initiator runs the **client** half of
+/// `system/protocol/connect` and the responder **serves** it.
+///
+/// So the channel alone is not enough for the caller to use it. Both peers reach
+/// `establish_live` under §6.5's rendezvous-driven trigger (b), both come away
+/// holding the same `RTCDataChannel`, and nothing in that channel says who
+/// speaks HELLO first — the identical ambiguity §7.4.1 exists to resolve for the
+/// native punch, where "both sides dialed" destroys the signal. Without this
+/// field the caller defaults to the client half on both ends and produces
+/// §7.4.1's first named failure: *both sides send HELLO — a crossed handshake*.
+///
+/// Carried out of `negotiate` because this is the only place that knows: the
+/// role is decided by `pair_should_suppress_offer` (or by glare resolution) deep
+/// inside the loop, and is not recoverable from the channel afterwards.
+#[derive(Debug)]
+pub struct Negotiated<C> {
+    /// The open data channel.
+    pub channel: C,
+    /// Did this peer post the offer? `true` → §7.4.1 **initiator** (sends
+    /// HELLO); `false` → §7.4.1 **responder** (serves it).
+    pub offered: bool,
+}
+
 pub async fn negotiate<C: Carrier, I: WebRtcIo>(
     party: &WebRtcParty,
     carrier: &C,
     io: &I,
-) -> Result<I::Channel, WebRtcError> {
+) -> Result<Negotiated<I::Channel>, WebRtcError> {
     let started = io.now_ms();
     let mut posted: Vec<Vec<u8>> = Vec::new();
     let mut session = party.session_id.clone();
@@ -1024,6 +1061,8 @@ pub async fn negotiate<C: Carrier, I: WebRtcIo>(
     // window closing says *which* half failed instead of guessing at rendezvous.
     let mut counterpart_msgs = 0usize;
     let mut channel_wait: Option<String> = None;
+    let mut candidates_posted = 0usize;
+    let mut candidates_fed = 0usize;
     let mut tick = 0u64;
     loop {
         tick += 1;
@@ -1032,6 +1071,8 @@ pub async fn negotiate<C: Carrier, I: WebRtcIo>(
                 offered,
                 answered,
                 counterpart_msgs,
+                candidates_posted,
+                candidates_fed,
                 channel_wait,
             });
         }
@@ -1137,6 +1178,7 @@ pub async fn negotiate<C: Carrier, I: WebRtcIo>(
                 username_fragment: local.username_fragment,
             };
             post(carrier, &party.key, &party.signer, &c, &mut posted).await?;
+            candidates_posted += 1;
         }
         for remote in candidates_for(&mine, &session) {
             if fed_candidates.contains(&remote) {
@@ -1146,14 +1188,22 @@ pub async fn negotiate<C: Carrier, I: WebRtcIo>(
                 .await
                 .map_err(WebRtcError::Substrate)?;
             fed_candidates.push(remote);
+            // Counted, not logged: a `debug!` here fires once per candidate per
+            // negotiation and says nothing on its own. What answers
+            // "did the trickled candidates reach the pc?" is the pair
+            // (posted, fed) at the moment the window closes — zero fed with a
+            // non-empty bucket is a correlation bug, non-zero fed with
+            // `ice=failed` means they landed and ICE still found no pair.
+            candidates_fed += 1;
         }
 
         if answered {
             let remaining = party
                 .deadline_ms
                 .saturating_sub(io.now_ms().saturating_sub(started));
+            let before_wait = io.now_ms();
             match io.wait_open(remaining.min(party.poll_interval_ms)).await {
-                Ok(channel) => return Ok(channel),
+                Ok(channel) => return Ok(Negotiated { channel, offered }),
                 // Deliberately not logged here. This is a *poll* — the timeout
                 // handed down is one tick, so "not open yet" is the expected
                 // answer on every tick but the last, and a `warn!` in this arm
@@ -1166,6 +1216,24 @@ pub async fn negotiate<C: Carrier, I: WebRtcIo>(
                 // stall looked worker-side.
                 Err(e) => channel_wait = Some(e),
             }
+
+            // `wait_open` **is** this iteration's wait. Sleeping a full poll
+            // interval on top of it doubled the loop period to 2× — and only
+            // once `answered` is true, i.e. exactly while ICE is trying to hold
+            // a pair and the counterpart is still trickling. Every remote
+            // candidate arriving in that window waited up to twice as long to
+            // reach `addIceCandidate`, and every local one twice as long to be
+            // posted.
+            //
+            // Only the shortfall is made up, so the period is one poll interval
+            // whether `wait_open` returned early or ran to its bound. Sleeping
+            // nothing at all would hot-spin when the remaining window is shorter
+            // than a tick.
+            let waited = io.now_ms().saturating_sub(before_wait);
+            if waited < party.poll_interval_ms {
+                io.sleep_ms(party.poll_interval_ms - waited).await;
+            }
+            continue;
         }
 
         io.sleep_ms(party.poll_interval_ms).await;
@@ -1349,6 +1417,19 @@ mod tests {
         remote_answer_seen: Mutex<Option<String>>,
         open_after_answer: bool,
         clock: Mutex<u64>,
+        /// Model `wait_open` as a wait that actually *runs to its bound*, the
+        /// way a real one does: the main thread polls `readyState` until the
+        /// timeout it was handed expires. Off by default, because every other
+        /// test wants the instant answer.
+        ///
+        /// Without this the cadence is untestable, and untestable in a way that
+        /// hides the exact bug: a `wait_open` that consumes no virtual time
+        /// leaves `waited == 0`, so the shortfall sleep pays the full poll
+        /// interval and the fixed loop is indistinguishable from the broken one.
+        wait_open_runs_to_bound: bool,
+        /// Every `wait_open` timeout this peer was handed, in order. The loop
+        /// period is what these are counted against.
+        wait_open_calls: Mutex<Vec<u64>>,
     }
 
     impl StubBrowser {
@@ -1368,6 +1449,12 @@ mod tests {
         fn negotiated(&self) -> bool {
             self.remote_offer_seen.lock().unwrap().is_some()
                 || self.remote_answer_seen.lock().unwrap().is_some()
+        }
+
+        /// See [`StubBrowser::wait_open_runs_to_bound`].
+        fn with_wait_open_running_to_bound(mut self) -> Self {
+            self.wait_open_runs_to_bound = true;
+            self
         }
     }
 
@@ -1398,12 +1485,19 @@ mod tests {
             self.remote_fed.lock().unwrap().push(candidate.clone());
             Ok(())
         }
-        async fn wait_open(&self, _timeout_ms: u64) -> Result<String, String> {
+        async fn wait_open(&self, timeout_ms: u64) -> Result<String, String> {
+            self.wait_open_calls.lock().unwrap().push(timeout_ms);
             if self.open_after_answer && self.negotiated() {
-                Ok(format!("channel-{}", self.label))
-            } else {
-                Err("not open".into())
+                return Ok(format!("channel-{}", self.label));
             }
+            if self.wait_open_runs_to_bound {
+                // A real `wait_open` that never opens burns the whole timeout it
+                // was handed before reporting. Charge it to the virtual clock so
+                // the loop period is measurable.
+                *self.clock.lock().unwrap() += timeout_ms;
+                tokio::task::yield_now().await;
+            }
+            Err("not open".into())
         }
         async fn sleep_ms(&self, ms: u64) {
             *self.clock.lock().unwrap() += ms.max(1);
@@ -1480,8 +1574,16 @@ mod tests {
             negotiate(&hi_p, &hi_c, &hi_io),
         );
 
-        assert_eq!(lo_res.unwrap(), "channel-lo");
-        assert_eq!(hi_res.unwrap(), "channel-hi");
+        let (lo_ok, hi_ok) = (lo_res.unwrap(), hi_res.unwrap());
+        assert_eq!(lo_ok.channel, "channel-lo");
+        assert_eq!(hi_ok.channel, "channel-hi");
+        // §6.5 → §7.4.1: `lo` offered, so it is the initiator and sends HELLO;
+        // `hi` suppressed and answered, so it serves. One role assignment.
+        assert!(lo_ok.offered, "`lo` offers in pair mode — §7.4.1 initiator");
+        assert!(
+            !hi_ok.offered,
+            "`hi` suppresses and answers — §7.4.1 responder"
+        );
 
         // The pair optimization actually applied: hi suppressed its offer and
         // answered lo's, so exactly one offer exists and hi never saw a glare.
@@ -1555,8 +1657,16 @@ mod tests {
             negotiate(&lo_p, &lo_c, &lo_io),
             negotiate(&hi_p, &hi_c, &hi_io),
         );
-        assert_eq!(lo_res.unwrap(), "channel-lo");
-        assert_eq!(hi_res.unwrap(), "channel-hi");
+        let (lo_ok, hi_ok) = (lo_res.unwrap(), hi_res.unwrap());
+        assert_eq!(lo_ok.channel, "channel-lo");
+        assert_eq!(hi_ok.channel, "channel-hi");
+        // §6.5 → §7.4.1: `lo` offered, so it is the initiator and sends HELLO;
+        // `hi` suppressed and answered, so it serves. One role assignment.
+        assert!(lo_ok.offered, "`lo` offers in pair mode — §7.4.1 initiator");
+        assert!(
+            !hi_ok.offered,
+            "`hi` suppresses and answers — §7.4.1 responder"
+        );
     }
 
     /// And it still refuses the peer that has **not** flipped.
@@ -1583,6 +1693,188 @@ mod tests {
 
         let res = negotiate(&hi_p, &BucketView(&bucket), &StubBrowser::new("hi", true)).await;
         assert!(matches!(res, Err(WebRtcError::VerificationUnavailable)));
+    }
+
+    /// The post-answer loop must cost **one** poll interval per iteration, not
+    /// two.
+    ///
+    /// The regression this catches is the cadence half of the rung-1 hunt. Once
+    /// `answered` is true the loop paid `wait_open` **and then** a full
+    /// `sleep(poll_interval)` on top of it — a 2× period arriving exactly when
+    /// ICE is trying to hold a candidate pair and the counterpart is still
+    /// trickling. At the browser's 250ms default that made every remote
+    /// candidate wait up to 500ms to reach `addIceCandidate`.
+    ///
+    /// Measured as ticks-per-window rather than by reading the clock, because
+    /// the count is what a starved ICE agent actually experiences: with a 500ms
+    /// window and a 5ms interval a correct loop gets ~100 chances to trickle,
+    /// and the doubled one got ~50. The assertion sits well clear of both.
+    ///
+    /// Requires `wait_open_runs_to_bound` — a `wait_open` that consumes no
+    /// virtual time leaves `waited == 0`, the shortfall sleep pays the full
+    /// interval, and the fixed loop measures identically to the broken one.
+    #[tokio::test]
+    async fn the_post_answer_loop_costs_one_poll_interval_not_two() {
+        let bucket = SharedBucket::default();
+        // `open_after_answer: false` — nobody ever opens, so both peers run the
+        // post-answer path for the whole window, which is the path under test.
+        let lo_io = StubBrowser::new("lo", false).with_wait_open_running_to_bound();
+        let hi_io = StubBrowser::new("hi", false).with_wait_open_running_to_bound();
+        let (lo_p, hi_p) = two_parties(
+            VerificationPolicy::AllowUnverifiedPreContainer,
+            VerificationPolicy::AllowUnverifiedPreContainer,
+        );
+        let window = lo_p.deadline_ms;
+        let interval = lo_p.poll_interval_ms;
+
+        let (lo_c, hi_c) = (BucketView(&bucket), BucketView(&bucket));
+        let (lo_res, hi_res) = tokio::join!(
+            negotiate(&lo_p, &lo_c, &lo_io),
+            negotiate(&hi_p, &hi_c, &hi_io),
+        );
+        // Both must have reached the SDP exchange, or this measures nothing.
+        for (who, res) in [("lo", &lo_res), ("hi", &hi_res)] {
+            match res {
+                Err(WebRtcError::Timeout { answered, .. }) => {
+                    assert!(*answered, "{who} never answered; the measurement is void")
+                }
+                other => panic!("{who}: expected a §6.5 timeout, got {other:?}"),
+            }
+        }
+
+        let ideal = window / interval;
+        for (who, io) in [("lo", &lo_io), ("hi", &hi_io)] {
+            let ticks = io.wait_open_calls.lock().unwrap().len() as u64;
+            assert!(
+                ticks * 10 >= ideal * 8,
+                "{who}: {ticks} post-answer ticks in a {window}ms window at a \
+                 {interval}ms interval — a one-interval period gives ~{ideal}, and the \
+                 doubled period this guards against gives ~{}",
+                ideal / 2
+            );
+        }
+    }
+
+    /// Every `wait_open` is handed **at most one poll interval**, never the
+    /// whole remaining window.
+    ///
+    /// The companion invariant to the cadence: the loop stays responsive because
+    /// it re-collects between waits. A `wait_open` handed the full remaining
+    /// budget would block the trickle for the rest of the window — one long wait
+    /// instead of many short ones — which is the same starvation by a different
+    /// route and would not show up in a tick count alone.
+    #[tokio::test]
+    async fn no_single_wait_open_can_swallow_the_window() {
+        let bucket = SharedBucket::default();
+        let lo_io = StubBrowser::new("lo", false).with_wait_open_running_to_bound();
+        let hi_io = StubBrowser::new("hi", false).with_wait_open_running_to_bound();
+        let (lo_p, hi_p) = two_parties(
+            VerificationPolicy::AllowUnverifiedPreContainer,
+            VerificationPolicy::AllowUnverifiedPreContainer,
+        );
+        let interval = lo_p.poll_interval_ms;
+
+        let (lo_c, hi_c) = (BucketView(&bucket), BucketView(&bucket));
+        let _ = tokio::join!(
+            negotiate(&lo_p, &lo_c, &lo_io),
+            negotiate(&hi_p, &hi_c, &hi_io),
+        );
+
+        for (who, io) in [("lo", &lo_io), ("hi", &hi_io)] {
+            let calls = io.wait_open_calls.lock().unwrap().clone();
+            assert!(!calls.is_empty(), "{who} never reached wait_open");
+            for t in calls {
+                assert!(
+                    t <= interval,
+                    "{who}: wait_open was handed {t}ms, more than the {interval}ms poll \
+                     interval — one long wait starves the trickle exactly as a doubled \
+                     period does"
+                );
+            }
+        }
+    }
+
+    /// **A characterization test, and the finding it pins is a gap, not a fix.**
+    ///
+    /// `negotiate` checks `deadline_ms` only at the top of its loop, so a
+    /// `WebRtcIo` call that never resolves is awaited forever and the window is
+    /// never consulted again. The peer hangs with no terminal error — precisely
+    /// the `tick=2` silence `entity-browser-rust` reported.
+    ///
+    /// What shipped for that (`5e0c131`) is `WorkerWebRtcIo::call_bounded`,
+    /// which races every control round trip against the remaining window. That
+    /// lives in `core/peer/src/worker_webrtc.rs` and is **wasm32-only**, so the
+    /// browser leg is covered and the choreography is not: any other `WebRtcIo`
+    /// implementation — a native one, or the Direct-arm browser establisher the
+    /// module docs say is deliberately unbuilt — inherits the original hang.
+    ///
+    /// This test asserts the gap so it cannot be forgotten, and is written to
+    /// fail loudly if it is ever closed.
+    ///
+    /// **If this test fails, that is good news.** It means `negotiate` now
+    /// enforces its own deadline across a stalled seam call. Invert it into an
+    /// assertion that the call returns `Err` within the window, and delete this
+    /// paragraph.
+    #[tokio::test]
+    async fn a_stalled_seam_call_is_not_bounded_by_negotiate_itself() {
+        /// A main thread that accepts the answerer's `create_answer` and never
+        /// replies — the one round trip `tick=2` is made of.
+        struct StalledOnCreateAnswer(StubBrowser);
+        #[async_trait::async_trait]
+        impl WebRtcIo for StalledOnCreateAnswer {
+            type Channel = String;
+            async fn create_offer(&self) -> Result<String, String> {
+                self.0.create_offer().await
+            }
+            async fn create_answer(&self, _remote_offer_sdp: &str) -> Result<String, String> {
+                std::future::pending::<()>().await;
+                unreachable!("pending never resolves")
+            }
+            async fn accept_answer(&self, sdp: &str) -> Result<(), String> {
+                self.0.accept_answer(sdp).await
+            }
+            async fn drain_local_candidates(&self) -> Vec<LocalCandidate> {
+                self.0.drain_local_candidates().await
+            }
+            async fn add_remote_candidate(&self, c: &IceCandidate) -> Result<(), String> {
+                self.0.add_remote_candidate(c).await
+            }
+            async fn wait_open(&self, t: u64) -> Result<String, String> {
+                self.0.wait_open(t).await
+            }
+            async fn sleep_ms(&self, ms: u64) {
+                self.0.sleep_ms(ms).await
+            }
+            fn now_ms(&self) -> u64 {
+                self.0.now_ms()
+            }
+        }
+
+        let bucket = SharedBucket::default();
+        let lo_io = StubBrowser::new("lo", true);
+        let hi_io = StalledOnCreateAnswer(StubBrowser::new("hi", true));
+        let (lo_p, hi_p) = two_parties(
+            VerificationPolicy::AllowUnverifiedPreContainer,
+            VerificationPolicy::AllowUnverifiedPreContainer,
+        );
+
+        let (lo_c, hi_c) = (BucketView(&bucket), BucketView(&bucket));
+        // Real time, not the virtual clock: the point is that no amount of
+        // virtual budget makes the stalled call return, so only a wall-clock
+        // bound can end this test.
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(750), async {
+            tokio::join!(
+                negotiate(&lo_p, &lo_c, &lo_io),
+                negotiate(&hi_p, &hi_c, &hi_io),
+            )
+        })
+        .await;
+
+        assert!(
+            outcome.is_err(),
+            "negotiate returned on a stalled seam call — the deadline gap this \
+             pins has been closed. Invert this test: assert Err within the window."
+        );
     }
 
     /// What actually reaches the carrier is a container, and it is bound to the
@@ -1668,11 +1960,14 @@ mod tests {
                 offered,
                 answered,
                 counterpart_msgs,
+                candidates_posted: _,
+                candidates_fed,
                 channel_wait,
             }) => {
                 assert!(offered, "`lo` offers in pair mode");
                 assert!(!answered, "no counterpart, so no SDP exchange");
                 assert_eq!(counterpart_msgs, 0, "nobody deposited but us");
+                assert_eq!(candidates_fed, 0, "an empty bucket has none to feed");
                 assert_eq!(channel_wait, None, "never answered, so never waited");
             }
             other => panic!("expected a §6.5 timeout, got {other:?}"),

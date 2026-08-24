@@ -63,7 +63,9 @@ use entity_signaling::punch::{self, PunchIo, PunchParty};
 use entity_signaling::{key, RendezvousKey};
 
 use crate::carrier::PeerCarrier;
-use crate::live_establish::{EstablishCtx, LiveEstablish};
+use crate::live_establish::{
+    EstablishCtx, HandshakeRole, LiveEstablish, LiveEstablishError, LivePath,
+};
 use crate::transport::{Connection, Connector};
 
 /// The §6.3 posture of the **native** punch, named once here rather than
@@ -427,10 +429,17 @@ impl PeerPunchEstablisher {
 
 #[async_trait::async_trait]
 impl LiveEstablish for PeerPunchEstablisher {
-    async fn establish_live(&self, ctx: EstablishCtx, peer_id: &str) -> Option<Connection> {
+    async fn establish_live(
+        &self,
+        ctx: EstablishCtx,
+        peer_id: &str,
+    ) -> Result<LivePath, LiveEstablishError> {
         if ctx.expired() {
             tracing::debug!(remote_peer = %peer_id, "§10.3: deadline already passed; not starting a punch");
-            return None;
+            return Err(LiveEstablishError::NotAttempted {
+                substrate: SUBSTRATE_TCP,
+                reason: "the seam deadline had already passed".to_string(),
+            });
         }
 
         // §3.2 `pair` mode: the key is derived from the two peer-ids, sorted and
@@ -439,8 +448,14 @@ impl LiveEstablish for PeerPunchEstablisher {
         // needs no out-of-band agreement, unlike `tag` / `secret`.
         let key = self.rendezvous_key_for(peer_id);
 
+        let candidates = self.local_candidates(peer_id).await.ok_or_else(|| {
+            LiveEstablishError::NotAttempted {
+                substrate: SUBSTRATE_TCP,
+                reason: "no local candidate could be gathered for this peer".to_string(),
+            }
+        })?;
         let mut party = PunchParty::new(key, self.carrier.identity(), SUBSTRATE_TCP, PUNCH_TRUST)
-            .with_candidates(self.local_candidates(peer_id).await?);
+            .with_candidates(candidates);
         // §10.3 obligation 4 / §7.2.1: when §4.1's reconnect backoff owns the
         // retry, this punch gets exactly ONE carrier exchange. The crossing
         // budget is deliberately untouched.
@@ -456,7 +471,18 @@ impl LiveEstablish for PeerPunchEstablisher {
         match tokio::time::timeout(ctx.remaining(), attempt).await {
             Ok(Ok(conn)) => {
                 tracing::debug!(remote_peer = %peer_id, addr = %conn.remote_addr, "§7 punch established a direct path");
-                Some(conn)
+                // **Always the initiator, and that is a property of this module
+                // rather than a choice made here.** This is `punch::initiate` —
+                // the peer whose `connect-request` the counterpart collected,
+                // which is exactly §7.4.1's definition of the initiator. The
+                // responder half is `punch::respond`, deliberately not wired
+                // into this seam (see the module docs: the responder loop is
+                // rung 4 and needs a key-selection policy). If that lands, it
+                // reports `Responder` and nothing else here changes.
+                Ok(LivePath {
+                    connection: conn,
+                    role: HandshakeRole::Initiator,
+                })
             }
             // A §6.3 refusal is not "no live path" in the sense the rest of this
             // arm means — it is a **policy** decision this peer made about a
@@ -478,18 +504,27 @@ impl LiveEstablish for PeerPunchEstablisher {
                      container under `Require`. This is a MIXED BUILD (a peer older than \
                      the §6.1 deposit flip), not a NAT or connectivity failure"
                 );
-                None
+                Err(LiveEstablishError::Refused {
+                    substrate: SUBSTRATE_TCP,
+                    reason: e.to_string(),
+                })
             }
             // Every other failure is "no live path", never an error: §7.3.1
             // pin 1 makes a substrate mismatch explicitly not a dispatch error,
             // and §7.1 step 6 makes relay the outcome of every failed punch.
             Ok(Err(e)) => {
                 tracing::debug!(remote_peer = %peer_id, error = %e, "§7 punch found no live path; falling through");
-                None
+                Err(LiveEstablishError::NoPath {
+                    substrate: SUBSTRATE_TCP,
+                    reason: e.to_string(),
+                })
             }
             Err(_) => {
                 tracing::debug!(remote_peer = %peer_id, "§7 punch exceeded the seam deadline");
-                None
+                Err(LiveEstablishError::NoPath {
+                    substrate: SUBSTRATE_TCP,
+                    reason: "the punch exceeded the seam deadline".to_string(),
+                })
             }
         }
     }
@@ -617,10 +652,15 @@ mod tests {
         // responder gave up early, so asserting on the initiator alone points
         // the investigation at the wrong half.
         let (a_conn, (_b_conn, seen_initiator)) = match (a_res, b_res) {
-            (Some(a), Some(b)) => (a, b),
+            (Ok(a), Some(b)) => (a, b),
+            // The seam now carries a reason, so a failure names itself instead
+            // of reporting a bare `false` and sending the reader to both halves.
             (a, b) => panic!(
-                "punch did not complete — initiator got a path: {}, responder got a path: {}",
-                a.is_some(),
+                "punch did not complete — initiator: {}, responder got a path: {}",
+                match &a {
+                    Ok(_) => "got a path".to_string(),
+                    Err(e) => e.to_string(),
+                },
                 b.is_some()
             ),
         };
@@ -629,8 +669,16 @@ mod tests {
             seen_initiator, a_id,
             "the responder learns which peer it met — the id whose handshake it must SERVE (§7.4.1)"
         );
+        // §7.4.1: `punch::initiate` is the initiator by definition, so this seam
+        // must report the client role. A regression here is the crossed
+        // handshake — invisible to a same-impl test that ignores the field.
         assert_eq!(
-            a_conn.transport_type, "tcp",
+            a_conn.role,
+            HandshakeRole::Initiator,
+            "§7.4.1: the punch initiator runs the HELLO client half"
+        );
+        assert_eq!(
+            a_conn.connection.transport_type, "tcp",
             "§10.3 obligation 1: a punched connection is an ORDINARY transport, \
              indistinguishable to the entity layer from a dialed one"
         );
@@ -661,7 +709,7 @@ mod tests {
         let ctx =
             EstablishCtx::dispatch(web_time::Instant::now() + std::time::Duration::from_secs(3));
         assert!(
-            a.establish_live(ctx, "SomePeer").await.is_none(),
+            a.establish_live(ctx, "SomePeer").await.is_err(),
             "a dead carrier must present as no-live-path, never as a dispatch error"
         );
     }
@@ -675,6 +723,6 @@ mod tests {
         let (a, _) = establisher("NodeThatIsNotThere", 1, 0x55, a_addr);
         let past =
             EstablishCtx::dispatch(web_time::Instant::now() - std::time::Duration::from_secs(1));
-        assert!(a.establish_live(past, "SomePeer").await.is_none());
+        assert!(a.establish_live(past, "SomePeer").await.is_err());
     }
 }

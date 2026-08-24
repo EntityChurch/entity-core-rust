@@ -196,5 +196,124 @@ impl EstablishCtx {
 pub trait LiveEstablish: Send + Sync {
     /// Attempt to establish a live transport to `peer_id` by traversal, within
     /// `ctx`'s deadline.
-    async fn establish_live(&self, ctx: EstablishCtx, peer_id: &str) -> Option<Connection>;
+    ///
+    /// **`Err` is a reason, never a branch.** Every variant maps to the same
+    /// fall-through to relay at the call site — see [`LiveEstablishError`].
+    async fn establish_live(
+        &self,
+        ctx: EstablishCtx,
+        peer_id: &str,
+    ) -> Result<LivePath, LiveEstablishError>;
+}
+
+/// Which half of `system/protocol/connect` this peer runs on a traversed path.
+///
+/// `EXTENSION-SIGNALING.md` §7.4.1 `[cross-peer seam — MUST]`: *"the peer that
+/// offered `connect-request` — the initiator — runs the client half of
+/// `system/protocol/connect` (it sends HELLO); the peer that answered with
+/// `connect-response` — the responder — serves it."*
+///
+/// **Why the seam has to carry this at all.** An ordinary dial settles the role
+/// for free: exactly one side dialed, so exactly one side is the client. A
+/// traversal destroys that signal by construction — §7.1 step 4 has *both*
+/// peers dial simultaneously, and §6.5's browser leg has both peers reach this
+/// seam off one rendezvous key and come away holding one `RTCDataChannel`.
+/// Nothing in the resulting transport says who speaks first, so the establisher
+/// — the only party that knows the signaling role — must report it.
+///
+/// §7.4.1 names the two failures precisely, and both present as *"the punch
+/// didn't land"*, sending the investigation to the NAT layer where nothing is
+/// wrong: **both sides send HELLO** (a crossed handshake), or **neither does**
+/// (a silent hang). It also warns these are invisible to same-implementation
+/// tests, because both ends make the same choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandshakeRole {
+    /// This peer offered, so it sends HELLO — the ordinary dialer path.
+    Initiator,
+    /// The counterpart offered, so this peer **serves** the HELLO exchange.
+    ///
+    /// **A handshake role, not a socket role** (§7.4.1): serving does not make
+    /// this side passive at the transport layer. Both peers still dial/gather
+    /// and both still opened their own path; this governs only who speaks first
+    /// on the already-open connection.
+    Responder,
+}
+
+/// A traversed transport plus the handshake role that governs it.
+///
+/// The two are returned together because a `Connection` alone is unusable: the
+/// caller cannot know from the transport which half of the handshake to run,
+/// and guessing produces one of §7.4.1's two failures. See [`HandshakeRole`].
+pub struct LivePath {
+    pub connection: Connection,
+    pub role: HandshakeRole,
+}
+
+/// Why a §10.3 traversal produced no live path.
+///
+/// # Why this is a `Result` and not an `Option`
+///
+/// It was an `Option`, and the reason died inside each implementation at the
+/// moment of return. That cost three separate patches in two days — the browser
+/// establisher, the punch establisher, and `negotiate`'s discarded `wait_open`
+/// error — each re-implementing observability the seam had thrown away, and each
+/// leaving the next consumer to rediscover the same gap. `entity-core-go`'s
+/// equivalent seam already returned `(*Connection, error)`; theirs was a discard
+/// bug fixable in one line, ours was the type.
+///
+/// The operator-facing cost was a `Require` refusal — a **policy** decision about
+/// a reachable counterpart — reading as an ordinary failed traversal, i.e. as a
+/// NAT problem. The user-facing cost was `entity-browser-rust`'s: the same
+/// `None` reaching an end user as a bare "no transport profile for peer", naming
+/// neither WebRTC, nor a negotiation, nor a timeout.
+///
+/// # The invariant every caller must keep
+///
+/// **Reason for observability, never a branch for control flow.** §10.3 makes a
+/// failed traversal a *fall-through*, not an error, and §7.1 step 6 / §7.3.1
+/// pin 1 make relay the outcome of every failed punch. So a caller logs or
+/// surfaces the variant and then behaves identically for all of them. Turning
+/// [`Refused`](LiveEstablishError::Refused) into a hard dispatch failure would
+/// be a conformance break, not a refinement — agreed explicitly with both
+/// `entity-core-go` and `entity-browser-rust`.
+///
+/// The distinction the variants draw is the one that was being lost: *tried and
+/// failed* vs *declined on policy* vs *never attempted*.
+#[derive(Debug, thiserror::Error)]
+pub enum LiveEstablishError {
+    /// Traversal ran and no path came up inside the deadline. The ordinary
+    /// best-effort outcome, and the only one that is really "connectivity".
+    #[error("{substrate}: no live path — {reason}")]
+    NoPath {
+        substrate: &'static str,
+        reason: String,
+    },
+    /// Declined by **policy**, about a counterpart that may well be reachable —
+    /// §6.3 verification under `Require` being the live case. Never a NAT
+    /// problem, and the variant an operator most needs told apart from one.
+    #[error("{substrate}: refused — {reason}")]
+    Refused {
+        substrate: &'static str,
+        reason: String,
+    },
+    /// Never started: no deadline left, or this establisher does not handle this
+    /// peer at all. Distinct from `NoPath` because nothing was tried, so it says
+    /// nothing about whether a path exists.
+    #[error("{substrate}: not attempted — {reason}")]
+    NotAttempted {
+        substrate: &'static str,
+        reason: String,
+    },
+}
+
+impl LiveEstablishError {
+    /// The substrate that declined, for a caller assembling a message across
+    /// several seams.
+    pub fn substrate(&self) -> &'static str {
+        match self {
+            Self::NoPath { substrate, .. }
+            | Self::Refused { substrate, .. }
+            | Self::NotAttempted { substrate, .. } => substrate,
+        }
+    }
 }

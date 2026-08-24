@@ -41,5 +41,11 @@ web-sys = { version = "0.3", features = [
     "RtcIceCandidate",
     "RtcIceCandidateInit",
     "RtcPeerConnectionIceEvent",
+    # Read at failure time only. "the data channel closed before it opened" says
+    # the channel died, not why — and `closed` vs `never opened` have different
+    # causes. These two turn that into a verdict: ICE `failed` is a candidate
+    # problem, ICE `connected` with a dead channel is DTLS/SCTP.
+    "RtcIceConnectionState",
+    "RtcPeerConnectionState",
     "Event",
 ] }

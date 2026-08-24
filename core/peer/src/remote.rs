@@ -144,6 +144,29 @@ pub trait RemoteEndpoint: Send + Sync {
     fn remote_peer_id(&self) -> &str;
     fn remote_identity_hash(&self) -> Hash;
     fn capability(&self) -> &Entity;
+    /// The capability this endpoint may author an **originating** dispatch
+    /// under, when the caller supplies no explicit `dispatch_cap`.
+    ///
+    /// `None` means *this endpoint holds no originating authority* — distinct
+    /// from holding a bad one. Defaults to [`capability`](Self::capability),
+    /// which is correct for a dialed endpoint: it carries the grant the remote
+    /// issued to us.
+    ///
+    /// It is **not** correct for an acceptor. `InboundReentryEndpoint` holds the
+    /// cap it *minted for the remote* — grantee = the counterpart — so the old
+    /// blanket fallback authored requests under a capability that was never
+    /// ours. The far side answers `401 unresolvable_grantee`, and supplying the
+    /// missing identity would only turn that into `403 grantee_mismatch`;
+    /// neither names the real condition, which is that nothing was ever granted
+    /// to us. Returning `None` makes that failure local and named instead of a
+    /// misleading authz status from a peer.
+    ///
+    /// See `docs/SPEC-AMBIGUITIES.md`, "§6.5 symmetric originate" — how an
+    /// acceptor acquires originating authority is a genuine spec gap, and this
+    /// method deliberately does not invent one.
+    fn originating_capability(&self) -> Option<&Entity> {
+        Some(self.capability())
+    }
     fn auth_included(&self) -> &HashMap<Hash, Entity>;
     fn next_request_id(&self) -> String;
     fn transport_type(&self) -> &'static str;
@@ -383,6 +406,18 @@ impl RemoteEndpoint for InboundReentryEndpoint {
     }
     fn capability(&self) -> &Entity {
         &self.capability
+    }
+    /// **No originating authority.** `self.capability` is the cap this peer
+    /// MINTED FOR the remote (grantee = the counterpart), kept only to satisfy
+    /// the trait — the field's own comment says `send_execute` never reads it.
+    /// That held until the §7.4.1 responder path (`f00170c`) routed a
+    /// spontaneous outbound dispatch through this endpoint with no
+    /// `dispatch_cap`, and the blanket fallback happily authored under it.
+    ///
+    /// The §7a.2a reentry flow is unaffected: it passes the caller-minted cap
+    /// explicitly as `dispatch_cap`, which takes precedence over this.
+    fn originating_capability(&self) -> Option<&Entity> {
+        None
     }
     fn auth_included(&self) -> &HashMap<Hash, Entity> {
         &self.auth_included
@@ -713,8 +748,8 @@ pub async fn get_or_connect(
             // Ordered BEFORE the §10.2 delivery fallback (MUST, §10.3) — which
             // this tree does not implement, so the ordering holds trivially and
             // is not evidence for the rule. See the punch scope checkpoint.
-            if let Some(conn) = try_establish_live(peer_id, reentry.as_ref()).await {
-                let punched_addr = conn.remote_addr.clone();
+            if let Some(path) = try_establish_live(peer_id, reentry.as_ref()).await {
+                let punched_addr = path.connection.remote_addr.clone();
                 return adopt_transport_connection(
                     pool,
                     peer_id,
@@ -724,8 +759,11 @@ pub async fn get_or_connect(
                     local_peer_id,
                     home_format,
                     reentry,
-                    conn,
+                    path.connection,
                     &punched_addr,
+                    // §7.4.1: the establisher reports the role; this path never
+                    // guesses one, which is what produced the crossed handshake.
+                    path.role,
                 )
                 .await;
             }
@@ -800,6 +838,9 @@ pub async fn get_or_connect(
         reentry,
         transport_conn,
         &addr,
+        // An ordinary dial settles §7.4.1 for free: exactly one side dialed, so
+        // this side is the client. Unchanged behaviour, now stated.
+        crate::live_establish::HandshakeRole::Initiator,
     )
     .await
 }
@@ -831,7 +872,15 @@ async fn adopt_transport_connection(
     reentry: Option<Arc<crate::PeerShared>>,
     transport_conn: crate::transport::Connection,
     addr: &str,
+    role: crate::live_establish::HandshakeRole,
 ) -> Result<Arc<dyn RemoteEndpoint>, PeerError> {
+    // §7.4.1 `[cross-peer seam — MUST]`: the handshake role follows the
+    // signaling role, and only the establisher knows it. An ordinary dial is
+    // always `Initiator` — exactly one side dialed, so the role is free — and
+    // that path is unchanged. A traversed path is the case this exists for.
+    if role == crate::live_establish::HandshakeRole::Responder {
+        return serve_traversed_connection(peer_id, reentry, transport_conn).await;
+    }
     // The dispatch context is threaded to the reader (reentry) AND to the
     // §5 keepalive spawn below — clone the Arc before the move.
     let keepalive_shared = reentry.clone();
@@ -881,6 +930,123 @@ async fn adopt_transport_connection(
     Ok(won)
 }
 
+/// §7.4.1's responder half: **serve** the HELLO exchange on a traversed path,
+/// then dispatch back over the same connection.
+///
+/// > §7.4.1 `[cross-peer seam — MUST]`: *"the peer that answered with
+/// > `connect-response` — the responder — **serves** it."*
+///
+/// The counterpart is running the client half concurrently. If this side ran
+/// the client half too — which is what every traversed path did before this
+/// existed — both peers send HELLO and each reads the other's request where it
+/// expected its own response. That is §7.4.1's first named failure, and it is
+/// what `entity-browser-rust`'s rung-1 hit the moment the data channel finally
+/// stayed open:
+///
+/// ```text
+/// parse hello response: invalid: expected system/protocol/execute/response,
+/// got system/protocol/execute
+/// ```
+///
+/// # Why this still returns a usable outbound endpoint
+///
+/// We are here because dispatch wanted to *send* something, so serving is not
+/// enough on its own — but it is sufficient, because serving is exactly how a
+/// peer acquires a reentry endpoint. `handle_connection` completes the server
+/// handshake and registers an `InboundReentryEndpoint` (`connection.rs`), which
+/// is the same object §6.11(b)'s reentry fallback hands back for a peer that
+/// dialed us and runs no listener. So the responder dispatches back over the
+/// socket it just served, with no punch-aware branch anywhere below — §10.3
+/// obligation 1's "a traversed connection is an ordinary transport".
+///
+/// The wait is a poll rather than a signal because registration happens inside
+/// `handle_connection` after the auth exchange, and plumbing a notification out
+/// of it would reach into the shared accept path for one caller's benefit. The
+/// budget is deliberately short: the handshake is already in flight on an open
+/// connection, so this is waiting on a round trip, not on traversal.
+///
+/// # Why the future is boxed
+///
+/// This closes a real cycle: `handle_connection` runs `dispatch_request`,
+/// dispatch can reach the §10.3 seam, and the seam can land back here. That is
+/// reachable in practice — peer A serves B while dispatching to C, and C is B —
+/// so it is not an artefact to be designed away. An `async fn` would make the
+/// opaque future type infinitely sized (`cycle detected when borrow-checking
+/// handle_connection`); a `dyn Future` is concrete and breaks it.
+fn serve_traversed_connection(
+    peer_id: &str,
+    reentry: Option<Arc<crate::PeerShared>>,
+    conn: crate::transport::Connection,
+) -> ServedHandshake<'_> {
+    Box::pin(async move {
+        // Serving needs the peer's own dispatch context — there is no way to answer
+        // a HELLO without the identity and handlers behind it. A seam registered on
+        // a context that cannot serve is a wiring error, not a traversal failure.
+        let shared = reentry.ok_or_else(|| {
+            PeerError::ConnectionError(format!(
+                "§7.4.1: {} answered the §6.5 negotiation, so this peer must SERVE the \
+             handshake, but no dispatch context was threaded to the seam",
+                peer_id
+            ))
+        })?;
+
+        let serving = shared.clone();
+        // Detached on purpose: this loop lives as long as the connection does, and
+        // outlives the dispatch that triggered it. Same shape as the accept loop in
+        // `server.rs`, which is the point — the responder is served by exactly the
+        // path an accepted connection is.
+        crate::runtime::spawn(async move {
+            // `Box::pin` breaks a genuine async cycle: `handle_connection` dispatches,
+            // dispatch can reach the §10.3 seam, and the seam can land back here. The
+            // recursion is real (peer A serves B while dispatching to C, which is B)
+            // and only reachable through a spawn, so an indirection is the whole fix
+            // — without it the opaque future type is infinitely sized.
+            let served = Box::pin(crate::connection::handle_connection(conn, serving)).await;
+            if let Err(e) = served {
+                tracing::warn!(error = %e, "§7.4.1: serving a traversed connection failed");
+            }
+        });
+
+        // `handle_connection` registers on `shared.remote`, so read it from there
+        // rather than from a `pool` handle that may not be the same `RemoteState`.
+        for _ in 0..RESPONDER_REENTRY_POLLS {
+            if let Some(endpoint) = shared.remote.get_inbound(peer_id) {
+                tracing::debug!(
+                    remote_peer = %peer_id,
+                    "§7.4.1: served the traversed handshake; dispatching back over it"
+                );
+                return Ok(endpoint);
+            }
+            crate::runtime::sleep_ms(RESPONDER_REENTRY_POLL_MS).await;
+        }
+        Err(PeerError::ConnectionError(format!(
+            "§7.4.1: served the traversed path to {} but no reentry endpoint appeared \
+         within {}ms — the counterpart never completed the client handshake",
+            peer_id,
+            RESPONDER_REENTRY_POLLS * RESPONDER_REENTRY_POLL_MS
+        )))
+    })
+}
+
+/// The boxed return of [`serve_traversed_connection`]. `Send` follows the same
+/// split the rest of this crate uses: unconditional natively, dropped on wasm32
+/// where the browser handles behind a `Connection` are not `Send`.
+#[cfg(not(target_arch = "wasm32"))]
+type ServedHandshake<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Arc<dyn RemoteEndpoint>, PeerError>> + Send + 'a>,
+>;
+#[cfg(target_arch = "wasm32")]
+type ServedHandshake<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Arc<dyn RemoteEndpoint>, PeerError>> + 'a>,
+>;
+
+/// How long the §7.4.1 responder waits for its own `handle_connection` to
+/// finish the server handshake and register the reentry endpoint. Short by
+/// design: the connection is already open and the counterpart's HELLO is in
+/// flight, so this waits on one round trip.
+const RESPONDER_REENTRY_POLLS: u64 = 200;
+const RESPONDER_REENTRY_POLL_MS: u64 = 25;
+
 /// Consult the §10.3 seam, if one is registered on this dispatch context.
 ///
 /// `None` covers all three of "no traversal extension installed", "no carrier
@@ -891,7 +1057,7 @@ async fn adopt_transport_connection(
 async fn try_establish_live(
     peer_id: &str,
     reentry: Option<&Arc<crate::PeerShared>>,
-) -> Option<crate::transport::Connection> {
+) -> Option<crate::live_establish::LivePath> {
     let seam = reentry?.live_establish.as_ref()?;
     tracing::debug!(
         remote_peer = %peer_id,
@@ -905,11 +1071,35 @@ async fn try_establish_live(
     let ctx = crate::live_establish::EstablishCtx::dispatch(
         web_time::Instant::now() + crate::live_establish::DEFAULT_TRAVERSAL_BUDGET,
     );
-    let conn = seam.establish_live(ctx, peer_id).await;
-    if conn.is_none() {
-        tracing::debug!(remote_peer = %peer_id, "§10.3: no live path; falling through");
+    match seam.establish_live(ctx, peer_id).await {
+        Ok(path) => Some(path),
+        // **Every variant falls through identically.** The seam carries a reason
+        // so this line can name it; it is not a branch. §10.3 makes a failed
+        // traversal a fall-through and §7.1 step 6 makes relay the outcome, so
+        // turning `Refused` into a dispatch error here would be a conformance
+        // break rather than a refinement.
+        //
+        // `Refused` is `warn!` and the rest `debug!` purely because a policy
+        // decision about a *reachable* counterpart is the one an operator must
+        // not read as a NAT problem — the mis-read that cost this cohort three
+        // separate per-impl patches before the reason survived the seam at all.
+        Err(e) => {
+            match &e {
+                crate::live_establish::LiveEstablishError::Refused { .. } => tracing::warn!(
+                    remote_peer = %peer_id,
+                    error = %e,
+                    "§10.3: the live path was REFUSED by policy, not by connectivity; \
+                     falling through to relay"
+                ),
+                _ => tracing::debug!(
+                    remote_peer = %peer_id,
+                    error = %e,
+                    "§10.3: no live path; falling through"
+                ),
+            }
+            None
+        }
     }
-    conn
 }
 
 /// R6 dialer-side write: record the cap received from remote at handshake
@@ -1925,7 +2115,24 @@ pub async fn send_execute(
     // §3.6 step 5: the dispatched EXECUTE's capability is the continuation's
     // scoped dispatch_capability when present — never a silent fallback to
     // the broad connection grant (V7 §6.8). Ordinary dispatches pass None.
-    let effective_cap = dispatch_cap.unwrap_or_else(|| conn.capability());
+    let effective_cap = match dispatch_cap {
+        Some(cap) => cap,
+        // Not every endpoint holds originating authority. An acceptor's
+        // `capability()` is the cap it minted FOR the remote, so falling back to
+        // it authors a request under a grant that was never ours — which the
+        // far side reports as `401 unresolvable_grantee`, a status that points
+        // at marshalling rather than at the real condition. Refuse here so the
+        // failure is local, named, and attributable.
+        None => conn.originating_capability().ok_or_else(|| {
+            PeerError::ConnectionError(format!(
+                "no originating authority for {}: this endpoint holds no capability granted \
+                 to us by the remote, only one we minted for it. A dispatch over an accepted \
+                 connection must carry the caller-minted reentry capability explicitly \
+                 (§7a.2a). See docs/SPEC-AMBIGUITIES.md '§6.5 symmetric originate'.",
+                conn.remote_peer_id()
+            ))
+        })?,
+    };
 
     let envelope = build_authenticated_execute(
         keypair,

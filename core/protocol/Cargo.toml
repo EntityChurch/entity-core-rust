@@ -17,3 +17,7 @@ ciborium.workspace = true
 rand.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+# §5.2 capability expiry needs a wall clock, and `std::time::SystemTime::now()`
+# PANICS on wasm32-unknown-unknown ("time not implemented on this platform").
+# `web_time` re-exports the std types natively, so this changes nothing off-wasm.
+web-time.workspace = true

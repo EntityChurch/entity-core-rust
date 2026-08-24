@@ -1,7 +1,21 @@
 //! Request verification (§5.2).
 
 use std::collections::BTreeMap;
-use std::time::{SystemTime, UNIX_EPOCH};
+// **`web_time`, not `std::time`** (AGENTS.md). `std::time::SystemTime::now()`
+// panics outright on `wasm32-unknown-unknown` — "time not implemented on this
+// platform" — and both call sites below are on the request-verification path,
+// which every peer runs on every inbound request. In a browser that panic kills
+// the dispatch task: no response is ever written and the caller waits out its
+// full timeout with nothing logged on either side.
+//
+// It stayed invisible because a browser peer runs no listener, so inbound
+// dispatch had never executed in wasm at all until the §7.4.1 responder path
+// (`f00170c`) let a handshake complete. Note the `.unwrap_or_default()` below
+// guards `duration_since`, not `now()`, so it never caught this.
+//
+// `web_time` re-exports the std types on native targets, so this is a no-op
+// off-wasm.
+use web_time::{SystemTime, UNIX_EPOCH};
 
 use entity_capability::{CapabilityToken, Granter};
 use entity_crypto::{verify_for_key_type, KeyType};

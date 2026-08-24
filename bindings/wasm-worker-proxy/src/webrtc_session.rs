@@ -65,7 +65,15 @@ const CHANNEL_LABEL: &str = "entity";
 /// These are retained, never dropped early: a `MessagePort.onmessage` slot
 /// still pointing at a dropped closure invalidates the JS function, which is
 /// the same footgun the broker's one-handler-per-port design exists to avoid.
-type MessageClosures = RefCell<Vec<Closure<dyn FnMut(MessageEvent)>>>;
+///
+/// `Rc` because the buffering handler ([`attach_inbox`]) is installed from
+/// inside the `ondatachannel` closure, which runs long before `&self` is
+/// reachable and must still park its closure somewhere that outlives it.
+type MessageClosures = Rc<RefCell<Vec<Closure<dyn FnMut(MessageEvent)>>>>;
+
+/// Frames that arrived on the data channel before `wait_open` wired the
+/// `MessagePort` pump. See [`attach_inbox`] for why this must exist.
+type Inbox = Rc<RefCell<Vec<Vec<u8>>>>;
 
 pub(crate) struct WebRtcSession {
     pc: RtcPeerConnection,
@@ -82,6 +90,9 @@ pub(crate) struct WebRtcSession {
     _on_datachannel: Closure<dyn FnMut(RtcDataChannelEvent)>,
     /// Pump closures, retained for the same reason. Populated at channel-open.
     pumps: MessageClosures,
+    /// Frames caught between the channel becoming known and the pump being
+    /// wired, drained into the port in arrival order by `wait_open`.
+    inbox: Inbox,
     /// The broker's own end of the `MessageChannel`. Held for the session's
     /// life: dropping it closes the port and tears down the pump the instant
     /// `wait_open` returns.
@@ -138,12 +149,23 @@ impl WebRtcSession {
         );
         pc.set_onicecandidate(Some(on_ice.as_ref().unchecked_ref()));
 
+        let pumps: MessageClosures = Rc::new(RefCell::new(Vec::new()));
+        let inbox: Inbox = Rc::new(RefCell::new(Vec::new()));
+
         let channel: Rc<RefCell<Option<RtcDataChannel>>> = Rc::new(RefCell::new(None));
         let channel_for_dc = channel.clone();
+        let inbox_for_dc = inbox.clone();
+        let pumps_for_dc = pumps.clone();
         let on_datachannel =
             Closure::<dyn FnMut(RtcDataChannelEvent)>::new(move |ev: RtcDataChannelEvent| {
                 let dc = ev.channel();
                 dc.set_binary_type(RtcDataChannelType::Arraybuffer);
+                // **This is the answerer's exposure point.** `ondatachannel` is
+                // the first instant this side knows the channel exists, and the
+                // offerer — which created it and is the §7.4.1 initiator — may
+                // already be writing HELLO. Catch from here, not from
+                // `wait_open`.
+                attach_inbox(&dc, &inbox_for_dc, &pumps_for_dc);
                 *channel_for_dc.borrow_mut() = Some(dc);
             });
         pc.set_ondatachannel(Some(on_datachannel.as_ref().unchecked_ref()));
@@ -154,7 +176,8 @@ impl WebRtcSession {
             channel,
             _on_ice: on_ice,
             _on_datachannel: on_datachannel,
-            pumps: RefCell::new(Vec::new()),
+            pumps,
+            inbox,
             kept_ports: RefCell::new(Vec::new()),
         }))
     }
@@ -172,6 +195,11 @@ impl WebRtcSession {
             .pc
             .create_data_channel_with_data_channel_dict(CHANNEL_LABEL, &init);
         dc.set_binary_type(RtcDataChannelType::Arraybuffer);
+        // Symmetric with the answerer's `ondatachannel` catch. The offerer is
+        // normally the one that writes first (§7.4.1 initiator), so this side is
+        // far less exposed — but "less exposed" is a timing argument, and the
+        // whole point of the inbox is not to rest on one.
+        attach_inbox(&dc, &self.inbox, &self.pumps);
         *self.channel.borrow_mut() = Some(dc);
 
         let offer = JsFuture::from(self.pc.create_offer())
@@ -257,6 +285,30 @@ impl WebRtcSession {
         std::mem::take(&mut *self.gathered.borrow_mut())
     }
 
+    /// The ICE/connection verdict, read at failure time and appended to every
+    /// `wait_open` error.
+    ///
+    /// Without it, "data channel closed before it opened" names a symptom whose
+    /// causes are disjoint: `ice=failed` means no candidate pair was ever
+    /// nominated (a trickle problem — the remote candidates did not land);
+    /// `ice=connected`/`completed` with a dead channel means the pair was fine
+    /// and DTLS/SCTP is at fault; `ice=checking` means the window simply closed
+    /// too early. `entity-browser-rust`'s rung-1 offerer reported the closed
+    /// channel with nothing here to say which — and their bare-WebRTC control
+    /// passing on the same bridge with candidates in the SDP is only *evidence*
+    /// for the first, where this is a direct reading.
+    ///
+    /// Read rather than observed: a state-change subscription would say *when*
+    /// it turned, but the terminal state is what picks the branch, and it costs
+    /// two getters instead of two more retained closures.
+    fn state_summary(&self) -> String {
+        format!(
+            "ice={:?}, conn={:?}",
+            self.pc.ice_connection_state(),
+            self.pc.connection_state()
+        )
+    }
+
     /// The SDP this peer will actually present — `localDescription.sdp` *after*
     /// `setLocalDescription`, never the raw `createOffer()` output.
     ///
@@ -288,7 +340,10 @@ impl WebRtcSession {
                 match ch.as_ref() {
                     Some(dc) if dc.ready_state() == RtcDataChannelState::Open => true,
                     Some(dc) if dc.ready_state() == RtcDataChannelState::Closed => {
-                        return Err("data channel closed before it opened".into())
+                        return Err(format!(
+                            "data channel closed before it opened ({})",
+                            self.state_summary()
+                        ))
                     }
                     _ => false,
                 }
@@ -298,7 +353,8 @@ impl WebRtcSession {
             }
             if waited >= deadline_ticks {
                 return Err(format!(
-                    "data channel did not open within {timeout_ms}ms (§6.5 negotiation window)"
+                    "data channel did not open within {timeout_ms}ms (§6.5 negotiation window; {})",
+                    self.state_summary()
                 ));
             }
             waited += 1;
@@ -318,20 +374,31 @@ impl WebRtcSession {
         // RTCDataChannel -> port: inbound frames toward the worker.
         let ours_for_dc = ours.clone();
         let dc_to_port = Closure::<dyn FnMut(MessageEvent)>::new(move |ev: MessageEvent| {
-            let data = ev.data();
-            let bytes = if let Ok(buf) = data.clone().dyn_into::<js_sys::ArrayBuffer>() {
-                Uint8Array::new(&buf)
-            } else if let Ok(arr) = data.dyn_into::<Uint8Array>() {
-                arr
-            } else {
-                // Text frames are not part of this transport; a peer sending
-                // one is misconfigured, and forwarding it would corrupt the
-                // byte stream the framing layer expects.
+            let Some(bytes) = frame_bytes(ev.data()) else {
                 return;
             };
             let _ = ours_for_dc.post_message(&bytes);
         });
         dc.set_onmessage(Some(dc_to_port.as_ref().unchecked_ref()));
+
+        // Flush whatever the inbox caught before this pump existed, in arrival
+        // order and ahead of every live frame.
+        //
+        // **Ordering is guaranteed by the event loop, not by luck.** Everything
+        // from the `set_onmessage` above to the end of this drain runs in one
+        // synchronous block with no `await`, so no `message` event can be
+        // dispatched into the middle of it. Buffered frames are therefore posted
+        // strictly before any frame the new pump will ever see.
+        //
+        // Posting into `ours` before the worker has started `port1` is safe and
+        // is how this design already works: a `MessagePort` queues until the
+        // receiving end calls `start()`, which the worker does in
+        // `connection_from_port`.
+        for frame in std::mem::take(&mut *self.inbox.borrow_mut()) {
+            let arr = Uint8Array::new_with_length(frame.len() as u32);
+            arr.copy_from(&frame);
+            let _ = ours.post_message(&arr);
+        }
 
         // port -> RTCDataChannel: outbound frames from the worker.
         let dc_for_port = dc.clone();
@@ -361,6 +428,59 @@ impl WebRtcSession {
     pub(crate) fn close(&self) {
         self.pc.close();
     }
+}
+
+/// Catch inbound frames from the moment the channel is known until `wait_open`
+/// swaps in the real pump.
+///
+/// **Without this, frames in that window are lost outright.** An
+/// `RTCDataChannel` dispatches `message` events; it does not queue them, so an
+/// event with no listener is dropped rather than deferred — unlike a
+/// `MessagePort`, which queues until `start()`. The channel is known at
+/// `ondatachannel` (answerer) or at `create_data_channel` (offerer), but the
+/// pump is only wired inside `wait_open`, which `negotiate` calls on its *next*
+/// tick — up to a full poll interval later. The far side, seeing `open`, writes
+/// immediately into that gap.
+///
+/// Observed as exactly that: one rung-1 run where both peers logged the channel
+/// open, the initiator logged `sent hello`, and the responder logged
+/// `received frame = 0` and then failed its reentry wait. A second run on the
+/// same commit worked — the tell that this is a race, not a defect of shape.
+///
+/// No cap on the buffer, deliberately: it defers frames that would otherwise sit
+/// in the `MessagePort` queue a few milliseconds later, so it adds no exposure
+/// the port queue does not already have, and a cap that silently dropped frames
+/// would reintroduce the bug this exists to fix.
+fn attach_inbox(dc: &RtcDataChannel, inbox: &Inbox, pumps: &MessageClosures) {
+    let inbox_for_msg = inbox.clone();
+    let buffering = Closure::<dyn FnMut(MessageEvent)>::new(move |ev: MessageEvent| {
+        let Some(bytes) = frame_bytes(ev.data()) else {
+            return;
+        };
+        inbox_for_msg.borrow_mut().push(bytes.to_vec());
+    });
+    dc.set_onmessage(Some(buffering.as_ref().unchecked_ref()));
+    // Retained even after `wait_open` overwrites the handler slot: dropping a
+    // closure whose slot JS may still reference is the footgun this file's
+    // `pumps` vector exists to avoid.
+    pumps.borrow_mut().push(buffering);
+}
+
+/// The bytes of one data-channel frame, or `None` for anything that is not one.
+///
+/// Shared by the buffering handler and the live pump **so the two cannot drift**.
+/// If one accepted a frame shape the other rejected, a message would survive or
+/// vanish depending purely on when it arrived relative to `wait_open` — the same
+/// class of timing-dependent loss this whole path just fixed.
+///
+/// Text frames are not part of this transport; a peer sending one is
+/// misconfigured, and forwarding it would corrupt the byte stream the framing
+/// layer expects.
+fn frame_bytes(data: JsValue) -> Option<Uint8Array> {
+    if let Ok(buf) = data.clone().dyn_into::<js_sys::ArrayBuffer>() {
+        return Some(Uint8Array::new(&buf));
+    }
+    data.dyn_into::<Uint8Array>().ok()
 }
 
 /// How often `wait_open` re-checks `readyState`.

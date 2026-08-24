@@ -576,7 +576,8 @@ async fn run(args: &Args) -> anyhow::Result<Vec<(String, Json)>> {
     let mut why: Option<String> = None;
     let (punched, remote_peer, verified) = if args.role == "initiator" {
         match establisher.establish_live(deadline(), "").await {
-            Some(conn) => {
+            Ok(path) => {
+                let conn = path.connection;
                 let remote_addr = conn.remote_addr.clone();
                 // **Keep the cause.** A bare `verified:false` from this side is
                 // indistinguishable between a refused ping, a timed-out ping and
@@ -595,8 +596,14 @@ async fn run(args: &Args) -> anyhow::Result<Vec<(String, Json)>> {
                     }
                 }
             }
-            None => {
-                why = Some("no direct path within the deadline".to_string());
+            // **The seam's own reason, not a generic sentence.** This line used
+            // to read "no direct path within the deadline" for every outcome —
+            // including a §6.3 `Require` refusal, which is a policy decision
+            // about a reachable counterpart and presented here as a NAT problem.
+            // That is the exact mis-read the seam was changed to `Result` to fix,
+            // and this is the operator-visible field where it landed.
+            Err(e) => {
+                why = Some(e.to_string());
                 (false, String::new(), false)
             }
         }

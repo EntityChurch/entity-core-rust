@@ -4372,3 +4372,72 @@ Carried by core-go as the third of three pins on their §6.3 spec issue.
 illustrative. If illustrative, spell check (a) parametrically over `key_type` as the rest of V7 does.
 
 </details>
+
+---
+
+<details>
+<summary><b>§6.5 symmetric originate — who authorizes the answerer's outbound dispatch?</b>
+(EXTENSION-SIGNALING §6.5 trigger (b) × GUIDE-CONFORMANCE §7a.2a) — <i>2026-08-05, live rung-1 run</i></summary>
+
+**The passages.**
+
+`EXTENSION-SIGNALING.md` §6.5, *Two establishment triggers*, trigger (b): two peers that publish no
+`webrtc` profile "agree a rendezvous key **out of band** … and drive `establish_live` **off that
+key**". Both peers therefore originate over the **one** data channel that negotiation produces.
+
+`GUIDE-CONFORMANCE.md` §7a.2a is the only text covering how a non-dialing peer acquires authority to
+originate back:
+
+> the last three are the caller-minted authority for the reentry direction (this peer → caller)
+
+> **The reentry direction can only be authorized by the caller (a cap valid *at the caller*).** …
+> **(a) in-band params** (`reentry_capability`/`reentry_granter`/`reentry_cap_signature`)
+
+**The ambiguity.** §7a.2a describes *caller-authorizes-reentry*: the caller EXECUTEs an operation and
+hands the reentry capability in-band, so the handler dispatches back with an explicitly supplied cap.
+That shape presumes the reentry dispatch is **triggered by, and authorized within, an inbound
+request**.
+
+§6.5 trigger (b) produces a different shape the guide does not address: **both peers originate
+spontaneously and independently** over one channel, neither as a consequence of the other's request.
+The §7.4.1 role assignment settles who runs the HELLO *client* half, but says nothing about
+authority to *originate application dispatch* afterwards. After the handshake:
+
+- the **initiator** (offerer, dialer) holds the responder's grant — `held_capability` is written
+  dialer-side only — and can originate;
+- the **responder** (answerer, acceptor) has *minted* a capability for the initiator and holds
+  **nothing from** it, so it has no authority to originate at all.
+
+So on the browser↔browser leg the exchange is authorized in one direction only, while §6.5's own
+design has both peers driving the seam.
+
+**How it presents.** Not as a missing-authority error. The acceptor falls back to the connection's
+capability — which is the one it *granted to the remote* — and authors a request under a cap whose
+`grantee` is the counterpart. The far side answers `401 unresolvable_grantee` (the grantee is not in
+the envelope), and supplying that identity would only convert it to `403 grantee_mismatch`. Both
+statuses point at marshalling; neither names the real condition, which is *this peer was never
+granted anything*. Observed live, two browsers over a real data channel, 2026-08-05.
+
+**Interim choice.** Refuse locally instead of emitting an unauthorized request. The acceptor's
+endpoint stops offering the minted-for-remote capability as an originating credential, so a
+spontaneous dispatch fails **named and local** rather than as a remote authz status. This is
+deliberately *not* a mechanism for acquiring authority — it makes the gap loud instead of guessing at
+a grant the spec does not describe. The §7a.2a in-band path is untouched and still works.
+
+**Question for arch.** For §6.5 trigger (b), where both peers originate over one channel: does the
+acceptor acquire originating authority, and how? The candidate answers each have consequences worth
+ruling on rather than having two implementations pick differently:
+
+1. **Mutual minting at handshake** — the client also mints a cap for the server, so both hold a
+   `held_capability`. Protocol-visible and cross-peer observable; would need pinning, not local
+   choice.
+2. **§7a.2a is the only path** — the acceptor may originate *only* in response to an inbound request
+   carrying a reentry cap, and a spontaneous browser↔browser dispatch from the answerer is simply not
+   authorized. Then §6.5 trigger (b) should say so, because it currently reads as symmetric.
+3. **Out-of-band, like the rendezvous key** — the two peers that agreed the key also agree caps.
+
+`[§11.5.1]` flavour worth noting: this is invisible to a same-implementation *loopback* test, because
+it only appears once the two peers occupy genuinely different roles across a real negotiated channel.
+Our native suite never constructs the acceptor's originating path at all.
+
+</details>

@@ -6635,20 +6635,32 @@ mod tests {
             &self,
             ctx: live_establish::EstablishCtx,
             _peer_id: &str,
-        ) -> Option<transport::Connection> {
+        ) -> Result<live_establish::LivePath, live_establish::LiveEstablishError> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.saw_caller_owns_retry
                 .store(ctx.caller_owns_retry, std::sync::atomic::Ordering::SeqCst);
             // A real policy checks the deadline between rungs rather than
             // starting a carrier round trip it cannot finish (§10.3).
             if ctx.expired() {
-                return None;
+                return Err(live_establish::LiveEstablishError::NotAttempted {
+                    substrate: "memory",
+                    reason: "the seam deadline had already passed".to_string(),
+                });
             }
             use transport::Connector;
             transport::MemoryConnector::new(self.registry.clone())
                 .connect(&format!("memory://{}", self.target))
                 .await
-                .ok()
+                .map(|connection| live_establish::LivePath {
+                    connection,
+                    // This double dials a memory transport, so exactly one side
+                    // connected and §7.4.1 is settled the ordinary way.
+                    role: live_establish::HandshakeRole::Initiator,
+                })
+                .map_err(|e| live_establish::LiveEstablishError::NoPath {
+                    substrate: "memory",
+                    reason: e.to_string(),
+                })
         }
     }
 

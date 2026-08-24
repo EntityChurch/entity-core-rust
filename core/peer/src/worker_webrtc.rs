@@ -55,9 +55,11 @@ pub use entity_signaling::webrtc::VerificationPolicy;
 use web_sys::MessagePort;
 
 use crate::carrier::PeerCarrier;
-use crate::live_establish::{EstablishCtx, LiveEstablish};
+use crate::live_establish::{
+    EstablishCtx, HandshakeRole, LiveEstablish, LiveEstablishError, LivePath,
+};
 use crate::transport::{
-    connection_from_port_typed, sdp_digest, verified_sdp_from_bytes, Connection, ControlMessage,
+    connection_from_port_typed, sdp_digest, verified_sdp_from_bytes, ControlMessage,
     ControlPortClient, WebRtcReply, WireIceServer,
 };
 
@@ -82,14 +84,67 @@ unsafe impl<T> Send for SendWrapper<T> {}
 // SAFETY: as above.
 unsafe impl<T> Sync for SendWrapper<T> {}
 
+/// The substrate this establisher reports at the §10.3 seam. Same string the
+/// `Connection` is labelled with, so an operator correlating a seam refusal
+/// against a connection kind is reading one vocabulary, not two.
+const SUBSTRATE_WEBRTC: &str = "webrtc";
+
 /// A `WebRtcIo` whose `RTCPeerConnection` lives on the main thread.
 pub struct WorkerWebRtcIo {
     control: Rc<ControlPortClient>,
     negotiation_id: u64,
     started: web_time::Instant,
+    /// The §6.5 window, so every round trip can be bounded by what is left of
+    /// it. See [`WorkerWebRtcIo::call_bounded`].
+    deadline_ms: u64,
+    /// Set once the negotiated data channel belongs to a live `Connection`, so
+    /// `Drop` stops closing the `RTCPeerConnection` out from under it. See the
+    /// `Drop` impl.
+    handed_off: std::cell::Cell<bool>,
 }
 
 impl WorkerWebRtcIo {
+    /// Every main-thread round trip, bounded by what remains of the §6.5 window.
+    ///
+    /// **`ControlPortClient::webrtc_call` awaits its reply with no timeout at
+    /// all**, and `negotiate` checks the deadline only at the top of its loop.
+    /// So a round trip that never got an answer ignored the negotiation deadline
+    /// completely: the peer hung forever, emitted no timeout warn, and left
+    /// `establish_live` pending until the whole dispatch was abandoned.
+    ///
+    /// `entity-browser-rust` hit exactly that — both peers stuck at `tick=2`,
+    /// which is the iteration where the answerer calls `create_answer`, with no
+    /// terminal line from either. The broker replies on every path it *reaches*
+    /// (checked), so this covers the cases it does not: a reply lost in transit,
+    /// a promise that never settles, a control port that went away between the
+    /// post and the answer.
+    ///
+    /// The bound is the remaining window rather than a fixed per-call ceiling,
+    /// because the thing being honoured is `deadline_ms` — a caller that asked
+    /// for a 15s traversal budget should not be able to spend 15s *per* round
+    /// trip. Expiry is a `Substrate` error, so it surfaces through the ordinary
+    /// §6.5 failure path and still falls through to relay.
+    async fn call_bounded(
+        &self,
+        build: impl FnOnce(u64) -> ControlMessage,
+    ) -> Result<WebRtcReply, String> {
+        let elapsed = self.started.elapsed().as_millis() as u64;
+        let remaining = self.deadline_ms.saturating_sub(elapsed);
+        if remaining == 0 {
+            return Err("§6.5 window closed before this control round trip".to_string());
+        }
+        let call = self.control.webrtc_call(build);
+        futures::pin_mut!(call);
+        let timer = gloo_timers::future::TimeoutFuture::new(remaining.min(u32::MAX as u64) as u32);
+        match futures::future::select(call, timer).await {
+            futures::future::Either::Left((reply, _)) => reply,
+            futures::future::Either::Right(((), _)) => Err(format!(
+                "the main thread did not answer this control round trip within the \
+                 remaining §6.5 window ({remaining}ms)"
+            )),
+        }
+    }
+
     /// Ask the broker to mint an `RTCPeerConnection` for this pairing.
     ///
     /// `peer_id` is explicit rather than inferred — the v6 Subscribe lesson in
@@ -100,16 +155,32 @@ impl WorkerWebRtcIo {
     /// the worker is where the values are provisioned. Travelling with the
     /// request that consumes them makes worker/main skew impossible rather
     /// than merely unlikely. Empty means host-candidates-only, never "default".
+    /// `deadline_ms` is the §6.5 window this negotiation was granted. It is
+    /// taken here rather than passed per call because it bounds *every*
+    /// subsequent round trip — see [`WorkerWebRtcIo::call_bounded`] — and this
+    /// first one, which is itself a main-thread round trip that could hang.
     pub async fn open(
         control: Rc<ControlPortClient>,
         from_peer: &str,
         peer_id: &str,
         session_id: &[u8],
         ice_servers: Vec<WireIceServer>,
+        deadline_ms: u64,
     ) -> Result<Self, String> {
         let negotiation_id = control.next_negotiation_id();
-        let reply = control
-            .webrtc_call(|request_id| ControlMessage::WebRtcOpen {
+        let io = Self {
+            control,
+            negotiation_id,
+            started: web_time::Instant::now(),
+            deadline_ms,
+            handed_off: std::cell::Cell::new(false),
+        };
+        // Built before the call so the open itself is bounded by the same
+        // window. A broker that never answers `WebRtcOpen` would otherwise hang
+        // the negotiation before `negotiate` runs a single tick — the one round
+        // trip the loop's own deadline check can never reach.
+        let reply = io
+            .call_bounded(|request_id| ControlMessage::WebRtcOpen {
                 request_id,
                 negotiation_id,
                 peer_id: peer_id.to_string(),
@@ -119,11 +190,7 @@ impl WorkerWebRtcIo {
             })
             .await?;
         match reply {
-            WebRtcReply::Ack => Ok(Self {
-                control,
-                negotiation_id,
-                started: web_time::Instant::now(),
-            }),
+            WebRtcReply::Ack => Ok(io),
             other => Err(mismatch("Ack", &other)),
         }
     }
@@ -158,8 +225,7 @@ impl WebRtcIo for WorkerWebRtcIo {
 
     async fn create_offer(&self) -> Result<String, String> {
         let reply = self
-            .control
-            .webrtc_call(|request_id| ControlMessage::WebRtcCreateOffer {
+            .call_bounded(|request_id| ControlMessage::WebRtcCreateOffer {
                 request_id,
                 negotiation_id: self.negotiation_id,
             })
@@ -171,8 +237,7 @@ impl WebRtcIo for WorkerWebRtcIo {
         let remote = remote_offer_sdp.as_bytes().to_vec();
         let digest = sdp_digest(&remote);
         let reply = self
-            .control
-            .webrtc_call(|request_id| ControlMessage::WebRtcCreateAnswer {
+            .call_bounded(|request_id| ControlMessage::WebRtcCreateAnswer {
                 request_id,
                 negotiation_id: self.negotiation_id,
                 remote_sdp: remote.clone(),
@@ -186,8 +251,7 @@ impl WebRtcIo for WorkerWebRtcIo {
         let remote = remote_answer_sdp.as_bytes().to_vec();
         let digest = sdp_digest(&remote);
         let reply = self
-            .control
-            .webrtc_call(|request_id| ControlMessage::WebRtcAcceptAnswer {
+            .call_bounded(|request_id| ControlMessage::WebRtcAcceptAnswer {
                 request_id,
                 negotiation_id: self.negotiation_id,
                 remote_sdp: remote.clone(),
@@ -205,8 +269,7 @@ impl WebRtcIo for WorkerWebRtcIo {
         // fatal to the negotiation — the next tick tries again. Returning an
         // empty batch is the honest answer to "nothing arrived."
         let reply = self
-            .control
-            .webrtc_call(|request_id| ControlMessage::WebRtcDrainCandidates {
+            .call_bounded(|request_id| ControlMessage::WebRtcDrainCandidates {
                 request_id,
                 negotiation_id: self.negotiation_id,
             })
@@ -221,14 +284,35 @@ impl WebRtcIo for WorkerWebRtcIo {
                     username_fragment: c.username_fragment,
                 })
                 .collect(),
-            _ => Vec::new(),
+            // **Not "nothing arrived" — "they are gone."** The broker's
+            // `drain_candidates` is a `mem::take`, so the batch left `gathered`
+            // before this reply was built. A reply that is lost, fails, or
+            // arrives as the wrong variant destroys those candidates
+            // permanently: they are neither queued for the next tick nor
+            // posted, and the counterpart never learns they existed.
+            //
+            // The old comment here called an empty batch "the honest answer to
+            // nothing arrived", which is true for `Candidates([])` and false for
+            // every other arm. `call_bounded` made this strictly more reachable
+            // — a round trip that outruns the remaining window now returns
+            // `Err` where it used to block — so the loss gets a line rather than
+            // staying silent. `warn!`, because a silently halved candidate set
+            // is exactly the class of fault this leg has already paid for twice.
+            other => {
+                tracing::warn!(
+                    negotiation_id = self.negotiation_id,
+                    reply = ?other,
+                    "§6.5: a drained candidate batch was DISCARDED — the broker had \
+                     already taken them, so these candidates are lost, not deferred"
+                );
+                Vec::new()
+            }
         }
     }
 
     async fn add_remote_candidate(&self, candidate: &IceCandidate) -> Result<(), String> {
         let reply = self
-            .control
-            .webrtc_call(|request_id| ControlMessage::WebRtcAddCandidate {
+            .call_bounded(|request_id| ControlMessage::WebRtcAddCandidate {
                 request_id,
                 negotiation_id: self.negotiation_id,
                 candidate: candidate.candidate.clone(),
@@ -247,8 +331,7 @@ impl WebRtcIo for WorkerWebRtcIo {
 
     async fn wait_open(&self, timeout_ms: u64) -> Result<Self::Channel, String> {
         let reply = self
-            .control
-            .webrtc_call(|request_id| ControlMessage::WebRtcAwaitOpen {
+            .call_bounded(|request_id| ControlMessage::WebRtcAwaitOpen {
                 request_id,
                 negotiation_id: self.negotiation_id,
                 timeout_ms,
@@ -271,8 +354,31 @@ impl WebRtcIo for WorkerWebRtcIo {
     }
 }
 
+impl WorkerWebRtcIo {
+    /// Hand ownership of the `RTCPeerConnection` to the `Connection` built from
+    /// the negotiated channel, so `Drop` leaves it alone.
+    fn mark_handed_off(&self) {
+        self.handed_off.set(true);
+    }
+}
+
 impl Drop for WorkerWebRtcIo {
     fn drop(&mut self) {
+        // **Not when the channel was handed off.** `WebRtcClose` makes the
+        // broker call `pc.close()`, which closes the `RTCDataChannel` with it —
+        // and on the success path this value drops as soon as `establish_live`
+        // returns, while the `Connection` it just produced is a `MessagePort`
+        // whose far end the broker is pumping against that exact channel.
+        // Unconditional close therefore tore down every negotiation that
+        // *worked*, immediately, before the caller could send a byte.
+        //
+        // Latent until now only because no §6.5 negotiation has ever succeeded:
+        // rung-1 has never gone green, so the success path has never run in a
+        // browser. It would have failed on the first green run and looked like
+        // a transport bug rather than a lifecycle one.
+        if self.handed_off.get() {
+            return;
+        }
         // Fire-and-forget: there is no useful reply, and a dropped negotiation
         // must not leave an `RTCPeerConnection` alive on the main thread
         // waiting for one.
@@ -373,14 +479,21 @@ impl BrowserWebRtcEstablisher {
 
 #[async_trait::async_trait(?Send)]
 impl LiveEstablish for BrowserWebRtcEstablisher {
-    async fn establish_live(&self, ctx: EstablishCtx, peer_id: &str) -> Option<Connection> {
+    async fn establish_live(
+        &self,
+        ctx: EstablishCtx,
+        peer_id: &str,
+    ) -> Result<LivePath, LiveEstablishError> {
         // §6.4's skip-own. Not the only guard and not load-bearing:
         // `negotiate` calls `pair_should_suppress_offer`, which returns
         // `SelfNegotiation` for equal ids and is tested natively. This is the
         // cheap early exit that avoids minting an `RTCPeerConnection` on the
         // main thread only to tear it down one call later.
         if peer_id == self.self_peer_id {
-            return None;
+            return Err(LiveEstablishError::NotAttempted {
+                substrate: SUBSTRATE_WEBRTC,
+                reason: "§6.4 skip-own: the target is this peer".to_string(),
+            });
         }
 
         // Both ids must be the SAME KIND of string, and this is the only place
@@ -406,7 +519,12 @@ impl LiveEstablish for BrowserWebRtcEstablisher {
                 "§6.5: target is not a canonical base58 peer-id; refusing rather \
                  than deriving a rendezvous bucket the counterpart cannot share"
             );
-            return None;
+            return Err(LiveEstablishError::Refused {
+                substrate: SUBSTRATE_WEBRTC,
+                reason: "the target is not a canonical base58 peer-id, so no shared \
+                         rendezvous bucket could be derived"
+                    .to_string(),
+            });
         }
 
         // `pair` mode: both ids are known out of band, which is what makes the
@@ -435,7 +553,10 @@ impl LiveEstablish for BrowserWebRtcEstablisher {
                 remote_peer = %peer_id,
                 "§10.3: deadline already passed; not starting a §6.5 negotiation"
             );
-            return None;
+            return Err(LiveEstablishError::NotAttempted {
+                substrate: SUBSTRATE_WEBRTC,
+                reason: "the seam deadline had already passed".to_string(),
+            });
         }
 
         let session_id = SessionId::generate();
@@ -445,6 +566,7 @@ impl LiveEstablish for BrowserWebRtcEstablisher {
             peer_id,
             session_id.as_bytes(),
             self.ice_servers.clone(),
+            deadline_ms,
         )
         .await
         {
@@ -456,7 +578,10 @@ impl LiveEstablish for BrowserWebRtcEstablisher {
                     "§6.5: the main thread would not open an RTCPeerConnection; \
                      no negotiation was attempted"
                 );
-                return None;
+                return Err(LiveEstablishError::NotAttempted {
+                    substrate: SUBSTRATE_WEBRTC,
+                    reason: format!("the main thread would not open an RTCPeerConnection: {e}"),
+                });
             }
         };
 
@@ -488,8 +613,8 @@ impl LiveEstablish for BrowserWebRtcEstablisher {
         // the stricter behaviour is correct in both cases, and a policy that
         // retried only when the flag was clear would multiply budgets onto
         // someone else's node exactly as §7.2.1 warns.
-        let port = match negotiate(&party, &self.carrier, &io).await {
-            Ok(port) => port,
+        let negotiated = match negotiate(&party, &self.carrier, &io).await {
+            Ok(n) => n,
             // Every §6.5 failure is still "no live path" to the §10.3 seam —
             // same contract the native punch keeps, where relay is the outcome
             // of a failed traversal. What changed is that it is no longer
@@ -541,7 +666,10 @@ impl LiveEstablish for BrowserWebRtcEstablisher {
                     // reason is ICE/DTLS. Only the genuinely empty bucket sends
                     // anyone back to the node's log.
                     WebRtcError::Timeout {
-                        counterpart_msgs, ..
+                        counterpart_msgs,
+                        answered,
+                        candidates_fed,
+                        ..
                     } => tracing::warn!(
                         remote_peer = %peer_id,
                         self_peer_id = %self.self_peer_id,
@@ -553,10 +681,20 @@ impl LiveEstablish for BrowserWebRtcEstablisher {
                              against the node's offer/collect log \
                              (`RUST_LOG=entity_signaling=debug`) to tell an unshared bucket \
                              from an absent peer"
+                        } else if !*answered {
+                            "bucket was NON-EMPTY but the SDP exchange never completed — \
+                             correlation side: the counterpart deposited and we never paired \
+                             its offer/answer to our session_id"
+                        } else if *candidates_fed == 0 {
+                            "SDP exchange completed and NOT ONE remote candidate was fed — \
+                             the trickle never correlated, so ICE had no pair to nominate; \
+                             this is §6.5 candidate correlation, not the network"
                         } else {
-                            "bucket was NON-EMPTY — the counterpart was present, so this is \
-                             NOT a rendezvous failure; read `sdp_exchange` and `channel wait` \
-                             in the error above"
+                            "SDP exchange completed and remote candidates WERE fed — read \
+                             `ice=` in `channel wait`: `failed` means the pairs were tried \
+                             and none worked, `checking` means the window closed too early, \
+                             `connected`/`completed` means ICE was fine and DTLS/SCTP is at \
+                             fault"
                         },
                         "§6.5: the negotiation window closed without an open data channel"
                     ),
@@ -569,9 +707,51 @@ impl LiveEstablish for BrowserWebRtcEstablisher {
                         "§6.5: negotiation failed; no live path"
                     ),
                 }
-                return None;
+                // `VerificationUnavailable` is the policy case — a counterpart
+                // that could be reached and was declined — and it is the whole
+                // reason this seam carries a reason at all. Everything else is
+                // ordinary best-effort failure.
+                return Err(match &e {
+                    WebRtcError::VerificationUnavailable | WebRtcError::IdentitySkew { .. } => {
+                        LiveEstablishError::Refused {
+                            substrate: SUBSTRATE_WEBRTC,
+                            reason: e.to_string(),
+                        }
+                    }
+                    _ => LiveEstablishError::NoPath {
+                        substrate: SUBSTRATE_WEBRTC,
+                        reason: e.to_string(),
+                    },
+                });
             }
         };
+
+        // The negotiation owns the `RTCPeerConnection` right up to here; from
+        // this point the data channel belongs to the `Connection` below and
+        // outliving this scope is the whole point. Must precede the `Drop` that
+        // runs when `io` falls out of scope at the end of this function.
+        io.mark_handed_off();
+
+        // **The success line this arm never had.** `PeerPunchEstablisher` logs
+        // "§7 punch established a direct path"; this one logged nothing at all,
+        // so a §6.5 negotiation that *worked* was completely silent.
+        //
+        // That silence cost this cohort several rounds. We kept asking
+        // `entity-browser-rust` for "the offerer's terminal warn" and it never
+        // came — and the absence was read as a missing log rather than as what
+        // it was: **the offerer had no warn because the offerer succeeded.**
+        // Meanwhile the unconditional `Drop` tore the connection down
+        // microseconds later, and the answerer's `ice=Disconnected` was the only
+        // trace of a negotiation that had in fact completed end to end.
+        //
+        // `info!`, not `debug!`: at the S5 gate "did a live path come up?" is
+        // the question the whole leg exists to answer, and it must be legible
+        // without opting into a debug level.
+        tracing::info!(
+            remote_peer = %peer_id,
+            rendezvous_key = ?party.key,
+            "§6.5: a WebRTC data channel is OPEN — live path established"
+        );
 
         // The worker side of the handoff is unchanged code: the broker keeps
         // the far end and pumps the RTCDataChannel against it, so what arrives
@@ -579,10 +759,23 @@ impl LiveEstablish for BrowserWebRtcEstablisher {
         // Labelled `webrtc`, not `xworker`: the port is only the carrier of the
         // data channel, and at the S5 gate "which transport is this?" is the
         // first question asked of a connection.
-        Some(connection_from_port_typed(
-            port,
-            format!("webrtc://{peer_id}"),
-            "webrtc",
-        ))
+        // §6.5 → §7.4.1, "one role assignment, not two": the peer that offered
+        // is the initiator and sends HELLO; the peer that answered serves it.
+        // Both peers arrive here holding the same `RTCDataChannel` (§6.5 trigger
+        // (b) has both of them drive this seam off the rendezvous key), so this
+        // is the only thing that keeps them from both speaking first.
+        let role = if negotiated.offered {
+            HandshakeRole::Initiator
+        } else {
+            HandshakeRole::Responder
+        };
+        Ok(LivePath {
+            connection: connection_from_port_typed(
+                negotiated.channel,
+                format!("webrtc://{peer_id}"),
+                "webrtc",
+            ),
+            role,
+        })
     }
 }
