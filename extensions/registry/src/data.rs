@@ -339,9 +339,17 @@ pub struct IssuerPolicyData {
     pub mode: String,
     /// Allow-listed `target_peer_id`s (allowlist mode). `None` = no allowlist.
     pub allowlist: Option<Vec<String>>,
-    /// Optional glob (§4.1 shell-glob) bounding which names may be issued.
+    /// Optional glob bounding which names may be issued. **Its grammar is
+    /// unruled** — see `registration::name_constraints_match`; it is NOT §4's
+    /// closed dispatch grammar.
     pub name_constraints: Option<String>,
     pub default_ttl: Option<u64>,
+    /// §6a.9.1 `[MUST, v1.11]` — the issuer-side ceiling. **REQUIRED on any
+    /// policy that can reach *approve***, enforced at `set-issuer-policy`;
+    /// `Option` here because the *decoder* must be able to represent a stored
+    /// policy that predates the rule or was seeded out-of-band, which is
+    /// exactly the state the register/renew backstops answer.
+    pub max_ttl: Option<u64>,
 }
 
 impl Default for IssuerPolicyData {
@@ -364,6 +372,7 @@ impl Default for IssuerPolicyData {
             allowlist: None,
             name_constraints: None,
             default_ttl: None,
+            max_ttl: None,
         }
     }
 }
@@ -389,6 +398,7 @@ impl IssuerPolicyData {
             allowlist,
             name_constraints: field_text_opt(&map, "name_constraints"),
             default_ttl: field_u64_opt(&map, "default_ttl")?,
+            max_ttl: field_u64_opt(&map, "max_ttl")?,
         })
     }
 
@@ -402,6 +412,9 @@ impl IssuerPolicyData {
         }
         if let Some(t) = self.default_ttl {
             fields.push((text("default_ttl"), integer(t as i64)));
+        }
+        if let Some(t) = self.max_ttl {
+            fields.push((text("max_ttl"), integer(t as i64)));
         }
         if let Some(c) = &self.name_constraints {
             fields.push((text("name_constraints"), text(c)));

@@ -5242,15 +5242,30 @@ does — gets the cross-impl-visible wrong answer today. Found by `entity-core-g
 
 ---
 
-## EXTENSION-REVISION §6.1 — auto-version adopts an unfiltered root; `commit` builds a filtered one (SA-PY-8)
+## ~~EXTENSION-REVISION §6.1 — auto-version adopts an unfiltered root; `commit` builds a filtered one (SA-PY-8)~~ RESOLVED
 
 **Spec:** `EXTENSION-REVISION` §2.4 (*"Exclude applies to trie building"*) and §6.1
 (`auto_version_on_write` Algorithm block) ⨯ §4.4 (`handle_commit`); cross-reference
 `EXTENSION-TREE` §3.4.1a (tracking-config / `system/tree/root/{P}`).
 
-**Status: reported, NOT implemented — deliberately.** Answers arch
-`ROUTING-2026-08-18-f` §4b, which asked us to *"read both paths and report before
-implementing."*
+**Status: CLOSED 2026-08-18 — D1 landed as spec text and is implemented here.** Arch
+`ROUTING-2026-08-18-g` §1 folded `PROPOSAL-REVISION-AUTO-VERSION-EXCLUDE-PARITY` into
+§6.1 and recorded the refusal below as the correct call on the facts at the time
+(*"rust: §4b is now landed text — `EXTENSION-REVISION` 3.12 §6.1 — and your interim entry
+can close"*). Implemented at `59e6f55` exactly as the "when D1 lands" paragraph
+predicted: `filtered_root` in `auto_version_once`, O(1) adoption preserved for configs
+that do not filter. The owed vector is built —
+`engine::tests::rev_autoversion_exclude_parity_1`, which asserts the excluded path is
+absent from the emitted **trie** and that the auto root equals the root an explicit
+`commit` produces over the same live state. The original entry is kept below because the
+ruling it argued against was withdrawn, not overruled.
+
+**One thing the parity vector does NOT cover, measured while building it** — see the
+following entry: the same two paths still diverge on a **deletion**, for a different
+reason (Amendment 2 marker augmentation, not the exclude filter).
+
+**Answered** arch `ROUTING-2026-08-18-f` §4b, which asked us to *"read both paths and
+report before implementing."*
 
 ### What our two paths do (measured, not inferred)
 
@@ -5298,3 +5313,292 @@ adoption stays available for the common case. The emission gate
 path, then a non-excluded one; the auto-version entry's `root` MUST equal the `root` an
 explicit `commit` produces over the same live state. No current vector reaches this, which
 is why three implementations disagreed silently.
+
+---
+
+## EXTENSION-REVISION §6.1 Amendment 2 — our auto-version path emits no deletion markers, and §6.1 states that we do
+
+**Spec:** `EXTENSION-REVISION` §6.1 *"Deletion-marker emission at commit (v3.1, Amendment
+2)"* — *"When auto-version (**or** explicit `commit`) emits a new version, the new
+version's trie MUST include explicit entries for every path that was bound in the parent
+version's trie"* — and the v3.3 D3 ordering paragraph, which asserts as fact that *"Go and
+Rust already perform augment-then-dedup."*
+
+**Status: measured, reported, NOT implemented — and the reason is a missing primitive, not
+a disagreement with the rule.** Found while building D1's parity vector (the entry above);
+it is the same failure shape (one tree state, two roots, depending on which path emitted
+the version) arriving through a different rule.
+
+### Measured, not inferred
+
+Same parent head, same live state, same config, both paths run:
+
+| path | live state | parent version's trie | emitted trie |
+|---|---|---|---|
+| explicit `commit` (`perform_commit`) | `{a}` | `{a, b}` | `{a, b→CANONICAL_DELETION_MARKER}` |
+| auto-version (`auto_version_once`) | `{a}` | `{a, b}` | `{a}` |
+
+Roots `3152e2da…` vs `baee6b81…`. `augment_bindings_with_markers` is called on the commit
+path only; the auto path adopts the tracked root, and EXTENSION-TREE's structural summary
+carries no markers because the live binding is simply gone. So the §6.1 D3 sentence above
+is **half true of us**: augment-then-dedup, yes — on one of the two paths.
+
+### Why it is not fixed in the same commit as D1
+
+Augmentation needs the set of paths bound in the parent trie but absent from the emitted
+one. §6.1's own *"Efficient diff path"* SHOULD names the primitive that produces it —
+`EXTENSION-TREE` §5's trie diff, *"O(changes × depth), not O(total paths in scope)"* —
+and **rust does not have it**. `entity_tree::trie` exposes `build_trie`,
+`collect_all_bindings`, `trie_put/remove/get` and no diff; `core/tree`'s `tree:diff`
+handler decodes both sides into full binding maps and compares them, which is O(N).
+Implementing augmentation on today's primitives therefore means `collect_all_bindings` over
+the parent root **on every auto-version emit** — O(tree) per put, for every tracked prefix
+including the non-filtering ones §6.1 deliberately keeps at O(1). That trades a silent DAG
+fork for a silent 100×-per-put regression, which this repo has already eaten once
+(`SyncTreeHook` config decode) and named in `AGENTS.md`.
+
+`entity-core-go` pays no such price because it **has** the primitive: `fire()` calls
+`emitDeletionMarkers` → `tree.TrieDiff(cs, parentRoot, liveRoot)`, which prunes identical
+subtrees structurally.
+
+**Interim choice:** auto-version emits without markers (unchanged behavior), and the gap is
+stated here rather than closed by an O(N) rebuild. `commit` is unaffected and stays
+conformant.
+
+**Owed, and it is ours, not upstream's:** a structural `trie_diff(store, base, target) →
+(added, removed, changed)` in `core/tree/src/trie.rs` that prunes on equal node hashes,
+then marker augmentation on the auto path built on it, plus the vector this entry's table
+describes (auto-version after an unbind MUST emit `path→CANONICAL_DELETION_MARKER`). The
+`tree:diff` handler should move onto the same primitive — it is the second caller and it is
+O(N) today.
+
+**Upstream ask (small):** §6.1's D3 paragraph names Rust as already doing augment-then-dedup
+on both paths. It is accurate for `commit` and wrong for auto-version, and a factual claim
+about an implementation inside a normative ordering rule is load-bearing — it is exactly the
+kind of sentence that stops a routing from being written. Please drop the impl attribution
+or scope it to the commit path.
+
+---
+
+## ~~EXTENSION-TYPE §4.6 `type_pattern` — the one place the withdrawn doublestar pin is still implemented, and go and we implement it identically~~ RESOLVED
+
+> **RULED 2026-08-18 — arch `ROUTING-2026-08-18-o` §4. RESOLVED; landed.**
+> The ask below was *"does §5's TYPE-defers-to-§5.4 correction reach §4.6
+> `type_pattern`?"* — **yes**, and arch routed it to all three seats as one
+> row rather than to us alone, which is what the entry asked for. Both
+> implemented seats moved together, so the divergence risk the interim choice
+> was protecting against never materialised.
+>
+> **Verified by construction, not by the routing table:** `entity-core-go`
+> `79cc8da` replaced `globMatch`/`globMatchSegments` with
+> `capability.MatchesPattern(ent.Type, pattern)` at **both** call sites in
+> `ext/type/constraint/handler.go` — enumerated, not grepped for one hit. We
+> now delegate to the same §5.4 matcher (`entity_capability::matches_pattern`,
+> `extensions/type-system/src/type_pattern.rs`); `glob.rs` is deleted rather
+> than left as a second matcher that happens to agree.
+>
+> **The `**`-should-be-refused half of the ask did not land and is withdrawn
+> as a question.** §4.6 patterns have no write-time handler op — a
+> `type_pattern` constraint is a field on a type definition, not a config
+> written through a validating operation — so there is no §4.4.17-V6-shaped
+> enforcement site to put a refusal at. Under §5.4 a `**` is simply literal
+> bytes and matches nothing, which is the fail-closed direction; the tests in
+> `type_pattern.rs` pin that reading explicitly.
+
+**(original entry, kept for the record)**
+
+## EXTENSION-TYPE §4.6 `type_pattern` — the one place the withdrawn doublestar pin is still implemented, and go and we implement it identically
+
+**Spec:** `EXTENSION-TYPE` §4.6 (`type_pattern` constraint) ⨯ `ENTITY-CORE-PROTOCOL` §5.4
+`matches_pattern`; arch `ROUTING-2026-08-18-i` §2 (doublestar withdrawn) and §5 (*"TYPE now
+defers to §5.4"*).
+
+**Status: observed while sweeping the glob ruling's boundary; NOT changed, deliberately —
+this is a cohort question, not a rust defect.**
+
+§2.4's third consequence is explicit that the four forms are revision-local and that *"a `*`
+appearing outside these two fields … is §5.4's `*`"*, and §5 of the routing says TYPE now
+defers to §5.4 as well. Under §5.4, `system/capability/*` matches
+`system/capability/path-scope/foo` — the `*` crosses `/`.
+
+Our `type_pattern` validator does not do that. `extensions/type-system/src/glob.rs` is a
+doublestar matcher: `*` is **segment-scoped** and `**` crosses `/` — the exact table arch
+withdrew this morning, with a test asserting
+`!glob_match("system/capability/*", "system/capability/path-scope/foo")`.
+
+**And `entity-core-go` reads it the same way** — `globMatch` /
+`globMatchSegments` (`ext/type/constraint/handler.go`) splits on `/` and treats `*` as one
+segment, `**` as many. Two seats, same non-§5.4 reading, in the same surface.
+
+So changing it unilaterally would break the thing the ruling exists to protect: it would
+diverge us from go to match text, which is the failure §1 of `ROUTING-2026-08-18-g`
+records ("a ruling routed but not folded produces the divergence it was written to close").
+Our other type-name matcher is already fine and already agrees with go: query's
+`type_filter` (`extensions/query/src/index.rs`, `sqlite_index.rs`) is §5.4 — `*`,
+`prefix/*` retaining the slash, else exact.
+
+**Ask:** does §5's TYPE-defers-to-§5.4 correction reach §4.6 `type_pattern`? If yes it is a
+behavior change owed by **both** implemented seats and wants routing to both together (and
+`**` should be refused there rather than silently reinterpreted — same reasoning as §4.4.17
+V6). If no, §4.6 wants a sentence saying so, because it is now the only surviving doublestar
+in the corpus's implementations.
+
+**Interim choice:** unchanged, and pinned by the existing tests so the reading is at least
+explicit rather than accidental.
+
+---
+
+## EXTENSION-HISTORY §6.2 — the three-key order is still not total, and §4.4.18 already pinned the missing key
+
+**Spec:** `EXTENSION-HISTORY` §6.2 (`pattern_specificity`, `[MUST, v1.7]`) ⨯
+`EXTENSION-REVISION` §4.4.18 (`pattern_specificity`, `[v3.12]`).
+
+**Status: implemented with a fourth key; routing the gap rather than treating our choice as
+the answer.**
+
+§6.2's rule is *"the selection MUST NOT depend on enumeration order"*, and it gives three
+keys: literal-segment count, total depth, then lexicographic byte order on the
+**canonicalized pattern**. That is total over *patterns* and not over *configs*. History
+configs live at `system/history/config/{config_name}`, and two `{config_name}`s may
+legitimately carry the same `pattern` with different `enabled` / `events` / `max_depth` —
+they are then one content-addressed entity under two bindings. All three keys tie, and the
+winner is again whatever `list_entities` yielded first: the exact dependence the MUST
+forbids, surviving the fix that was written to remove it.
+
+`EXTENSION-REVISION` §4.4.18 pinned this same tiebreak one section over, in the revision
+of the same day, and named the same reason: *"Two configs may legitimately carry the same
+`pattern` under different `{name}`s, so rank plus literal length is not yet a total order.
+The remaining tie is broken by lexicographic byte order on `pattern`, **then on the
+config's `{name}`**."*
+
+**Interim choice:** key 4 = lexicographic byte order on `{config_name}`, lower wins —
+REVISION's ruling applied verbatim rather than a mechanism invented here. Named at
+`more_specific` (`extensions/history/src/engine.rs`) and gated by
+`hist_config_same_pattern_two_names_resolves_by_name_not_enumeration`, which writes the
+pair in both insertion orders.
+
+**Ask:** add `{config_name}` as §6.2's key 4, or say why history's domain differs from
+merge-config's. It is cross-impl-observable — which config wins decides whether a
+transition is recorded and with what `max_depth`.
+
+**Second, smaller:** `HIST-CONFIG-SPECIFICITY-1` says to *"write at a path both match"*
+using §6.2's worked pair `a/b/c/d` and `a/*/c/*/e`. **No such path exists.** Under §5.4 —
+which §2.2 names as the pattern syntax — `a/*/c/*/e` has no trailing `/*` and is not bare
+`*`, so it is an **exact** pattern whose interior `*`s are literal bytes; it matches the
+one string `a/*/c/*/e`, which `a/b/c/d` does not match. The pair separates the *scorer*
+(which is what the surrounding prose argues, and it does so correctly) but cannot drive the
+*selection* the vector describes. We gate both halves separately —
+`hist_config_specificity_1_two_key_order_separates_the_spec_pair` for the scoring claim on
+the spec's own pair, and `..._selection_is_independent_of_insertion_order` for the ordering
+property on a pair that genuinely both match (`/{peer}/a/b/*` vs `*/a/b/c`, tied on keys
+1–2). A conformance runner implementing the vector as written would assert against a config
+that never matches.
+
+---
+
+## EXTENSION-REVISION §4.4.18 — key 3 of `pattern_specificity` is unreachable under §2.4's four forms
+
+**Spec:** `EXTENSION-REVISION` §4.4.18 (`pattern_specificity` total order, `[v3.12]`) ⨯ §2.4
+(the closed four-form grammar).
+
+**Status: implemented as written; reporting an observation, not asking for a change.**
+
+The order is *"rank, then literal length, then **lexicographic byte order on `pattern`**, then
+on the config's `{name}`."* Key 3 runs only when two **distinct** patterns tie on rank **and**
+literal length **and both match the same subject**. Under §2.4 no such pair exists:
+
+| Rank | Why two same-length distinct patterns cannot share a subject |
+|---|---|
+| 3 `<lit>` | two exacts matching one subject are the same string |
+| 2 `<lit>/*` | equal literal length + distinct ⇒ distinct prefixes ⇒ disjoint |
+| 1 `*<lit>` | equal literal length + distinct ⇒ distinct suffixes ⇒ disjoint |
+| 0 `*` | one member |
+
+So the only reachable tie is the **same-pattern** one — which is exactly what
+`MERGE-SPEC-TIE-1` sets up — and key 4 (`{name}`) is what decides it. Key 3 is inert.
+
+**Not a defect and nothing to fix:** it is cheap, it is correct, and it costs one `cmp`. We
+implement it, and we gate its unreachability by enumeration over the forms
+(`merge_spec_key_3_pattern_order_is_unreachable_by_construction`, `extensions/revision/src/merge.rs`)
+rather than leaving an unexercised branch that reads as covered. **Worth knowing because it
+means `MERGE-SPEC-TIE-1` is the only vector that exercises the tail of the order at all** —
+a peer that implements keys 1–2 plus `{name}` and skips key 3 is indistinguishable from a
+conformant one, so the vector list cannot detect a peer that got key 3 wrong.
+
+**One vector note, and it is the load-bearing half of `MERGE-SPEC-TIE-1`.** The row says to
+write the two configs *"in both orders"*. Against a store whose `list` is sorted by path —
+ours is `BTreeMap`-backed, and path order within one config prefix **is** `{name}` order —
+re-inserting in the other order changes nothing about what is enumerated, so a
+keep-whichever-came-first peer passes both rows by luck. §4.4.18's own argument is that
+`list_entities` ordering is *unspecified*, so the property under test is enumeration order,
+not insertion order. We drive the vector through a reverse-enumerating `LocationIndex`
+double as well as the sorted store, and verified the row goes red against rank-only
+comparison only with the double in place. **Suggest the vector say "in both enumeration
+orders" and note that insertion order is not a proxy for it** — otherwise every
+sorted-store implementation reports a pass it did not earn.
+
+---
+
+## EXTENSION-REGISTRY §4.1 step 2 — the dispatch filter has two readings, we and core-go each hold one, and neither is right on both cases
+
+**Spec:** `EXTENSION-REGISTRY` §4.1 step 2 (the `name_format_dispatch` filter) ⨯ §4's
+*"filter, not a routing table"* paragraph ⨯ §4.1a's catch-all `MUST`.
+**Surfaced by:** `entity-core-go`'s new wire check `registry.v15_dispatch_grammar`
+(`cf6871e` / `08684b2`), run against a live rust peer at `c06a6ab`.
+
+**Status: NOT converged. This is a cross-impl-observable divergence on the privacy
+mechanism, and it is routed rather than settled locally.**
+
+§4.1 step 2's second sentence is per-backend and has two clauses:
+
+> Backends **without** a `name_format_dispatch` entry default to "match all" (no filtering);
+> backends **with** one are consulted **ONLY** when the pattern matches.
+
+Its first sentence, and §4's *"eligible at the **union** of their `backend_kinds`"*, read as
+set-valued: the eligible set is the union over matching rules.
+
+The two produce different chains, and the seats split:
+
+| Case | `entity-core-rust` | `entity-core-go` | Which sentence answers it |
+|---|---|---|---|
+| kind named by **no** rule; some other rule matches the name | consulted | **excluded** | *"without an entry … match all"* → rust |
+| kind named by a rule; **no** rule matches the name | **excluded** | consulted | *"with one … ONLY when the pattern matches"* → rust |
+
+core-go's algorithm is *"if any rule matched, restrict to the union; else leave the chain
+unfiltered"* (`ext/registry/registry.go`). Its `else` branch contradicts the second clause
+outright: a backend **with** an entry is consulted when its pattern did not match. Ours
+follows both clauses.
+
+**But ours has the worse security property, and that is the real question.** §4.1 step 2's
+MUST is *"the catch-all MUST NOT name a backend whose consultation transmits the queried
+name"* — because *"the catch-all is the path every unscoped name takes."* Under
+*named-by-no-rule-means-always-consulted*, an operator evades that MUST by **omitting the
+row**: a `dns-txt` backend that appears in no dispatch rule is consulted for **every** bare
+name a user types, which is exactly the irreversible disclosure the MUST exists to prevent,
+reached by leaving a line out rather than by writing one. A normative rule that omission
+bypasses is unlikely to be the intended reading, and go's direction is the fail-closed one.
+
+**Ask:** rule it, and route the ruling to **both** seats as one item. If the union reading
+wins, §4.1 step 2's second sentence needs scoping ("a deployment carrying no
+`name_format_dispatch` at all") or withdrawing, and go's no-match fallback needs the same
+fix we would — leaving the chain unfiltered is not what *"treated as matching the
+catch-all"* says either. If the per-backend reading wins, the catch-all MUST needs a
+companion clause binding backends that appear in no rule.
+
+**Interim choice:** unchanged, and now pinned from **both** sides so the reading is explicit
+rather than accidental — `meta_resolver_dispatch_filter_excludes_local_name` (row 2) and
+`a_backend_kind_named_by_no_dispatch_rule_is_never_narrowed_out` (row 1),
+`extensions/registry/src/tests.rs`. Whichever way it is ruled, exactly one of those two
+tests flips.
+
+**One thing worth telling core-go directly, because it affects what their check proves.**
+`v15_dispatch_grammar` drives the grammar *through* the filter: it installs a rule naming
+`did-web`, leaves `local-name` unnamed in the chain, and reads `resolved` vs
+`chain_exhausted` as the discriminator. Against a peer implementing the per-backend reading
+`local-name` is never narrowed out, so **every row returns `resolved`** and the check reports
+the filter divergence while measuring nothing at all about the matcher — the three rows it
+expects `resolved` for (`a?c`/`abc`, `a[bc]d`/`abd`, `*@*.*`/`plainhandle`) pass **trivially**,
+for the wrong reason. The grammar half is a real requirement and is separately gated in-tree
+(`reg_dispatch_grammar_1`, `extensions/registry/src/tests.rs`, verified red against a POSIX
+matcher by mutation). Suggest the check name the kind it narrows to in the chain as well, so
+the two readings agree on the setup and the discriminator is the matcher.

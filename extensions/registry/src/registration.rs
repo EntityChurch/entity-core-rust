@@ -75,7 +75,7 @@ use crate::data::{
     STATUS_BOUND, STATUS_PENDING_REVIEW,
 };
 use crate::log::now_ms;
-use crate::resolver::{find_binding_signature, glob_match, peer_pubkey_from_entity};
+use crate::resolver::{find_binding_signature, peer_pubkey_from_entity};
 use crate::result::{entity_result, error, hash_result, register_result, status_result};
 use crate::{
     binding_body_path, by_name_pointer_path, issuer_policy_path, pending_body_path,
@@ -314,7 +314,7 @@ impl RegisterRequestHandler {
         };
         // name_constraints bounds which names the registry will issue, in any mode.
         if let Some(glob) = &policy.name_constraints {
-            if !glob_match(glob, &req.name) {
+            if !name_constraints_match(glob, &req.name) {
                 return error(
                     STATUS_FORBIDDEN,
                     "not_entitled",
@@ -323,6 +323,44 @@ impl RegisterRequestHandler {
             }
         }
         let norm = normalize_name(&req.name, "none");
+
+        // D12 — the backstop for D11 (below, at `set-issuer-policy`).
+        //
+        // D11 refuses a null-`default_ttl` policy at the door, but §6a.9.2's
+        // store-first rule means such a policy is still reachable: seeded by a
+        // CLI flag, written directly to the tree, or predating the rule. So the
+        // resolved ttl is re-checked here, BEFORE both the manual-queue and the
+        // direct-issue arms — queueing a request that can only ever mint an
+        // invalid binding just moves the failure to the operator's approval.
+        //
+        // Refuse rather than substitute an implementation-chosen default: that
+        // is §6a.9.2's default-synthesis mistake applied to a security-relevant
+        // field, and it would let two registries answer identically-stored
+        // policies with different binding lifetimes — a determinism split the
+        // operator never sees. Minting is not an option either: the result is a
+        // null-ttl binding, which D3 now makes unresolvable.
+        //
+        // The clamp (§6a.9.1 `[MUST, v1.11]`) rides the same expression:
+        // resolve through the cascade, then `min(resolved, policy.max_ttl)`.
+        // A request above the ceiling is **CLAMPED, not refused** — refusing
+        // would bill a well-formed request for a policy the requester cannot
+        // read (§6a.9.2's own reason for not gating the requester) and would
+        // teach requesters to probe for the ceiling. The clamp is silent by
+        // design: the issued binding carries the clamped value, which is
+        // signed, published and readable.
+        let resolved_ttl = clamp_to_ceiling(req.requested_ttl.or(policy.default_ttl), &policy);
+        if resolved_ttl.is_none() {
+            return error(
+                STATUS_FORBIDDEN,
+                "policy_rejected",
+                "resolved ttl is null: the request omitted requested_ttl and the issuer \
+                 policy defines no default_ttl. Refusing rather than minting a null-ttl \
+                 binding (unresolvable per CAP registry D3) or substituting an \
+                 implementation-chosen default (CAP registry D12). Set default_ttl on \
+                 the issuer policy.",
+            );
+        }
+
         match policy.mode.as_str() {
             MODE_OPEN => {
                 // First-come-first-serve: only the name-taken check gates.
@@ -415,7 +453,8 @@ impl RegisterRequestHandler {
 
         // Approved — record the nonce, then sign + publish (the §6a.8 act).
         self.location_index.set(&nonce_path, request_hash);
-        let ttl = req.requested_ttl.or(policy.default_ttl);
+        // Non-null by the D12 guard above.
+        let ttl = resolved_ttl;
         match self.issue_binding(&norm, &req.target_peer_id, req.transports, ttl, None) {
             // §6a.9 step 3 `[RULED 2026-08-12]`: `{status: "bound", binding_hash}`
             // in register-request's own result type. Previously a bare
@@ -578,6 +617,74 @@ impl RegisterRequestHandler {
         if let Some(rejection) = self.check_replay(&prev.target_peer_id, &nonce, issued_at) {
             return rejection;
         }
+        // §6a.9.1 `[MUST, v1.9/v1.10/v1.11]` — renew resolves its `ttl`
+        // through a THREE-STEP cascade and never refuses for a missing one.
+        //
+        // Renew is a **second producer of peer-issued bindings** and the
+        // null-`ttl` rules swept only `register-request`: a renew omitting
+        // `ttl` against a policy with no `default_ttl` minted a null-`ttl`
+        // successor, which §6a.3 forbids and §6a.4 will not honor. Steps, in
+        // order:
+        //
+        //   1. the request's own `ttl`
+        //   2. the issuer policy's `default_ttl` — current operator intent
+        //      outranks history, so an operator who lowers it sees renewals
+        //      pick it up. **This is why the order is not inherit-first.**
+        //   3. the superseded binding's `ttl`
+        //
+        // Step 3 is *not* an implementation-chosen default, and that
+        // distinction is the whole ruling: a synthesized number is one the
+        // implementation invents, so two registries answer identically-stored
+        // policies differently. The predecessor's `ttl` is **the registry's
+        // own prior signed act on this exact name** — recovered, not chosen,
+        // byte-identical at every conformant peer.
+        //
+        // Refusing at renew would be the wrong side by §6a.9.2's own
+        // reasoning: at register the input is genuinely missing, at renew the
+        // registry holds a valid `ttl` it issued itself. Refusing would revoke
+        // a name by inaction, for a policy defect the registrant cannot see or
+        // fix, on the one operation whose purpose is to keep the name alive.
+        //
+        // The policy is optional here on purpose. §6a.9.2's *"unset is not a
+        // mode"* closes the **register** surface on an unarmed registry; a
+        // curated registry (§6a.8) that issued a binding out-of-band can still
+        // be asked to renew it, and step 3 answers that without a policy.
+        let policy = self.load_policy();
+        let cascaded = new_ttl
+            .or_else(|| policy.as_ref().and_then(|p| p.default_ttl))
+            .or(prev.ttl);
+
+        // The cascade fails closed when the predecessor itself is invalid
+        // `[MUST, v1.10]`. Step 3 is non-null *on every conformant mint path*,
+        // which is not the same as non-null: a predecessor carrying
+        // `ttl: null` can be already there — seeded out-of-band, written
+        // straight to the tree, or predating these rules. **An unreachable
+        // branch that is asserted rather than enforced is how the shape it
+        // forbids gets minted**: guard the deref to avoid a panic, fall
+        // through, and out comes the null-`ttl` binding the whole rule set
+        // exists to prevent. So it is enforced, and it is unreachable on any
+        // conformant path for exactly that reason.
+        let Some(resolved) = cascaded else {
+            return error(
+                STATUS_FORBIDDEN,
+                "policy_rejected",
+                "renew ttl cascade yielded null at all three steps (request, issuer \
+                 policy default_ttl, superseded binding) — the predecessor carries a \
+                 null ttl, which §6a.3 forbids and no conformant path mints. Refusing \
+                 and publishing nothing rather than minting a null-ttl successor or \
+                 substituting a default (§6a.9.1 v1.10).",
+            );
+        };
+        // …then the ceiling, as on the register path.
+        let renew_ttl = policy
+            .as_ref()
+            .map_or(Some(resolved), |p| clamp_to_ceiling(Some(resolved), p));
+
+        // Nonce recorded only once the request is going to be honored. The
+        // v1.10 refusal MUST publish nothing, and burning the requester's
+        // nonce on a refusal is a publication in the only sense that matters
+        // to them: the retry that would succeed after the operator fixes the
+        // policy comes back as a replay instead.
         self.location_index.set(
             &register_nonce_path(&self.peer_id, &prev.target_peer_id, &nonce),
             ctx.params.content_hash,
@@ -588,7 +695,7 @@ impl RegisterRequestHandler {
             &norm,
             &prev.target_peer_id,
             prev.transports,
-            new_ttl,
+            renew_ttl,
             Some(binding_hash),
         ) {
             Ok(h) => hash_result("binding_hash", h),
@@ -636,11 +743,43 @@ impl RegisterRequestHandler {
             }
         }
 
+        // The **third** producer of peer-issued bindings, and the one no
+        // routing named. `approve-request` mints from a body queued days
+        // earlier, so it owes the register path's cascade *and* its ceiling —
+        // read from the policy **now**, not from the policy that was live when
+        // the request was queued. An operator who lowers `max_ttl` after
+        // queueing and then approves must not sign above the ceiling they
+        // just set; §6a.9.2's *"current operator intent outranks history"* is
+        // the same argument the renew cascade puts step 2 above step 3 for.
+        //
+        // A queued request whose ttl cannot resolve is refused rather than
+        // signed: the D12 guard on the register path already declines to
+        // *queue* one, so reaching here means the policy changed underneath —
+        // which is exactly the stored-state-is-already-bad case, at the
+        // operator's own operation.
+        let policy = self.load_policy();
+        let approve_ttl = clamp_to_ceiling(
+            pending
+                .requested_ttl
+                .or_else(|| policy.as_ref().and_then(|p| p.default_ttl)),
+            &policy.clone().unwrap_or_default(),
+        );
+        if approve_ttl.is_none() {
+            return error(
+                STATUS_FORBIDDEN,
+                "policy_rejected",
+                "resolved ttl is null at approval: the queued request carried no \
+                 requested_ttl and the issuer policy now defines no default_ttl. \
+                 Refusing rather than minting a null-ttl binding (§6a.3 / D3) or \
+                 substituting a default (§6a.9.2 / D12).",
+            );
+        }
+
         let binding_hash = match self.issue_binding(
             &pending.name,
             &pending.target_peer_id,
             pending.transports.clone(),
-            pending.requested_ttl,
+            approve_ttl,
             None,
         ) {
             Ok(h) => h,
@@ -859,6 +998,78 @@ impl RegisterRequestHandler {
                     ),
                 )
             }
+        }
+
+        // D11 (§6a.9.2 / CAP registry, arch 2026-08-18) — a live-registration
+        // policy MUST define `default_ttl`.
+        //
+        // Every storable mode reaching this point (open, allowlist, manual) can
+        // issue a binding, and a request that omits `requested_ttl` against a
+        // policy with no `default_ttl` resolves to a null ttl — a binding D3
+        // makes unresolvable. So such a policy can only mint bindings no
+        // conformant resolver will accept.
+        //
+        // Refused HERE rather than at register-time, which is the whole point of
+        // the ruling: a 400 at register bills the *requester* for what is an
+        // *operator* misconfiguration, and the operator's field lives on this
+        // entity — this is the only place the missing value can actually be
+        // supplied. Same move §6a.9.2 already makes for domain-control one
+        // bullet up: decline to arm a mode we cannot serve, rather than storing
+        // a policy that can only fail later.
+        if policy.default_ttl.is_none() {
+            return error(
+                STATUS_BAD_REQUEST,
+                "invalid_params",
+                "a live-registration issuer policy MUST define default_ttl: without it \
+                 a request that omits requested_ttl resolves to a null ttl, and a \
+                 null-ttl peer-issued binding is unresolvable (CAP registry D3). \
+                 Refusing to store rather than arming a policy that can only mint \
+                 invalid bindings (CAP registry D11).",
+            );
+        }
+
+        // §6a.9.1 `[MUST, v1.11]` — `max_ttl` is REQUIRED on any policy that
+        // can reach *approve*, and it is refused **here**, at *"the same
+        // trigger, the same site, and the same reason as the `default_ttl`
+        // rule above"*: the operator's field, set through the operator's
+        // operation.
+        //
+        // What it bounds is not a null — it is the requester's own number.
+        // Step 1 of both cascades accepts `requested_ttl` verbatim and until
+        // now nothing capped it, so an unbounded requester-chosen `ttl`
+        // reproduces the permanently-unrevokable binding §6a.3 exists to
+        // prevent **without ever setting the field to null**: §6a.4's expiry
+        // check is the only check a hostile byte-server cannot influence, and
+        // a decade-long `ttl` makes a withheld revocation last a decade.
+        //
+        // The ceiling that actually protects a consumer is the *resolver's*
+        // (see `RegistryHandler::apply_resolver_ceiling`) — a hostile issuer
+        // just sets `max_ttl` high, so only the party bearing the risk can
+        // bound it. This half is operator hygiene: it stops a careless
+        // registrant asking for a decade.
+        let Some(max_ttl) = policy.max_ttl else {
+            return error(
+                STATUS_BAD_REQUEST,
+                "invalid_params",
+                "a live-registration issuer policy MUST define max_ttl (§6a.9.1 v1.11): \
+                 without it `requested_ttl` is unbounded, and an unbounded ttl is a \
+                 binding whose withheld revocation has no bound at all — the \
+                 permanently-unrevokable shape §6a.3 exists to prevent, reached \
+                 without ever setting the field to null.",
+            );
+        };
+        // `default_ttl` MUST NOT exceed `max_ttl`. A policy violating that is
+        // internally contradictory rather than merely lax: the value the
+        // registry supplies when the requester omits one would itself be
+        // clamped by the next line of the same policy.
+        if policy.default_ttl.is_some_and(|d| d > max_ttl) {
+            return error(
+                STATUS_BAD_REQUEST,
+                "invalid_params",
+                "issuer policy is self-contradictory: default_ttl exceeds max_ttl \
+                 (§6a.9.1 v1.11) — the registry's own fallback would be clamped by \
+                 its own ceiling",
+            );
         }
 
         // Store the submitted entity as-is. Re-encoding via `to_entity`
@@ -1115,4 +1326,150 @@ impl RegisterRequestHandler {
             .set(&signature_pointer_path(&self.peer_id, target), sig_hash);
         Ok(())
     }
+}
+
+/// §6a.9.1 `[MUST, v1.11]` — apply the issuer-side ceiling to a resolved
+/// `ttl`: `effective = min(resolved, policy.max_ttl)`.
+///
+/// **A request above the ceiling is CLAMPED, not refused.** Refusing would
+/// bill a well-formed request for a policy the requester cannot read —
+/// §6a.9.2's own stated reason for not gating the requester — and it teaches
+/// requesters to probe for the ceiling. DNS does not `NXDOMAIN` a long TTL;
+/// it caps it.
+///
+/// `None` in, `None` out: this bounds a value, it never supplies one. The
+/// null-`ttl` refusals are the callers' job and they run on the clamped
+/// result, so a policy whose ceiling is the only source of a number still
+/// refuses rather than inventing one.
+///
+/// A policy with **no** `max_ttl` clamps nothing. `set-issuer-policy` refuses
+/// to store such a policy, so reaching this with `max_ttl: None` means the
+/// stored state predates the rule or was seeded out-of-band — the same
+/// already-bad-stored-state case the register/renew backstops answer, and
+/// silently substituting a ceiling here would be the implementation-chosen
+/// default §6a.9.2 forbids one paragraph up.
+fn clamp_to_ceiling(resolved: Option<u64>, policy: &IssuerPolicyData) -> Option<u64> {
+    match (resolved, policy.max_ttl) {
+        (Some(t), Some(ceiling)) => Some(t.min(ceiling)),
+        (other, _) => other,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// §6a.9.1 `issuer-policy.name_constraints` — grammar UNRULED, deliberately
+// left on the POSIX reading
+// ---------------------------------------------------------------------------
+
+/// Match a name against `issuer-policy.name_constraints` (§6a.9.1).
+///
+/// **This is NOT [`crate::resolver::dispatch_match`], and the split is the
+/// point.** §4's `name_format_dispatch.pattern` grammar was closed at
+/// `REGISTRY 1.13` — `*` only, every other byte a literal. §6a.9.1's
+/// `name_constraints` is the *fourth* glob-shaped field in this extension and
+/// its grammar is **unruled**: the spec says only *"`<glob | null>`, e.g. only
+/// issue `"*.lab"`"*, which every POSIX and every closed reading satisfies
+/// identically.
+///
+/// `entity-core-go` surfaced this by running the matcher-convergence grep its
+/// own discipline mandates, and **routed it (spec-issue `2026-08-18-e`)
+/// rather than converging a cross-impl-observable surface unilaterally** —
+/// which is the call arch upheld on the dispatch matter one field over. We
+/// hold the same line: this field decides which names a registry will sign,
+/// so a peer that reads `app-[0-9]` as a character class and one that reads
+/// it as five literal bytes admit **different name sets** from the same
+/// stored policy. Converging it here, ahead of a ruling, is how three
+/// implementations end up with three matchers.
+///
+/// So this keeps the POSIX behaviour the field has always had —
+/// `*` (any run), `?` (one character), `[…]` character classes with `!`
+/// negation — **unchanged and unshared**, and it is a separate function from
+/// the ruled one so that neither can drift into the other. Two matchers in
+/// one tree silently agreeing is exactly what core-go's finding names.
+///
+/// **Owed when arch rules:** if the answer is "same closed grammar as §4",
+/// this collapses to a call to `dispatch_match` and the vector rows below
+/// invert.
+pub(crate) fn name_constraints_match(pattern: &str, name: &str) -> bool {
+    posix_glob(pattern.as_bytes(), name.as_bytes())
+}
+
+fn posix_glob(mut p: &[u8], mut t: &[u8]) -> bool {
+    loop {
+        match p.first() {
+            None => return t.is_empty(),
+            Some(b'*') => {
+                while p.first() == Some(&b'*') {
+                    p = &p[1..];
+                }
+                if p.is_empty() {
+                    return true;
+                }
+                for i in 0..=t.len() {
+                    if posix_glob(p, &t[i..]) {
+                        return true;
+                    }
+                }
+                return false;
+            }
+            Some(b'?') => {
+                if t.is_empty() {
+                    return false;
+                }
+                p = &p[1..];
+                t = &t[1..];
+            }
+            Some(b'[') => {
+                if t.is_empty() {
+                    return false;
+                }
+                match posix_class(&p[1..], t[0]) {
+                    Some(consumed) => {
+                        p = &p[1 + consumed..];
+                        t = &t[1..];
+                    }
+                    None => return false,
+                }
+            }
+            Some(&c) => {
+                if t.first() != Some(&c) {
+                    return false;
+                }
+                p = &p[1..];
+                t = &t[1..];
+            }
+        }
+    }
+}
+
+/// Match `ch` against a `[...]` class starting after the `[`. Returns the
+/// number of bytes consumed up to and including the closing `]`, or `None` if
+/// no match / malformed.
+fn posix_class(spec: &[u8], ch: u8) -> Option<usize> {
+    let mut i = 0;
+    let negate = spec.first() == Some(&b'!');
+    if negate {
+        i += 1;
+    }
+    let mut matched = false;
+    let start = i;
+    while i < spec.len() {
+        let c = spec[i];
+        if c == b']' && i > start {
+            return if matched != negate { Some(i + 1) } else { None };
+        }
+        if i + 2 < spec.len() && spec[i + 1] == b'-' && spec[i + 2] != b']' {
+            let lo = c;
+            let hi = spec[i + 2];
+            if ch >= lo && ch <= hi {
+                matched = true;
+            }
+            i += 3;
+        } else {
+            if ch == c {
+                matched = true;
+            }
+            i += 1;
+        }
+    }
+    None // unterminated class
 }

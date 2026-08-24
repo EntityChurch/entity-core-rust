@@ -27,7 +27,7 @@ use entity_types::{
 };
 
 use crate::format::validate_format;
-use crate::glob::glob_match;
+use crate::type_pattern::type_pattern_matches;
 
 /// `system/type/constraint/*` handler.
 ///
@@ -110,9 +110,9 @@ impl StandardConstraintHandler {
         };
 
         match resolved_type {
-            // Resolution succeeded; check glob.
+            // Resolution succeeded; check the §4.6 pattern (§5.4 forms).
             Some(t) => {
-                if glob_match(pattern, &t) {
+                if type_pattern_matches(pattern, &t) {
                     ValidateResult::valid()
                 } else {
                     ValidateResult::invalid(format!(

@@ -100,7 +100,7 @@ impl RevisionEngine {
         // validated at coordination time (engine::validate_revision_config).
         // Here we only filter per the config's declared excludes.
         for pat in &config.exclude {
-            if exclude_pattern_matches(pat, relative) {
+            if glob_match(pat, relative) {
                 return false;
             }
         }
@@ -154,6 +154,44 @@ impl RevisionEngine {
             .collect()
     }
 
+    /// Apply the config's `exclude` / `exclude_types` to the tracked root, so
+    /// the auto-version path emits the trie `commit` builds for the same live
+    /// state and config (EXTENSION-REVISION §6.1 D1).
+    ///
+    /// **The O(1) adoption is preserved exactly**: with neither field set the
+    /// filtered trie IS the tracked root by construction (§6.1 states this
+    /// normatively), and it is returned with no walk and no rebuild — every
+    /// non-filtering config, the common case, pays nothing per put. A config
+    /// that does filter pays a trie rebuild per emit, which is the cost §6.1
+    /// requires; the alternative is minting version identities that disagree
+    /// across peers.
+    fn filtered_root(&self, tracked_root: Hash, config: &RevisionConfig) -> Result<Hash, String> {
+        if config.exclude.is_empty() && config.exclude_types.is_empty() {
+            return Ok(tracked_root);
+        }
+
+        let store = self.content_store.as_ref();
+        let mut filtered = std::collections::BTreeMap::new();
+        for (relative, hash) in trie::collect_all_bindings(store, tracked_root, "") {
+            if config.exclude.iter().any(|p| glob_match(p, &relative)) {
+                continue;
+            }
+            if !config.exclude_types.is_empty() {
+                if let Some(entity) = store.get(&hash) {
+                    if config
+                        .exclude_types
+                        .iter()
+                        .any(|p| glob_match(p, &entity.entity_type))
+                    {
+                        continue;
+                    }
+                }
+            }
+            filtered.insert(relative, hash);
+        }
+        trie::build_trie(store, &filtered)
+    }
+
     /// Execute the per-write auto-version algorithm for one config
     /// (PROPOSAL-REVISION-AUTO-VERSION-FIX §6.1).
     fn auto_version_once(
@@ -182,6 +220,19 @@ impl RevisionEngine {
         let head_path = crate::rev_head_path(&self.local_peer_id_str, &ph);
         let current_head = self.location_index.get(&head_path);
 
+        // D1 (§6.1) — the version root is the EXCLUDE-FILTERED trie, the same
+        // computation `handle_commit` performs; it is NOT the raw tracked root.
+        // The tracked root comes from EXTENSION-TREE §3.4.1a's structural
+        // summary, which knows nothing of any revision `exclude` ("a direct
+        // pointer", no filtering stage) — so adopting it wholesale emitted, one
+        // write late, a version whose root committed to exactly the data the
+        // config says is not versioned. Suppressing the version FOR an excluded
+        // write (`config_matches`, above) is the emission gate, and conflating
+        // it with the filter is the trap the ruling names: a version entry's
+        // identity IS its root, so the same tree state under the same config
+        // minted two different entry hashes depending on which path emitted it.
+        let version_root = self.filtered_root(tracked_root, config)?;
+
         // Dedup: if current head already records this root, nothing to do.
         if let Some(h) = current_head {
             if let Some(entry) = self
@@ -189,7 +240,7 @@ impl RevisionEngine {
                 .get(&h)
                 .and_then(|e| decode_revision_entry(&e))
             {
-                if entry.root == tracked_root {
+                if entry.root == version_root {
                     return Ok(());
                 }
             }
@@ -199,7 +250,7 @@ impl RevisionEngine {
         let mut parents: Vec<Hash> = current_head.into_iter().collect();
         trie::sorted_parents(&mut parents);
         let entry = build_revision_entry(&RevisionEntryData {
-            root: tracked_root,
+            root: version_root,
             parents,
         })?;
         let entry_hash = self.content_store.put(entry).map_err(|e| e.to_string())?;
@@ -296,23 +347,68 @@ impl SyncTreeHook for RevisionEngine {
     }
 }
 
-/// Match an exclude pattern (glob-style, with `**` suffix supported) against
-/// a relative path. Minimal matcher — exact and prefix forms only.
-pub(crate) fn exclude_pattern_matches(pattern: &str, relative: &str) -> bool {
-    let pat = pattern.trim_start_matches('/');
-    // Strip trailing /** or /*
-    let stripped = pat
-        .strip_suffix("/**")
-        .or_else(|| pat.strip_suffix("/*"))
-        .unwrap_or(pat);
-    if stripped == "**" || stripped.is_empty() {
+/// EXTENSION-REVISION §2.4 `glob_match` — the `exclude` / `exclude_types`
+/// matcher, **exactly four forms and no others**, tested in the spec's order.
+/// `subject` is the prefix-relative path for `exclude` and the entity type
+/// name for `exclude_types`.
+///
+/// 1. `*` — MATCH-ALL.
+/// 2. `<lit>/*` — SUBTREE PREFIX, identical to ENTITY-CORE-PROTOCOL §5.4
+///    `matches_pattern`: the `*` crosses `/` at ANY depth. The trailing `*` is
+///    dropped and the `/` is RETAINED, so `system/revision/*` reaches
+///    `system/revision/head/{H}/deep` yet not the sibling `system/revisionary`.
+///    This is why §6.1's Reentrancy exclusion needs no second wildcard.
+/// 3. `*<lit>` — TRAILING LITERAL, a byte-suffix over the WHOLE subject; `/` is
+///    NOT special. `*.cache` matches `a/b/foo.cache` and `.cache`, not
+///    `a/cache/b` or `foo.cache.tmp`. The one form beyond §5.4's vocabulary, and
+///    it exists for match-by-extension.
+/// 4. `<lit>` — EXACT. `docs` matches `docs`, **not** `docs/x` — the old
+///    literal-prefix fallback here was over-exclusion with no pattern
+///    authorizing it.
+///
+/// The grammar is CLOSED and hash-determining: it decides trie membership,
+/// membership decides the version `root`, and `root` is the version entry's
+/// identity — two peers reading a pattern differently mint different version
+/// hashes for identical content with nothing failing anywhere. There is no `**`
+/// and no segment-scoped `*`; anything outside the four forms is refused at
+/// config write by [`valid_exclude_pattern`] (§4.4.17 V6) and never reaches here.
+pub(crate) fn glob_match(pattern: &str, subject: &str) -> bool {
+    // 1. MATCH-ALL
+    if pattern == "*" {
         return true;
     }
-    if pat.ends_with("**") || pat.ends_with("/*") {
-        relative == stripped || relative.starts_with(&format!("{}/", stripped))
-    } else {
-        // Literal match (or literal-prefix fallback for patterns without **).
-        relative == stripped || relative.starts_with(&format!("{}/", stripped))
+    // 2. SUBTREE PREFIX — drop the `*`, retain the `/`.
+    if pattern.ends_with("/*") {
+        return subject.starts_with(&pattern[..pattern.len() - 1]);
+    }
+    // 3. TRAILING LITERAL — whole-subject byte suffix.
+    if let Some(lit) = pattern.strip_prefix('*') {
+        return subject.ends_with(lit);
+    }
+    // 4. EXACT
+    subject == pattern
+}
+
+/// EXTENSION-REVISION §4.4.17 **V6** — an `exclude` / `exclude_types` pattern
+/// MUST be one of [`glob_match`]'s four forms and nothing else: at most one
+/// `*`, positioned as the whole pattern, the final character after a `/`, or
+/// the first character. `**`, `a/**/b`, `a*b` and `*a*` are all
+/// `400 config/invalid-exclude-pattern`.
+///
+/// This is the load-bearing half of the rule. A matcher that merely *omits*
+/// `**` and one that *rejects* it are indistinguishable until a config carries
+/// one — and a stored pattern two peers evaluate differently is a DAG fork by
+/// configuration. Refusing at write time is what makes the grammar closed
+/// rather than merely described.
+pub(crate) fn valid_exclude_pattern(pattern: &str) -> bool {
+    match pattern.matches('*').count() {
+        0 => true, // form 4 — exact
+        1 => {
+            pattern == "*"                  // form 1
+                || pattern.ends_with("/*")  // form 2 — final char, preceded by `/`
+                || pattern.starts_with('*') // form 3 — first char
+        }
+        _ => false, // two or more `*`
     }
 }
 
@@ -466,6 +562,31 @@ pub fn validate_revision_config(config: &RevisionConfig) -> Result<(), ConfigVal
         });
     }
 
+    // V6 (§4.4.17) — every exclude / exclude_types pattern is one of §2.4's
+    // four forms. Checked BEFORE the required-exclude coverage below, so a
+    // pattern we cannot evaluate is never *interpreted* by a coverage check on
+    // its way to being stored.
+    for (field, patterns) in [
+        ("exclude", &config.exclude),
+        ("exclude_types", &config.exclude_types),
+    ] {
+        for pattern in patterns {
+            if !valid_exclude_pattern(pattern) {
+                return Err(ConfigValidationError {
+                    code: "config/invalid-exclude-pattern".into(),
+                    message: format!(
+                        "{} pattern {:?} is not one of §2.4's four forms \
+                         (*, <literal>/*, *<literal>, exact): a valid pattern has at most \
+                         one *, either the whole pattern, the final char after a /, or the \
+                         first char",
+                        field, pattern
+                    ),
+                    status: 400,
+                });
+            }
+        }
+    }
+
     match config.merge_order.as_str() {
         "deterministic" | "caller-perspective" => {}
         other => {
@@ -548,10 +669,16 @@ fn prefix_encompasses(canonical_prefix: &str, target: &str) -> bool {
 }
 
 /// Does the exclude list contain a pattern that covers `target` (canonical
-/// form) relative to `canonical_prefix`? Patterns are matched as the exclude
-/// would be applied in `find_auto_version_prefixes` — i.e., a pattern that is
-/// a path prefix of the required-exclude path (with or without a `**` suffix)
-/// counts as covering it.
+/// form) relative to `canonical_prefix`?
+///
+/// §6.1's Reentrancy MUST is about a **subtree**: every write under
+/// `system/revision/…` must be suppressed, not just the node itself. Under
+/// §2.4's closed grammar only two of the four forms can express that — form 1
+/// (`*`) and form 2 (`<literal>/*`, which crosses `/` at any depth). An exact
+/// pattern (form 4) excludes one path and leaves its descendants versioned, and
+/// a trailing literal (form 3) is an extension filter; neither covers a
+/// subtree, so neither satisfies the requirement. That is stricter than the
+/// pre-§2.4 code here, which treated any literal as a prefix.
 fn exclude_list_covers(excludes: &[String], canonical_prefix: &str, target: &str) -> bool {
     let target_relative = if canonical_prefix.is_empty() {
         target.to_string()
@@ -563,20 +690,24 @@ fn exclude_list_covers(excludes: &[String], canonical_prefix: &str, target: &str
             .unwrap_or(target)
             .to_string()
     };
+    // What must be covered is the target AND everything below it.
+    let target_subtree = if target_relative.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", target_relative)
+    };
 
-    for raw in excludes {
-        let pat = raw
-            .trim_matches('/')
-            .trim_end_matches("**")
-            .trim_end_matches('/');
-        if pat.is_empty() {
-            return true;
+    excludes.iter().any(|pattern| {
+        if pattern == "*" {
+            return true; // form 1 — everything
         }
-        if target_relative == pat || target_relative.starts_with(&format!("{}/", pat)) {
-            return true;
+        match pattern.strip_suffix('*') {
+            // form 2 — the retained `/` is what stops `system/revisionary/*`
+            // from reading as coverage of `system/revision`.
+            Some(literal) if literal.ends_with('/') => target_subtree.starts_with(literal),
+            _ => false,
         }
-    }
-    false
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -779,10 +910,13 @@ fn default_exclude_pattern(canonical_prefix: &str, target: &str) -> String {
             .unwrap_or(target)
             .to_string()
     };
+    // §2.4 form 2 crosses `/` at any depth, so the subtree pattern needs no
+    // second wildcard — `system/revision/*` already reaches
+    // `system/revision/head/{H}/…`. (Was `**` until the grammar was closed.)
     if rel.is_empty() {
-        "**".to_string()
+        "*".to_string()
     } else {
-        format!("{}/**", rel)
+        format!("{}/*", rel)
     }
 }
 
@@ -824,6 +958,10 @@ mod tests {
             (
                 entity_ecf::text("exclude"),
                 entity_ecf::Value::Array(cfg.exclude.iter().map(entity_ecf::text).collect()),
+            ),
+            (
+                entity_ecf::text("exclude_types"),
+                entity_ecf::Value::Array(cfg.exclude_types.iter().map(entity_ecf::text).collect()),
             ),
             (
                 entity_ecf::text("merge_order"),
@@ -965,7 +1103,7 @@ mod tests {
         let hook = ConfigCoordinationHook::new(store.clone(), li.clone(), peer_id.clone());
 
         let mut cfg = base_config("/", true);
-        cfg.exclude = vec!["system/**".to_string()];
+        cfg.exclude = vec!["system/*".to_string()];
         let cfg_hash = store.put(make_config_entity(&cfg)).unwrap();
         let ph = test_ph(&peer_id, "/");
         let event = TreeChangeEvent {
@@ -1103,7 +1241,7 @@ mod tests {
     #[test]
     fn validate_accepts_universal_with_system_shorthand() {
         let mut cfg = base_config("/", true);
-        cfg.exclude = vec!["system/**".to_string()];
+        cfg.exclude = vec!["system/*".to_string()];
         validate_revision_config(&cfg).expect("valid");
     }
 
@@ -1112,7 +1250,7 @@ mod tests {
         let mut cfg = base_config("/", true);
         cfg.exclude = REQUIRED_EXCLUDES
             .iter()
-            .map(|p| format!("{}/**", p))
+            .map(|p| format!("{}/*", p))
             .collect();
         validate_revision_config(&cfg).expect("valid");
     }
@@ -1122,9 +1260,9 @@ mod tests {
         let mut cfg = base_config("/", true);
         // Missing system/history and system/clock.
         cfg.exclude = vec![
-            "system/revision/**".to_string(),
-            "system/tree/root/**".to_string(),
-            "system/tree/tracking-config/**".to_string(),
+            "system/revision/*".to_string(),
+            "system/tree/root/*".to_string(),
+            "system/tree/tracking-config/*".to_string(),
         ];
         let err = validate_revision_config(&cfg).expect_err("should reject");
         assert!(
@@ -1336,7 +1474,7 @@ mod tests {
 
         // Config covers universal tree; reentrancy guard still excludes us.
         let mut cfg = base_config("/", true);
-        cfg.exclude = vec!["system/**".to_string()];
+        cfg.exclude = vec!["system/*".to_string()];
         install_config(&store, &li, &peer_id, "universal", &cfg);
         seed_tracked_root(&li, &peer_id, "", sample_hash(0x11));
 
@@ -1358,7 +1496,7 @@ mod tests {
         let engine = RevisionEngine::new(store.clone(), li.clone(), peer_id.clone());
 
         let mut cfg = base_config("project/", true);
-        cfg.exclude = vec!["build/**".to_string()];
+        cfg.exclude = vec!["build/*".to_string()];
         install_config(&store, &li, &peer_id, "main", &cfg);
         seed_tracked_root(&li, &peer_id, "project", sample_hash(0x01));
 
@@ -1479,5 +1617,303 @@ mod tests {
                 .root,
             sample_hash(0xbb)
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // EXTENSION-REVISION §6.1 D1 — the version root is exclude-filtered on
+    // BOTH paths that emit a version. `REV-AUTOVERSION-EXCLUDE-PARITY-1`.
+    // -----------------------------------------------------------------------
+
+    /// Bind an entity into the live tree under the peer-qualified path, the way
+    /// a `tree:put` would, and return its hash.
+    fn put_live(
+        store: &Arc<MemoryContentStore>,
+        li: &Arc<MemoryLocationIndex>,
+        peer_id: &str,
+        bare_path: &str,
+        entity_type: &str,
+        content: &str,
+    ) -> Hash {
+        let data = entity_ecf::to_ecf(&entity_ecf::text(content));
+        let hash = store.put(Entity::new(entity_type, data).unwrap()).unwrap();
+        li.set(&format!("/{}/{}", peer_id, bare_path), hash);
+        hash
+    }
+
+    #[test]
+    fn rev_autoversion_exclude_parity_1() {
+        let (store, li) = make_stores();
+        let peer_id = test_peer_id();
+        let engine = RevisionEngine::new(store.clone(), li.clone(), peer_id.clone());
+
+        let mut cfg = base_config("project/", true);
+        cfg.exclude = vec!["build/*".to_string()];
+        install_config(&store, &li, &peer_id, "main", &cfg);
+
+        let keep = put_live(
+            &store,
+            &li,
+            &peer_id,
+            "project/keep.txt",
+            "test/doc",
+            "keep",
+        );
+        let dropped = put_live(
+            &store,
+            &li,
+            &peer_id,
+            "project/build/out.bin",
+            "test/doc",
+            "artifact",
+        );
+
+        // The tracked root is EXTENSION-TREE §3.4.1a's structural summary: the
+        // trie over every live binding under the prefix, with no filtering
+        // stage anywhere in its derivation.
+        let tracked = trie::build_trie(
+            store.as_ref(),
+            &std::collections::BTreeMap::from([
+                ("build/out.bin".to_string(), dropped),
+                ("keep.txt".to_string(), keep),
+            ]),
+        )
+        .unwrap();
+        seed_tracked_root(&li, &peer_id, "project", tracked);
+
+        let evt = event_for(&peer_id, "project/keep.txt", keep);
+        engine
+            .on_tree_change(&evt, &mut ExecutionContext::default())
+            .unwrap();
+
+        let ph = test_ph(&peer_id, "project/");
+        let head = li.get(&crate::rev_head_path(&peer_id, &ph)).expect("head");
+        let emitted = decode_revision_entry(&store.get(&head).unwrap())
+            .unwrap()
+            .root;
+
+        assert_ne!(
+            emitted, tracked,
+            "the raw tracked root still carries build/out.bin — adopting it is the D1 defect"
+        );
+        let bindings = trie::collect_all_bindings(store.as_ref(), emitted, "");
+        assert!(bindings.contains_key("keep.txt"));
+        assert!(
+            !bindings.contains_key("build/out.bin"),
+            "an excluded path must not be IN the emitted trie, not merely fail to trigger it"
+        );
+
+        // The parity claim itself: the same live state and config through the
+        // explicit `commit` path must produce the same root, because a version
+        // entry's identity is its root.
+        let (_, commit_root, _) =
+            crate::commit_logic::perform_commit(store.as_ref(), li.as_ref(), "project/", &peer_id)
+                .unwrap();
+        assert_eq!(
+            emitted, commit_root,
+            "auto-version and commit must agree on the root over identical state"
+        );
+    }
+
+    #[test]
+    fn autoversion_exclude_types_reaches_the_trie_too() {
+        let (store, li) = make_stores();
+        let peer_id = test_peer_id();
+        let engine = RevisionEngine::new(store.clone(), li.clone(), peer_id.clone());
+
+        let mut cfg = base_config("project/", true);
+        // Form 3 — `app/*-draft` would be an infix `*` and is refused by V6.
+        cfg.exclude_types = vec!["*-draft".to_string()];
+        install_config(&store, &li, &peer_id, "main", &cfg);
+
+        let keep = put_live(&store, &li, &peer_id, "project/a", "app/note", "keep");
+        let dropped = put_live(&store, &li, &peer_id, "project/b", "app/note-draft", "wip");
+
+        let tracked = trie::build_trie(
+            store.as_ref(),
+            &std::collections::BTreeMap::from([
+                ("a".to_string(), keep),
+                ("b".to_string(), dropped),
+            ]),
+        )
+        .unwrap();
+        seed_tracked_root(&li, &peer_id, "project", tracked);
+
+        engine
+            .on_tree_change(
+                &event_for(&peer_id, "project/a", keep),
+                &mut ExecutionContext::default(),
+            )
+            .unwrap();
+
+        let ph = test_ph(&peer_id, "project/");
+        let head = li.get(&crate::rev_head_path(&peer_id, &ph)).expect("head");
+        let emitted = decode_revision_entry(&store.get(&head).unwrap())
+            .unwrap()
+            .root;
+        let bindings = trie::collect_all_bindings(store.as_ref(), emitted, "");
+        assert!(bindings.contains_key("a"));
+        assert!(!bindings.contains_key("b"), "excluded by type, at the trie");
+    }
+
+    #[test]
+    fn autoversion_without_filters_still_adopts_the_tracked_root() {
+        // The §6.1 fast path is normative, and it is what keeps auto-version
+        // O(1) per put for every config that does not filter.
+        let (store, li) = make_stores();
+        let peer_id = test_peer_id();
+        let engine = RevisionEngine::new(store.clone(), li.clone(), peer_id.clone());
+
+        let cfg = base_config("project/", true);
+        install_config(&store, &li, &peer_id, "main", &cfg);
+        let tracked = sample_hash(0x42);
+        seed_tracked_root(&li, &peer_id, "project", tracked);
+
+        engine
+            .on_tree_change(
+                &event_for(&peer_id, "project/file.txt", sample_hash(0x01)),
+                &mut ExecutionContext::default(),
+            )
+            .unwrap();
+
+        let ph = test_ph(&peer_id, "project/");
+        let head = li.get(&crate::rev_head_path(&peer_id, &ph)).expect("head");
+        // `tracked` is not a real trie node — adopting it verbatim is the point:
+        // no walk, no rebuild, and no content-store read of the root at all.
+        assert_eq!(
+            decode_revision_entry(&store.get(&head).unwrap())
+                .unwrap()
+                .root,
+            tracked
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // EXTENSION-REVISION §2.4 / §4.4.17 V6 — the closed four-form grammar.
+    // The `REV-GLOB-*` conformance vectors, pinned here because the matcher is
+    // hash-determining: it decides trie membership, membership decides `root`,
+    // `root` is the version entry's identity.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn rev_glob_prefix_1_subtree_form_crosses_slash_at_any_depth() {
+        // Form 2 is §5.4's subtree match — this is the §6.1 Reentrancy case,
+        // and it needs no second wildcard.
+        assert!(glob_match(
+            "system/revision/*",
+            "system/revision/head/abc/deep/x"
+        ));
+        assert!(glob_match("system/revision/*", "system/revision/head"));
+    }
+
+    #[test]
+    fn rev_glob_prefix_2_retained_slash_blocks_the_sibling_prefix() {
+        // The `/` is retained when the `*` is dropped, so a sibling whose name
+        // merely starts with the literal does NOT match.
+        assert!(!glob_match("system/revision/*", "system/revisionary/x"));
+        assert!(!glob_match("build/*", "buildings/x"));
+    }
+
+    #[test]
+    fn rev_glob_suffix_1_and_2_trailing_literal_is_a_whole_subject_suffix() {
+        assert!(glob_match("*.cache", "a/b/foo.cache"));
+        assert!(glob_match("*.cache", ".cache"));
+        // `/` is not special, and the suffix must terminate the subject.
+        assert!(!glob_match("*.cache", "a/cache/b"));
+        assert!(!glob_match("*.cache", "foo.cache.tmp"));
+    }
+
+    #[test]
+    fn rev_glob_exact_1_form_four_is_exact_not_a_prefix() {
+        assert!(glob_match("docs", "docs"));
+        // The pre-§2.4 matcher returned true here — a literal was treated as a
+        // path prefix, silently over-excluding every descendant.
+        assert!(!glob_match("docs", "docs/x"));
+    }
+
+    #[test]
+    fn rev_glob_all_1_bare_star_matches_everything() {
+        assert!(glob_match("*", "a/b/c"));
+        assert!(glob_match("*", ""));
+    }
+
+    #[test]
+    fn rev_glob_types_1_the_same_forms_apply_to_the_type_subject() {
+        assert!(glob_match("app/*", "app/note"));
+        assert!(!glob_match("app/*", "application/note"));
+        assert!(glob_match("*-draft", "app/note-draft"));
+        assert!(!glob_match("*-draft", "app/note"));
+    }
+
+    #[test]
+    fn rev_glob_reject_1_doublestar_is_refused_at_config_write() {
+        // The load-bearing vector: a matcher that merely *omits* `**` and one
+        // that *rejects* it are indistinguishable until a config carries one.
+        assert!(!valid_exclude_pattern("**"));
+
+        let mut cfg = base_config("project/", false);
+        cfg.exclude = vec!["**".to_string()];
+        let err = validate_revision_config(&cfg).expect_err("`**` must be refused");
+        assert_eq!(err.code, "config/invalid-exclude-pattern");
+        assert_eq!(err.status, 400);
+    }
+
+    #[test]
+    fn rev_glob_reject_2_infix_and_multi_star_forms_are_refused() {
+        for bad in ["a/**/b", "a*b", "*a*", "**/*.cache", "sys*/x"] {
+            assert!(!valid_exclude_pattern(bad), "{bad:?} must be invalid");
+            let mut cfg = base_config("project/", false);
+            cfg.exclude = vec![bad.to_string()];
+            let err = validate_revision_config(&cfg).expect_err("must reject");
+            assert_eq!(err.code, "config/invalid-exclude-pattern", "for {bad:?}");
+        }
+        // …and the same rule binds `exclude_types`, which is the second field
+        // §4.4.17 V6 names.
+        let mut cfg = base_config("project/", false);
+        cfg.exclude_types = vec!["app/**".to_string()];
+        let err = validate_revision_config(&cfg).expect_err("must reject");
+        assert_eq!(err.code, "config/invalid-exclude-pattern");
+        assert!(err.message.contains("exclude_types"), "{}", err.message);
+    }
+
+    #[test]
+    fn v6_accepts_exactly_the_four_forms() {
+        for good in ["*", "system/revision/*", "*.cache", "docs", ""] {
+            assert!(valid_exclude_pattern(good), "{good:?} must be valid");
+        }
+        let mut cfg = base_config("project/", false);
+        cfg.exclude = vec![
+            "*".into(),
+            "system/revision/*".into(),
+            "*.cache".into(),
+            "docs".into(),
+        ];
+        cfg.exclude_types = vec!["app/*".into(), "*-draft".into()];
+        validate_revision_config(&cfg).expect("the four forms are valid");
+    }
+
+    #[test]
+    fn v6_runs_before_the_required_exclude_coverage_check() {
+        // An invalid pattern must never be *interpreted* by a coverage check on
+        // its way to being stored: `system/**` would otherwise be read as
+        // covering the required excludes and stored as a pattern we refuse to
+        // evaluate.
+        let mut cfg = base_config("/", true);
+        cfg.exclude = vec!["system/**".to_string()];
+        let err = validate_revision_config(&cfg).expect_err("must reject");
+        assert_eq!(err.code, "config/invalid-exclude-pattern");
+    }
+
+    #[test]
+    fn required_exclude_coverage_needs_a_subtree_form() {
+        // Form 4 (exact) excludes the node and leaves its descendants
+        // versioned, so it does not satisfy §6.1's Reentrancy MUST — the
+        // pre-§2.4 code accepted it by treating every literal as a prefix.
+        let mut cfg = base_config("/", true);
+        cfg.exclude = vec!["system".to_string()];
+        let err = validate_revision_config(&cfg).expect_err("exact form is not coverage");
+        assert_eq!(err.code, "config/missing-required-exclude");
+
+        cfg.exclude = vec!["system/*".to_string()];
+        validate_revision_config(&cfg).expect("the subtree form covers");
     }
 }

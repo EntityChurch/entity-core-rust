@@ -4,7 +4,8 @@
 //! `:invalidate-cache(name | null) → ()`. The resolve algorithm (§4.1):
 //!
 //! 1. **Pinned bindings** override everything → synthesized result (§4.1.2).
-//! 2. **`name_format_dispatch`** narrows the chain (POSIX shell-glob); the
+//! 2. **`name_format_dispatch`** narrows the chain (§4's closed grammar —
+//!    `*` only, every other byte literal; see [`dispatch_match`]); the
 //!    primary privacy mechanism — backends without a dispatch entry match-all.
 //! 3. **Filtered chain in priority order** — first validated hit wins.
 //! 4. else **`chain_exhausted`** (fail-closed; no silent fallback).
@@ -140,10 +141,40 @@ impl RegistryHandler {
             return self.synthesize_pin(pin);
         }
 
-        // Step 2: name_format_dispatch filter (privacy mechanism). A backend
-        // kind that appears in ANY dispatch rule is "restricted" — consulted
-        // only when a rule whose backend_kinds contains it matches the name.
-        // Kinds appearing in no rule are match-all.
+        // Step 2: name_format_dispatch filter (the primary privacy mechanism).
+        // A backend kind that appears in ANY dispatch rule is "restricted" —
+        // consulted only when a rule whose backend_kinds contains it matches
+        // the name. Kinds appearing in no rule are match-all.
+        //
+        // **This is §4.1 step 2's second sentence, per backend, both clauses:**
+        // *"Backends without a `name_format_dispatch` entry default to 'match
+        // all' (no filtering); backends with one are consulted ONLY when the
+        // pattern matches."*
+        //
+        // **core-go reads it differently and its `registry.v15_dispatch_grammar`
+        // check encodes their reading** (`ext/registry/registry.go`): if any
+        // rule matches, the chain is restricted to the union of the matching
+        // rules' kinds; if none matches, the chain is left unfiltered. Those
+        // two algorithms differ on two cases, and neither of us is right on
+        // both:
+        //
+        // | case | this peer | core-go | §4.1 step 2 |
+        // |---|---|---|---|
+        // | kind named by NO rule, some other rule matches | consulted | excluded | *"without an entry … match all"* → **ours** |
+        // | kind named by a rule, NO rule matches the name | excluded | consulted | *"with one … ONLY when the pattern matches"* → **ours** |
+        //
+        // We hold this reading because both rows follow from the sentence that
+        // addresses the case directly, and go's fallback contradicts the
+        // second clause outright. **It is not the comfortable answer:** on row
+        // 1 our reading makes step 2's own MUST — *"the catch-all MUST NOT
+        // name a backend whose consultation transmits the queried name"* —
+        // evadable by **omitting** the row, since a `dns-txt` backend named by
+        // no rule is then consulted for every bare name. That is a real
+        // argument for go's direction and it is why this is routed rather
+        // than settled here (`docs/SPEC-AMBIGUITIES.md`); converging a
+        // security-relevant cross-impl surface onto a reading that
+        // contradicts a plain normative sentence, to turn a wire check green,
+        // is the move this repo does not make.
         let restricted: std::collections::HashSet<&str> = config
             .name_format_dispatch
             .iter()
@@ -153,10 +184,9 @@ impl RegistryHandler {
             if !restricted.contains(kind) {
                 return true;
             }
-            config
-                .name_format_dispatch
-                .iter()
-                .any(|r| r.backend_kinds.iter().any(|k| k == kind) && glob_match(&r.pattern, name))
+            config.name_format_dispatch.iter().any(|r| {
+                r.backend_kinds.iter().any(|k| k == kind) && dispatch_match(&r.pattern, name)
+            })
         };
 
         // Step 3: filtered chain in ascending priority order; first validated hit.
@@ -220,7 +250,7 @@ impl RegistryHandler {
                     continue;
                 }
             }
-            return result;
+            return apply_resolver_ceiling(result, entry);
         }
         ResolutionResult::chain_exhausted()
     }
@@ -480,97 +510,155 @@ pub(crate) fn peer_pubkey_from_entity(entity: &Entity) -> Option<[u8; 32]> {
     pk.as_slice().try_into().ok()
 }
 
-// ---------------------------------------------------------------------------
-// POSIX shell-glob matcher (§4.1 name_format_dispatch.pattern)
-// ---------------------------------------------------------------------------
-
-/// Minimal POSIX shell-glob: `*` (any run), `?` (one char), `[...]` char class
-/// (with leading `!` negation). Matches against the whole string.
-pub fn glob_match(pattern: &str, text: &str) -> bool {
-    glob_rec(pattern.as_bytes(), text.as_bytes())
+/// §6a.9.1 `[MUST when present, v1.11]` — the **resolver's own** TTL ceiling:
+/// a binding's effective lifetime is `min(binding.ttl, local_max)`, computed
+/// at resolution and **never written back** into the binding.
+///
+/// **This is the half that protects the consumer, and it is the load-bearing
+/// one.** §6a.3's whole argument is about the consumer: a hostile byte-server
+/// withholds a revocation and `ttl` bounds the exposure. A ceiling the
+/// *registry* enforces cannot protect a consumer from that registry — a
+/// hostile or compromised issuer simply sets `max_ttl` high. Only the party
+/// bearing the risk can bound it. This is the split DNS settled decades ago:
+/// the authority sets the record's TTL, the resolver caps what it will honor
+/// (`max-cache-ttl`), because the resolver is the one holding stale data.
+///
+/// **Never written back, and that is the property that would rot silently.**
+/// This is a *use* bound, not a re-issue: the binding body is untouched, so
+/// `result.binding` stays byte-identical clamped and unclamped. If a refactor
+/// ever rewrote the binding to carry the clamped TTL, its content address
+/// would move and every signature over it would stop verifying — gated by
+/// `resolver_ceiling_does_not_move_the_binding_hash`, which asserts the hash
+/// rather than the number for exactly that reason.
+///
+/// **No default is shipped, and that is conformance rather than
+/// incompleteness.** §6a.3's ceiling is a `MAY` and the spec writes no number
+/// for the reason §4.10 writes none: there is no defensible constant, and
+/// choosing one makes every unconfigured deployment look configured.
+///
+/// The value rides the chain entry's `hints` — §4's own opaque
+/// backend-config slot, which `neg_ttl` already uses — so it is **durable
+/// config read at resolution**, not a process-lifetime setting. A ceiling
+/// read at fetch time applies on a cold boot and silently does not on a warm
+/// one, and a security control present on one boot path and absent on the
+/// other is worse than absent: it tests green on whichever path the test
+/// happens to take.
+pub(crate) fn apply_resolver_ceiling(
+    mut result: ResolutionResult,
+    entry: &crate::data::ResolverChainEntry,
+) -> ResolutionResult {
+    let Some(local_max) = resolver_max_ttl_from_hints(&entry.hints) else {
+        return result;
+    };
+    result.ttl = match result.ttl {
+        Some(t) => Some(t.min(local_max)),
+        // A sticky binding (a pin, a local-name) carries no `ttl`. The
+        // resolver's ceiling is a bound on how long a value may be honored,
+        // so an absent lifetime becomes the declared maximum rather than
+        // staying unbounded — that is the whole point of declaring one.
+        // (`peer-issued` never reaches this arm: §6a.4 requires a non-null
+        // `ttl` before a result is surfaced at all.)
+        None => Some(local_max),
+    };
+    result
 }
 
-fn glob_rec(mut p: &[u8], mut t: &[u8]) -> bool {
+/// Read the resolver's declared ceiling (ms) from a chain entry's `hints`.
+///
+/// `0` is **dropped rather than honored**: taken literally it expires every
+/// binding instantly and the operator sees *"no binding for this name"* —
+/// indistinguishable from a bad signature or a revocation, which is the worst
+/// possible diagnostic for a value that is almost certainly a typo or an
+/// unset field serialized as zero.
+fn resolver_max_ttl_from_hints(hints: &Option<entity_ecf::Value>) -> Option<u64> {
+    let map = hints.as_ref()?.as_map()?;
+    map.iter().find_map(|(k, v)| {
+        if k.as_text() == Some("max_ttl") {
+            v.as_integer()
+                .and_then(|i| u64::try_from(i).ok())
+                .filter(|ms| *ms > 0)
+        } else {
+            None
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// §4 `name_format_dispatch.pattern` — the CLOSED grammar `[MUST, REGISTRY 1.13]`
+// ---------------------------------------------------------------------------
+
+/// Match a `name_format_dispatch[].pattern` against a user-facing name.
+///
+/// **The grammar is closed and every byte that is not `*` is a literal.**
+/// §4's pseudocode, verbatim:
+///
+/// - `*` matches any run of characters, **including none**.
+/// - **Any other byte** — `?`, `[`, `]`, `\`, `.`, `:`, `@`, `/` — matches
+///   only itself.
+/// - Any **number** of `*` is permitted; `*@*.*` is three and it is in
+///   §4.1a's own table.
+/// - **`/` is not a separator.** A name is a flat string with no segment
+///   structure.
+/// - The match is **anchored at both ends**; there is no substring form.
+///
+/// **Implementations MUST NOT delegate this to a path-glob or shell-glob
+/// library**, which is what this replaced: a POSIX matcher granting `?` a
+/// one-character meaning and `[…]` a character-class meaning the grammar does
+/// not confer. *"A matcher that merely omits those features and one that
+/// treats them as literals are indistinguishable until a name or a pattern
+/// carries one"* — the `**` lesson, transplanted. `entity-core-go` found this
+/// by reading its own call site (`08684b2`), routed the reading rather than
+/// shipping a third matcher, and arch closed the grammar in `1.13`.
+///
+/// **This is not `ENTITY-CORE-PROTOCOL` §5.4 and MUST NOT be read as it.**
+/// §5.4 governs *paths*, where `pattern/*` is a subtree prefix; a name is
+/// flat, so §5.4's forms have nothing to bind to. The two are separate
+/// matchers over separate domains and neither confers a reading on the other.
+///
+/// **No pattern is invalid, so there is no write-time rejection** — every
+/// string is well-formed because every non-`*` byte is a literal. That is a
+/// deliberate difference from `EXTENSION-REVISION`'s four forms, which need a
+/// `400` because that grammar *can* be violated: a registry MUST NOT reject a
+/// dispatch pattern for containing `?`, `[`, or `\`.
+pub fn dispatch_match(pattern: &str, name: &str) -> bool {
+    dispatch_match_bytes(pattern.as_bytes(), name.as_bytes())
+}
+
+fn dispatch_match_bytes(mut p: &[u8], mut n: &[u8]) -> bool {
     loop {
         match p.first() {
-            None => return t.is_empty(),
+            // Anchored at the end: the pattern is spent, so the name must be.
+            None => return n.is_empty(),
             Some(b'*') => {
-                // Collapse consecutive stars.
+                // Collapse a run of `*` — `**` is not a token here, it is two
+                // wildcards, and any number is permitted.
                 while p.first() == Some(&b'*') {
                     p = &p[1..];
                 }
                 if p.is_empty() {
+                    // Trailing `*` absorbs the remainder, `/` included.
                     return true;
                 }
-                // Try to match the rest at every suffix.
-                for i in 0..=t.len() {
-                    if glob_rec(p, &t[i..]) {
+                // `*` crosses `/`: every suffix is a candidate, with no
+                // separator to stop at. This is `REG-DISPATCH-GRAMMAR-1`'s
+                // fourth row (`x*z` matches `x/y/z`) and the one that fails
+                // against every path-glob implementation.
+                for i in 0..=n.len() {
+                    if dispatch_match_bytes(p, &n[i..]) {
                         return true;
                     }
                 }
                 return false;
             }
-            Some(b'?') => {
-                if t.is_empty() {
-                    return false;
-                }
-                p = &p[1..];
-                t = &t[1..];
-            }
-            Some(b'[') => {
-                if t.is_empty() {
-                    return false;
-                }
-                match class_match(&p[1..], t[0]) {
-                    Some(consumed) => {
-                        p = &p[1 + consumed..];
-                        t = &t[1..];
-                    }
-                    None => return false,
-                }
-            }
+            // EVERY other byte is a literal. No `?`, no `[…]`, no escape:
+            // a `\` matches a `\`.
             Some(&c) => {
-                if t.first() != Some(&c) {
+                if n.first() != Some(&c) {
                     return false;
                 }
                 p = &p[1..];
-                t = &t[1..];
+                n = &n[1..];
             }
         }
     }
-}
-
-/// Match `ch` against a `[...]` class starting after the `[`. Returns the
-/// number of bytes consumed up to and including the closing `]`, or `None` if
-/// no match / malformed.
-fn class_match(spec: &[u8], ch: u8) -> Option<usize> {
-    let mut i = 0;
-    let negate = spec.first() == Some(&b'!');
-    if negate {
-        i += 1;
-    }
-    let mut matched = false;
-    let start = i;
-    while i < spec.len() {
-        let c = spec[i];
-        if c == b']' && i > start {
-            // closing bracket
-            return if matched != negate { Some(i + 1) } else { None };
-        }
-        // range a-z
-        if i + 2 < spec.len() && spec[i + 1] == b'-' && spec[i + 2] != b']' {
-            let lo = c;
-            let hi = spec[i + 2];
-            if ch >= lo && ch <= hi {
-                matched = true;
-            }
-            i += 3;
-        } else {
-            if ch == c {
-                matched = true;
-            }
-            i += 1;
-        }
-    }
-    None // unterminated class
 }

@@ -628,6 +628,19 @@ impl RevisionHandler {
                     ));
                 }
 
+                // §4.4.18 V7 — the pattern grammar, path scope only. A
+                // distinct code from `invalid_strategy` because §4.4.18 pins
+                // one: `config/invalid-merge-pattern`.
+                if scope_segment == "path" {
+                    if let Some(reason) = validate_merge_pattern_for_write(config_data) {
+                        return Ok(error_result(
+                            STATUS_BAD_REQUEST,
+                            "config/invalid-merge-pattern",
+                            &reason,
+                        ));
+                    }
+                }
+
                 let config_entity =
                     Entity::new("system/revision/merge-config", config_data.clone())
                         .map_err(|e| HandlerError::Internal(e.to_string()))?;
@@ -819,6 +832,59 @@ fn validate_merge_config_for_write(data: &[u8]) -> Option<String> {
     None
 }
 
+/// EXTENSION-REVISION §4.4.18 **V7** `[MUST, v3.12]` — a path-scoped
+/// merge-config's `pattern` MUST be one of §2.4's four forms.
+///
+/// Returns the rejection reason, or `None` when the pattern is acceptable.
+/// The caller answers `400 config/invalid-merge-pattern` and lands no
+/// binding.
+///
+/// **Same grammar, same reason, and the same write-time site as §4.4.17 V6.**
+/// `pattern` selects the merge strategy, the strategy decides the merged
+/// bytes, and the merged bytes are the version `root` — so a pattern the peer
+/// cannot evaluate under the four rules must not reach the tree. A matcher
+/// that merely *omits* `**` and one that *rejects* it are indistinguishable
+/// until a config carries one, and then the two peers disagree about which
+/// strategy applies. Read-time handling can only collapse the stored value
+/// silently.
+///
+/// **`scope: "type"` is exempt because it carries no `pattern` at all** — a
+/// type-scoped config is keyed by the type name in its tree path. Validating
+/// it here is what would break the canonical shape, which is the mistake
+/// `find_merge_strategy` already made once in the other direction (requiring
+/// `pattern` on the type-scoped read path, which skipped Step 1 entirely).
+///
+/// An **absent** `pattern` under `scope: "path"` is refused by the same
+/// clause: §4.4.18's condition is *"is not one of §2.4's four forms"*, and a
+/// path-scoped config with no pattern cannot match any path, so it is the
+/// sentinel-without-its-companion-field shape one bullet up.
+fn validate_merge_pattern_for_write(data: &[u8]) -> Option<String> {
+    let pattern = ciborium::from_reader::<ciborium::Value, _>(data)
+        .ok()
+        .and_then(|v| {
+            v.as_map().and_then(|m| {
+                m.iter()
+                    .find(|(k, _)| k.as_text() == Some("pattern"))
+                    .and_then(|(_, v)| v.as_text().map(|s| s.to_string()))
+            })
+        });
+
+    match pattern {
+        None => Some(
+            "pattern: a path-scoped merge-config MUST carry a `pattern` — without one it \
+             matches no path and can never select a strategy (EXTENSION-REVISION §4.4.18 V7)"
+                .to_string(),
+        ),
+        Some(p) if !engine::valid_exclude_pattern(&p) => Some(format!(
+            "pattern: {:?} carries more than one `*`, or a `*` that is neither the whole \
+             pattern, the final character after `/`, nor the first character — the closed \
+             four-form grammar (EXTENSION-REVISION §2.4, enforced at §4.4.18 V7)",
+            p
+        )),
+        Some(_) => None,
+    }
+}
+
 struct ConfigParams {
     name: String,
     action: String,
@@ -930,7 +996,7 @@ fn build_config_result(
 
 impl RevisionHandler {
     async fn handle_log(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
-        let (prefix, limit, since) = decode_log_params(&ctx.params.data)?;
+        let (prefix, limit, start_at) = decode_log_params(&ctx.params.data)?;
         let effective_limit = limit.unwrap_or(50);
 
         let abs_prefix = resolve_prefix(&prefix, &self.local_peer_id);
@@ -955,12 +1021,17 @@ impl RevisionHandler {
             }
         };
 
-        // W2: pass since to walk_history; fetch limit+1 to detect has_more
+        // §4.4.2: `start_at` is an INCLUSIVE anchor — the walk begins AT it and
+        // proceeds toward older ancestors, so over v1→v2→v3 a log anchored at
+        // v2 returns [v2, v1]. Absent ⇒ begin at HEAD. It is the walk ROOT, not
+        // a stop point: passing it as `stop_at` (what the old `since` did) is
+        // the exclusive-watermark reading that belongs to `fetch`.
+        let walk_root = start_at.unwrap_or(head_hash);
         let history = walk_history(
             self.content_store.as_ref(),
-            head_hash,
+            walk_root,
             effective_limit + 1,
-            since,
+            None,
         );
 
         let has_more = history.len() > effective_limit;
@@ -2366,7 +2437,7 @@ impl RevisionHandler {
 
 impl RevisionHandler {
     async fn handle_fetch(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
-        let (prefix, depth, since) = decode_log_params(&ctx.params.data)?;
+        let (prefix, depth, since) = decode_fetch_walk_params(&ctx.params.data)?;
         let effective_depth = depth.unwrap_or(50);
 
         let abs_prefix = resolve_prefix(&prefix, &self.local_peer_id);
@@ -3382,13 +3453,22 @@ pub(crate) mod commit_logic {
                     if cfg
                         .exclude
                         .iter()
-                        .any(|pat| crate::engine::exclude_pattern_matches(pat, path))
+                        .any(|pat| crate::engine::glob_match(pat, path))
                     {
                         continue;
                     }
                     if !cfg.exclude_types.is_empty() {
                         if let Some(entity) = content_store.get(hash) {
-                            if cfg.exclude_types.iter().any(|t| t == &entity.entity_type) {
+                            // REV-GLOB-TYPES-1: §2.4's four forms apply to the
+                            // type-name subject too — `app/*` and `*-draft` both
+                            // match here. This was an exact comparison, which
+                            // silently ignored every patterned exclude_types
+                            // entry a peer had stored.
+                            if cfg
+                                .exclude_types
+                                .iter()
+                                .any(|pat| crate::engine::glob_match(pat, &entity.entity_type))
+                            {
                                 continue;
                             }
                         }
@@ -3570,6 +3650,22 @@ fn decode_fetch_params(data: &[u8]) -> Result<FetchParams, HandlerError> {
     })
 }
 
+/// `system/revision/log-params` (§4.4.2): `prefix`, optional `limit`, optional
+/// `start_at`.
+///
+/// **`start_at`, never `since`.** The two operations that carried the name
+/// `since` meant opposite directions with it, and their result sets are not
+/// off-by-one — they are disjoint: `fetch(since: v2)` returns `[v3]` (newer
+/// than the anchor, exclusive — a watermark), `log(since: v2)` returned
+/// `[v2, v1]` (older, inclusive — a cursor). Both readings are right for their
+/// own operation, so the collision is removed rather than adjudicated:
+/// `fetch` keeps `since` (§4.4.6), `log` takes `start_at`, an INCLUSIVE anchor
+/// that walks toward older versions.
+///
+/// A stray `since` on `log` is a **400**, not a silently-ignored key — there is
+/// no installed base to migrate, and ignoring it would answer a watermark
+/// question with a cursor's disjoint result set. §4.4.2: *"Implementations MUST
+/// NOT accept `since` on `log`."*
 fn decode_log_params(data: &[u8]) -> Result<(String, Option<usize>, Option<Hash>), HandlerError> {
     let val: ciborium::Value = ciborium::from_reader(data)
         .map_err(|e| HandlerError::InvalidParams(format!("decode: {}", e)))?;
@@ -3579,13 +3675,60 @@ fn decode_log_params(data: &[u8]) -> Result<(String, Option<usize>, Option<Hash>
 
     let mut prefix = None;
     let mut limit = None;
-    let mut since = None;
+    let mut start_at = None;
 
     for (k, v) in map {
         match k.as_text() {
             Some("prefix") => prefix = v.as_text().map(|s| s.to_string()),
             Some("limit") | Some("depth") => {
                 limit = v.as_integer().map(|i| i128::from(i) as usize);
+            }
+            Some("start_at") => {
+                if let ciborium::Value::Bytes(b) = v {
+                    start_at = Hash::from_bytes(b).ok();
+                }
+            }
+            Some("since") => {
+                return Err(HandlerError::InvalidParams(
+                    "log does not accept 'since'; use 'start_at' (an inclusive anchor that \
+                     walks toward older versions)"
+                        .into(),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let prefix = prefix.ok_or_else(|| HandlerError::InvalidParams("missing 'prefix'".into()))?;
+    Ok((prefix, limit, start_at))
+}
+
+/// `system/revision/fetch-params` as consumed by the local `fetch` walk
+/// (§4.4.6): `prefix`, optional `depth`/`limit`, optional `since`.
+///
+/// `fetch` keeps `since` — an EXCLUSIVE watermark ("I have up to v2, send what
+/// I lack"), which is why it stops the walk rather than anchoring it. It shared
+/// `decode_log_params` until `log` was renamed; the two are separate decoders
+/// now precisely because one field name meaning two directions is the defect
+/// §4.4.2 removed.
+fn decode_fetch_walk_params(
+    data: &[u8],
+) -> Result<(String, Option<usize>, Option<Hash>), HandlerError> {
+    let val: ciborium::Value = ciborium::from_reader(data)
+        .map_err(|e| HandlerError::InvalidParams(format!("decode: {}", e)))?;
+    let map = val
+        .as_map()
+        .ok_or_else(|| HandlerError::InvalidParams("params not a map".into()))?;
+
+    let mut prefix = None;
+    let mut depth = None;
+    let mut since = None;
+
+    for (k, v) in map {
+        match k.as_text() {
+            Some("prefix") => prefix = v.as_text().map(|s| s.to_string()),
+            Some("limit") | Some("depth") => {
+                depth = v.as_integer().map(|i| i128::from(i) as usize);
             }
             Some("since") => {
                 if let ciborium::Value::Bytes(b) = v {
@@ -3597,7 +3740,7 @@ fn decode_log_params(data: &[u8]) -> Result<(String, Option<usize>, Option<Hash>
     }
 
     let prefix = prefix.ok_or_else(|| HandlerError::InvalidParams("missing 'prefix'".into()))?;
-    Ok((prefix, limit, since))
+    Ok((prefix, depth, since))
 }
 
 fn decode_prefix_only(data: &[u8]) -> Result<String, HandlerError> {
@@ -4432,6 +4575,103 @@ mod tests {
         );
     }
 
+    /// Extract the `code` field of an error-entity result.
+    fn error_code_of(result: &HandlerResult) -> String {
+        let v: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
+        v.as_map()
+            .unwrap()
+            .iter()
+            .find_map(|(k, v)| {
+                if k.as_text() == Some("code") {
+                    v.as_text().map(|s| s.to_string())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_default()
+    }
+
+    /// `MERGE-PATTERN-REJECT-1` (§4.4.18 **V7**, `[MUST, v3.12]`) — a
+    /// path-scoped `pattern` outside §2.4's four forms is
+    /// `400 config/invalid-merge-pattern` and **no binding lands**.
+    ///
+    /// This is V6's rule at V7's site, and the load-bearing half of the
+    /// grammar: a peer that drops `**` from its *matcher* and a peer that
+    /// rejects `**` at config *write* are indistinguishable until a config
+    /// carries one — and then the two disagree about which strategy resolves
+    /// a conflict, which decides the merged bytes, which are the version
+    /// `root`.
+    #[tokio::test]
+    async fn merge_pattern_reject_1_rejects_patterns_outside_the_four_forms() {
+        let (store, li) = make_stores();
+        let handler = make_handler(store.clone(), li.clone());
+
+        for bad in ["**", "a/**/b", "a*b", "*a*"] {
+            let params = make_merge_config_params(
+                "path",
+                "reject-me",
+                "set",
+                Some(bad),
+                Some("three-way"),
+                None,
+            );
+            let ctx = make_ctx("merge-config", params);
+            let result = handler.handle(&ctx).await.unwrap();
+            assert_eq!(result.status, STATUS_BAD_REQUEST, "pattern {bad:?}");
+            assert_eq!(
+                error_code_of(&result),
+                "config/invalid-merge-pattern",
+                "pattern {bad:?}"
+            );
+            let path = format!(
+                "/{}/system/revision/config/merge/path/reject-me",
+                test_peer_id()
+            );
+            assert!(li.get(&path).is_none(), "no binding may land for {bad:?}");
+        }
+
+        // Control (required) — a rejection row without its acceptance control
+        // passes trivially against a peer that rejects everything
+        // (GUIDE-CONFORMANCE §2.4a).
+        let params = make_merge_config_params(
+            "path",
+            "accept-me",
+            "set",
+            Some("docs/*"),
+            Some("three-way"),
+            None,
+        );
+        let ctx = make_ctx("merge-config", params);
+        let result = handler.handle(&ctx).await.unwrap();
+        assert_eq!(result.status, entity_handler::STATUS_OK, "control accepted");
+        let path = format!(
+            "/{}/system/revision/config/merge/path/accept-me",
+            test_peer_id()
+        );
+        assert!(li.get(&path).is_some(), "control config MUST bind");
+    }
+
+    /// V7's `scope: "path"` guard is not decoration: a **type**-scoped config
+    /// is keyed by the type name in its tree path and carries no `pattern` at
+    /// all, so running the pattern rule against it would refuse the canonical
+    /// shape. This is the same shape `find_merge_strategy` got wrong once in
+    /// the other direction, by *requiring* `pattern` on the type-scoped read
+    /// path and thereby skipping Step 1 entirely.
+    #[tokio::test]
+    async fn merge_pattern_v7_does_not_bind_type_scoped_configs() {
+        let (store, li) = make_stores();
+        let handler = make_handler(store.clone(), li.clone());
+        let params =
+            make_merge_config_params("type", "app/doc", "set", None, Some("three-way"), None);
+        let ctx = make_ctx("merge-config", params);
+        let result = handler.handle(&ctx).await.unwrap();
+        assert_eq!(
+            result.status,
+            entity_handler::STATUS_OK,
+            "a type-scoped config carries no pattern and MUST still be accepted"
+        );
+    }
+
     #[tokio::test]
     async fn merge_config_set_rejects_deletion_resolution_keep_both() {
         // EXTENSION-REVISION v3.1 §2.3: `deletion_resolution: keep-both` MUST
@@ -4646,6 +4886,122 @@ mod tests {
         } else {
             panic!("versions should be array");
         }
+    }
+
+    /// §4.4.2 — `start_at` is an INCLUSIVE anchor: the walk begins AT it and
+    /// moves toward older versions. Over v1→v2→v3, `log(start_at: v2)` returns
+    /// `[v2, v1]` — not `[v3]` (the exclusive-floor reading the old `since`
+    /// gave, which is `fetch`'s watermark) and not `[v3, v2]` (head-anchored
+    /// with an inclusive floor).
+    #[tokio::test]
+    async fn log_start_at_is_an_inclusive_anchor_walking_older() {
+        let (store, li) = make_stores();
+        let handler = make_handler(store.clone(), li.clone());
+
+        let mut versions = Vec::new();
+        for content in ["v1", "v2", "v3"] {
+            put_entity(store.as_ref(), li.as_ref(), "data/foo", content);
+            let ctx = make_ctx("commit", make_params("data/", vec![]));
+            let r = handler.handle(&ctx).await.unwrap();
+            let ciborium::Value::Bytes(b) = decode_result_field(&r.result, "version").unwrap()
+            else {
+                panic!("version is bytes")
+            };
+            versions.push(Hash::from_bytes(&b).unwrap());
+        }
+
+        let params = make_params(
+            "data/",
+            vec![(
+                "start_at",
+                ciborium::Value::Bytes(versions[1].to_bytes().to_vec()),
+            )],
+        );
+        let result = handler.handle(&make_ctx("log", params)).await.unwrap();
+        assert_eq!(result.status, STATUS_OK);
+
+        let ciborium::Value::Array(arr) = decode_result_field(&result.result, "versions").unwrap()
+        else {
+            panic!("versions is an array")
+        };
+        let walked: Vec<Hash> = arr
+            .iter()
+            .map(|v| {
+                let ciborium::Value::Bytes(b) = v else {
+                    panic!("hash bytes")
+                };
+                Hash::from_bytes(b).unwrap()
+            })
+            .collect();
+        assert_eq!(
+            walked,
+            vec![versions[1], versions[0]],
+            "start_at: v2 over v1→v2→v3 must return [v2, v1] — the anchor first, then older"
+        );
+    }
+
+    /// The other half of §4.4.2: *"Implementations MUST NOT accept `since` on
+    /// `log`."* A stray `since` is a 400, not a key we silently ignore into the
+    /// opposite direction's answer.
+    #[tokio::test]
+    async fn log_refuses_since_it_is_fetchs_watermark() {
+        let (store, li) = make_stores();
+        let handler = make_handler(store.clone(), li.clone());
+
+        put_entity(store.as_ref(), li.as_ref(), "data/foo", "v1");
+        let r = handler
+            .handle(&make_ctx("commit", make_params("data/", vec![])))
+            .await
+            .unwrap();
+        let ciborium::Value::Bytes(v1) = decode_result_field(&r.result, "version").unwrap() else {
+            panic!("version is bytes")
+        };
+
+        let params = make_params("data/", vec![("since", ciborium::Value::Bytes(v1))]);
+        match handler.handle(&make_ctx("log", params)).await {
+            Err(HandlerError::InvalidParams(m)) => assert!(
+                m.contains("start_at"),
+                "the refusal must name the field that replaced it: {m}"
+            ),
+            Err(other) => panic!("expected invalid_params, got {other:?}"),
+            Ok(_) => panic!("`since` on log must be refused, not silently ignored"),
+        }
+    }
+
+    /// `fetch` keeps `since` — the exclusive watermark. The two decoders were
+    /// one function until the rename; this pins that the split did not take
+    /// `since` away from the operation that owns it.
+    #[tokio::test]
+    async fn fetch_still_takes_since() {
+        let (store, li) = make_stores();
+        let handler = make_handler(store.clone(), li.clone());
+
+        put_entity(store.as_ref(), li.as_ref(), "data/foo", "v1");
+        let r = handler
+            .handle(&make_ctx("commit", make_params("data/", vec![])))
+            .await
+            .unwrap();
+        let ciborium::Value::Bytes(v1) = decode_result_field(&r.result, "version").unwrap() else {
+            panic!("version is bytes")
+        };
+        put_entity(store.as_ref(), li.as_ref(), "data/foo", "v2");
+        handler
+            .handle(&make_ctx("commit", make_params("data/", vec![])))
+            .await
+            .unwrap();
+
+        let params = make_params("data/", vec![("since", ciborium::Value::Bytes(v1))]);
+        let result = handler.handle(&make_ctx("fetch", params)).await.unwrap();
+        assert_eq!(result.status, STATUS_OK);
+        let ciborium::Value::Array(arr) = decode_result_field(&result.result, "versions").unwrap()
+        else {
+            panic!("versions is an array")
+        };
+        assert_eq!(
+            arr.len(),
+            1,
+            "fetch(since: v1) walks from head and stops AT v1 — the watermark is exclusive"
+        );
     }
 
     #[tokio::test]

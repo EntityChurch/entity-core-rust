@@ -61,7 +61,7 @@ impl HistoryEngine {
             .into_iter()
             .filter_map(|e| {
                 let entity = self.content_store.get(&e.hash)?;
-                decode_history_config(&entity)
+                decode_history_config(&entity, config_name_of(&e.path))
             })
             .collect()
     }
@@ -436,6 +436,9 @@ fn build_transition_entity(f: &TransitionFields<'_>) -> Entity {
 /// Parsed history configuration.
 #[derive(Debug, Clone)]
 pub struct HistoryConfig {
+    /// The `{config_name}` segment of `system/history/config/{config_name}`
+    /// — the §6.2 key-4 tiebreak, see [`more_specific`].
+    pub name: String,
     pub pattern: String,
     pub enabled: bool,
     pub events: Vec<String>,
@@ -445,6 +448,7 @@ pub struct HistoryConfig {
 impl Default for HistoryConfig {
     fn default() -> Self {
         Self {
+            name: String::new(),
             pattern: String::new(),
             enabled: false,
             events: vec![
@@ -488,22 +492,82 @@ pub fn canonicalize_pattern(pattern: &str, local_peer_id: &str) -> String {
     format!("/{}/{}", local_peer_id, pattern)
 }
 
-/// Compute pattern specificity for history config matching (spec §2.2).
+/// Compute pattern specificity for history config matching (§6.2, `[MUST,
+/// v1.7]`).
 ///
-/// Higher value = more specific. Rules:
-/// 1. Count literal (non-wildcard) segments
-/// 2. Explicit peer ID beats wildcard peer at same depth
-fn pattern_specificity(pattern: &str) -> u32 {
-    let segments: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
-    let mut score: u32 = 0;
-    for seg in &segments {
-        if *seg != "*" {
-            score += 2; // literal segment
-        } else {
-            score += 1; // wildcard segment (less specific)
+/// **A scalar cannot carry a two-key order, and this used to be a scalar.**
+/// §2.2 states the order as *"(1) number of literal (non-wildcard) segments,
+/// then (2) total segment depth"*; the prior implementation collapsed both
+/// into `2 points per literal segment, 1 per wildcard`. That scalar
+/// manufactures ties §2.2 does not have — the spec's own worked pair
+/// `a/b/c/d` (4 literal, depth 4) and `a/*/c/*/e` (3 literal, depth 5) both
+/// score 8 — and `select_matching_config` then resolved them by whatever
+/// `location_index.list` happened to yield first. Two peers with identical
+/// configs and identical content could record different history with nothing
+/// failing anywhere.
+///
+/// Returned as an ordered tuple, most significant first:
+///
+/// | Key | Value |
+/// |---|---|
+/// | 1 | count of **literal** (non-`*`) segments — higher wins |
+/// | 2 | **total** segment depth — higher wins |
+/// | 3 | lexicographic byte order on the canonicalized pattern — **lower** wins |
+///
+/// Key 3 is what makes the order **total**: keys 1–2 are not, since `a/*/c`
+/// and `a/b/*` agree on both. It is peer-independent, so every conformant
+/// peer selects the same config. This function returns keys 1–2; key 3 is
+/// applied by [`more_specific`], which is the only comparison site.
+///
+/// §2.2's peer-ID rule needs no separate key — an explicit peer segment is
+/// literal and a `*` peer segment is not, so key 1 already ranks
+/// `/{peerA}/project/*` above `*/project/*`.
+fn pattern_specificity(pattern: &str) -> (usize, usize) {
+    let mut literal = 0usize;
+    let mut depth = 0usize;
+    for seg in pattern.split('/').filter(|s| !s.is_empty()) {
+        depth += 1;
+        if seg != "*" {
+            literal += 1;
         }
     }
-    score
+    (literal, depth)
+}
+
+/// The §6.2 order: keys 1–2 higher-wins, then key 3 lexicographic
+/// **lower**-wins on the canonicalized pattern. Returns whether `cand` beats
+/// `best`. Each argument is `(keys_1_2, canonical_pattern, config_name)`.
+///
+/// Written as an explicit `cmp` chain rather than one tuple compare because
+/// key 3 runs the *other* direction — folding it in as a `Reverse` works but
+/// leaves the flip invisible at the one site that has to get it right.
+///
+/// **Key 4 — the config `{name}` — is ours, not §6.2's, and it closes §6.2's
+/// own MUST.** §6.2 stops its key list at the canonicalized pattern, but two
+/// configs at `system/history/config/{name}` may legitimately carry the same
+/// `pattern` under different `{name}`s (they are then *one* content-addressed
+/// entity under two bindings). Keys 1–3 tie on that pair, so a pattern-only
+/// order still resolves it by whatever `list` yielded first — the very
+/// dependence the `[MUST, v1.7]` forbids. `EXTENSION-REVISION` §4.4.18 pins
+/// exactly this tiebreak for merge-config (*"lexicographic byte order on
+/// `pattern`, then on the config's `{name}`"*), one section over and for the
+/// identical reason, so this is that ruling applied rather than a mechanism
+/// invented here. Filed for arch in `docs/SPEC-AMBIGUITIES.md`.
+fn more_specific(cand: ((usize, usize), &str, &str), best: ((usize, usize), &str, &str)) -> bool {
+    let (cand_key, cand_pattern, cand_name) = cand;
+    let (best_key, best_pattern, best_name) = best;
+    match cand_key.cmp(&best_key) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => match cand_pattern.cmp(best_pattern) {
+            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Greater => false,
+            // Same canonical pattern: lower `{name}` wins. Never `<=` — an
+            // all-key tie is the same config seen twice, and keeping the
+            // incumbent is a no-op either way.
+            std::cmp::Ordering::Equal => cand_name < best_name,
+        },
+    }
 }
 
 /// Check if a path matches a pattern (simplified §5.4 pattern matching).
@@ -552,7 +616,7 @@ pub fn find_history_config(
         .into_iter()
         .filter_map(|e| {
             let entity = content_store.get(&e.hash)?;
-            decode_history_config(&entity)
+            decode_history_config(&entity, config_name_of(&e.path))
         })
         .collect();
 
@@ -561,27 +625,38 @@ pub fn find_history_config(
 
 /// Pick the most-specific matching config from an already-decoded list.
 /// Used by the engine's hot path against its cached configs.
+///
+/// §6.2 `[MUST, v1.7]`: **the selection MUST NOT depend on enumeration
+/// order.** `location_index.list` ordering is unspecified, so every key of
+/// [`more_specific`] has to be decided before the incumbent is kept.
 pub fn select_matching_config(
     configs: &[HistoryConfig],
     path: &str,
     local_peer_id: &str,
 ) -> Option<HistoryConfig> {
-    let mut best: Option<(&HistoryConfig, u32)> = None;
+    let mut best: Option<(&HistoryConfig, (usize, usize), String)> = None;
     for cfg in configs {
         let canonical = canonicalize_pattern(&cfg.pattern, local_peer_id);
         if !matches_history_pattern(path, &canonical) {
             continue;
         }
-        let specificity = pattern_specificity(&canonical);
-        if best.as_ref().is_none_or(|(_, s)| specificity > *s) {
-            best = Some((cfg, specificity));
+        let key = pattern_specificity(&canonical);
+        let wins = match &best {
+            None => true,
+            Some((best_cfg, best_key, best_pattern)) => more_specific(
+                (key, &canonical, &cfg.name),
+                (*best_key, best_pattern, &best_cfg.name),
+            ),
+        };
+        if wins {
+            best = Some((cfg, key, canonical));
         }
     }
-    best.map(|(c, _)| c.clone())
+    best.map(|(c, _, _)| c.clone())
 }
 
 /// Decode a history config entity's data.
-fn decode_history_config(entity: &Entity) -> Option<HistoryConfig> {
+fn decode_history_config(entity: &Entity, name: String) -> Option<HistoryConfig> {
     if entity.entity_type != entity_types::TYPE_HISTORY_CONFIG {
         return None;
     }
@@ -626,11 +701,22 @@ fn decode_history_config(entity: &Entity) -> Option<HistoryConfig> {
         .and_then(|i| u64::try_from(i).ok());
 
     Some(HistoryConfig {
+        name,
         pattern,
         enabled,
         events,
         max_depth,
     })
+}
+
+/// The `{config_name}` of a `…/system/history/config/{config_name}` binding.
+///
+/// Read from the *binding path* rather than from the entity, because the
+/// config entity carries no name field — the name IS the tree location, and
+/// two configs with byte-identical data (same `pattern`, same settings) are
+/// one content-addressed entity under two paths.
+fn config_name_of(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or("").to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -805,6 +891,127 @@ mod tests {
         );
         assert!(pattern_specificity("/peer/project/*") > pattern_specificity("*/project/*"));
         assert!(pattern_specificity("/peer/*") > pattern_specificity("*"));
+    }
+
+    /// `HIST-CONFIG-SPECIFICITY-1`, scoring half — **§6.2's own worked pair**,
+    /// which is exactly the pair the previous scalar could not separate.
+    ///
+    /// `a/b/c/d` (4 literal, depth 4) against `a/*/c/*/e` (3 literal, depth
+    /// 5); canonicalized, the shared peer segment makes them (5,5) and (4,6).
+    /// Under the old *"2 points per literal segment, 1 per wildcard"* scalar
+    /// **both score 10** and the winner was whichever `list` yielded first.
+    /// Under the tuple the first wins on key 1 and nothing else is consulted.
+    #[test]
+    fn hist_config_specificity_1_two_key_order_separates_the_spec_pair() {
+        let pid = test_peer_id();
+        let a = canonicalize_pattern("a/b/c/d", &pid);
+        let b = canonicalize_pattern("a/*/c/*/e", &pid);
+
+        // The tuple ranks `a/b/c/d` first, on key 1.
+        assert_eq!(pattern_specificity(&a), (5, 5));
+        assert_eq!(pattern_specificity(&b), (4, 6));
+        assert!(pattern_specificity(&a) > pattern_specificity(&b));
+
+        // …and the scalar this replaced ties them. Recomputed here rather
+        // than asserted in prose: if a future edit reintroduces any
+        // literal-vs-depth weighting that ties, this line is what fails.
+        let scalar = |p: &str| -> usize {
+            p.split('/')
+                .filter(|s| !s.is_empty())
+                .map(|s| if s == "*" { 1 } else { 2 })
+                .sum()
+        };
+        assert_eq!(
+            scalar(&a),
+            scalar(&b),
+            "the pair the old scalar could not separate"
+        );
+    }
+
+    /// `HIST-CONFIG-SPECIFICITY-1`, selection half — **written in both
+    /// insertion orders**, since §6.2's `[MUST, v1.7]` is that the selection
+    /// not depend on enumeration, and *"a peer that ties resolves by
+    /// enumeration and will pass one order by luck."*
+    ///
+    /// The pair is chosen to tie on keys 1 **and** 2 so key 3 is the only
+    /// thing deciding: `/{peer}/a/b/*` and `*/a/b/c` are each 3 literal
+    /// segments at depth 4, and both match `/{peer}/a/b/c`. `*` (0x2A) sorts
+    /// below `/` (0x2F), so `*/a/b/c` wins on key 3 — and it wins from either
+    /// insertion order.
+    ///
+    /// *(§6.2's own worked pair cannot serve here: under §5.4 `a/*/c/*/e` is
+    /// an **exact** pattern — the interior `*`s are literal bytes — so no
+    /// path matches both it and `a/b/c/d`. The scoring half above gates that
+    /// pair directly; this half gates the ordering property. Filed in
+    /// `docs/SPEC-AMBIGUITIES.md`.)*
+    #[test]
+    fn hist_config_specificity_1_selection_is_independent_of_insertion_order() {
+        let pid = test_peer_id();
+        let path = format!("/{}/a/b/c", pid);
+
+        let subtree = HistoryConfig {
+            name: "z-subtree".into(),
+            pattern: "a/b/*".into(),
+            enabled: true,
+            ..Default::default()
+        };
+        let peer_wildcard = HistoryConfig {
+            name: "a-wildcard".into(),
+            pattern: "*/a/b/c".into(),
+            enabled: true,
+            ..Default::default()
+        };
+
+        // Tie on keys 1-2 — otherwise this vector proves nothing about key 3.
+        let k_subtree = pattern_specificity(&canonicalize_pattern(&subtree.pattern, &pid));
+        let k_wildcard = pattern_specificity(&canonicalize_pattern(&peer_wildcard.pattern, &pid));
+        assert_eq!(
+            k_subtree, k_wildcard,
+            "keys 1-2 must tie for key 3 to be under test"
+        );
+
+        for (label, configs) in [
+            (
+                "subtree first",
+                vec![subtree.clone(), peer_wildcard.clone()],
+            ),
+            (
+                "wildcard first",
+                vec![peer_wildcard.clone(), subtree.clone()],
+            ),
+        ] {
+            let picked = select_matching_config(&configs, &path, &pid).expect("a config matches");
+            assert_eq!(picked.pattern, "*/a/b/c", "insertion order: {label}");
+        }
+    }
+
+    /// Key 4 (ours, see [`more_specific`]): same canonical pattern under two
+    /// `{name}`s is a keys-1-3 tie, and §6.2's MUST still binds.
+    #[test]
+    fn hist_config_same_pattern_two_names_resolves_by_name_not_enumeration() {
+        let pid = test_peer_id();
+        let path = format!("/{}/a/b/c", pid);
+        let z = HistoryConfig {
+            name: "z-cfg".into(),
+            pattern: "a/b/*".into(),
+            enabled: true,
+            max_depth: Some(9),
+            ..Default::default()
+        };
+        let a = HistoryConfig {
+            name: "a-cfg".into(),
+            pattern: "a/b/*".into(),
+            enabled: true,
+            max_depth: Some(1),
+            ..Default::default()
+        };
+        for (label, configs) in [
+            ("z first", vec![z.clone(), a.clone()]),
+            ("a first", vec![a.clone(), z.clone()]),
+        ] {
+            let picked = select_matching_config(&configs, &path, &pid).expect("a config matches");
+            assert_eq!(picked.name, "a-cfg", "insertion order: {label}");
+        }
     }
 
     // --- matches_history_pattern ---

@@ -3368,6 +3368,13 @@ fn system_registry_issuer_policy() -> TypeDefinition {
         .field("allowlist", opt_arr(t("system/peer-id")))
         .field("name_constraints", opt("primitive/string"))
         .field("default_ttl", opt("primitive/uint"))
+        // §6a.9.1 `[MUST, v1.11]` — REQUIRED on any policy that can reach
+        // *approve*, but declared OPTIONAL here: the type describes what may
+        // be decoded, and a policy predating the rule (seeded out-of-band or
+        // written straight to the tree) must still decode so the register /
+        // renew backstops can refuse it. The requirement is enforced at
+        // `set-issuer-policy`, which is where the operator's field is set.
+        .field("max_ttl", opt("primitive/uint"))
         .build()
 }
 

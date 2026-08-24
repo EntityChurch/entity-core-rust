@@ -412,20 +412,33 @@ fn find_deletion_resolution(
     local_peer_id: &str,
 ) -> DeletionResolution {
     let path_config_prefix = format!("/{}/system/revision/config/merge/path/", local_peer_id,);
-    let mut best_match: Option<(usize, DeletionResolution)> = None;
+    // §4.4.18's total order. This is the *sibling site* of `find_merge_strategy`
+    // below: §4.4.18's pseudocode names Step 2's strategy selection, and the
+    // identical selection over the identical config namespace also decides
+    // `deletion_resolution`. One routed pointer, two binding sites — a fix at
+    // only one leaves half the merge outcome resolved by store enumeration.
+    let mut best_match: Option<((u8, usize), String, String, DeletionResolution)> = None;
     for entry in location_index.list(&path_config_prefix) {
         if let Some(config_entity) = store.get(&entry.hash) {
             if let Some((pattern, dr)) = decode_deletion_resolution_config(&config_entity.data) {
-                if path_pattern_matches(&pattern, path) {
-                    let specificity = pattern.len();
-                    if best_match.as_ref().is_none_or(|(s, _)| specificity > *s) {
-                        best_match = Some((specificity, dr));
+                if !path_pattern_matches(&pattern, path) {
+                    continue;
+                }
+                let name = config_name_of(&entry.path);
+                let key = pattern_specificity(&pattern);
+                let wins = match &best_match {
+                    None => true,
+                    Some((best_key, best_pattern, best_name, _)) => {
+                        more_specific((key, &pattern, name), (*best_key, best_pattern, best_name))
                     }
+                };
+                if wins {
+                    best_match = Some((key, pattern, name.to_string(), dr));
                 }
             }
         }
     }
-    best_match.map(|(_, dr)| dr).unwrap_or_default()
+    best_match.map(|(_, _, _, dr)| dr).unwrap_or_default()
 }
 
 fn decode_deletion_resolution_config(data: &[u8]) -> Option<(String, DeletionResolution)> {
@@ -588,21 +601,34 @@ pub fn find_merge_strategy(
 
     // Step 2 — per-path config: global at system/revision/config/merge/path/
     let path_config_prefix = format!("/{}/system/revision/config/merge/path/", local_peer_id,);
-    let mut best_match: Option<(usize, MergeStrategy)> = None;
+    // §4.4.18's total order — see `pattern_specificity` / `more_specific`.
+    // `pattern.len()` was the prior scorer and it is wrong on both the rows
+    // §4.4.18 calls load-bearing: it ties `*` against `a` (MERGE-SPEC-ORDER-2)
+    // and it ranks `*.lock` above `docs/*` (MERGE-SPEC-ORDER-1), because
+    // length is not form.
+    let mut best_match: Option<((u8, usize), String, String, MergeStrategy)> = None;
     for entry in location_index.list(&path_config_prefix) {
         if let Some(config_entity) = store.get(&entry.hash) {
             let config = decode_merge_config(&config_entity.data);
             if let (Some(pattern), Some(strategy)) = (config.pattern, config.strategy) {
-                if path_pattern_matches(&pattern, path) {
-                    let specificity = pattern.len();
-                    if best_match.as_ref().is_none_or(|(s, _)| specificity > *s) {
-                        best_match = Some((specificity, strategy));
+                if !path_pattern_matches(&pattern, path) {
+                    continue;
+                }
+                let name = config_name_of(&entry.path);
+                let key = pattern_specificity(&pattern);
+                let wins = match &best_match {
+                    None => true,
+                    Some((best_key, best_pattern, best_name, _)) => {
+                        more_specific((key, &pattern, name), (*best_key, best_pattern, best_name))
                     }
+                };
+                if wins {
+                    best_match = Some((key, pattern, name.to_string(), strategy));
                 }
             }
         }
     }
-    if let Some((_, strategy)) = best_match {
+    if let Some((_, _, _, strategy)) = best_match {
         return strategy;
     }
 
@@ -644,17 +670,101 @@ fn decode_merge_config(data: &[u8]) -> DecodedMergeConfig {
     DecodedMergeConfig { pattern, strategy }
 }
 
+/// Per-path merge-config matching (§4.4.4 Step 2 pseudocode: `glob_match(
+/// config.data.pattern, path)`). Same closed four-form grammar as `exclude` —
+/// `entity-core-go` resolves merge configs through its `globMatch` too, so this
+/// is the cohort-aligned reading.
+///
+/// The hand-rolled version this replaces had two defects the grammar removes:
+/// it dropped the `/` when stripping `/*` (so `docs/*` matched the sibling
+/// `docsy/readme`), and it carried a `/**` form that no longer exists anywhere
+/// in the corpus.
 fn path_pattern_matches(pattern: &str, path: &str) -> bool {
+    crate::engine::glob_match(pattern, path)
+}
+
+// ---------------------------------------------------------------------------
+// §4.4.18 `pattern_specificity` — the total order, pinned `[v3.12]`
+// ---------------------------------------------------------------------------
+
+/// Rank a merge-config `pattern` by §4.4.18's table. Higher is more specific.
+///
+/// | Rank | Form | Rationale |
+/// |---|---|---|
+/// | 3 | `<lit>` — **exact** | constrains the whole subject; matches one path |
+/// | 2 | `<lit>/*` — **subtree prefix** | anchored at the trie root; longer `lit` outranks shorter |
+/// | 1 | `*<lit>` — **trailing literal** | unanchored — matches at any depth; longer `lit` outranks shorter |
+/// | 0 | `*` — **match-all** | constrains nothing |
+///
+/// `literal` is the pattern with its single `*` removed, so the second
+/// component orders within a rank. The rank is primary and the length never
+/// crosses it: `a` (rank 3, literal length 1) outranks `docs/*` (rank 2,
+/// literal length 5).
+///
+/// **Rank 2 above rank 1 is the one genuinely chosen rung** and §4.4.18
+/// records it as a choice: for `docs/a.lock` both `docs/*` and `*.lock` match
+/// and neither contains the other. The prefix names a location the operator
+/// laid out; the suffix names a file kind that may appear anywhere, so the
+/// anchored claim is the narrower one.
+///
+/// **This is revision-local and MUST NOT be shared with `EXTENSION-HISTORY`
+/// §6.2's function of the same name.** That one orders *tree paths* by
+/// literal segments then depth; this one orders *merge patterns* by form.
+/// §4.4.18 says so in as many words — *"an implementation that shares one
+/// function between the two sites is wrong at whichever site it did not come
+/// from."* Ours are two private functions in two crates, which is why this
+/// paragraph exists rather than a `pub use`.
+fn pattern_specificity(pattern: &str) -> (u8, usize) {
     if pattern == "*" {
-        return true;
+        return (0, 0);
     }
-    if let Some(prefix) = pattern.strip_suffix("/*") {
-        return path.starts_with(prefix) && path.len() > prefix.len();
+    if let Some(lit) = pattern.strip_suffix("/*") {
+        // The `/` belongs to the literal — it is what blocks the
+        // sibling-prefix false positive in `glob_match`, so it is part of
+        // what the pattern constrains.
+        return (2, lit.len() + 1);
     }
-    if let Some(prefix) = pattern.strip_suffix("/**") {
-        return path.starts_with(prefix);
+    if let Some(lit) = pattern.strip_prefix('*') {
+        return (1, lit.len());
     }
-    pattern == path
+    (3, pattern.len())
+}
+
+/// The §4.4.18 total order over `(specificity, pattern, config {name})`.
+/// Returns whether `cand` beats `best`.
+///
+/// **Ties are impossible, and that is the requirement `[MUST]`.** Rank plus
+/// literal length is not yet a total order — two configs may legitimately
+/// carry the same `pattern` under different `{name}`s. The remaining tie goes
+/// to lexicographic byte order on `pattern`, then on `{name}`; both are
+/// peer-independent, so every conformant peer selects the same config. The
+/// `specificity > best_specificity` comparison this replaces kept whichever
+/// config `location_index.list` happened to yield first, and that ordering is
+/// unspecified — two peers with identical configs and identical content could
+/// resolve the same conflict differently, with nothing failing anywhere.
+fn more_specific(cand: ((u8, usize), &str, &str), best: ((u8, usize), &str, &str)) -> bool {
+    let (cand_key, cand_pattern, cand_name) = cand;
+    let (best_key, best_pattern, best_name) = best;
+    match cand_key.cmp(&best_key) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        // Both remaining keys run lower-wins, the opposite direction from the
+        // rank — spelled out rather than folded into one tuple compare.
+        std::cmp::Ordering::Equal => match cand_pattern.cmp(best_pattern) {
+            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Greater => false,
+            std::cmp::Ordering::Equal => cand_name < best_name,
+        },
+    }
+}
+
+/// The `{name}` of a `…/system/revision/config/merge/path/{name}` binding.
+///
+/// Read from the binding path, not the entity: two configs with byte-identical
+/// data are one content-addressed entity under two paths, so the name is the
+/// only thing that distinguishes them.
+fn config_name_of(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or("")
 }
 
 #[cfg(test)]
@@ -1372,7 +1482,299 @@ mod tests {
     fn test_star_pattern_matches_nested_path() {
         assert!(path_pattern_matches("*", "docs/deep/readme"));
         assert!(path_pattern_matches("*", "top"));
-        assert!(path_pattern_matches("docs/**", "docs/deep/readme"));
+        // §2.4 form 2 crosses `/` at any depth, so the subtree form is
+        // `docs/*` — `docs/**` is not in the grammar any more.
+        assert!(path_pattern_matches("docs/*", "docs/deep/readme"));
         assert!(!path_pattern_matches("docs/*", "other/readme"));
+        // The retained `/` — the sibling-prefix false positive the old
+        // hand-rolled matcher had (it stripped `/*` down to `docs`).
+        assert!(!path_pattern_matches("docs/*", "docsy/readme"));
+    }
+
+    // -----------------------------------------------------------------
+    // §4.4.18 merge-matcher vectors (REQUIRED, `[v3.12]`)
+    //
+    // "This surface is merge-outcome-determining, so it is not validated by
+    // prose." Each drives `find_merge_strategy` directly, which is the
+    // function §4.4.18 Step 2 describes; the two `SPEC-ORDER` rows and the
+    // `SPEC-TIE` row are the ones that need more than one matching config,
+    // which is the configuration an operator reaches as soon as they have
+    // both a location rule and a file-kind rule.
+    // -----------------------------------------------------------------
+
+    /// Bind a path-scoped merge config at `…/config/merge/path/{name}`.
+    fn put_path_config(
+        store: &dyn ContentStore,
+        li: &dyn LocationIndex,
+        name: &str,
+        pattern: &str,
+        strategy: &str,
+    ) {
+        let data = entity_ecf::to_ecf(&entity_ecf::cbor_map! {
+            "pattern" => entity_ecf::text(pattern),
+            "strategy" => entity_ecf::text(strategy)
+        });
+        let hash = store
+            .put(Entity::new("system/revision/merge-config", data).unwrap())
+            .unwrap();
+        li.set(
+            &format!("/test-peer/system/revision/config/merge/path/{}", name),
+            hash,
+        );
+    }
+
+    fn strategy_for(li: &dyn LocationIndex, store: &dyn ContentStore, path: &str) -> MergeStrategy {
+        find_merge_strategy(path, None, li, store, None, None, "test-peer")
+    }
+
+    /// `MERGE-PATTERN-SUFFIX-1` — form 3 is a **whole-subject byte suffix**
+    /// and reaches any depth. §5.1's own worked example, and it is
+    /// unexpressible under §5.4.
+    #[test]
+    fn merge_pattern_suffix_1() {
+        let (store, li) = stores();
+        put_path_config(&store, &li, "lockfiles", "*.lock", "source-wins");
+        assert_eq!(
+            strategy_for(&li, &store, "deep/nested/a.lock"),
+            MergeStrategy::SourceWins
+        );
+    }
+
+    /// `MERGE-PATTERN-SUBTREE-1` — form 2 crosses `/` at depth, and the
+    /// retained `/` blocks the sibling-prefix false positive.
+    #[test]
+    fn merge_pattern_subtree_1() {
+        let (store, li) = stores();
+        put_path_config(&store, &li, "docs-rule", "docs/*", "target-wins");
+        assert_eq!(
+            strategy_for(&li, &store, "docs/deep/nested/x"),
+            MergeStrategy::TargetWins
+        );
+        // `docsy/x` is NOT matched — falls through to the §5.2 default.
+        assert_eq!(
+            strategy_for(&li, &store, "docsy/x"),
+            MergeStrategy::ThreeWay
+        );
+    }
+
+    /// `MERGE-SPEC-ORDER-1` — **the row that fails on a first-match-wins
+    /// implementation.** `docs/*` (rank 2, anchored subtree) outranks
+    /// `*.lock` (rank 1, floating suffix) at `docs/a.lock`, where both match
+    /// and neither contains the other.
+    ///
+    /// Also the row that fails on the `pattern.len()` scorer this replaced:
+    /// `*.lock` is 6 bytes and `docs/*` is 6, so length alone ties and the
+    /// store's enumeration decided.
+    #[test]
+    fn merge_spec_order_1_anchored_prefix_outranks_floating_suffix() {
+        for (label, order) in [
+            ("docs first", ["docs-rule", "lock-rule"]),
+            ("lock first", ["lock-rule", "docs-rule"]),
+        ] {
+            let (store, li) = stores();
+            for name in order {
+                match name {
+                    "docs-rule" => put_path_config(&store, &li, name, "docs/*", "target-wins"),
+                    _ => put_path_config(&store, &li, name, "*.lock", "source-wins"),
+                }
+            }
+            assert_eq!(
+                strategy_for(&li, &store, "docs/a.lock"),
+                MergeStrategy::TargetWins,
+                "insertion order: {label}"
+            );
+        }
+    }
+
+    /// `MERGE-SPEC-ORDER-2` — exact (rank 3) outranks match-all (rank 0)
+    /// **regardless of enumeration order**. The pattern strings are
+    /// deliberately one character each: any scorer that ranks by total
+    /// pattern length rather than by form ties here, and a tie is resolved by
+    /// store enumeration order.
+    #[test]
+    fn merge_spec_order_2_exact_outranks_match_all() {
+        for (label, order) in [
+            ("star first", ["z-star", "a-exact"]),
+            ("exact first", ["a-exact", "z-star"]),
+        ] {
+            let (store, li) = stores();
+            for name in order {
+                match name {
+                    "z-star" => put_path_config(&store, &li, name, "*", "source-wins"),
+                    _ => put_path_config(&store, &li, name, "a", "target-wins"),
+                }
+            }
+            assert_eq!(
+                strategy_for(&li, &store, "a"),
+                MergeStrategy::TargetWins,
+                "insertion order: {label}"
+            );
+        }
+    }
+
+    /// A `LocationIndex` that hands `list` back **reversed**.
+    ///
+    /// `MemoryLocationIndex` is `BTreeMap`-backed, so its `list` is sorted by
+    /// path — and within one config prefix, path order *is* `{name}` order,
+    /// which happens to coincide with key 4. Against that store a
+    /// keep-whichever-came-first implementation passes `MERGE-SPEC-TIE-1` by
+    /// luck, in **both** insertion orders: re-inserting in the other order
+    /// does not change what the store enumerates. §4.4.18's point is that
+    /// `list_entities` ordering is *unspecified*, so the vector has to vary
+    /// enumeration, not insertion. This double is that variation, and it is
+    /// what makes the row fail against rank-only comparison.
+    struct ReverseListIndex(MemoryLocationIndex);
+
+    impl LocationIndex for ReverseListIndex {
+        fn set(&self, path: &str, hash: Hash) {
+            self.0.set(path, hash)
+        }
+        fn get(&self, path: &str) -> Option<Hash> {
+            self.0.get(path)
+        }
+        fn has(&self, path: &str) -> bool {
+            self.0.has(path)
+        }
+        fn remove(&self, path: &str) -> Option<Hash> {
+            self.0.remove(path)
+        }
+        fn len_prefix(&self, prefix: &str) -> usize {
+            self.0.len_prefix(prefix)
+        }
+        fn list(&self, prefix: &str) -> Vec<entity_store::LocationEntry> {
+            let mut entries = self.0.list(prefix);
+            entries.reverse();
+            entries
+        }
+    }
+
+    /// `MERGE-SPEC-TIE-1` — **the row that catches a peer that kept
+    /// rank-only comparison.** Two configs, the *same* `pattern`, different
+    /// `{name}`; lexicographic `{name}` breaks the tie, so the result does
+    /// not depend on enumeration order.
+    ///
+    /// Run against both a forward- and a reverse-enumerating store, because
+    /// the sorted store alone cannot discriminate (see [`ReverseListIndex`]).
+    #[test]
+    fn merge_spec_tie_1_same_pattern_resolves_by_config_name() {
+        for (label, reverse) in [("sorted store", false), ("reversed store", true)] {
+            let store = MemoryContentStore::new();
+            let li: Box<dyn LocationIndex> = if reverse {
+                Box::new(ReverseListIndex(MemoryLocationIndex::new()))
+            } else {
+                Box::new(MemoryLocationIndex::new())
+            };
+            put_path_config(&store, li.as_ref(), "z-cfg", "docs/*", "source-wins");
+            put_path_config(&store, li.as_ref(), "a-cfg", "docs/*", "target-wins");
+            assert_eq!(
+                strategy_for(li.as_ref(), &store, "docs/readme"),
+                MergeStrategy::TargetWins,
+                "enumeration: {label}"
+            );
+        }
+    }
+
+    /// §4.4.18's **key 3 — lexicographic byte order on `pattern`— is
+    /// unreachable, and we say so at the code rather than leave an
+    /// unexercised branch reading as covered.**
+    ///
+    /// Key 3 only runs when two *distinct* patterns tie on rank and literal
+    /// length **and both match the same subject**. Under §2.4's four forms no
+    /// such pair exists: rank 3 is exact (two exacts matching one subject are
+    /// the same string), rank 2 patterns of equal literal length are distinct
+    /// prefixes and therefore disjoint, rank 1 likewise for suffixes, and
+    /// rank 0 has exactly one member (`*`). So the only reachable tie is the
+    /// same-pattern one, which key 4 (`{name}`) decides — which is exactly
+    /// the case `MERGE-SPEC-TIE-1` describes.
+    ///
+    /// Proven by enumeration over the forms rather than asserted: for each
+    /// rank, a same-length distinct pair, shown to have no common subject.
+    #[test]
+    fn merge_spec_key_3_pattern_order_is_unreachable_by_construction() {
+        // Rank 2 — equal literal length, distinct prefixes.
+        for subject in ["docs/x", "abcd/x", "docs/abcd/x", "x"] {
+            assert!(
+                !(path_pattern_matches("docs/*", subject)
+                    && path_pattern_matches("abcd/*", subject)),
+                "no subject may match both rank-2 patterns: {subject}"
+            );
+        }
+        // Rank 1 — equal literal length, distinct suffixes.
+        for subject in ["a.lock", "a.mock", "a.lock.mock", "x"] {
+            assert!(
+                !(path_pattern_matches("*.lock", subject)
+                    && path_pattern_matches("*.mock", subject)),
+                "no subject may match both rank-1 patterns: {subject}"
+            );
+        }
+        // Rank 3 — two exacts matching one subject are the same pattern, so
+        // the tie is key 4's, not key 3's.
+        assert!(path_pattern_matches("docs/a", "docs/a"));
+        assert!(!path_pattern_matches("docs/b", "docs/a"));
+        // Rank 0 has one member.
+        assert_eq!(pattern_specificity("*"), (0, 0));
+    }
+
+    /// The sibling site: `deletion_resolution` selection reads the same
+    /// namespace with the same order, and §4.4.18's pseudocode names only the
+    /// strategy half. A fix at one site and not the other leaves half the
+    /// merge outcome resolved by store enumeration.
+    ///
+    /// Uses `MERGE-SPEC-ORDER-2`'s one-character pair for the same reason
+    /// that row does — `*` and `a` tie under any length-based scorer — and
+    /// runs it against a reverse-enumerating store so a keep-whichever-came-
+    /// first implementation cannot pass on the sorted store's luck.
+    #[test]
+    fn merge_spec_order_binds_deletion_resolution_too() {
+        let put_dr = |store: &dyn ContentStore,
+                      li: &dyn LocationIndex,
+                      name: &str,
+                      pattern: &str,
+                      dr: &str| {
+            let data = entity_ecf::to_ecf(&entity_ecf::cbor_map! {
+                "pattern" => entity_ecf::text(pattern),
+                "deletion_resolution" => entity_ecf::text(dr)
+            });
+            let hash = store
+                .put(Entity::new("system/revision/merge-config", data).unwrap())
+                .unwrap();
+            li.set(
+                &format!("/test-peer/system/revision/config/merge/path/{}", name),
+                hash,
+            );
+        };
+
+        for (label, reverse) in [("sorted store", false), ("reversed store", true)] {
+            let store = MemoryContentStore::new();
+            let li: Box<dyn LocationIndex> = if reverse {
+                Box::new(ReverseListIndex(MemoryLocationIndex::new()))
+            } else {
+                Box::new(MemoryLocationIndex::new())
+            };
+            // `*` is rank 0 and `a` is rank 3; both match the path `a`, and
+            // both are one byte, so only the rank separates them.
+            put_dr(&store, li.as_ref(), "z-star", "*", "deletion-wins");
+            put_dr(&store, li.as_ref(), "a-exact", "a", "preserve-on-conflict");
+            assert_eq!(
+                find_deletion_resolution("a", li.as_ref(), &store, "test-peer"),
+                DeletionResolution::PreserveOnConflict,
+                "enumeration: {label}"
+            );
+        }
+    }
+
+    /// The rank table itself, since every vector above depends on it and
+    /// each row is one comparison.
+    #[test]
+    fn merge_pattern_specificity_rank_table() {
+        assert_eq!(pattern_specificity("*"), (0, 0));
+        assert_eq!(pattern_specificity("*.lock"), (1, 5));
+        assert_eq!(pattern_specificity("docs/*"), (2, 5));
+        assert_eq!(pattern_specificity("docs/readme"), (3, 11));
+        // Rank is primary: a one-byte exact outranks a long prefix.
+        assert!(pattern_specificity("a") > pattern_specificity("very/long/prefix/*"));
+        // Within a rank, the longer literal wins.
+        assert!(pattern_specificity("docs/deep/*") > pattern_specificity("docs/*"));
+        assert!(pattern_specificity("*.lockfile") > pattern_specificity("*.lock"));
     }
 }

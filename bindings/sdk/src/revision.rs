@@ -53,9 +53,9 @@ pub struct RevisionStatus {
 }
 
 /// Decoded result of `system/revision:log`. Per `EXTENSION-REVISION`
-/// §4.3 walk-history form. The handler walks backwards from HEAD up
-/// to `limit` entries (default 50) and stops at the optional `since`
-/// version anchor.
+/// §4.4.2 walk-history form. The handler walks toward older versions
+/// from the optional `start_at` anchor (HEAD when absent), up to
+/// `limit` entries (default 50).
 #[derive(Debug, Clone)]
 pub struct RevisionLog {
     /// Prefix as echoed by the handler.
@@ -64,9 +64,10 @@ pub struct RevisionLog {
     /// `versions[0]`, the oldest within the window is the last entry.
     /// Empty when the prefix has never been committed.
     pub versions: Vec<Hash>,
-    /// `true` when the walk hit the limit before reaching `since` or
-    /// the parentless root. Callers paginate by passing the last
-    /// returned hash as `since` on the next call.
+    /// `true` when the walk hit the limit before reaching the
+    /// parentless root. Callers paginate by passing the version AFTER
+    /// the last returned one as the next call's `start_at` — the
+    /// anchor is INCLUSIVE, so re-passing the last hash repeats it.
     pub has_more: bool,
 }
 
@@ -405,13 +406,14 @@ impl<'a> RevisionOps<'a> {
         }
     }
 
-    /// Walk the version history under `prefix` from HEAD backwards.
-    /// Per `EXTENSION-REVISION §4.3` walk-history form.
+    /// Walk the version history under `prefix` toward older versions.
+    /// Per `EXTENSION-REVISION §4.4.2` walk-history form.
     ///
     /// `limit` caps the number of versions returned (default 50 on the
-    /// handler when `None`). `since` is an optional anchor — the walk
-    /// stops when it reaches that version. Use the last returned hash
-    /// as the next call's `since` for backwards pagination.
+    /// handler when `None`). `start_at` is an optional INCLUSIVE anchor
+    /// — the walk begins AT that version rather than at HEAD, and the
+    /// anchor is the first result. `since` is not accepted here (the
+    /// handler answers 400); it is `fetch`'s exclusive watermark.
     ///
     /// Returns an empty `versions` array when the prefix has never
     /// been committed; `has_more` is `false` in that case.
@@ -420,9 +422,9 @@ impl<'a> RevisionOps<'a> {
         &self,
         prefix: impl Into<String>,
         limit: Option<usize>,
-        since: Option<Hash>,
+        start_at: Option<Hash>,
     ) -> impl std::future::Future<Output = Result<RevisionLog, SdkError>> + Send + 'static {
-        let params = build_log_params(prefix.into(), limit, since);
+        let params = build_log_params(prefix.into(), limit, start_at);
         let fut = self
             .ctx
             .execute("system/revision", "log", params, ExecuteOptions::default());
@@ -441,9 +443,9 @@ impl<'a> RevisionOps<'a> {
         &self,
         prefix: impl Into<String>,
         limit: Option<usize>,
-        since: Option<Hash>,
+        start_at: Option<Hash>,
     ) -> impl std::future::Future<Output = Result<RevisionLog, SdkError>> + 'static {
-        let params = build_log_params(prefix.into(), limit, since);
+        let params = build_log_params(prefix.into(), limit, start_at);
         let fut = self
             .ctx
             .execute("system/revision", "log", params, ExecuteOptions::default());
@@ -733,7 +735,7 @@ impl<'a> RevisionOps<'a> {
         depth: Option<usize>,
         since: Option<Hash>,
     ) -> impl std::future::Future<Output = Result<RevisionFetch, SdkError>> + Send + 'static {
-        let params = build_log_params(prefix.into(), depth, since);
+        let params = build_fetch_params(prefix.into(), depth, since);
         let fut = self.ctx.execute(
             "system/revision",
             "fetch",
@@ -757,7 +759,7 @@ impl<'a> RevisionOps<'a> {
         depth: Option<usize>,
         since: Option<Hash>,
     ) -> impl std::future::Future<Output = Result<RevisionFetch, SdkError>> + 'static {
-        let params = build_log_params(prefix.into(), depth, since);
+        let params = build_fetch_params(prefix.into(), depth, since);
         let fut = self.ctx.execute(
             "system/revision",
             "fetch",
@@ -1157,13 +1159,38 @@ fn decode_hash_field(v: &ciborium::Value) -> Option<Hash> {
     }
 }
 
-/// Build the log-params body. Per `EXTENSION-REVISION §4.3`: `prefix`
-/// is required; `limit` and `since` are optional. ECF-sorted order:
-/// `limit`, `prefix`, `since`.
-fn build_log_params(prefix: String, limit: Option<usize>, since: Option<Hash>) -> Entity {
+/// Build the log-params body. Per `EXTENSION-REVISION §4.4.2`: `prefix` is
+/// required; `limit` and `start_at` are optional.
+///
+/// `start_at`, not `since` — `log` takes an INCLUSIVE anchor and walks toward
+/// older versions, while `fetch` takes an exclusive `since` watermark and walks
+/// toward newer. One name for both made their result sets disjoint for the same
+/// argument, so the collision was removed at the wire and the two builders are
+/// separate here for the same reason.
+fn build_log_params(prefix: String, limit: Option<usize>, start_at: Option<Hash>) -> Entity {
     let mut fields: Vec<(ciborium::Value, ciborium::Value)> = Vec::new();
     if let Some(n) = limit {
         fields.push((entity_ecf::text("limit"), entity_ecf::integer(n as i64)));
+    }
+    fields.push((entity_ecf::text("prefix"), entity_ecf::text(&prefix)));
+    if let Some(h) = start_at {
+        fields.push((
+            entity_ecf::text("start_at"),
+            ciborium::Value::Bytes(h.to_bytes().to_vec()),
+        ));
+    }
+    let data = entity_ecf::to_ecf(&ciborium::Value::Map(fields));
+    Entity::new("system/revision/log-params", data)
+        .expect("log-params entity construction is infallible")
+}
+
+/// Build the fetch-params body (`EXTENSION-REVISION §4.4.6`): `prefix`
+/// required, `depth` and `since` optional. `since` is the exclusive watermark
+/// — "I have up to this version, send what I lack".
+fn build_fetch_params(prefix: String, depth: Option<usize>, since: Option<Hash>) -> Entity {
+    let mut fields: Vec<(ciborium::Value, ciborium::Value)> = Vec::new();
+    if let Some(n) = depth {
+        fields.push((entity_ecf::text("depth"), entity_ecf::integer(n as i64)));
     }
     fields.push((entity_ecf::text("prefix"), entity_ecf::text(&prefix)));
     if let Some(h) = since {
@@ -1173,8 +1200,8 @@ fn build_log_params(prefix: String, limit: Option<usize>, since: Option<Hash>) -
         ));
     }
     let data = entity_ecf::to_ecf(&ciborium::Value::Map(fields));
-    Entity::new("system/revision/log-params", data)
-        .expect("log-params entity construction is infallible")
+    Entity::new("system/revision/fetch-params", data)
+        .expect("fetch-params entity construction is infallible")
 }
 
 fn decode_log_result(entity: &Entity) -> Result<RevisionLog, SdkError> {

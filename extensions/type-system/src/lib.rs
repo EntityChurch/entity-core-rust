@@ -15,8 +15,8 @@
 pub mod compare;
 pub mod constraint;
 pub mod format;
-pub mod glob;
 pub mod narrowing;
+pub mod type_pattern;
 pub mod validate;
 
 pub use constraint::StandardConstraintHandler;

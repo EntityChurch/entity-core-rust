@@ -11,7 +11,8 @@ use entity_store::{ContentStore, LocationIndex, MemoryContentStore, MemoryLocati
 use crate::data::*;
 use crate::local_name::LocalNameHandler;
 use crate::log::ResolutionLog;
-use crate::resolver::{glob_match, RegistryHandler};
+use crate::registration::name_constraints_match;
+use crate::resolver::{dispatch_match, RegistryHandler};
 
 const PEER: &str = "z6MkTestPeerIdForRegistry";
 
@@ -626,22 +627,193 @@ fn resolution_log_ring_eviction() {
 }
 
 // ---------------------------------------------------------------------------
-// Glob matcher
+// §4 `name_format_dispatch.pattern` — the closed grammar
 // ---------------------------------------------------------------------------
 
+/// `REG-DISPATCH-GRAMMAR-1` (REQUIRED, cross-impl-observable) — the four
+/// rows arch pinned at `REGISTRY 1.13`, each with the control that makes it
+/// discriminating.
+///
+/// Rows 1 and 2 are what fail against a POSIX / shell-glob matcher, which is
+/// what this peer shipped: `?` had a one-character meaning and `[…]` a
+/// character-class meaning the grammar does not grant. Row 4 is what fails
+/// against a **path**-glob, where `*` stops at `/`. **A matcher that merely
+/// omits those features and one that treats them as literals are
+/// indistinguishable until a name or a pattern carries one.**
 #[test]
-fn glob_matcher() {
-    assert!(glob_match("*", "anything"));
-    assert!(glob_match("*.eth", "vitalik.eth"));
-    assert!(!glob_match("*.eth", "vitalik.com"));
-    assert!(glob_match("did:web:*", "did:web:example.com"));
-    assert!(glob_match("*@*.*", "alice@example.com"));
-    assert!(!glob_match("*@*.*", "noatsign"));
-    assert!(glob_match("a?c", "abc"));
-    assert!(!glob_match("a?c", "ac"));
-    assert!(glob_match("[a-c]x", "bx"));
-    assert!(!glob_match("[a-c]x", "dx"));
-    assert!(glob_match("[!a-c]x", "dx"));
+fn reg_dispatch_grammar_1() {
+    // Row 1 — `?` is a literal question mark, not "any one character".
+    assert!(dispatch_match("a?c", "a?c"));
+    assert!(!dispatch_match("a?c", "abc"));
+
+    // Row 2 — `[…]` is four literal bytes, not a character class.
+    assert!(dispatch_match("a[bc]d", "a[bc]d"));
+    assert!(!dispatch_match("a[bc]d", "abd"));
+
+    // Row 3 — any NUMBER of `*` is permitted; `*@*.*` is three, and it is in
+    // §4.1a's own table.
+    assert!(dispatch_match("*@*.*", "alice@example.com"));
+
+    // Row 4 — `*` crosses `/`. A name is a flat string with no segment
+    // structure; this is the row that fails against every path-glob.
+    assert!(dispatch_match("x*z", "x/y/z"));
+}
+
+/// The rest of the grammar, since each clause of §4's pseudocode is one
+/// assertion and none of them is exercised by the four rows above.
+#[test]
+fn dispatch_grammar_closed_clauses() {
+    // `*` matches any run INCLUDING NONE.
+    assert!(dispatch_match("a*c", "ac"));
+    assert!(dispatch_match("*", ""));
+
+    // Anchored at BOTH ends — there is no substring form.
+    assert!(!dispatch_match("bc", "abcd"));
+    assert!(dispatch_match("*bc*", "abcd"));
+
+    // Every other byte is a literal, including the ones a shell would eat.
+    for (pattern, name) in [
+        ("a\\c", "a\\c"),
+        ("a.c", "a.c"),
+        ("did:web:*", "did:web:example.com"),
+        ("*.eth", "vitalik.eth"),
+    ] {
+        assert!(dispatch_match(pattern, name), "{pattern:?} vs {name:?}");
+    }
+    assert!(!dispatch_match("a.c", "abc"), "`.` is a literal dot");
+    assert!(!dispatch_match("*.eth", "vitalik.com"));
+    assert!(!dispatch_match("*@*.*", "noatsign"));
+
+    // No pattern is invalid — every string is well-formed because every
+    // non-`*` byte is a literal. An unterminated `[` is a literal `[`, not a
+    // parse failure and not a rejection.
+    assert!(dispatch_match("a[b", "a[b"));
+    assert!(!dispatch_match("a[b", "ab"));
+}
+
+/// The **other half** of §4.1 step 2's per-backend rule, and the row on
+/// which `entity-core-go`'s `registry.v15_dispatch_grammar` measures us as
+/// FAIL: *"Backends without a `name_format_dispatch` entry default to 'match
+/// all' (no filtering)."*
+///
+/// A `local-name` backend named by no rule stays consulted even while a rule
+/// matching the queried name narrows to `did-web`. core-go restricts the
+/// chain to the union of the matching rules' kinds and so excludes it. Both
+/// readings are in §4.1 step 2 — ours in its second sentence, theirs in its
+/// first — and the divergence is routed, not accidental (see
+/// `docs/SPEC-AMBIGUITIES.md`). Pinned here so it is explicit: if arch rules
+/// for the union reading, **this is the test that must flip**, and the
+/// companion `meta_resolver_dispatch_filter_excludes_local_name` is the one
+/// that must NOT.
+#[tokio::test]
+async fn a_backend_kind_named_by_no_dispatch_rule_is_never_narrowed_out() {
+    let (cs, li) = stores();
+    let pet = LocalNameHandler::new(cs.clone(), li.clone(), PEER.into());
+    pet.handle(&ctx(
+        "bind",
+        vec![
+            (text("name"), text("a?c")),
+            (text("target_peer_id"), text("z6MkAlice")),
+        ],
+    ))
+    .await
+    .unwrap();
+
+    // A rule that MATCHES the queried name and names a kind the chain does
+    // not carry. `local-name` appears in no rule at all.
+    let cfg = ResolverConfigData {
+        resolver_chain: vec![ResolverChainEntry {
+            backend_kind: "local-name".into(),
+            backend_id: PEER.into(),
+            priority: 0,
+            accepted_trust_anchors: vec![],
+            hints: None,
+        }],
+        name_format_dispatch: vec![DispatchRule {
+            pattern: "a?c".into(),
+            backend_kinds: vec!["did-web".into()],
+        }],
+        ..Default::default()
+    };
+    install_config(&cs, &li, &cfg);
+    let reg = registry(&cs, &li);
+    let r = reg
+        .handle(&ctx("resolve", vec![(text("name"), text("a?c"))]))
+        .await
+        .unwrap();
+    assert_eq!(
+        result_field(&decode_result(&r), "status")
+            .unwrap()
+            .as_text(),
+        Some("resolved"),
+        "a kind named by no dispatch rule defaults to match-all (§4.1 step 2)"
+    );
+}
+
+/// §4.1a rows 2 and 6 are a **no-op for this peer, proven by construction**
+/// — arch's `-o` §4 files them as *"owed if you ship the list"*, and we do
+/// not ship it.
+///
+/// The bounded region that makes the enumeration exhaustive is *every
+/// construction of a `ResolverConfigData` and every write to
+/// `resolver_config_path` in non-test code*, not a grep for `did:web:`.
+/// There are exactly two: `RegistryHandler::default_local_name_only` (below)
+/// and `cmd/entity-peer`'s `--peer-issued-registry` install, which builds its
+/// chain explicitly and takes `name_format_dispatch` from
+/// `..Default::default()`. `DispatchRule` itself is constructed only by the
+/// decoder — i.e. only from a config an operator supplied.
+///
+/// This is the gate, not the proof: if a seed policy ever *does* ship the
+/// §4.1a list, this test fails and rows 2 (`did:key:*` → `self-certifying`)
+/// and 6 (catch-all admits `out-of-band`, not `pinned`) become owed at their
+/// v1.13 values.
+#[test]
+fn we_ship_no_default_dispatch_list_so_rows_2_and_6_are_inert() {
+    let cfg = ResolverConfigData::default();
+    assert!(
+        cfg.name_format_dispatch.is_empty(),
+        "shipping a §4.1a default list makes rows 2 and 6 owed — see arch ROUTING-2026-08-18-q §3"
+    );
+
+    // A name matching no entry is treated as matching the catch-all (§4.1a),
+    // and with no entries at all every backend is unrestricted — which is the
+    // behaviour `meta_resolver_dispatch_filter_excludes_local_name` pins from
+    // the other side.
+    assert!(cfg.resolver_chain.is_empty());
+}
+
+/// §6a.9.1 `name_constraints` is a **separate, unruled** matcher and keeps
+/// its POSIX reading until arch answers core-go's spec-issue `2026-08-18-e`.
+///
+/// Pinned so the divergence is explicit rather than accidental: these rows
+/// are the exact inverse of `REG-DISPATCH-GRAMMAR-1`'s first two, and they
+/// are what will flip if the ruling says "same closed grammar as §4".
+#[test]
+fn name_constraints_keeps_the_unruled_posix_reading() {
+    // The documented example works under either reading — which is why the
+    // field's grammar was never forced.
+    assert!(name_constraints_match("*.lab", "widget.lab"));
+    assert!(!name_constraints_match("*.lab", "widget.com"));
+
+    // …and these are where the two readings part company.
+    assert!(
+        name_constraints_match("a?c", "abc"),
+        "POSIX: `?` is any one char"
+    );
+    assert!(
+        name_constraints_match("[a-c]x", "bx"),
+        "POSIX: `[…]` is a class"
+    );
+    assert!(!name_constraints_match("[a-c]x", "dx"));
+    assert!(name_constraints_match("[!a-c]x", "dx"));
+
+    // The two matchers MUST NOT be the same function. If a future edit
+    // collapses them, this is the assertion that says so out loud.
+    assert_ne!(
+        name_constraints_match("a?c", "abc"),
+        dispatch_match("a?c", "abc"),
+        "the §4 grammar is ruled and §6a.9.1's is not — they are separate matchers"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2410,6 +2582,8 @@ async fn set_issuer_policy_round_trips_through_get() {
         mode: MODE_ALLOWLIST.into(),
         allowlist: Some(vec!["peer-a".into()]),
         default_ttl: Some(3_600_000),
+        // §6a.9.1 v1.11 — REQUIRED on any policy that can reach *approve*.
+        max_ttl: Some(86_400_000),
         ..Default::default()
     };
 
@@ -2427,6 +2601,7 @@ async fn set_issuer_policy_round_trips_through_get() {
         to_ecf(&Value::Map(vec![
             (text("allowlist"), Value::Array(vec![text("peer-a")])),
             (text("default_ttl"), entity_ecf::integer(3_600_000)),
+            (text("max_ttl"), entity_ecf::integer(86_400_000)),
             (text("mode"), text(MODE_ALLOWLIST)),
             (text("zz_unknown_field"), text("must survive")),
         ])),
@@ -2478,15 +2653,22 @@ async fn set_issuer_policy_replaces_whole() {
         allowlist: Some(vec!["peer-a".into()]),
         name_constraints: Some("*.lab".into()),
         default_ttl: Some(3_600_000),
+        max_ttl: Some(86_400_000),
     };
     handler
         .handle(&policy_ctx("set-issuer-policy", full.to_entity().unwrap()))
         .await
         .unwrap();
 
-    // ...then write a bare `open` carrying neither.
+    // ...then write a bare `open` dropping the other optionals. `default_ttl`
+    // is no longer optional for a live policy (CAP registry D11), so it rides
+    // along with a DIFFERENT value — the replace property is now shown by that
+    // value changing rather than by clearing, since a merge would keep the
+    // first one.
     let bare = IssuerPolicyData {
         mode: MODE_OPEN.into(),
+        default_ttl: Some(7_200_000),
+        max_ttl: Some(86_400_000),
         ..Default::default()
     };
     let set = handler
@@ -2510,8 +2692,134 @@ async fn set_issuer_policy_replaces_whole() {
         "name_constraints survived a whole-replace — that is merge semantics"
     );
     assert_eq!(
-        stored.default_ttl, None,
-        "default_ttl survived a whole-replace — that is merge semantics"
+        stored.default_ttl,
+        Some(7_200_000),
+        "default_ttl not replaced whole — a merge would have kept 3_600_000"
+    );
+}
+
+/// D11 (CAP registry, arch 2026-08-18) — a live-registration policy with a null
+/// `default_ttl` MUST be refused `400` and MUST NOT be stored.
+///
+/// Such a policy can only mint null-ttl bindings, which D3 now makes
+/// unresolvable — so it is a registry armed to produce nothing a conformant
+/// resolver will accept. The refusal belongs HERE and not at register-time: a
+/// 400 at register bills the requester for an operator misconfiguration, and
+/// the operator's field lives on this entity. Same move §6a.9.2 already makes
+/// for `domain-control`.
+///
+/// The second assertion is the load-bearing one — a 400 that stored the policy
+/// anyway passes a status-only check.
+#[tokio::test]
+async fn set_issuer_policy_null_default_ttl_rejected_and_not_stored() {
+    for mode in [MODE_OPEN, MODE_ALLOWLIST, MODE_MANUAL] {
+        let (cs, li) = stores();
+        let registry = IdentityKeypair::Ed25519(Keypair::generate());
+        let handler = reg_handler(&cs, &li, &registry);
+
+        let policy = IssuerPolicyData {
+            mode: mode.into(),
+            allowlist: Some(vec!["peer-a".into()]),
+            default_ttl: None,
+            ..Default::default()
+        };
+        let set = handler
+            .handle(&policy_ctx(
+                "set-issuer-policy",
+                policy.to_entity().unwrap(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            set.status, 400,
+            "mode {mode:?}: a null default_ttl can only mint bindings D3 refuses"
+        );
+
+        // Nothing stored — `get` must still report unset.
+        let got = handler
+            .handle(&no_params_ctx("get-issuer-policy"))
+            .await
+            .unwrap();
+        assert_eq!(
+            got.status, 404,
+            "mode {mode:?}: the rejected policy was stored anyway"
+        );
+    }
+}
+
+/// D12 — the backstop: a null-`default_ttl` policy seeded OUT OF BAND (CLI flag,
+/// direct tree write, or predating D11) must not mint, and must not queue.
+///
+/// D11 guards the door; §6a.9.2's store-first rule means the door is not the
+/// only way in. Refusing rather than substituting an implementation-chosen
+/// default is the point — a synthesized default is the §6a.9.2
+/// default-synthesis mistake on a security-relevant field, and would let two
+/// registries answer identically-stored policies with different binding
+/// lifetimes.
+#[tokio::test]
+async fn out_of_band_null_default_ttl_policy_refuses_at_register() {
+    let (cs, li) = stores();
+    let registry = IdentityKeypair::Ed25519(Keypair::generate());
+    let handler = reg_handler(&cs, &li, &registry);
+
+    // Seed directly, bypassing D11 — this is the state D12 exists for.
+    let policy = IssuerPolicyData {
+        mode: MODE_OPEN.into(),
+        default_ttl: None,
+        ..Default::default()
+    };
+    let entity = policy.to_entity().unwrap();
+    let hash = entity.content_hash;
+    cs.put(entity).unwrap();
+    li.set(
+        &crate::issuer_policy_path(registry.peer_id().as_str()),
+        hash,
+    );
+
+    // The request must OMIT requested_ttl — that is the only way the resolved
+    // ttl reaches null. A request supplying its own ttl is unaffected by D12
+    // and is asserted below as the control.
+    let owner = Keypair::generate();
+    let no_ttl = RegisterRequestData {
+        name: "billslab.com".into(),
+        target_peer_id: owner.peer_id().as_str().into(),
+        transports: vec![Value::Text("tcp://billslab.com:9000".into())],
+        requested_ttl: None,
+        nonce: b"n1".to_vec(),
+        issued_at: crate::log::now_ms(),
+    }
+    .to_entity()
+    .unwrap();
+    let out = handler.handle(&register_ctx(no_ttl, &owner)).await.unwrap();
+    assert_eq!(
+        out.status, 403,
+        "a request resolving to a null ttl must be refused, not minted"
+    );
+
+    // And nothing was bound or queued.
+    assert!(
+        li.get(&by_name_pointer_path(
+            registry.peer_id().as_str(),
+            "billslab.com"
+        ))
+        .is_none(),
+        "a null-ttl binding was minted anyway"
+    );
+
+    // Control: the same seeded policy still issues for a request that supplies
+    // its own ttl. D12 refuses the null resolution, not the policy's existence —
+    // a guard that rejected every register would pass the assertions above
+    // while proving nothing.
+    let out2 = handler
+        .handle(&register_ctx(
+            mk_request("other.example", owner.peer_id().as_str(), b"n2"),
+            &owner,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        out2.status, 200,
+        "a request carrying requested_ttl must still issue under the same policy"
     );
 }
 
@@ -2652,6 +2960,10 @@ async fn set_issuer_policy_arms_a_registry_that_then_issues() {
             "set-issuer-policy",
             IssuerPolicyData {
                 mode: MODE_OPEN.into(),
+                // D11: a live-registration policy MUST define default_ttl.
+                default_ttl: Some(3_600_000),
+                // v1.11: …and max_ttl, bounding the requester's own number.
+                max_ttl: Some(86_400_000),
                 ..Default::default()
             }
             .to_entity()
@@ -2731,5 +3043,572 @@ async fn set_issuer_policy_rejects_a_foreign_entity_type() {
     assert_eq!(
         got.status, 404,
         "a refused set must not have armed anything"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// §6a.9.1 the TTL ceiling and the renew cascade `[MUST, v1.9/v1.10/v1.11]`
+// ---------------------------------------------------------------------------
+
+/// Read the `ttl` off an issued binding body.
+fn binding_ttl(cs: &Arc<dyn ContentStore>, h: Hash) -> Option<u64> {
+    BindingData::from_entity(&cs.get(&h).expect("binding stored"))
+        .unwrap()
+        .ttl
+}
+
+/// `REG-TTL-CEILING-1` — `set-issuer-policy` refuses a live policy with no
+/// `max_ttl`, and one whose `default_ttl` exceeds it. **With the control**,
+/// because a rejection row without its acceptance control passes trivially
+/// against a peer that rejects everything.
+#[tokio::test]
+async fn reg_ttl_ceiling_1() {
+    let (cs, li) = stores();
+    let registry = IdentityKeypair::Ed25519(Keypair::generate());
+    let handler = reg_handler(&cs, &li, &registry);
+
+    // Absent max_ttl on a live mode → 400.
+    let no_ceiling = IssuerPolicyData {
+        mode: MODE_OPEN.into(),
+        default_ttl: Some(3_600_000),
+        ..Default::default()
+    };
+    let r = handler
+        .handle(&policy_ctx(
+            "set-issuer-policy",
+            no_ceiling.to_entity().unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status, 400,
+        "a live policy with no max_ttl MUST be refused"
+    );
+    assert!(
+        li.get(&issuer_policy_path(registry.peer_id().as_str()))
+            .is_none(),
+        "a refused policy MUST NOT be stored"
+    );
+
+    // default_ttl > max_ttl → 400. The policy is self-contradictory: the
+    // registry's own fallback would be clamped by its own ceiling.
+    let inverted = IssuerPolicyData {
+        mode: MODE_OPEN.into(),
+        default_ttl: Some(90_000_000),
+        max_ttl: Some(86_400_000),
+        ..Default::default()
+    };
+    let r = handler
+        .handle(&policy_ctx(
+            "set-issuer-policy",
+            inverted.to_entity().unwrap(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(r.status, 400, "default_ttl above max_ttl MUST be refused");
+
+    // Control — both present, default_ttl <= max_ttl, accepted.
+    let ok = IssuerPolicyData {
+        mode: MODE_OPEN.into(),
+        default_ttl: Some(3_600_000),
+        max_ttl: Some(86_400_000),
+        ..Default::default()
+    };
+    let r = handler
+        .handle(&policy_ctx("set-issuer-policy", ok.to_entity().unwrap()))
+        .await
+        .unwrap();
+    assert_eq!(
+        r.status, 200,
+        "a policy with both, correctly ordered, is accepted"
+    );
+}
+
+/// `REG-TTL-CLAMP-1` — `register-request` and `renew-request` each carrying a
+/// `ttl` above `max_ttl` are both **accepted `200`**, and both issued bindings
+/// carry **exactly `max_ttl`**.
+///
+/// The clamp is asserted on the *binding's* value, not on the response code,
+/// **because a peer that refuses instead of clamping also returns a non-`200`
+/// and would otherwise be indistinguishable.** Refusing is the wrong side by
+/// §6a.9.2's own reasoning: it bills a well-formed request for a policy the
+/// requester cannot read, and teaches requesters to probe for the ceiling.
+#[tokio::test]
+async fn reg_ttl_clamp_1() {
+    const CEILING: u64 = 86_400_000; // 1 day
+    let (cs, li) = stores();
+    let registry = IdentityKeypair::Ed25519(Keypair::generate());
+    install_policy(
+        &cs,
+        &li,
+        registry.peer_id().as_str(),
+        &IssuerPolicyData {
+            mode: MODE_OPEN.into(),
+            default_ttl: Some(3_600_000),
+            max_ttl: Some(CEILING),
+            ..Default::default()
+        },
+    );
+    let handler = reg_handler(&cs, &li, &registry);
+    let owner = Keypair::generate();
+
+    // register — requested_ttl is a year, well above the ceiling.
+    let mut req = RegisterRequestData {
+        name: "billslab.com".into(),
+        target_peer_id: owner.peer_id().as_str().to_string(),
+        transports: vec![Value::Text("tcp://billslab.com:9000".into())],
+        requested_ttl: Some(31_536_000_000),
+        nonce: b"clamp-reg".to_vec(),
+        issued_at: crate::log::now_ms(),
+    };
+    let r = handler
+        .handle(&register_ctx(req.to_entity().unwrap(), &owner))
+        .await
+        .unwrap();
+    assert_eq!(r.status, 200, "above the ceiling is CLAMPED, not refused");
+    let registered = binding_hash_of(&r);
+    assert_eq!(
+        binding_ttl(&cs, registered),
+        Some(CEILING),
+        "the issued binding carries exactly max_ttl"
+    );
+
+    // renew — same shape, on the binding just issued.
+    let renew = signed_op_ctx(
+        "renew-request",
+        TYPE_RENEW_REQUEST,
+        vec![
+            (
+                text("binding_hash"),
+                Value::Bytes(registered.to_bytes().to_vec()),
+            ),
+            (text("ttl"), entity_ecf::integer(31_536_000_000)),
+            (text("nonce"), Value::Bytes(b"clamp-renew".to_vec())),
+            (
+                text("issued_at"),
+                entity_ecf::integer(crate::log::now_ms() as i64),
+            ),
+        ],
+        &owner,
+    );
+    let r = handler.handle(&renew).await.unwrap();
+    assert_eq!(r.status, 200);
+    assert_eq!(
+        binding_ttl(&cs, binding_hash_of(&r)),
+        Some(CEILING),
+        "renew clamps to the same ceiling"
+    );
+
+    // The clamp does not touch a request already under the ceiling.
+    req.name = "under.example".into();
+    req.requested_ttl = Some(1_000);
+    req.nonce = b"clamp-under".to_vec();
+    let r = handler
+        .handle(&register_ctx(req.to_entity().unwrap(), &owner))
+        .await
+        .unwrap();
+    assert_eq!(binding_ttl(&cs, binding_hash_of(&r)), Some(1_000));
+}
+
+/// Arm a curated registry that has issued one binding, and return
+/// `(handler, owner, binding_hash)`.
+async fn curated_with_one_binding(
+    cs: &Arc<dyn ContentStore>,
+    li: &Arc<dyn LocationIndex>,
+    registry: &IdentityKeypair,
+    policy: &IssuerPolicyData,
+    requested_ttl: Option<u64>,
+) -> (RegisterRequestHandler, Keypair, Hash) {
+    install_policy(
+        cs,
+        li,
+        registry.peer_id().as_str(),
+        &IssuerPolicyData {
+            mode: MODE_OPEN.into(),
+            default_ttl: Some(3_600_000),
+            max_ttl: Some(86_400_000),
+            ..Default::default()
+        },
+    );
+    let handler = reg_handler(cs, li, registry);
+    let owner = Keypair::generate();
+    let req = RegisterRequestData {
+        name: "billslab.com".into(),
+        target_peer_id: owner.peer_id().as_str().to_string(),
+        transports: vec![Value::Text("tcp://billslab.com:9000".into())],
+        requested_ttl,
+        nonce: b"seed".to_vec(),
+        issued_at: crate::log::now_ms(),
+    };
+    let r = handler
+        .handle(&register_ctx(req.to_entity().unwrap(), &owner))
+        .await
+        .unwrap();
+    assert_eq!(r.status, 200, "seed binding issued");
+    let h = binding_hash_of(&r);
+    // Now swap in the policy the vector actually wants to test against.
+    install_policy(cs, li, registry.peer_id().as_str(), policy);
+    (handler, owner, h)
+}
+
+fn renew_ctx_with(binding: Hash, ttl: Option<u64>, nonce: &[u8], key: &Keypair) -> HandlerContext {
+    let mut fields = vec![
+        (
+            text("binding_hash"),
+            Value::Bytes(binding.to_bytes().to_vec()),
+        ),
+        (text("nonce"), Value::Bytes(nonce.to_vec())),
+        (
+            text("issued_at"),
+            entity_ecf::integer(crate::log::now_ms() as i64),
+        ),
+    ];
+    if let Some(t) = ttl {
+        fields.push((text("ttl"), entity_ecf::integer(t as i64)));
+    }
+    signed_op_ctx("renew-request", TYPE_RENEW_REQUEST, fields, key)
+}
+
+/// `REG-RENEW-TTL-CASCADE-1` — three rows against a curated registry whose
+/// stored policy has no `default_ttl`.
+///
+/// Row (b) is the one that fails against **both** a null-minting peer and a
+/// refusing peer; row (c) is the one that fails against a peer that
+/// implemented inherit-first. Together they pin that step 2 (the operator's
+/// current intent) outranks step 3 (the registry's own prior signed act) —
+/// *"an operator who lowers `default_ttl` sees renewals pick it up"*.
+#[tokio::test]
+async fn reg_renew_ttl_cascade_1() {
+    const PREDECESSOR_TTL: u64 = 7_200_000;
+
+    // (a) renew WITH an explicit ttl → accepted, successor carries it.
+    {
+        let (cs, li) = stores();
+        let registry = IdentityKeypair::Ed25519(Keypair::generate());
+        let (handler, owner, seed) = curated_with_one_binding(
+            &cs,
+            &li,
+            &registry,
+            &IssuerPolicyData {
+                mode: MODE_OPEN.into(),
+                max_ttl: Some(86_400_000),
+                ..Default::default()
+            },
+            Some(PREDECESSOR_TTL),
+        )
+        .await;
+        let r = handler
+            .handle(&renew_ctx_with(seed, Some(1_800_000), b"a", &owner))
+            .await
+            .unwrap();
+        assert_eq!(r.status, 200);
+        assert_eq!(
+            binding_ttl(&cs, binding_hash_of(&r)),
+            Some(1_800_000),
+            "step 1"
+        );
+    }
+
+    // (b) renew OMITTING ttl against a policy with no default_ttl →
+    //     accepted, successor carries THE SUPERSEDED BINDING's ttl.
+    {
+        let (cs, li) = stores();
+        let registry = IdentityKeypair::Ed25519(Keypair::generate());
+        let (handler, owner, seed) = curated_with_one_binding(
+            &cs,
+            &li,
+            &registry,
+            &IssuerPolicyData {
+                mode: MODE_OPEN.into(),
+                max_ttl: Some(86_400_000),
+                ..Default::default()
+            },
+            Some(PREDECESSOR_TTL),
+        )
+        .await;
+        let r = handler
+            .handle(&renew_ctx_with(seed, None, b"b", &owner))
+            .await
+            .unwrap();
+        assert_eq!(r.status, 200, "MUST NOT refuse for a missing ttl");
+        assert_eq!(
+            binding_ttl(&cs, binding_hash_of(&r)),
+            Some(PREDECESSOR_TTL),
+            "step 3 — recovered from the registry's own prior signed act, not invented"
+        );
+    }
+
+    // (c) the same renew against a policy that DOES carry default_ttl →
+    //     successor carries the POLICY's value, not the predecessor's.
+    {
+        let (cs, li) = stores();
+        let registry = IdentityKeypair::Ed25519(Keypair::generate());
+        let (handler, owner, seed) = curated_with_one_binding(
+            &cs,
+            &li,
+            &registry,
+            &IssuerPolicyData {
+                mode: MODE_OPEN.into(),
+                default_ttl: Some(600_000),
+                max_ttl: Some(86_400_000),
+                ..Default::default()
+            },
+            Some(PREDECESSOR_TTL),
+        )
+        .await;
+        let r = handler
+            .handle(&renew_ctx_with(seed, None, b"c", &owner))
+            .await
+            .unwrap();
+        assert_eq!(r.status, 200);
+        assert_eq!(
+            binding_ttl(&cs, binding_hash_of(&r)),
+            Some(600_000),
+            "step 2 outranks step 3 — current operator intent over history"
+        );
+    }
+}
+
+/// `REG-RENEW-TTL-NULLPRED-1` `[v1.10]` — a peer-issued binding with
+/// `ttl: null` written **directly to the tree**, renewed with no `ttl`
+/// against a policy with no `default_ttl`: `403 policy_rejected`, nothing
+/// published.
+///
+/// **The control is `REG-RENEW-TTL-CASCADE-1` row (b), which must still
+/// return `200`** — without it this row passes against a peer that refuses
+/// every ttl-less renew.
+///
+/// This is the branch that is unreachable on any conformant path and is
+/// required precisely for that reason: *"an unreachable branch that is
+/// asserted rather than enforced is how the shape it forbids gets minted."*
+#[tokio::test]
+async fn reg_renew_ttl_nullpred_1() {
+    let (cs, li) = stores();
+    let registry = IdentityKeypair::Ed25519(Keypair::generate());
+    let IdentityKeypair::Ed25519(ref registry_kp) = registry else {
+        unreachable!("constructed Ed25519 one line up")
+    };
+    let rid = registry.peer_id().as_str().to_string();
+    let owner = Keypair::generate();
+
+    // The two-stage shape: write the bad binding straight to the tree, the
+    // way a seed, an out-of-band tool, or a peer predating the rule would.
+    publish_binding(
+        &cs,
+        &li,
+        &rid,
+        registry_kp,
+        "billslab.com",
+        owner.peer_id().as_str(),
+        crate::log::now_ms(),
+        None, // ttl: null — the shape §6a.3 forbids and no conformant mint produces
+    );
+    let seed = li
+        .get(&crate::by_name_pointer_path(&rid, "billslab.com"))
+        .expect("binding bound by name");
+    assert_eq!(
+        binding_ttl(&cs, seed),
+        None,
+        "the predecessor really is null-ttl"
+    );
+
+    install_policy(
+        &cs,
+        &li,
+        &rid,
+        &IssuerPolicyData {
+            mode: MODE_OPEN.into(),
+            max_ttl: Some(86_400_000),
+            ..Default::default()
+        },
+    );
+    let handler = reg_handler(&cs, &li, &registry);
+    let before = li.list(&format!("/{}/system/registry/binding/", rid)).len();
+
+    let r = handler
+        .handle(&renew_ctx_with(seed, None, b"np", &owner))
+        .await
+        .unwrap();
+    assert_eq!(r.status, 403, "all three cascade steps null MUST refuse");
+    let code = result_field(&decode_result(&r), "code")
+        .and_then(|v| v.as_text().map(|s| s.to_string()))
+        .unwrap_or_default();
+    assert_eq!(code, "policy_rejected");
+    assert_eq!(
+        li.list(&format!("/{}/system/registry/binding/", rid)).len(),
+        before,
+        "MUST publish nothing — no successor binding, no pointer move"
+    );
+    assert_eq!(
+        li.get(&crate::by_name_pointer_path(&rid, "billslab.com")),
+        Some(seed),
+        "the by-name pointer still names the predecessor"
+    );
+    // …and the refusal did not burn the requester's nonce: the retry that
+    // succeeds once the operator fixes the policy must not come back as a
+    // replay.
+    assert!(
+        li.get(&crate::register_nonce_path(
+            &rid,
+            owner.peer_id().as_str(),
+            b"np"
+        ))
+        .is_none(),
+        "a refused renew publishes nothing, and that includes the nonce marker"
+    );
+}
+
+/// The **resolver's** ceiling (§6a.9.1 `[MUST when present]`) —
+/// `min(binding.ttl, local_max)`, computed at resolution and **never written
+/// back**.
+///
+/// The load-bearing assertion is the *binding hash*, not the number: if a
+/// refactor ever rewrote the binding to carry the clamped TTL, the content
+/// address would move and every signature over it would stop verifying.
+/// **That is the property that would rot silently** — asserting the clamped
+/// number alone would not catch it.
+#[test]
+fn resolver_ceiling_does_not_move_the_binding_hash() {
+    let (cs, li) = stores();
+    let registry_kp = Keypair::generate();
+    let rid = registry_kp.peer_id().as_str().to_string();
+    let target = Keypair::generate().peer_id().as_str().to_string();
+    cs.put(registry_kp.peer_entity().unwrap()).unwrap();
+    publish_binding(
+        &cs,
+        &li,
+        &rid,
+        &registry_kp,
+        "billslab.com",
+        &target,
+        crate::log::now_ms(),
+        Some(86_400_000), // 1 day, issued
+    );
+
+    let unclamped =
+        crate::peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com")
+            .expect("resolves");
+    assert_eq!(unclamped.ttl, Some(86_400_000));
+
+    let hints = Value::Map(vec![(text("max_ttl"), entity_ecf::integer(3_600_000))]);
+    let entry = pi_entry(&rid, Some(hints));
+    let clamped = crate::resolver::apply_resolver_ceiling(
+        crate::peer_issued::resolve_one(&cs, &li, &entry, "billslab.com").expect("resolves"),
+        &entry,
+    );
+
+    assert_eq!(
+        clamped.ttl,
+        Some(3_600_000),
+        "honoured lifetime is min(ttl, local_max)"
+    );
+    assert_eq!(
+        clamped.binding, unclamped.binding,
+        "the binding is byte-identical clamped and unclamped — a use bound, not a re-issue"
+    );
+    assert_eq!(
+        binding_ttl(&cs, clamped.binding.unwrap()),
+        Some(86_400_000),
+        "and the stored body still carries the ISSUED value"
+    );
+
+    // A ceiling above the binding's own ttl changes nothing.
+    let generous = pi_entry(
+        &rid,
+        Some(Value::Map(vec![(
+            text("max_ttl"),
+            entity_ecf::integer(999_000_000),
+        )])),
+    );
+    let r = crate::resolver::apply_resolver_ceiling(
+        crate::peer_issued::resolve_one(&cs, &li, &generous, "billslab.com").expect("resolves"),
+        &generous,
+    );
+    assert_eq!(r.ttl, Some(86_400_000));
+
+    // `0` is DROPPED, not honoured: honoured literally it expires every
+    // binding instantly and the operator sees "no binding for this name" —
+    // indistinguishable from a bad signature or a revocation.
+    let zero = pi_entry(
+        &rid,
+        Some(Value::Map(vec![(text("max_ttl"), entity_ecf::integer(0))])),
+    );
+    let r = crate::resolver::apply_resolver_ceiling(
+        crate::peer_issued::resolve_one(&cs, &li, &zero, "billslab.com").expect("resolves"),
+        &zero,
+    );
+    assert_eq!(r.ttl, Some(86_400_000), "a zero ceiling is dropped");
+}
+
+/// `approve-request` is the **third** producer of peer-issued bindings, and
+/// no routing named it. It owes the same cascade and the same ceiling, read
+/// from the policy that is live **now** rather than the one that was live
+/// when the request was queued.
+#[tokio::test]
+async fn approve_request_applies_the_ceiling_live_not_as_queued() {
+    let (cs, li) = stores();
+    let registry = IdentityKeypair::Ed25519(Keypair::generate());
+    let rid = registry.peer_id().as_str().to_string();
+    install_policy(
+        &cs,
+        &li,
+        &rid,
+        &IssuerPolicyData {
+            mode: MODE_MANUAL.into(),
+            default_ttl: Some(3_600_000),
+            max_ttl: Some(86_400_000),
+            ..Default::default()
+        },
+    );
+    let handler = reg_handler(&cs, &li, &registry);
+    let owner = Keypair::generate();
+
+    // Queue a request asking for a year.
+    let req = RegisterRequestData {
+        name: "billslab.com".into(),
+        target_peer_id: owner.peer_id().as_str().to_string(),
+        transports: vec![Value::Text("tcp://billslab.com:9000".into())],
+        requested_ttl: Some(31_536_000_000),
+        nonce: b"queued".to_vec(),
+        issued_at: crate::log::now_ms(),
+    };
+    let queued = handler
+        .handle(&register_ctx(req.to_entity().unwrap(), &owner))
+        .await
+        .unwrap();
+    assert_eq!(queued.status, 202, "manual mode queues");
+    let pending_hash = result_field(&decode_result(&queued), "pending_hash")
+        .and_then(|v| v.as_bytes())
+        .map(|b| Hash::from_bytes(b).unwrap())
+        .expect("pending_hash");
+
+    // The operator LOWERS the ceiling before approving.
+    install_policy(
+        &cs,
+        &li,
+        &rid,
+        &IssuerPolicyData {
+            mode: MODE_MANUAL.into(),
+            default_ttl: Some(600_000),
+            max_ttl: Some(1_800_000),
+            ..Default::default()
+        },
+    );
+
+    let approved = handler
+        .handle(&ctx(
+            "approve-request",
+            vec![(
+                text("pending_hash"),
+                Value::Bytes(pending_hash.to_bytes().to_vec()),
+            )],
+        ))
+        .await
+        .unwrap();
+    assert_eq!(approved.status, 200);
+    assert_eq!(
+        binding_ttl(&cs, binding_hash_of(&approved)),
+        Some(1_800_000),
+        "approve signs under the ceiling the operator set, not the one at queue time"
     );
 }
