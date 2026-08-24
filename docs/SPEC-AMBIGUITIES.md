@@ -3601,3 +3601,41 @@ MAY (a peer that never collects is then conformant)? If the MUST stands, the
 one-knob spelling is confirmed and the sweep is a scoped follow-on, not this
 cycle. **Answer the model question before three seats each build a background
 deleter.**
+
+---
+
+## V7 §3.3 — EXECUTE_RESPONSE `result` shape on a `202`/accepted ack: bare CBOR null vs `primitive/null` entity
+
+**Date:** 2026-07-19. **Status:** Rust made tolerant (consumes both); the "which
+shape is canonical" question routed to the cohort. Surfaced by entity-core-go's
+Go↔Rust desync report (`docs/validation/reports/2026-07-19-go-rust-response-frame-desync.md`);
+Rust root-cause + fix in `docs/validation/reports/2026-07-19-go-rust-response-null-result.md`.
+
+**Spec:** ENTITY-CORE-PROTOCOL-V7 §3.3 (EXECUTE_RESPONSE: `{request_id, status,
+result}`). The spec types `result` as an entity but does not pin what a response
+that has *no meaningful result* (a `202`-accepted async ack, where the operation
+completes later) puts in the field.
+
+**The divergence (both live impls, confirmed in source).**
+- **Go** (`core/protocol/async.go::make202Response`): `Result: []byte{0xf6}` — a
+  **bare CBOR null**, no `{type, data, content_hash}` wrapper.
+- **Rust** (`core/peer/src/connection.rs::build_202_response`): a **`primitive/null`
+  entity** — `{type:"primitive/null", data:0xf6, content_hash}`.
+
+Each impl's encoder and decoder agree with themselves, so same-side round-trips
+pass and neither caught it — the classic cross-impl-fidelity trap. Rust's reader
+rejected Go's bare null (`params must be a CBOR map (entity)`), stranding the
+async ack and cascading into a serving outage under load.
+
+**Interim choice (landed).** Rust's reader is now **tolerant**: a bare CBOR null
+`result` parses to the same `primitive/null` entity Rust emits, so both shapes
+are accepted (Postel / MUST-ignore spirit). A non-null malformed `result` still
+errors — the tolerance is scoped to null exactly. Rust's *emit* is unchanged
+(still the `primitive/null` wrapper); only the read path was widened.
+
+**Question for the cohort.** Is the `202` `result` canonically **bare null** or a
+**`primitive/null` entity**? A tolerant reader unblocks interop today, but the
+three seats should agree on one *emit* shape so the wire is single-valued. Rust
+can switch its emit to bare null trivially if that is the ruling — the read path
+already accepts both either way. Low urgency (tolerance holds), but worth a pin
+so a future byte-exact `202` vector isn't ambiguous.

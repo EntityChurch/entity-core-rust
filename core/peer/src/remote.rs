@@ -1506,11 +1506,27 @@ fn spawn_reader_loop(
             let resp = match entity_protocol::parse_execute_response(&envelope) {
                 Ok(r) => r,
                 Err(e) => {
+                    // A frame we can't parse must fail *its own* request fast —
+                    // it must never desync the multiplexed connection (we keep
+                    // reading: `read_frame` already consumed this frame at its
+                    // length boundary, so the next frame is intact) and it must
+                    // never leave the awaiting caller to burn the full request
+                    // timeout. Best-effort recover the `request_id` (a
+                    // top-level response field, independent of the unparseable
+                    // `result`) and drop that caller's oneshot: its await then
+                    // resolves immediately as a connection error instead of
+                    // hanging. If we can't recover the id, drop the frame and
+                    // read on (still no desync).
+                    let rid = entity_protocol::extract_response_request_id(&envelope);
                     tracing::warn!(
                         remote_peer = %remote_peer_id,
                         error = %e,
-                        "reader: parse_execute_response failed, dropping frame"
+                        request_id = rid.as_deref().unwrap_or("<unknown>"),
+                        "reader: parse_execute_response failed, failing that request"
                     );
+                    if let Some(rid) = rid {
+                        pending.lock().unwrap().remove(&rid);
+                    }
                     continue;
                 }
             };

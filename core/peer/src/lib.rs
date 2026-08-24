@@ -407,49 +407,67 @@ impl Peer {
                     // would silently disable the SB1 chain-root check and
                     // persist subscriber_identity = Hash::zero().
                     let local_identity = shared.identity_hash;
-                    // EXTENSION-SUBSCRIPTION §4.2 delivery capability: the
-                    // capability presented on the delivery EXECUTE depends on
-                    // where the inbox lives.
-                    //   Cross-peer: present the subscriber's deliver_token. Its
-                    //     granter is the subscriber, which is the *receiver's*
-                    //     local_peer_id, so the receiver's VerifyChain roots at
-                    //     its own identity. We pass it as opts.capability so the
-                    //     remote dispatch path uses it as the EXECUTE capability
-                    //     and bundles its delegation chain (persisted locally at
-                    //     subscribe time, §3.1 step 2b) into the envelope.
-                    //   Same-peer: leave it unset — the local dispatch uses the
-                    //     server's own system/inbox handler grant; the
-                    //     deliver_token already served its purpose at subscribe
-                    //     time, and presenting it locally would make its remote
-                    //     granter the dispatch root (no local trust anchor).
-                    // Dropping the token (the pre-fix behavior) made the remote
-                    // path fall back to the connection grant, which on the
-                    // §6.11(b) reentry path is a publisher-authored placeholder
-                    // the subscriber cannot root — the cross-impl delivery hang.
-                    let deliver_capability = if crate::remote::is_remote_uri(
+                    // EXTENSION-SUBSCRIPTION §4.2 delivery capability +
+                    // coherent-capability B-rooting (Go routing 2026-07-19).
+                    //
+                    // The delivery EXECUTE's Site-3 root check runs AT THE
+                    // RECEIVER: the presented `capability`'s authority chain MUST
+                    // root at the receiving peer (Go `VerifyChain` M6,
+                    // `core/capability/delegation.go`). The subscriber's
+                    // deliver_token is NOT a reliable anchor for that — a
+                    // *delegated* token roots wherever its parent chain
+                    // terminates, which for a token minted with the SENDER's
+                    // connection grant as parent (e.g. the cohort validator's
+                    // `CreateDeliveryToken`) is the **sender**, not the receiver.
+                    // Presenting such a token as the EXECUTE capability made the
+                    // receiver's Site-3 fail with "root capability granter is not
+                    // local peer" — the cross-impl delivery 403 (bc096b2 fixed
+                    // the desync it cascaded into; this fixes the delivery
+                    // itself).
+                    //
+                    //   Cross-peer: present the *connection grant* of the
+                    //     connection to the receiver — `send_execute`'s `None`
+                    //     path falls back to `conn.capability()`. A connection
+                    //     Rust dials to the receiver is granted BY the receiver,
+                    //     so that grant is B-rooted at the verifying peer and
+                    //     passes Site-3 — the same receiver-rooted anchor Go and
+                    //     Python present. The deliver_token still rides in the
+                    //     envelope `included` (below) so the receiver's
+                    //     scope/SB1 check on it is satisfied.
+                    //   Same-peer: `None` too — local dispatch uses the server's
+                    //     own system/inbox handler grant (root == local peer).
+                    let is_remote = crate::remote::is_remote_uri(
                         &req.deliver_uri,
                         shared.keypair.peer_id().as_str(),
-                    ) {
-                        Some(req.deliver_token.clone())
-                    } else {
-                        None
-                    };
+                    );
                     // PROPOSAL-CONVERGENT-MIRRORING §2: when the subscription
                     // opted into include_payload, the engine attached the
                     // changed entity to req.included. Pass it through to the
                     // dispatch envelope's `included` so the subscriber sees the
-                    // entity atomically with the notification.
+                    // entity atomically with the notification. For a cross-peer
+                    // delivery we also fold in the deliver_token entity so the
+                    // receiver can resolve it for its scope/SB1 check even though
+                    // the EXECUTE capability is now the (receiver-rooted)
+                    // connection grant rather than the token itself.
+                    let mut included = req.included;
+                    if is_remote {
+                        included
+                            .entry(req.deliver_token.content_hash)
+                            .or_insert_with(|| req.deliver_token.clone());
+                    }
                     let execute_fn = connection::make_execute_fn(
                         shared,
                         Some(local_identity),
-                        req.included,
+                        included,
                         None, // engine-initiated, no parent bounds
                         None, // engine-initiated, no external caller
                     );
                     let opts = entity_handler::ExecuteOptions {
                         resource: req.resource,
                         request_id: Some(req.request_id),
-                        capability: deliver_capability,
+                        // Receiver-rooted connection grant (None → conn.capability()),
+                        // not the sender-rooted deliver_token. See above.
+                        capability: None,
                         ..Default::default()
                     };
                     execute_fn(

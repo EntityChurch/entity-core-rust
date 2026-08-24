@@ -20,7 +20,7 @@ pub use connect::{
 pub use response::{
     build_error_response, build_error_response_with_marker, build_execute_response,
     build_execute_response_full, build_execute_response_with_included, extract_rejected_marker,
-    parse_execute_response, ParsedResponse,
+    extract_response_request_id, parse_execute_response, ParsedResponse,
 };
 pub use verify::{
     capability_path_for_scan, check_creator_authority, collect_authority_chain,
@@ -717,6 +717,72 @@ mod tests {
         assert_eq!(parsed.request_id, "req-2");
         assert_eq!(parsed.status, 404);
         assert_eq!(parsed.result.entity_type, entity_types::TYPE_ERROR);
+    }
+
+    /// Cross-impl regression (Go↔Rust pooled-connection desync, 2026-07-19):
+    /// Go's `make202Response` sends `result` as a **bare CBOR null** (0xf6),
+    /// not a `{type,data,content_hash}` entity wrapper. Rust emits its own 202
+    /// as a `primitive/null` entity, so a same-side round-trip never exercised
+    /// the bare-null form; a cross-peer 202 ack from Go used to fail
+    /// `parse_execute_response` with "params must be a CBOR map (entity)",
+    /// which stranded the reader. Tolerate it: a null result parses to the
+    /// same `primitive/null` entity we emit.
+    #[test]
+    fn test_parse_go_style_202_null_result() {
+        // Hand-build Go's shape: ECF map {result: null, status: 202,
+        // request_id} in canonical key order (result < status by lex,
+        // request_id last by encoded-key length — same order as
+        // build_execute_response_full).
+        let mut data = Vec::new();
+        data.push(0xA3); // map(3)
+        entity_ecf::encode_cbor_text(&mut data, "result");
+        data.push(0xf6); // CBOR null — the Go 202 ack shape
+        entity_ecf::encode_cbor_text(&mut data, "status");
+        entity_ecf::encode_cbor_uint(&mut data, 202);
+        entity_ecf::encode_cbor_text(&mut data, "request_id");
+        entity_ecf::encode_cbor_text(&mut data, "req-202");
+
+        let entity = Entity::new(entity_types::TYPE_EXECUTE_RESPONSE, data).unwrap();
+        let envelope = Envelope::new(entity);
+
+        let parsed = parse_execute_response(&envelope)
+            .expect("a bare-null 202 result must parse (Go make202Response shape)");
+        assert_eq!(parsed.request_id, "req-202");
+        assert_eq!(parsed.status, 202);
+        assert_eq!(
+            parsed.result.entity_type, "primitive/null",
+            "null result maps to the primitive/null entity we emit for our own 202"
+        );
+    }
+
+    /// Reader fast-fail path (P1 hardening): a genuinely unparseable result
+    /// (here an integer — neither an entity map nor null) still errors the
+    /// full parse (we do NOT over-tolerate), but `extract_response_request_id`
+    /// can still recover the id so the reader fails exactly that one caller
+    /// instead of dropping the frame and hanging it for the request timeout.
+    #[test]
+    fn test_extract_request_id_from_unparseable_response() {
+        let mut data = Vec::new();
+        data.push(0xA3); // map(3)
+        entity_ecf::encode_cbor_text(&mut data, "result");
+        entity_ecf::encode_cbor_uint(&mut data, 7); // not an entity, not null
+        entity_ecf::encode_cbor_text(&mut data, "status");
+        entity_ecf::encode_cbor_uint(&mut data, 200);
+        entity_ecf::encode_cbor_text(&mut data, "request_id");
+        entity_ecf::encode_cbor_text(&mut data, "req-bad");
+
+        let entity = Entity::new(entity_types::TYPE_EXECUTE_RESPONSE, data).unwrap();
+        let envelope = Envelope::new(entity);
+
+        assert!(
+            parse_execute_response(&envelope).is_err(),
+            "a non-null malformed result must still error (no silent coercion)"
+        );
+        assert_eq!(
+            extract_response_request_id(&envelope).as_deref(),
+            Some("req-bad"),
+            "reader can still recover request_id to fast-fail that one caller"
+        );
     }
 
     /// Full wire round-trip: build error response → encode_envelope →

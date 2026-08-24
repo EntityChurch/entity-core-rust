@@ -3331,6 +3331,68 @@ fn test_apply_to_compare_builtin_alias() {
 }
 
 #[test]
+fn test_field_on_constructed_entity_through_map() {
+    // v3.19c M3 cross-impl parity regression (found by the browser host's
+    // Go-oracle replay of workbench's Asteroids — the actor-projection
+    // pattern `map(slots, λi. construct(…))` → `map(acts, λa. field(a, f))`).
+    // A constructed entity packed into a map result rides as its bare
+    // 33-byte in-flight hash ref (`compute_value_to_cbor`); a subsequent
+    // `compute/field` over those elements must resolve through the
+    // `constructed_in_flight` registry. Go keeps typed *constructedValue
+    // pointers inside collection arrays, so this evaluates there; without
+    // the registry hit the Rust arm faulted `type_mismatch` on the same
+    // program. (Registry-identity resolution only — NOT the N3-forbidden
+    // 33-byte shape sniff.)
+    let cs = MemoryContentStore::new();
+    let li = MemoryLocationIndex::new();
+
+    // inner: map([10, 20], λx. construct(test/actor, {v: x}))
+    let arr = Entity::new(
+        TYPE_LITERAL,
+        entity_ecf::to_ecf(&entity_ecf::cbor_map! {
+            "value" => Value::Array(vec![entity_ecf::integer(10), entity_ecf::integer(20)])
+        }),
+    )
+    .unwrap();
+    let arr_h = cs.put(arr).unwrap();
+    let x_ref = cs.put(make_scope_lookup("x")).unwrap();
+    let cons = cs.put(make_construct("test/actor", &[("v", x_ref)])).unwrap();
+    let inner_fn = cs.put(make_lambda(&["x"], cons)).unwrap();
+    let inner_map = cs
+        .put(make_apply_handler(
+            "system/compute/builtins/map",
+            "eval",
+            &[("collection", arr_h), ("fn", inner_fn)],
+        ))
+        .unwrap();
+
+    // outer: map(inner, λa. field(a, "v"))
+    let a_ref = cs.put(make_scope_lookup("a")).unwrap();
+    let field = cs.put(make_field("v", a_ref)).unwrap();
+    let outer_fn = cs.put(make_lambda(&["a"], field)).unwrap();
+    let outer_map = make_apply_handler(
+        "system/compute/builtins/map",
+        "eval",
+        &[("collection", inner_map), ("fn", outer_fn)],
+    );
+
+    let result = eval_entity(&cs, &li, &outer_map);
+    match result {
+        ComputeValue::Primitive(Value::Array(items)) => {
+            let ints: Vec<i128> = items
+                .iter()
+                .map(|v| match v {
+                    Value::Integer(i) => (*i).into(),
+                    other => panic!("expected int element, got {:?}", other),
+                })
+                .collect();
+            assert_eq!(ints, vec![10, 20]);
+        }
+        other => panic!("expected array result, got {:?}", other),
+    }
+}
+
+#[test]
 fn test_apply_to_store_builtin_alias_roundtrip() {
     // Mirror of Go's `v314_builtin_store_roundtrip`:
     // compute/apply(system/compute/builtins/store,

@@ -187,7 +187,21 @@ pub fn parse_execute_response(envelope: &Envelope) -> Result<ParsedResponse, Pro
             Some("request_id") => request_id = v.as_text().map(|s| s.to_string()),
             Some("status") => status = v.as_integer().and_then(|i| u32::try_from(i).ok()),
             Some("result") => {
-                result_entity = Some(decode_entity_from_value(v)?);
+                // A bare CBOR null `result` is the 202-accepted async ack
+                // shape Go emits (`make202Response` → `Result: []byte{0xf6}`),
+                // with no `{type,data,content_hash}` wrapper. Rust emits its
+                // own 202 as a `primitive/null` *entity*
+                // (`peer::connection::build_202_response`), so a same-side
+                // round-trip never exercised the bare-null form — a cross-impl
+                // gap that stranded Go's 202 ack in the reader. Tolerate it
+                // (Postel / MUST-ignore spirit): map a null result to the same
+                // `primitive/null` entity we emit, keeping `result: Entity`.
+                // See docs/validation/reports/
+                // 2026-07-19-go-rust-response-null-result.md.
+                result_entity = Some(match v {
+                    ciborium::Value::Null => null_result_entity(),
+                    _ => decode_entity_from_value(v)?,
+                });
             }
             // EXTENSION-DURABILITY §5 — optional durability verdict. Bare
             // CBOR map of {requested, applied, committed?, max_available?,
@@ -219,6 +233,36 @@ pub fn parse_execute_response(envelope: &Envelope) -> Result<ParsedResponse, Pro
         durability,
         included,
     })
+}
+
+/// The canonical "no result" payload for a 202-accepted async ack: a
+/// `primitive/null` entity wrapping CBOR null. This is exactly what
+/// `peer::connection::build_202_response` emits, so mapping an inbound bare
+/// CBOR null `result` (Go's `make202Response` shape) to this entity makes
+/// the two implementations' 202 acks equivalent on the read path.
+fn null_result_entity() -> Entity {
+    // 0xf6 = CBOR null. `Entity::new` computes the content hash.
+    Entity::new("primitive/null", vec![0xf6]).expect("primitive/null is a valid entity")
+}
+
+/// Best-effort extract just the `request_id` from an EXECUTE_RESPONSE
+/// envelope, independent of whether `status`/`result` parse. The multiplexed
+/// reader uses this to fast-fail the matching in-flight request when a frame
+/// is otherwise unparseable — rather than dropping the frame and stranding
+/// the caller until its full request timeout. Returns `None` when the root
+/// is not an EXECUTE_RESPONSE or `request_id` is absent/non-text.
+pub fn extract_response_request_id(envelope: &Envelope) -> Option<String> {
+    if envelope.root.entity_type != TYPE_EXECUTE_RESPONSE {
+        return None;
+    }
+    let value: ciborium::Value = ciborium::from_reader(envelope.root.data.as_slice()).ok()?;
+    let map = value.as_map()?;
+    for (k, v) in map {
+        if k.as_text() == Some("request_id") {
+            return v.as_text().map(|s| s.to_string());
+        }
+    }
+    None
 }
 
 /// A parsed EXECUTE_RESPONSE.

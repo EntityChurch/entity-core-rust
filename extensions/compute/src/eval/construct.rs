@@ -66,6 +66,31 @@ fn extract_field(name: &str, target: &ComputeValue, ctx: &mut EvalContext<'_>) -
         }
     }
 
+    // Case 1b — in-flight THROUGH a collection: a constructed entity that
+    // rode through map/filter/fold or a construct field got packed to its
+    // bare 33-byte hash ref (`compute_value_to_cbor`). If those bytes are a
+    // hash in THIS eval's `constructed_in_flight` registry, it is the same
+    // in-flight value and field access must keep working — Go holds typed
+    // `*constructedValue` pointers inside collection arrays, so
+    // `map(slots, actorFn)` → `map(acts, λa. field(a, …))` (the Asteroids
+    // actor-projection pattern) evaluates there; without this case the Rust
+    // arm faults `type_mismatch` on the same program — a cross-impl
+    // boundary divergence caught by the browser host's Go-oracle replay.
+    // This is NOT the N3-forbidden 33-byte shape sniff: it resolves only
+    // hash identities this eval itself constructed (registry hit), never
+    // arbitrary bytes.
+    if let ComputeValue::Primitive(Value::Bytes(bytes)) = target {
+        if let Ok(h) = entity_hash::Hash::from_bytes(bytes) {
+            if let Some(typed_value) = ctx
+                .constructed_in_flight
+                .get(&h)
+                .and_then(|m| m.get(name).cloned())
+            {
+                return typed_value;
+            }
+        }
+    }
+
     // Case 2 — read-back / hand-built: return the bare data per N3.
     let raw = match target {
         ComputeValue::Entity(e) => {
