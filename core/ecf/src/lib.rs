@@ -12,7 +12,8 @@ pub use encoder::{
     encode_head, to_ecf,
 };
 pub use value::{
-    array, bool_val, bytes, default_map, integer, map_from_iter, map_insert, null, text, ValueExt,
+    array, bool_val, bytes, default_map, integer, map_from_iter, map_insert, null, text, uinteger,
+    ValueExt,
 };
 
 // Re-export ciborium::Value as our canonical CBOR value type.

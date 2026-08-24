@@ -2418,9 +2418,14 @@ pub fn build_202_response(
 /// has a `system/handler` manifest at `resolved.pattern`. Per V7 §6.6 the
 /// manifest's `expression_path` field is the entity-native dispatch target.
 ///
-/// §7.1 fail-closed: handler grant MUST be present and non-empty before
-/// invoking the evaluator — otherwise the expression would run with no
-/// capability ceiling.
+/// §7.1 fail-closed: handler grant MUST be **present** before invoking the
+/// evaluator — otherwise the expression would run with no capability ceiling.
+/// Presence is the check; **emptiness is not** — §6.8 blesses the empty grant
+/// (a pure-functional handler needs no impure authority, and an empty scope
+/// covers nothing, so every impure op fails its own per-op check). §6.1's
+/// "and non-empty" is the defect, ruled so in
+/// `PROPOSAL-CAPABILITY-EMPTY-GRANTS-AND-POLICY-WITHDRAWAL` §1 — see the
+/// guard's own comment below, which this once contradicted.
 ///
 /// If the manifest has no `expression_path`, dispatch fails 404 — the manifest
 /// is malformed (per V7 §3.7 `expression_path` is the only entry point an

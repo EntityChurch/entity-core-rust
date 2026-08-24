@@ -543,17 +543,32 @@ async fn revoke_writes_marker_for_unknown_token_hash() {
 }
 
 fn policy_entry_params(peer_pattern: &str, grants: &[GrantEntry]) -> Entity {
+    policy_entry_params_ttl(peer_pattern, grants, None)
+}
+
+fn policy_entry_params_ttl(
+    peer_pattern: &str,
+    grants: &[GrantEntry],
+    ttl_ms: Option<u64>,
+) -> Entity {
     let arr: Vec<entity_ecf::Value> = grants
         .iter()
         .map(entity_capability::encode_grant_entry)
         .collect();
-    let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+    let mut fields = vec![
         (entity_ecf::text("grants"), entity_ecf::Value::Array(arr)),
         (
             entity_ecf::text("peer_pattern"),
             entity_ecf::text(peer_pattern),
         ),
-    ]));
+    ];
+    if let Some(t) = ttl_ms {
+        fields.push((
+            entity_ecf::text("ttl_ms"),
+            entity_ecf::Value::Integer(ciborium::value::Integer::from(t)),
+        ));
+    }
+    let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(fields));
     Entity::new("system/capability/policy-entry", data).unwrap()
 }
 
@@ -1051,4 +1066,456 @@ async fn unknown_operation_returns_501() {
     );
     let res = handler.handle(&ctx).await.unwrap();
     assert_eq!(res.status, 501);
+}
+
+// ---------------------------------------------------------------------------
+// §6.2 request step 4 — the mint temporal ceiling
+// (PROPOSAL-CAPABILITY-MINT-TEMPORAL-CEILING-AND-THE-WITHDRAWAL-BOUND §3.2)
+// ---------------------------------------------------------------------------
+
+fn request_params_ttl(grants: &[GrantEntry], ttl_ms: u64) -> Entity {
+    let arr: Vec<entity_ecf::Value> = grants
+        .iter()
+        .map(entity_capability::encode_grant_entry)
+        .collect();
+    let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+        (entity_ecf::text("grants"), entity_ecf::Value::Array(arr)),
+        (
+            entity_ecf::text("ttl_ms"),
+            entity_ecf::Value::Integer(ciborium::value::Integer::from(ttl_ms)),
+        ),
+    ]));
+    Entity::new("system/capability/request", data).unwrap()
+}
+
+fn minted_token(res: &entity_handler::HandlerResult) -> CapabilityToken {
+    let e = res
+        .included
+        .values()
+        .find(|e| e.entity_type == "system/capability/token")
+        .expect("mint returns its token in `included`");
+    CapabilityToken::from_entity(e).unwrap()
+}
+
+/// The load-bearing case: a `request`-minted token is a ROOT cap
+/// (`parent: null`), so §5.6's parent→child expiry attenuation cannot reach
+/// it. Without the step-4 clamp a caller whose own cap dies in an hour mints
+/// a token good for a decade — temporal attenuation would be the one
+/// dimension a requester can escape.
+#[tokio::test]
+async fn request_mint_cannot_outlive_the_caller_capability() {
+    let (handler, _kp, identity_hash, pid, _store) = make_handler();
+    let mut caller = caller_cap_tree_get_all(&pid, identity_hash);
+    let caller_expiry = now_ms() + 3_600_000; // caller's own cap: one hour
+    caller.expires_at = Some(caller_expiry);
+
+    let req_grants = vec![GrantEntry {
+        handlers: PathScope::new(vec!["system/tree".into()]),
+        resources: PathScope::new(vec![canonicalize("data/foo", &pid).unwrap()]),
+        operations: IdScope::new(vec!["get".into()]),
+        peers: None,
+        constraints: None,
+        allowances: None,
+    }];
+    // Ten years.
+    let ctx = make_ctx(
+        "request",
+        request_params_ttl(&req_grants, 315_360_000_000),
+        Some(caller),
+        caller_author_hash(),
+        None,
+    );
+    let res = handler.handle(&ctx).await.unwrap();
+    assert_eq!(res.status, STATUS_OK);
+    assert_eq!(
+        minted_token(&res).expires_at,
+        Some(caller_expiry),
+        "minted token MUST NOT outlive the capability that authorized the request"
+    );
+}
+
+/// The policy author's handle on what is minted beneath its own entry — and
+/// the number that makes withdrawal a bounded operation (§3.2: the entry's
+/// `ttl_ms` IS the withdrawal latency).
+#[tokio::test]
+async fn request_mint_is_bounded_by_the_policy_entrys_ttl() {
+    let (handler, _kp, identity_hash, pid, _store) = make_handler();
+    let caller = caller_cap_tree_get_all(&pid, identity_hash); // no expiry
+    let author = caller_author_hash();
+    let author_hex = hex_of(&author);
+
+    let policy_grants = vec![GrantEntry {
+        handlers: PathScope::new(vec!["system/tree".into()]),
+        resources: PathScope::new(vec![canonicalize("data/*", &pid).unwrap()]),
+        operations: IdScope::new(vec!["get".into(), "put".into()]),
+        peers: None,
+        constraints: None,
+        allowances: None,
+    }];
+    let ttl = 60_000u64; // policy ceiling: one minute
+    let cfg_ctx = make_ctx(
+        "configure",
+        policy_entry_params_ttl(&author_hex, &policy_grants, Some(ttl)),
+        None,
+        author,
+        None,
+    );
+    assert_eq!(handler.handle(&cfg_ctx).await.unwrap().status, STATUS_OK);
+
+    let req_grants = vec![GrantEntry {
+        handlers: PathScope::new(vec!["system/tree".into()]),
+        resources: PathScope::new(vec![canonicalize("data/foo", &pid).unwrap()]),
+        operations: IdScope::new(vec!["get".into()]),
+        peers: None,
+        constraints: None,
+        allowances: None,
+    }];
+    let before = now_ms();
+    let ctx = make_ctx(
+        "request",
+        request_params_ttl(&req_grants, 315_360_000_000), // ten years
+        Some(caller),
+        author,
+        None,
+    );
+    let res = handler.handle(&ctx).await.unwrap();
+    let after = now_ms();
+    assert_eq!(res.status, STATUS_OK);
+    let exp = minted_token(&res)
+        .expires_at
+        .expect("policy ttl bounds the mint");
+    assert!(
+        exp >= before + ttl && exp <= after + ttl,
+        "expires_at {exp} must be created_at + policy ttl ({ttl}ms), not the requested ten years"
+    );
+}
+
+/// No ceiling anywhere defined is still "no expiry" — the clamp bounds, it
+/// does not invent an expiry the spec never asked for.
+#[tokio::test]
+async fn request_mint_with_no_ceiling_anywhere_has_no_expiry() {
+    let (handler, _kp, identity_hash, pid, _store) = make_handler();
+    let caller = caller_cap_tree_get_all(&pid, identity_hash); // expires_at: None
+    let req_grants = vec![GrantEntry {
+        handlers: PathScope::new(vec!["system/tree".into()]),
+        resources: PathScope::new(vec![canonicalize("data/foo", &pid).unwrap()]),
+        operations: IdScope::new(vec!["get".into()]),
+        peers: None,
+        constraints: None,
+        allowances: None,
+    }];
+    let ctx = make_ctx(
+        "request",
+        request_params(&req_grants), // no ttl_ms; no policy entry written
+        Some(caller),
+        caller_author_hash(),
+        None,
+    );
+    let res = handler.handle(&ctx).await.unwrap();
+    assert_eq!(res.status, STATUS_OK);
+    assert_eq!(minted_token(&res).expires_at, None);
+}
+
+/// The MIN itself, at the unit. Covers the case the spec's formula is silent
+/// on — a caller-supplied `ttl_ms` that overflows `created_at + ttl` — where
+/// wrapping would mint a token born already-expired and silently invert the
+/// requester's intent.
+#[test]
+fn clamp_mint_expiry_takes_the_min_of_defined_ceilings() {
+    let now = 1_000_000u64;
+    // Nothing defined → no expiry.
+    assert_eq!(clamp_mint_expiry(now, None, None, None), None);
+    // Each source alone.
+    assert_eq!(
+        clamp_mint_expiry(now, Some(now + 5), None, None),
+        Some(now + 5)
+    );
+    assert_eq!(clamp_mint_expiry(now, None, Some(5), None), Some(now + 5));
+    assert_eq!(clamp_mint_expiry(now, None, None, Some(5)), Some(now + 5));
+    // The caller cap wins over a longer request TTL — the §3 case.
+    assert_eq!(
+        clamp_mint_expiry(now, Some(now + 10), None, Some(1_000)),
+        Some(now + 10)
+    );
+    // The policy TTL wins over a longer request TTL.
+    assert_eq!(
+        clamp_mint_expiry(now, None, Some(10), Some(1_000)),
+        Some(now + 10)
+    );
+    // A request narrower than both ceilings is honored as-is.
+    assert_eq!(
+        clamp_mint_expiry(now, Some(now + 900), Some(800), Some(7)),
+        Some(now + 7)
+    );
+    // `ttl_ms == 0` is a DEFINED bound (expires immediately), not an absent
+    // one — reading it as "no bound" would turn the most restrictive request
+    // into the most permissive.
+    assert_eq!(clamp_mint_expiry(now, None, None, Some(0)), Some(now));
+    assert_eq!(clamp_mint_expiry(now, None, Some(0), None), Some(now));
+    // Overflow drops the term rather than wrapping; the real ceiling binds.
+    assert_eq!(
+        clamp_mint_expiry(now, Some(now + 10), None, Some(u64::MAX)),
+        Some(now + 10)
+    );
+    // …and with nothing else defined, an overflowing TTL leaves no bound at
+    // all — never a past one.
+    assert_eq!(clamp_mint_expiry(now, None, None, Some(u64::MAX)), None);
+    assert_eq!(clamp_mint_expiry(now, None, Some(u64::MAX), None), None);
+}
+
+// ---------------------------------------------------------------------------
+// D2 — an empty `policy-entry.grants` is the withdrawal form
+// (PROPOSAL-CAPABILITY-EMPTY-GRANTS-AND-POLICY-WITHDRAWAL §2.2/§3)
+// ---------------------------------------------------------------------------
+
+/// Writing `grants: []` for a peer is accepted, and it is a CEILING of
+/// nothing at `request`: every non-empty request from that peer fails subset
+/// validation. This is the withdrawal operation the app tier needs, and it is
+/// only expressible because an exact-match entry suppresses `default` by
+/// existing — removal (the distinct third operation) restores the fallback.
+#[tokio::test]
+async fn an_empty_policy_entry_is_accepted_and_withdraws_future_mints() {
+    let (handler, _kp, identity_hash, pid, _store) = make_handler();
+    let caller = caller_cap_tree_get_all(&pid, identity_hash);
+    let author = caller_author_hash();
+    let author_hex = hex_of(&author);
+
+    // A `default` entry wide enough to authorize the request below — the
+    // fallback the empty exact entry must suppress rather than fall through to.
+    let wide = vec![GrantEntry {
+        handlers: PathScope::new(vec!["system/tree".into()]),
+        resources: PathScope::new(vec![canonicalize("data/*", &pid).unwrap()]),
+        operations: IdScope::new(vec!["get".into(), "put".into()]),
+        peers: None,
+        constraints: None,
+        allowances: None,
+    }];
+    let cfg_default = make_ctx(
+        "configure",
+        policy_entry_params(entity_capability::POLICY_FALLBACK_SEGMENT, &wide),
+        None,
+        author,
+        None,
+    );
+    assert_eq!(
+        handler.handle(&cfg_default).await.unwrap().status,
+        STATUS_OK
+    );
+
+    // The withdrawal write itself: empty grants, accepted (no count guard).
+    let cfg_empty = make_ctx(
+        "configure",
+        policy_entry_params(&author_hex, &[]),
+        None,
+        author,
+        None,
+    );
+    assert_eq!(
+        handler.handle(&cfg_empty).await.unwrap().status,
+        STATUS_OK,
+        "an empty policy entry is the withdrawal form, not a malformed write"
+    );
+
+    let req_grants = vec![GrantEntry {
+        handlers: PathScope::new(vec!["system/tree".into()]),
+        resources: PathScope::new(vec![canonicalize("data/foo", &pid).unwrap()]),
+        operations: IdScope::new(vec!["get".into()]),
+        peers: None,
+        constraints: None,
+        allowances: None,
+    }];
+    let req_ctx = make_ctx(
+        "request",
+        request_params(&req_grants),
+        Some(caller.clone()),
+        author,
+        None,
+    );
+    assert_eq!(
+        handler.handle(&req_ctx).await.unwrap().status,
+        STATUS_FORBIDDEN,
+        "the empty entry is a ceiling of nothing here, and it MUST suppress `default`"
+    );
+
+    // Removal is the distinct third operation: drop the entry and the same
+    // request succeeds against `default` again.
+    let entry_path = format!("/{}/system/capability/policy/{}", pid, author_hex);
+    handler.location_index.remove(&entry_path);
+    let req_ctx = make_ctx(
+        "request",
+        request_params(&req_grants),
+        Some(caller),
+        author,
+        None,
+    );
+    assert_eq!(
+        handler.handle(&req_ctx).await.unwrap().status,
+        STATUS_OK,
+        "removing the entry restores the `default` fallback — a different operation from writing it empty"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// CAP-6 over the handler seam — the three wire-observable properties core-go's
+// `request_ttl_zero_and_overflow` check asserts (validate-peer (u), go 5b5ba0d)
+// ---------------------------------------------------------------------------
+
+fn request_grants(pid: &str) -> Vec<GrantEntry> {
+    vec![GrantEntry {
+        handlers: PathScope::new(vec!["system/tree".into()]),
+        resources: PathScope::new(vec![canonicalize("data/foo", pid).unwrap()]),
+        operations: IdScope::new(vec!["get".into()]),
+        peers: None,
+        constraints: None,
+        allowances: None,
+    }]
+}
+
+/// CAP-6 rule 1: `ttl_ms: 0` is a DEFINED ceiling meaning *expire immediately*
+/// (`created_at`), not the "no bound" spelling. With a caller cap an hour out,
+/// the pre-CAP-6 reading (0 == undefined) would clamp to the caller cap — so
+/// `minted < caller_exp` is what separates the two readings. core-go's clamp
+/// reads `0` as undefined today; this is the assertion that will catch it.
+#[tokio::test]
+async fn request_ttl_zero_expires_immediately_not_at_the_caller_cap() {
+    let (handler, _kp, identity_hash, pid, _store) = make_handler();
+    let mut caller = caller_cap_tree_get_all(&pid, identity_hash);
+    let caller_exp = now_ms() + 3_600_000;
+    caller.expires_at = Some(caller_exp);
+
+    let before = now_ms();
+    let ctx = make_ctx(
+        "request",
+        request_params_ttl(&request_grants(&pid), 0),
+        Some(caller),
+        caller_author_hash(),
+        None,
+    );
+    let res = handler.handle(&ctx).await.unwrap();
+    let after = now_ms();
+    assert_eq!(res.status, STATUS_OK);
+    let exp = minted_token(&res)
+        .expires_at
+        .expect("ttl_ms: 0 is a defined ceiling, not the absent spelling");
+    assert!(
+        exp < caller_exp,
+        "ttl_ms: 0 minted expires_at={exp}, not before the caller cap {caller_exp} — 0 was read as 'no bound'"
+    );
+    assert!(
+        (before..=after).contains(&exp),
+        "ttl_ms: 0 must mint at created_at (≈ now), got {exp}"
+    );
+}
+
+/// CAP-6 rule 2: an overflowing `created_at + ttl_ms` contributes NO ceiling —
+/// it drops out and the finite caller cap binds. A wrap would yield a value
+/// *earlier* than the caller cap, so asserting the exact caller-cap value
+/// proves the term was dropped rather than wrapped.
+#[tokio::test]
+async fn request_overflowing_ttl_drops_the_term_and_the_caller_cap_binds() {
+    let (handler, _kp, identity_hash, pid, _store) = make_handler();
+    let mut caller = caller_cap_tree_get_all(&pid, identity_hash);
+    let caller_exp = now_ms() + 3_600_000;
+    caller.expires_at = Some(caller_exp);
+
+    let ctx = make_ctx(
+        "request",
+        request_params_ttl(&request_grants(&pid), u64::MAX - 10),
+        Some(caller),
+        caller_author_hash(),
+        None,
+    );
+    let res = handler.handle(&ctx).await.unwrap();
+    assert_eq!(res.status, STATUS_OK);
+    assert_eq!(
+        minted_token(&res).expires_at,
+        Some(caller_exp),
+        "an overflowing term MUST drop out, leaving the caller cap exactly — a wrap lands earlier"
+    );
+}
+
+/// CAP-6 rule 3 — core-go's strengthened probe (u), and the **only** wire
+/// condition that tells "term absent" apart from "huge-finite". A finite
+/// caller cap masks the defect (both readings clamp to it), so present the
+/// §4.4 connection-cap shape (nil expiry) and make the overflowing `ttl_ms`
+/// the only candidate ceiling: a correct impl mints NO expiry, while a wrap,
+/// a saturate, or an arbitrary-precision `created_at + ttl_ms` (core-py's
+/// CAP-6 failure) mints a bounded or undecodable one.
+///
+/// The `expires_at` key must be **absent** from the token's CBOR, not present
+/// as null — absent is the encoding for "no bound".
+#[tokio::test]
+async fn no_ceiling_overflow_mints_no_expiry_at_all() {
+    let (handler, _kp, identity_hash, pid, _store) = make_handler();
+    let caller = caller_cap_tree_get_all(&pid, identity_hash); // §4.4 shape: no expiry
+
+    let ctx = make_ctx(
+        "request",
+        request_params_ttl(&request_grants(&pid), u64::MAX - 10),
+        Some(caller),
+        caller_author_hash(),
+        None,
+    );
+    let res = handler.handle(&ctx).await.unwrap();
+    assert_eq!(res.status, STATUS_OK);
+
+    let token_entity = res
+        .included
+        .values()
+        .find(|e| e.entity_type == "system/capability/token")
+        .expect("mint returns its token");
+    let token = CapabilityToken::from_entity(token_entity).unwrap();
+    assert_eq!(
+        token.expires_at, None,
+        "with no other ceiling, an overflowing ttl_ms MUST leave the token unbounded — \
+         a bounded value here is a wrap, a saturate, or arbitrary precision"
+    );
+    let decoded: ciborium::Value = ciborium::de::from_reader(token_entity.data.as_slice()).unwrap();
+    assert!(
+        !decoded
+            .as_map()
+            .unwrap()
+            .iter()
+            .any(|(k, _)| k.as_text() == Some("expires_at")),
+        "an absent bound is an absent key, not a null one"
+    );
+}
+
+/// Characterization, not a fix: a `ttl_ms` too large for CBOR's integer range
+/// arrives as a bignum tag and declares **no bound** — it is neither an error
+/// nor a truncation. Pinned because the surrounding rule ("an unrepresentable
+/// temporal term is absent, never wrapped") makes this the shape a reader
+/// expects to be handled deliberately, and because the mint side of the same
+/// value is a hard refusal (`decode_temporal_field`) — the asymmetry is
+/// intentional and would otherwise look like an oversight.
+#[tokio::test]
+async fn a_ttl_ms_that_does_not_fit_u64_declares_no_bound() {
+    let (handler, _kp, identity_hash, pid, _store) = make_handler();
+    let caller = caller_cap_tree_get_all(&pid, identity_hash); // no expiry
+
+    let arr: Vec<entity_ecf::Value> = request_grants(&pid)
+        .iter()
+        .map(entity_capability::encode_grant_entry)
+        .collect();
+    // The bignum shape: `2^64 + 5`, which CBOR cannot carry as a uint at all.
+    let huge = ciborium::Value::Tag(
+        2,
+        Box::new(ciborium::Value::Bytes(
+            (u128::from(u64::MAX) + 6).to_be_bytes().to_vec(),
+        )),
+    );
+    let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+        (entity_ecf::text("grants"), entity_ecf::Value::Array(arr)),
+        (entity_ecf::text("ttl_ms"), huge),
+    ]));
+    let params = Entity::new("system/capability/request", data).unwrap();
+
+    let ctx = make_ctx("request", params, Some(caller), caller_author_hash(), None);
+    let res = handler.handle(&ctx).await.unwrap();
+    assert_eq!(res.status, STATUS_OK);
+    assert_eq!(
+        minted_token(&res).expires_at,
+        None,
+        "an unrepresentable ttl_ms declares no bound; it MUST NOT truncate into a short one"
+    );
 }

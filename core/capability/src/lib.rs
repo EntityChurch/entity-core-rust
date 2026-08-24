@@ -1222,12 +1222,12 @@ impl CapabilityToken {
 
     /// Encode to ECF bytes suitable for creating an entity.
     pub fn to_ecf(&self) -> Vec<u8> {
-        use entity_ecf::{integer, text, Value};
+        use entity_ecf::{text, uinteger, Value};
 
         let mut entries = Vec::new();
 
         // created_at
-        entries.push((text("created_at"), integer(self.created_at as i64)));
+        entries.push((text("created_at"), uinteger(self.created_at)));
 
         // delegation_caveats
         if let Some(ref dc) = self.delegation_caveats {
@@ -1236,7 +1236,7 @@ impl CapabilityToken {
 
         // expires_at
         if let Some(exp) = self.expires_at {
-            entries.push((text("expires_at"), integer(exp as i64)));
+            entries.push((text("expires_at"), uinteger(exp)));
         }
 
         // grantee
@@ -1254,7 +1254,7 @@ impl CapabilityToken {
 
         // not_before
         if let Some(nb) = self.not_before {
-            entries.push((text("not_before"), integer(nb as i64)));
+            entries.push((text("not_before"), uinteger(nb)));
         }
 
         // parent
@@ -1344,13 +1344,13 @@ impl CapabilityToken {
                     }
                 }
                 Some("created_at") => {
-                    created_at = v.as_integer().and_then(|i| u64::try_from(i).ok());
+                    created_at = decode_temporal_field(v, "created_at")?;
                 }
                 Some("expires_at") => {
-                    expires_at = v.as_integer().and_then(|i| u64::try_from(i).ok());
+                    expires_at = decode_temporal_field(v, "expires_at")?;
                 }
                 Some("not_before") => {
-                    not_before = v.as_integer().and_then(|i| u64::try_from(i).ok());
+                    not_before = decode_temporal_field(v, "not_before")?;
                 }
                 Some("delegation_caveats") => {
                     delegation_caveats = Some(decode_delegation_caveats(v)?);
@@ -1371,6 +1371,36 @@ impl CapabilityToken {
             delegation_caveats,
         })
     }
+}
+
+/// Decode one of the token's `primitive/uint` millisecond fields
+/// (`created_at` / `expires_at` / `not_before`).
+///
+/// **A value that does not fit `u64` is malformed, not absent.** Reading it as
+/// absent is fail-*open* on the one field that bounds a token's life: an
+/// `expires_at` a peer minted at arbitrary precision (`created_at + ttl_ms`
+/// with no overflow check — the CAP-6 defect) would land here as "no expiry"
+/// and hand the grantee an immortal cap, while a `u64` implementation that
+/// refuses to decode it — go does — sees a malformed token. Two peers reading
+/// one token two ways is exactly what §5.10 cross-peer determinism forbids, so
+/// this refuses too. §5.6's rule is that an unrepresentable term is **absent**
+/// on the wire, and only the minter can make it so.
+///
+/// `null` stays legal: our optional-field convention is *SHOULD be absent, null
+/// is valid*, and both spell "no bound".
+fn decode_temporal_field(v: &ciborium::Value, field: &str) -> Result<Option<u64>, CapabilityError> {
+    if v.is_null() {
+        return Ok(None);
+    }
+    let i = v.as_integer().ok_or_else(|| {
+        CapabilityError::Invalid(format!("{field} must be an integer (primitive/uint)"))
+    })?;
+    u64::try_from(i).map(Some).map_err(|_| {
+        CapabilityError::Invalid(format!(
+            "{field} does not fit primitive/uint — an unrepresentable temporal value MUST be \
+             absent on the wire, never carried at arbitrary precision, wrapped, or saturated"
+        ))
+    })
 }
 
 impl GrantEntry {
@@ -2822,6 +2852,107 @@ mod canonicalize_entity_uri_tests {
             !got.starts_with(&format!("/{}/entity", LOCAL)),
             "a remote address canonicalized to a LOCAL path: {}",
             got
+        );
+    }
+}
+
+#[cfg(test)]
+mod temporal_field_wire_tests {
+    use super::*;
+
+    fn token_with_expiry(expires_at: Option<u64>) -> CapabilityToken {
+        CapabilityToken {
+            grants: Vec::new(),
+            granter: Granter::single(Hash::compute("system/peer", &[9])),
+            grantee: Hash::compute("system/peer", &[8]),
+            parent: None,
+            created_at: 1_700_000_000_000,
+            expires_at,
+            not_before: None,
+            delegation_caveats: None,
+        }
+    }
+
+    /// `expires_at` is `primitive/uint`. Encoding it through `x as i64` made
+    /// every value above `i64::MAX` **negative** on the wire — and the values
+    /// that reach that range are exactly the ones a saturating temporal clamp
+    /// produces (`u64::MAX`, e.g. EXTENSION-ROLE §5.3's `saturating_add`). A
+    /// negative `expires_at` is refused by a `u64` reader (or read as absent),
+    /// so the cast turned an absurd expiry into a malformed one.
+    #[test]
+    fn an_expires_at_above_i64_max_survives_the_round_trip() {
+        for exp in [u64::MAX, (i64::MAX as u64) + 1, 1_700_000_000_000] {
+            let entity = token_with_expiry(Some(exp)).to_entity().unwrap();
+            let back = CapabilityToken::from_entity(&entity).unwrap();
+            assert_eq!(
+                back.expires_at,
+                Some(exp),
+                "expires_at {exp} must round-trip as a CBOR uint, not wrap negative"
+            );
+        }
+    }
+
+    /// The ingest half of CAP-6, and the fail-open one. A peer that computes
+    /// `created_at + ttl_ms` at arbitrary precision (py's defect, wire-caught
+    /// by core-go's no-ceiling probe) mints an `expires_at` no `u64` reader can
+    /// represent. Reading it as *absent* would hand the grantee an immortal
+    /// cap while go refuses the same bytes — one token, two peers, two
+    /// lifetimes, which is what §5.10 determinism forbids. Refuse it.
+    #[test]
+    fn an_unrepresentable_expires_at_is_refused_not_read_as_absent() {
+        // The two shapes an out-of-range `expires_at` actually arrives in:
+        // a CBOR bignum (tag 2 — what a language whose integers cannot
+        // overflow emits for `created_at + ttl_ms`), and a negative integer
+        // (what a `u64 as i64` encoder emits above `i64::MAX` — the bug fixed
+        // one test up, whose output any peer may still be holding).
+        let bignum = ciborium::Value::Tag(
+            2,
+            Box::new(ciborium::Value::Bytes(
+                (u128::from(u64::MAX) + 1_000).to_be_bytes().to_vec(),
+            )),
+        );
+        let negative = ciborium::Value::Integer(ciborium::value::Integer::from(-11i64));
+        for hostile in [bignum, negative] {
+            let entity = token_with_expiry(Some(1_700_000_000_000))
+                .to_entity()
+                .unwrap();
+            let value: ciborium::Value = ciborium::from_reader(entity.data.as_slice()).unwrap();
+            let mut map = value.as_map().unwrap().clone();
+            for (k, v) in map.iter_mut() {
+                if k.as_text() == Some("expires_at") {
+                    *v = hostile.clone();
+                }
+            }
+            let data = entity_ecf::to_ecf(&ciborium::Value::Map(map));
+            let entity = entity_entity::Entity::new(entity_types::TYPE_CAP_TOKEN, data).unwrap();
+            let err = CapabilityToken::from_entity(&entity)
+                .expect_err("a token whose expires_at is not a primitive/uint is malformed");
+            assert!(
+                err.to_string().contains("expires_at"),
+                "the error must name the field: {err}"
+            );
+        }
+    }
+
+    /// `null` remains the legal-but-discouraged spelling of "no bound" — the
+    /// optional-field convention is *SHOULD be absent, null is valid*, and the
+    /// refusal above must not sweep it up.
+    #[test]
+    fn a_null_expires_at_still_decodes_as_no_expiry() {
+        let entity = token_with_expiry(None).to_entity().unwrap();
+        let value: ciborium::Value = ciborium::from_reader(entity.data.as_slice()).unwrap();
+        let mut map = value.as_map().unwrap().clone();
+        map.push((entity_ecf::text("expires_at"), ciborium::Value::Null));
+        map.sort_by(|a, b| {
+            a.0.as_text()
+                .unwrap_or_default()
+                .cmp(b.0.as_text().unwrap_or_default())
+        });
+        let data = entity_ecf::to_ecf(&ciborium::Value::Map(map));
+        let entity = entity_entity::Entity::new(entity_types::TYPE_CAP_TOKEN, data).unwrap();
+        assert_eq!(
+            CapabilityToken::from_entity(&entity).unwrap().expires_at,
+            None
         );
     }
 }

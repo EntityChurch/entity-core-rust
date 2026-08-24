@@ -1,6 +1,6 @@
 # entity-core-rust — status
 
-_Updated: 2026-08-14 · public: v0.8.0 (master)_
+_Updated: 2026-08-17 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -34,6 +34,102 @@ and tree semantics are interop-validated against the Go and Python peers, not
 just self-tested.
 
 ## Where we left off
+
+_2026-08-17 (h) — **CAP-6 confirmed on the wire (17/17), and the sweep past it found the ingest
+half, where the same value was fail-open.**_
+
+core-go's routing package left rust exactly one item: confirm `clamp_mint_expiry` is reachable.
+Done wire-driven rather than asserted — `validate-peer -category capability` against a live rust
+peer at this commit is **17 P / 0 W / 0 F / 0 S**, and the JSON confirms go's strengthened
+no-ceiling probe (u) actually **ran** rather than skipping on its nil-expiry-cap precondition:
+*"no-ceiling overflow minted NO expiry (term absent, not huge-finite/saturated)"*. All three
+CAP-6 properties are now pinned in rust's own suite too.
+
+**Following CAP-6's sentence to its boundary found it broken twice more here**, on the sides
+nobody was checking. **Encode:** `expires_at as i64` made any value above `i64::MAX` *negative*
+on the wire — reachable from our own ROLE §5.3 `saturating_add`, which produces exactly
+`u64::MAX`; fixed with a new `entity_ecf::uinteger`, byte-identical below the cutover.
+**Decode:** an unrepresentable `expires_at` (py's bignum `created_at + ttl_ms`, or §1.1's
+negative) was read as *absent* — i.e. rust ingested it as a cap that **never expires**, while go
+refuses the same bytes. One token, two peers, two lifetimes; we held the fail-open half. Now
+refused, with `null` still legal. Both verified against their mutations.
+
+Back to arch: the "MUST NOT wrap" sentence needs an **ingest** clause (it currently binds the
+minter, and the reader is where the fail-open lives), and drop-vs-saturate is no longer a tie —
+saturation manufactures the one value our encoder could not carry. To keystone: **CAP-6b**, an
+ingest vector that does not exist today (present a token with an unrepresentable `expires_at`;
+refusing is the pass, reading it as no-expiry is the fail) — rust failed it until this commit.
+Report: `docs/validation/reports/2026-08-17-h-*`. Gate: `make test` **2106 / 0F** · clippy · fmt.
+
+_2026-08-17 (d) — **both capability rulings are built, and the clamp arch asked for turned out to
+be the thing unblocking a 403 nobody had measured.**_
+
+Arch `cb5df2c` ruled two halves of the same surface: an empty `policy-entry.grants` is the
+withdrawal form (D2), and a `request`-minted root token MUST be bounded by
+`MIN(caller_cap.expires_at, now + policy.ttl_ms, now + request.ttl_ms)` (§3). core-go implemented
+both first and routed three findings; rust seconds all three from its own source and adds four.
+
+**D2 needed no code here** — rust already accepted the empty entry, and the dual-path semantics
+(ceiling at `request`, a union term that contributes nothing *and suppresses `default`* at §4.4)
+already held. It now has a test instead of resting on the absence of a guard, including the leg
+that makes withdrawal ≠ removal: dropping the entry restores the `default` fallback and the same
+request succeeds. **§3 needed the clamp** (`clamp_mint_expiry`) plus the `policy-entry.ttl_ms`
+decode it depends on, which we had never read.
+
+**What the clamp found.** Arch's §3.1 table measured rust as "no clamp → mints the ten-year
+token." Wrong direction: rust's step-3 subset check is whole-token `is_attenuated`, which also
+enforces §5.6's child-expiry rule, and the probe was built `expires_at: None` — so **every**
+`request` from a caller whose own cap expires was `403`, ten-year `ttl_ms` or not. The mint was
+unreachable, not unbounded. Fix is the shape rule ROLE v1.7 §5.3 already states for its RL2
+hypothetical, arriving in the mirror direction — now a ratified `AGENTS.md` discipline (a
+hypothetical you check MUST carry the shape you will write).
+
+**Four things back to arch** (`docs/validation/reports/2026-08-17-d-*`): the corrected §3.1 row,
+with the vector implication (assert `200` + clamped expiry, or a 403 impl and an unbounded impl
+score identically); **the §4.4 hole** — the same policy grants are unioned into a connection grant
+that rust *and* go mint with **no `expires_at`, and neither reads `ttl_ms` there**, so §3.2 as
+drafted bounds one of the two consultation points the ruling itself names; the corollary that on
+that path the granter **does** hold the minted hash (`minted_capability`, §9.1 R6-a), so `revoke`
+is addressable and the "granter never holds the hash" premise is `request`-specific; and
+**`ttl_ms: 0`**, where go's new `> 0` guard turns the most restrictive input into no bound at all
+(rust and py both treat `0` as defined). Gate: `make test` **2099 / 0F** · clippy · fmt.
+
+_2026-08-15 — **core-go's 502 was ours, one commit old, and it lived in the gap between a MUST
+and the only path that supplies its input on the wire.**_
+
+They established what a prior handoff had waved off as load noise: rust 502s every reentrant
+`system/validate/dispatch-outbound`, deterministically, single dispatch as well as concurrent,
+while go and py pass the identical harness on the same box. Their discriminator was right and the
+defect was ours — **introduced by our own v1.22 §4.3 fail-closed at `deb5127`**, five commits
+earlier. §4.3 says a bundler that cannot resolve a granter/grantee `system/peer` MUST fail at
+bundle time; we implemented the MUST with a resolver that reads only the local content store.
+Correct for every chain §3.2 step 5 persists at install — and wrong for the one path where the
+caller hands the dispatcher its authority **in params** (GUIDE-CONFORMANCE §7a.2a). The bundler
+declared unreachable a chain it was holding. Fixed at `c09d402`: the dispatch-site resolver reads
+the leaf cap and `opts.included` before the store, which is transport assembly (those entities
+were already merged into the outbound bundle) and not an authority decision — B still verifies
+every link. Outgoing packet: `ROUTING-2026-08-15-the-502-was-ours-*`.
+
+**Measured on their harness, not asserted:** `validate-complete.sh rust` at `c09d402` — both rows
+PASS in both passes; pass 1 **1571 P / 10 W / 0 F / 0 S**, pass 1b 629 P / 7 W / 0 F, pass 2 55/0F,
+pass 3 27/0F. The `substitute` SKIP that exits pass 3 non-zero is our unwired
+`system/substitute/http`, named below, not new. Gate: `make test` **2069 / 0F** · clippy · fmt ·
+wasm.
+
+**The ratchet, and it is the point:** the surface go scored had **no rust test at all**, which is
+how a one-commit-old regression shipped past a green suite.
+`core/peer/tests/conformance_reentry_7a2a.rs` now drives the §7a.2a round trip over the wire
+between two peers (502 before, 200 after, asserting the downstream echo's own status), with a
+control on the same row — a granter nobody can resolve — proving §4.3 still refuses, so reading
+in-band authority cannot silently become waving everything through.
+
+**One finding back to go:** with the 502 gone, `encoding.hash_wire_format` failed a *different*
+run and passed the next, same commit, nothing differing but freshly-generated keys. Their
+`hashWireCandidate` byte-scans raw handshake frames for `0x58` + a 33/49 length and hard-FAILs on
+any third byte that is not an allocated format code — a sequence that occurs by chance in
+high-entropy frame material, for any implementation. One run in six here; **and go recorded the
+identical FAIL+SKIP pair against python on 08-08 and closed it as "a flake."** Same scanner, same
+signature, no root cause until now. Routed with the mechanism, the run table, and a fix direction.
 
 _2026-08-14 (b) — **the admin-seeded posture is expressible on rust's wire; `--seed-policy` is the
 flag core-go asked for.**_

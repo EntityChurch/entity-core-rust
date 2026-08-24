@@ -135,6 +135,19 @@ pub fn integer(n: i64) -> Value {
     Value::Integer(ciborium::value::Integer::from(n))
 }
 
+/// Create a CBOR integer value from a `u64`.
+///
+/// Use this — not `integer(x as i64)` — for any field the wire types as
+/// `primitive/uint`. A `u64` above `i64::MAX` cast to `i64` is **negative**,
+/// so the cast silently encodes a millisecond timestamp as a negative integer
+/// that every reader then rejects or reads as absent. The values that reach
+/// that range are exactly the ones a temporal-ceiling saturation produces
+/// (`u64::MAX`), so the cast turns a merely-absurd expiry into a malformed
+/// one. Encoding is identical to `integer` for everything `≤ i64::MAX`.
+pub fn uinteger(n: u64) -> Value {
+    Value::Integer(ciborium::value::Integer::from(n))
+}
+
 /// Create a CBOR bool value.
 pub fn bool_val(b: bool) -> Value {
     Value::Bool(b)

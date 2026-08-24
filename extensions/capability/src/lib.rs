@@ -65,6 +65,17 @@ impl PolicyMatchForm {
     }
 }
 
+/// A matched `system/capability/policy/{peer_pattern}` entry, as the two
+/// ceilings it carries: `grants` (the scope ceiling, §6.2 step 3) and
+/// `ttl_ms` (the temporal ceiling, §6.2 step 4).
+struct PolicyEntry {
+    grants: Vec<GrantEntry>,
+    /// Optional; absent = this entry adds no temporal bound. It is **not**
+    /// a default TTL — it is a CEILING, and it is this peer's withdrawal
+    /// latency for tokens already minted under the entry.
+    ttl_ms: Option<u64>,
+}
+
 /// `system/capability` handler implementing request / delegate / revoke.
 pub struct CapabilityHandler {
     content_store: Arc<dyn ContentStore>,
@@ -149,13 +160,34 @@ impl CapabilityHandler {
             ));
         }
 
+        // The matched policy entry is consulted twice — as the scope CEILING
+        // at step 3 below, and as the temporal ceiling (`ttl_ms`) at step 4 —
+        // so resolve it once, up front.
+        let policy = self.lookup_policy_entry(&author);
+        let created_at = now_ms();
+        // §6.2 step 4's temporal ceiling, computed BEFORE the step-3
+        // attenuation probe so the probe and the minted token share a shape.
+        // They must: `is_attenuated` enforces §5.6's "child expiration must
+        // not exceed parent's", and a probe carrying `expires_at: None`
+        // against a caller cap that *does* expire is an infinite child under
+        // a finite parent — every request from an expiring cap would 403,
+        // whatever `ttl_ms` it asked for. (EXTENSION-ROLE v1.7 §5.3 names the
+        // same rule for the RL2 hypothetical, in its escalating direction:
+        // build the probe with the expiry the issued cap will actually get.)
+        let expires_at = clamp_mint_expiry(
+            created_at,
+            caller_cap.expires_at,
+            policy.as_ref().and_then(|(e, _)| e.ttl_ms),
+            req.ttl_ms,
+        );
+
         let child = CapabilityToken {
             grants: req.grants.clone(),
             granter: Granter::single(self.identity_hash),
             grantee: author,
             parent: None,
-            created_at: 0,
-            expires_at: None,
+            created_at,
+            expires_at,
             not_before: None,
             delegation_caveats: None,
         };
@@ -173,9 +205,9 @@ impl CapabilityHandler {
                 ),
             ));
         }
-        if let Some((policy_grants, form)) = self.lookup_policy_grants(&author) {
+        if let Some((entry, form)) = policy.as_ref() {
             let policy_token = CapabilityToken {
-                grants: policy_grants,
+                grants: entry.grants.clone(),
                 granter: Granter::single(self.identity_hash),
                 grantee: self.identity_hash,
                 parent: None,
@@ -211,17 +243,24 @@ impl CapabilityHandler {
             }
         }
 
-        let created_at = now_ms();
-        let expires_at = req.ttl_ms.and_then(|t| created_at.checked_add(t));
-
         self.mint_and_return(req.grants, author, None, created_at, expires_at)
     }
 
     /// V7 §6.2 v7.64 dual-form policy resolution. Walks the lookup
     /// order: (1) hex form, (2) Base58 form, (3) `default`. Returns
-    /// the first matching entry's `grants` array **and which form
-    /// matched**, or `None` if no entry exists at any of the three
-    /// paths. The form is carried purely for diagnostics — a
+    /// the first matching entry — its `grants` array and its optional
+    /// `ttl_ms` ceiling — **and which form matched**, or `None` if no
+    /// entry exists at any of the three paths.
+    ///
+    /// **First match wins, and an exact match suppresses `default` even
+    /// when it is empty.** That is what makes `configure{grants: []}` a
+    /// withdrawal rather than a no-op: the empty entry matches at step
+    /// (1), so `default` is never consulted, and an empty ceiling fails
+    /// every non-empty request's subset check. Removing the entry is the
+    /// distinct third operation — it restores the `default` fallback.
+    /// (PROPOSAL-CAPABILITY-EMPTY-GRANTS-AND-POLICY-WITHDRAWAL §2.2/§3.)
+    ///
+    /// The form is carried purely for diagnostics — a
     /// [`PolicyMatchForm::Fallback`] match means this caller had no
     /// entry of their own and inherited the peer-wide `default`, which
     /// is the case where a narrow entry rejects requests its author
@@ -241,14 +280,14 @@ impl CapabilityHandler {
     /// the v7.65 §6 lazy-canonicalization machinery: operator may write
     /// a pre-configured Base58-form entry before having the public_key;
     /// on first match (post-handshake) it canonicalizes in place.
-    fn lookup_policy_grants(&self, author: &Hash) -> Option<(Vec<GrantEntry>, PolicyMatchForm)> {
+    fn lookup_policy_entry(&self, author: &Hash) -> Option<(PolicyEntry, PolicyMatchForm)> {
         let author_hex = hex_of(author);
         let by_hex = format!(
             "/{}/system/capability/policy/{}",
             self.local_peer_id, author_hex
         );
-        if let Some(grants) = self.read_policy_grants(&by_hex) {
-            return Some((grants, PolicyMatchForm::Hex));
+        if let Some(entry) = self.read_policy_entry(&by_hex) {
+            return Some((entry, PolicyMatchForm::Hex));
         }
 
         // Try the Base58 form (pre-configured "pending-canonicalization"
@@ -260,13 +299,13 @@ impl CapabilityHandler {
                 "/{}/system/capability/policy/{}",
                 self.local_peer_id, author_b58
             );
-            if let Some(grants) = self.read_policy_grants(&by_b58) {
+            if let Some(entry) = self.read_policy_entry(&by_b58) {
                 // V7 §3.6 v7.65 lazy-canonicalization event: pubkey is now
                 // known (this codepath only fires post-resolve); rebind the
                 // policy entry under the canonical hex form and clear the
                 // Base58 entry. Idempotent + self-healing.
                 self.canonicalize_policy_entry(&by_b58, &by_hex);
-                return Some((grants, PolicyMatchForm::Base58));
+                return Some((entry, PolicyMatchForm::Base58));
             }
         }
 
@@ -274,8 +313,8 @@ impl CapabilityHandler {
             "/{}/system/capability/policy/{}",
             self.local_peer_id, POLICY_FALLBACK_SEGMENT
         );
-        self.read_policy_grants(&by_default)
-            .map(|g| (g, PolicyMatchForm::Fallback))
+        self.read_policy_entry(&by_default)
+            .map(|e| (e, PolicyMatchForm::Fallback))
     }
 
     /// Derive the canonical wire PeerID (Base58) for the peer at
@@ -311,7 +350,7 @@ impl CapabilityHandler {
         );
     }
 
-    fn read_policy_grants(&self, path: &str) -> Option<Vec<GrantEntry>> {
+    fn read_policy_entry(&self, path: &str) -> Option<PolicyEntry> {
         let h = self.location_index.get(path)?;
         let entity = self.content_store.get(&h)?;
         if entity.entity_type != TYPE_CAP_POLICY_ENTRY {
@@ -319,18 +358,31 @@ impl CapabilityHandler {
         }
         let val: ciborium::Value = ciborium::de::from_reader(entity.data.as_slice()).ok()?;
         let map = val.as_map()?;
+        let mut grants: Option<Vec<GrantEntry>> = None;
+        let mut ttl_ms: Option<u64> = None;
         for (k, v) in map {
-            if k.as_text() == Some("grants") {
-                let arr = v.as_array()?;
-                let mut out = Vec::with_capacity(arr.len());
-                for entry in arr {
-                    let g = decode_grant_entry(entry).ok()?;
-                    out.push(g);
+            match k.as_text() {
+                Some("grants") => {
+                    let arr = v.as_array()?;
+                    let mut out = Vec::with_capacity(arr.len());
+                    for entry in arr {
+                        let g = decode_grant_entry(entry).ok()?;
+                        out.push(g);
+                    }
+                    grants = Some(out);
                 }
-                return Some(out);
+                Some("ttl_ms") => {
+                    ttl_ms = decode_ttl_ms(v);
+                }
+                _ => {}
             }
         }
-        None
+        // No `grants` key at all is not a policy entry we can consult — an
+        // entry that carries `grants: []` IS one (the withdrawal form).
+        Some(PolicyEntry {
+            grants: grants?,
+            ttl_ms,
+        })
     }
 
     fn handle_delegate(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
@@ -897,12 +949,7 @@ fn decode_delegate_request(params: &Entity) -> Result<DelegateRequest, String> {
                 }
             }
             Some("ttl_ms") => {
-                if let ciborium::Value::Integer(i) = v {
-                    let n: i128 = (*i).into();
-                    if n >= 0 {
-                        ttl_ms = Some(n as u64);
-                    }
-                }
+                ttl_ms = decode_ttl_ms(v);
             }
             _ => {}
         }
@@ -937,12 +984,7 @@ fn decode_capability_request(params: &Entity) -> Result<CapabilityRequest, Strin
                 }
             }
             Some("ttl_ms") => {
-                if let ciborium::Value::Integer(i) = v {
-                    let n: i128 = (*i).into();
-                    if n >= 0 {
-                        ttl_ms = Some(n as u64);
-                    }
-                }
+                ttl_ms = decode_ttl_ms(v);
             }
             _ => {}
         }
@@ -1067,6 +1109,72 @@ fn build_revocation_entity(rv: &CapabilityRevocation, revoked_at: u64) -> Result
     ));
     let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(fields));
     Entity::new(TYPE_CAP_REVOCATION, data).map_err(|e| e.to_string())
+}
+
+/// Decode a caller-supplied `ttl_ms` (`request`, `delegate`, and the
+/// `policy-entry` ceiling).
+///
+/// A negative value, a non-integer, **or a value that does not fit `u64`** all
+/// yield `None` — "this source declares no bound," which is what
+/// [`clamp_mint_expiry`] does with an overflowing term anyway.
+///
+/// This replaces three hand-rolled copies of the same `if n >= 0 { n as u64 }`.
+/// The cast was **not** a live truncation, which is worth writing down because
+/// it reads like one: `ciborium::value::Integer` is bounded to CBOR's own
+/// integer range (`-2^64 ..= 2^64-1`), so a non-negative one always fits `u64`,
+/// and anything larger arrives as a bignum tag that never matched the
+/// `Value::Integer` arm in the first place. What the shared decoder buys is
+/// that the out-of-range form is now *deliberately* undefined at one site
+/// instead of incidentally undefined at three.
+fn decode_ttl_ms(v: &ciborium::Value) -> Option<u64> {
+    let i = v.as_integer()?;
+    u64::try_from(i).ok()
+}
+
+/// V7 §6.2 `request` step 4 — the minted token's `expires_at` is the MIN of
+/// every **defined** temporal ceiling:
+///
+/// ```text
+/// MIN(caller_capability.expires_at, created_at + policy.ttl_ms, created_at + request.ttl_ms)
+/// ```
+///
+/// `request` mints a **root** cap (`parent: null`), so §5.6's parent→child
+/// expiry attenuation never reaches it: without this clamp a caller whose own
+/// cap expires in an hour can ask for `ttl_ms = 10 years` and get it, and the
+/// policy author has no handle on the lifetime of what is minted under its own
+/// entry. That also makes withdrawal a bounded operation — the entry's
+/// `ttl_ms` is the withdrawal latency for tokens already issued.
+/// (`PROPOSAL-CAPABILITY-MINT-TEMPORAL-CEILING-AND-THE-WITHDRAWAL-BOUND` §3.2;
+/// the §5.6 MIN-defined construction, generalized from ROLE to `request`.)
+///
+/// Only defined values participate; `caller_exp` is absolute, both `ttl_ms`
+/// values are relative to `created_at`. All-undefined yields `None` (no
+/// expiry). **`ttl_ms == 0` is a defined bound**, not an absent one — it means
+/// "expires immediately," which is what an operator writing a zero withdrawal
+/// latency is asking for; reading it as "no bound" would invert a caller's
+/// most restrictive request into its most permissive. (go's `> 0` guard
+/// currently reads it the other way — filed to arch, 2026-08-17-d.)
+///
+/// **Overflow drops the term** rather than wrapping: `created_at + ttl_ms`
+/// past `u64::MAX` would otherwise mint a token born already-expired from a
+/// huge caller-supplied `ttl_ms`. The spec's MIN formula is silent here and
+/// the cohort had diverged (rust drops, py cannot wrap, go wrapped until
+/// `b5cecbf`); dropping leaves the other, real ceilings to bind.
+fn clamp_mint_expiry(
+    created_at: u64,
+    caller_exp: Option<u64>,
+    policy_ttl_ms: Option<u64>,
+    req_ttl_ms: Option<u64>,
+) -> Option<u64> {
+    let from_ttl = |ttl: u64| created_at.checked_add(ttl);
+    [
+        caller_exp,
+        policy_ttl_ms.and_then(from_ttl),
+        req_ttl_ms.and_then(from_ttl),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
 }
 
 fn hex_of(h: &Hash) -> String {
