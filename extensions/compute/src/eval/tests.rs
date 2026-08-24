@@ -3150,6 +3150,176 @@ fn test_cast_int_to_uint_negative_reinterprets() {
     }
 }
 
+/// F-1 (packet R1) — a `numeric-cast → uint` result preserves its major-0
+/// encoding **through materialization** into a construct field, not only in
+/// flight. Spec-derived target (§2.2 rule 10's exception, §2.3 N1): the
+/// materialized entity must be byte-identical to a hand-built entity carrying
+/// `{v: <uint 2⁶⁴−1>}`, whose canonical data bytes are
+/// `a1 6176 1bffffffffffffffff`. The regression was `*u as i64` collapsing the
+/// magnitude to `-1` (major type 1, `0x20`) at the materialization boundary,
+/// making the constructed hash byte-identical to `construct{v: -1}` — a silent
+/// content-hash divergence with no error surfaced. No Go oracle: the hand-built
+/// equivalence is the convergence gate.
+#[test]
+fn test_f1_cast_negative_to_uint_materialized_preserves_major0() {
+    let cs = MemoryContentStore::new();
+    let li = MemoryLocationIndex::new();
+
+    let neg1 = cs.put(make_literal_int(-1)).unwrap();
+    let cast_h = cs
+        .put(make_numeric_cast(neg1, TYPE_PRIMITIVE_UINT))
+        .unwrap();
+    let expr = make_construct("app/corpus/cast", &[("v", cast_h)]);
+    let constructed = match eval_entity(&cs, &li, &expr) {
+        ComputeValue::Entity(e) => e,
+        other => panic!("expected entity, got {:?}", other),
+    };
+
+    // Exact §2.3 N1 target: {"v": uint 18446744073709551615} in ECF.
+    // a1 = map(1); 6176 = text "v"; 1b ff*8 = major-0 u64::MAX.
+    let expected: Vec<u8> = vec![
+        0xa1, 0x61, 0x76, 0x1b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    ];
+    assert_eq!(
+        constructed.data, expected,
+        "materialized 'v' must be major-0 (0x1b ff…ff), NOT signed 0x20"
+    );
+
+    // The hand-built convergence gate (spec-defined, not Go-defined).
+    let hand_built = Entity::new(
+        "app/corpus/cast",
+        entity_ecf::to_ecf(&entity_ecf::cbor_map! {
+            "v" => Value::Integer(ciborium::value::Integer::from(u64::MAX))
+        }),
+    )
+    .unwrap();
+    assert_eq!(
+        constructed.content_hash, hand_built.content_hash,
+        "materialized construct{{v: cast(-1,uint)}} MUST equal hand-built {{v: uint 2⁶⁴−1}}"
+    );
+
+    // And it must NOT collapse to the signed control construct{v: -1}.
+    let neg1_lit = cs.put(make_literal_int(-1)).unwrap();
+    let signed_expr = make_construct("app/corpus/cast", &[("v", neg1_lit)]);
+    let signed_control = match eval_entity(&cs, &li, &signed_expr) {
+        ComputeValue::Entity(e) => e,
+        other => panic!("expected entity, got {:?}", other),
+    };
+    assert_ne!(
+        constructed.content_hash, signed_control.content_hash,
+        "cast(-1,uint) must not materialize identically to a bare -1 (the F-1 no-op)"
+    );
+}
+
+/// F-1 residual (corpus `…-through-if-materialized`) — the major-0 encoding of
+/// a `cast(-1,uint)` result must survive **indirection through a compute/if
+/// branch**, not only the direct construct-field case. Rule 11 drops the
+/// unsigned-*op* intent through the branch; rule 10's exception keeps the
+/// major-0 *encoding*. So `construct{v: if(true, cast(-1,uint), 0)}` MUST
+/// materialize byte-identically to the direct `construct{v: cast(-1,uint)}`.
+/// The regression was the trampoline's `strip_cast_tag` collapsing the
+/// magnitude to signed −1 (major 1) — direct-green + through-if-red is the
+/// signature of the tag-strip-vs-encoding conflation.
+#[test]
+fn test_f1_cast_negative_to_uint_through_if_matches_direct() {
+    let cs = MemoryContentStore::new();
+    let li = MemoryLocationIndex::new();
+
+    // Direct: construct{v: cast(-1, uint)}.
+    let neg1_d = cs.put(make_literal_int(-1)).unwrap();
+    let cast_d = cs
+        .put(make_numeric_cast(neg1_d, TYPE_PRIMITIVE_UINT))
+        .unwrap();
+    let direct = match eval_entity(
+        &cs,
+        &li,
+        &make_construct("app/corpus/cast", &[("v", cast_d)]),
+    ) {
+        ComputeValue::Entity(e) => e,
+        other => panic!("expected entity, got {:?}", other),
+    };
+
+    // Through-if: construct{v: if(eq(1,1), cast(-1, uint), 0)}.
+    let one_a = cs.put(make_literal_uint(1)).unwrap();
+    let one_b = cs.put(make_literal_uint(1)).unwrap();
+    let cond = cs.put(make_compare("eq", one_a, one_b)).unwrap();
+    let neg1_i = cs.put(make_literal_int(-1)).unwrap();
+    let cast_i = cs
+        .put(make_numeric_cast(neg1_i, TYPE_PRIMITIVE_UINT))
+        .unwrap();
+    let zero = cs.put(make_literal_int(0)).unwrap();
+    let if_expr = cs.put(make_if(cond, cast_i, Some(zero))).unwrap();
+    let through_if = match eval_entity(
+        &cs,
+        &li,
+        &make_construct("app/corpus/cast", &[("v", if_expr)]),
+    ) {
+        ComputeValue::Entity(e) => e,
+        other => panic!("expected entity, got {:?}", other),
+    };
+
+    assert_eq!(
+        through_if.content_hash, direct.content_hash,
+        "through-if cast must materialize identically to direct (indirection drops \
+         op-intent, NOT the major-0 encoding)"
+    );
+    // And it must be the major-0 form, not the signed collapse.
+    let expected: Vec<u8> = vec![
+        0xa1, 0x61, 0x76, 0x1b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    ];
+    assert_eq!(
+        through_if.data, expected,
+        "through-if 'v' must be major-0 (0x1b ff…ff), NOT signed 0x20"
+    );
+}
+
+/// Q1 (packet §2.4, amended) — a **materialized** `compute/error` hashes on
+/// `code` **alone**; `message` is diagnostic-only and must not enter the
+/// content hash (or independently-constructed peers diverge on the error's
+/// hash — the F-1 class of silent divergence). The dispatch-boundary
+/// status-200 form keeps `message`. This locks the fork.
+#[test]
+fn test_q1_materialized_error_code_only_dispatch_keeps_message() {
+    use crate::types::ComputeError;
+
+    // Same code, different messages.
+    let a = ComputeError::TypeMismatch("expected int, got string".into());
+    let b = ComputeError::TypeMismatch("a wholly different message".into());
+
+    // Materialized form: code-only → the two converge to one entity.
+    let ma = a.to_entity();
+    let mb = b.to_entity();
+    assert_eq!(
+        ma.content_hash, mb.content_hash,
+        "materialized errors with equal code MUST converge regardless of message"
+    );
+    let ma_data = decode_data(&ma).unwrap();
+    assert_eq!(
+        ma_data.get("code").and_then(|v| v.as_text()),
+        Some("type_mismatch")
+    );
+    assert!(
+        ma_data.get("message").is_none(),
+        "materialized compute/error MUST NOT carry 'message' in its canonical content"
+    );
+
+    // Dispatch form: keeps message → the two diverge, and message is present.
+    let da = a.to_dispatch_entity();
+    let db = b.to_dispatch_entity();
+    assert_ne!(
+        da.content_hash, db.content_hash,
+        "dispatch status-200 form retains 'message' and so differs by it"
+    );
+    assert_eq!(
+        decode_data(&da)
+            .unwrap()
+            .get("message")
+            .and_then(|v| v.as_text()),
+        Some("expected int, got string"),
+        "dispatch form must carry the diagnostic message"
+    );
+}
+
 #[test]
 fn test_cast_uint_max_to_int_reinterprets() {
     let cs = MemoryContentStore::new();
@@ -3356,7 +3526,9 @@ fn test_field_on_constructed_entity_through_map() {
     .unwrap();
     let arr_h = cs.put(arr).unwrap();
     let x_ref = cs.put(make_scope_lookup("x")).unwrap();
-    let cons = cs.put(make_construct("test/actor", &[("v", x_ref)])).unwrap();
+    let cons = cs
+        .put(make_construct("test/actor", &[("v", x_ref)]))
+        .unwrap();
     let inner_fn = cs.put(make_lambda(&["x"], cons)).unwrap();
     let inner_map = cs
         .put(make_apply_handler(

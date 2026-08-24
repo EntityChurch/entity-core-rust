@@ -244,8 +244,12 @@ pub(super) fn eval_construct(
     // bare V7 §1.4 form for the materialized data — entity-/closure-/error-
     // valued fields → bare `system/hash` byte string (with the referenced
     // entity ensured resident in the content store); primitive/record →
-    // inline; `Uint` strips its cast tag (§2.2 rule 11). The materialized
-    // entity is byte-identical to a hand-built (`Entity::new`) equivalent.
+    // inline; a `Uint` (numeric-cast → uint result) materializes as its
+    // non-negative magnitude, CBOR major type 0 (§2.2 rule 10's exception,
+    // F-1). The materialized entity is byte-identical to a hand-built
+    // (`Entity::new`) equivalent. (The per-eval `constructed_in_flight`
+    // side-table below still strips the ephemeral cast *tag* per rule 11 — the
+    // tag governs downstream unsigned ops, not the materialized encoding.)
     //
     // Alongside the materialized form, this loop **also records the original
     // typed `ComputeValue` per field** in a per-eval `constructed_in_flight`
@@ -304,7 +308,8 @@ pub(super) fn eval_construct(
 /// form: entity / closure / error → bare `system/hash` content reference
 /// (the entity's `content_hash` bytes — algorithm || digest, variable-length
 /// per V7 §1.2; entity made resident in the content store); primitive /
-/// record → inlined bare CBOR; `Uint` strips its cast tag (§2.2 rule 11).
+/// record → inlined bare CBOR; `Uint` materializes as its non-negative
+/// magnitude (CBOR major type 0) per §2.2 rule 10's exception (F-1).
 ///
 /// This is the "materialize-at-encode" half of v3.19c α — the constructed
 /// entity's data fields are bare per V7 §1.4 from the moment of construction,
@@ -335,8 +340,16 @@ fn encode_construct_field_bare(value: &ComputeValue, ctx: &mut EvalContext<'_>) 
         }
         ComputeValue::Primitive(v) => v.clone(),
         ComputeValue::Uint(u) => {
-            // §2.2 rule 11: strip cast tag at the construct field boundary.
-            Value::Integer(ciborium::value::Integer::from(*u as i64))
+            // §2.2 rule 10's exception (F-1): a value produced by
+            // `numeric-cast → uint` materializes as its non-negative magnitude
+            // — CBOR major type 0 (`0x1b ff…ff` for u64::MAX), never
+            // signed-canonical. The cast's value-conversion and its major-0
+            // encoding *always* apply, including through materialization into a
+            // construct field, not only in flight. Encoding `*u as i64` here
+            // collapsed 2⁶⁴−1 back to `-1` (major 1), making the cast a no-op at
+            // the materialization boundary and silently diverging the
+            // content-hash. Matches `to_result_entity` and `compute_value_to_cbor`.
+            Value::Integer(ciborium::value::Integer::from(*u))
         }
     }
 }

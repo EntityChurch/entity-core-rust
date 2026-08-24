@@ -232,7 +232,6 @@ impl ComputeEngine {
                         &entry.subgraph_path,
                         &result_path,
                         "installation_grant_invalid",
-                        "Installation grant expired",
                         ctx,
                     );
                     return;
@@ -244,7 +243,6 @@ impl ComputeEngine {
                 &entry.subgraph_path,
                 &result_path,
                 "installation_grant_invalid",
-                "Installation grant missing or invalid",
                 ctx,
             );
             return;
@@ -316,12 +314,14 @@ impl ComputeEngine {
         subgraph_path: &str,
         result_path: &str,
         error_code: &str,
-        error_message: &str,
         ctx: &mut ExecutionContext,
     ) {
+        // §2.4 (amended — Q1): the frozen error written to result_path is a
+        // materialized/stored `compute/error`, so its canonical content is
+        // `code` **alone** — no `message` in the content hash (diagnostic-only
+        // fields would diverge the hash cross-impl).
         let error_data = entity_ecf::cbor_map! {
-            "code" => entity_ecf::text(error_code),
-            "message" => entity_ecf::text(error_message)
+            "code" => entity_ecf::text(error_code)
         };
         let error_entity =
             Entity::new(TYPE_ERROR, entity_ecf::to_ecf(&error_data)).expect("error entity");
@@ -444,13 +444,7 @@ impl SyncTreeHook for ComputeEngine {
 
             // Cascade depth check: >= 16 → freeze (§7.3)
             if ctx.cascade_depth >= CASCADE_DEPTH_COMPUTE_FREEZE {
-                self.freeze_subgraph(
-                    &entry.subgraph_path,
-                    &result_path,
-                    "cascade_limit",
-                    "Cascade depth exceeded during reactive re-evaluation",
-                    ctx,
-                );
+                self.freeze_subgraph(&entry.subgraph_path, &result_path, "cascade_limit", ctx);
                 continue;
             }
 

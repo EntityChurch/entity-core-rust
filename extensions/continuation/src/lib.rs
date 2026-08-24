@@ -11,6 +11,7 @@ use entity_entity::{Entity, EntityUri};
 use entity_handler::{
     Bounds, DeliverySpec, ExecuteFn, ExecuteOptions, Handler, HandlerContext, HandlerError,
     HandlerResult, STATUS_BAD_REQUEST, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_OK,
+    STATUS_RATE_LIMITED,
 };
 use entity_hash::Hash;
 use entity_store::{CasError, ContentStore, LocationIndex};
@@ -111,13 +112,24 @@ fn new_chain_id() -> String {
 /// schedule-paced retry-forever roots fresh each tick (§5) and never reaches it.
 const MAX_CHAIN_DEPTH: u64 = 64;
 
-/// §3.9 suspension reason for a causal chain that exceeded [`MAX_CHAIN_DEPTH`].
-/// This is a continuation **suspend reason**, a distinct namespace from the
-/// capability authority-chain-walk wire error of the same spelling
-/// (`ProtocolError::ChainTooDeep`); the shared string is deliberate — it is the
-/// reason the proposal (§4) and Go both name, and the two axes never collide in
-/// one field.
-const CODE_CHAIN_DEPTH_EXCEEDED: &str = "chain_depth_exceeded";
+/// §3.9 / ENTITY-CORE-PROTOCOL §5.9 (0.8.1 Ruling 1/2) default continuation
+/// resource-backstop TTL. Seeded when a chain roots with no inherited `ttl`,
+/// decremented once per dispatch (§5.9). Set **above** the depth ceiling
+/// (8× [`MAX_CHAIN_DEPTH`]) so a synchronous self-referential chain brakes on
+/// `chain_depth` (the deterministic primary brake, §3.9) *before* TTL could
+/// mask it — TTL is a resource backstop, not the chain-length bound. Mirrors
+/// core-go's `DefaultChainTTL = 512` (8× ceiling 64).
+const DEFAULT_CHAIN_TTL: u64 = 8 * MAX_CHAIN_DEPTH;
+
+/// §3.9 suspension reason for a causal continuation-advancement chain that
+/// exceeded [`MAX_CHAIN_DEPTH`]: `bounds_exceeded` (ENTITY-CORE-PROTOCOL
+/// §4.10(b), 0.8.1 Ruling 3). **Deliberately NOT `chain_depth_exceeded`** —
+/// that spelling is the *capability* authority-chain depth limit (a 400 wire
+/// error, `ProtocolError::ChainTooDeep`), a different axis. The §3.9 depth
+/// brake is a 429, and this is the reason both the suspend response `code` and
+/// the resulting lost-error marker carry (the cross-peer A5 exact-reason
+/// string).
+const CODE_BOUNDS_EXCEEDED: &str = "bounds_exceeded";
 
 /// §3.6 step 6: the bounds for a dispatch made out of an advance.
 ///
@@ -138,6 +150,14 @@ fn dispatch_bounds(chain_err: &ChainErr) -> Option<Bounds> {
     };
     bounds.chain_id = Some(chain_err.chain_id.clone());
     bounds.chain_depth = Some(next_chain_depth(chain_err.parent_bounds.as_ref()));
+    // §5.9 (0.8.1 Ruling 1/2): seed the default resource-backstop TTL when the
+    // chain roots with none inherited. Seeded once (a causal hop inherits the
+    // parent's decremented ttl, which is `Some`, so this only fires at a root),
+    // and set above the depth ceiling so the §3.9 `chain_depth` brake fires
+    // first — TTL never masks the depth brake on a self-referential chain.
+    if bounds.ttl.is_none() {
+        bounds.ttl = Some(DEFAULT_CHAIN_TTL);
+    }
     Some(bounds)
 }
 
@@ -396,6 +416,7 @@ impl ContinuationHandler {
                 status,
                 &chain_err,
                 &ctx.included,
+                ctx.reactive_trigger,
             )
             .await;
         match &result {
@@ -415,6 +436,7 @@ impl ContinuationHandler {
         result
     }
 
+    #[allow(clippy::too_many_arguments)] // advance plumbing: every arg is a distinct §3.6 input
     async fn advance_at_path(
         &self,
         execute_fn: &ExecuteFn,
@@ -423,6 +445,7 @@ impl ContinuationHandler {
         status: u32,
         chain_err: &ChainErr,
         included: &HashMap<Hash, Entity>,
+        reactive_trigger: bool,
     ) -> Result<HandlerResult, HandlerError> {
         // Read entity at path
         if let Some(hash) = self.location_index.get(path) {
@@ -438,6 +461,7 @@ impl ContinuationHandler {
                                 status,
                                 chain_err,
                                 included,
+                                reactive_trigger,
                             )
                             .await;
                     }
@@ -695,7 +719,7 @@ impl ContinuationHandler {
             ),
             (
                 entity_ecf::text("reason"),
-                entity_ecf::text(CODE_CHAIN_DEPTH_EXCEEDED),
+                entity_ecf::text(CODE_BOUNDS_EXCEEDED),
             ),
             (entity_ecf::text("target"), entity_ecf::text(target)),
         ];
@@ -758,7 +782,7 @@ impl ContinuationHandler {
             }
         }
 
-        Ok(suspended_result(CODE_CHAIN_DEPTH_EXCEEDED, &suspended_path))
+        Ok(suspended_result(CODE_BOUNDS_EXCEEDED, &suspended_path))
     }
 
     #[allow(clippy::too_many_arguments)] // advance plumbing: every arg is a distinct §3.6 input
@@ -771,6 +795,7 @@ impl ContinuationHandler {
         status: u32,
         chain_err: &ChainErr,
         included: &HashMap<Hash, Entity>,
+        reactive_trigger: bool,
     ) -> Result<HandlerResult, HandlerError> {
         let cont = decode_continuation(cont_entity)?;
 
@@ -918,6 +943,34 @@ impl ContinuationHandler {
         // Amendment-12 ping-pong needs — the direct end-to-end proof of the fix.
         if let Some(depth) = child_bounds.as_ref().and_then(|b| b.chain_depth) {
             if depth > MAX_CHAIN_DEPTH {
+                // §3.10.2 lost marker — the brake's own bind, gated on the
+                // reactive-trigger path. Two ways an advance reaches this brake,
+                // and only one has a caller that will surface the 429:
+                //   • Synchronous forward dispatch (`reactive_trigger == false`):
+                //     the *caller* advance forward-dispatched into this one and
+                //     observes `suspend_for_chain_depth`'s `429 bounds_exceeded`
+                //     as a non-2xx forward-dispatch result — it binds the marker
+                //     via the §3.10.2 path below (line ~999). Self-binding here
+                //     too would double-bind, so we must NOT.
+                //   • Reactive delivery (`reactive_trigger == true`, the live cb2
+                //     inbox-receive self-delivery loop): this advance was reached
+                //     by delivery, its 429 return goes to the delivery layer, and
+                //     the delivery layer binds no chain marker. The 429 outcome is
+                //     LOST — so the brake MUST self-record the marker here, else
+                //     cb2's observable (a `bounds_exceeded` marker under the lost
+                //     sink) never surfaces. This is the inbox-path half the
+                //     synchronous unit test could not exercise (core-go gate).
+                if reactive_trigger {
+                    let ts = capture_failure_timestamp_ms();
+                    self.write_lost_error_marker(
+                        chain_err,
+                        &dispatch_target,
+                        STATUS_RATE_LIMITED,
+                        CODE_BOUNDS_EXCEEDED,
+                        ts,
+                        None,
+                    );
+                }
                 return self
                     .suspend_for_chain_depth(
                         chain_err,
@@ -3114,15 +3167,32 @@ fn advancement_not_found() -> HandlerResult {
     advancement_result(false)
 }
 
-/// §3.9 result for a chain-depth suspension: `advanced: false`, `suspended:
-/// true`, plus the reason and the path of the persisted
-/// `system/continuation/suspended` entity so a caller can `resume` it. Returns
-/// 200 — the advance was *handled* (the chain paused cleanly), it did not error.
+/// §3.9 result for a chain-depth suspension. Per ENTITY-CORE-PROTOCOL §3.9 the
+/// dispatch layer returns `{status: 429, result: {code: "bounds_exceeded",
+/// suspended_at: <path>}}`: **429**, not 200 — the causal chain hit its ceiling.
+///
+/// Two consumers depend on the 429 + `code`:
+/// - **The suspending advance's own caller** (a synchronous self-referential
+///   chain, CONTINUATION §3.9 cb2): the triggering advancement forward-dispatched
+///   *into* this one, so it observes this 429 as a non-2xx forward-dispatch
+///   result and — per §3.10.2 — binds a lost-error marker whose `{reason}` is
+///   this `code` (`bounds_exceeded`). That marker is the observable depth brake.
+/// - **An operator** reading `suspended_at`/`suspended_path` to `resume` the
+///   persisted `system/continuation/suspended` entity (the resume affordance).
+///
+/// `advanced`/`suspended`/`suspended_path` are retained for the resume
+/// affordance and backward compatibility; `code`/`suspended_at` are the §3.9
+/// wire shape.
 fn suspended_result(reason: &str, suspended_path: &str) -> HandlerResult {
     let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
         (entity_ecf::text("advanced"), entity_ecf::bool_val(false)),
+        (entity_ecf::text("code"), entity_ecf::text(reason)),
         (entity_ecf::text("reason"), entity_ecf::text(reason)),
         (entity_ecf::text("suspended"), entity_ecf::bool_val(true)),
+        (
+            entity_ecf::text("suspended_at"),
+            entity_ecf::text(suspended_path),
+        ),
         (
             entity_ecf::text("suspended_path"),
             entity_ecf::text(suspended_path),
@@ -3130,7 +3200,7 @@ fn suspended_result(reason: &str, suspended_path: &str) -> HandlerResult {
     ]));
     let result = Entity::new("system/continuation/advancement-result", data).unwrap();
     HandlerResult {
-        status: STATUS_OK,
+        status: STATUS_RATE_LIMITED,
         result,
         included: std::collections::HashMap::new(),
     }
@@ -4934,6 +5004,18 @@ mod tests {
             new_chain_id(),
             "a minted chain must be unique per advance"
         );
+        // §5.9 (0.8.1 Ruling 1/2): a root chain (no inherited ttl) seeds the
+        // default resource-backstop TTL, set above the depth ceiling so the
+        // §3.9 chain_depth brake fires first (depth is the primary brake).
+        assert_eq!(
+            minted.ttl,
+            Some(DEFAULT_CHAIN_TTL),
+            "root chain seeds the default ttl"
+        );
+        assert!(
+            DEFAULT_CHAIN_TTL > MAX_CHAIN_DEPTH,
+            "the seeded ttl MUST exceed the depth ceiling so ttl never masks the depth brake"
+        );
 
         // ttl already spent → hand the seam None so it raises
         // ttl_exhausted itself, rather than a second code path here.
@@ -5723,8 +5805,9 @@ mod tests {
 
         let r = h.handle(&ctx).await.unwrap();
         assert_eq!(
-            r.status, STATUS_OK,
-            "suspension is a clean handled outcome, not an error"
+            r.status, STATUS_RATE_LIMITED,
+            "§3.9 (0.8.1): the depth brake is 429 — a self-referential caller \
+             observes this non-2xx and binds the lost-error marker"
         );
         assert!(
             captured.lock().unwrap().is_none(),
@@ -5744,8 +5827,16 @@ mod tests {
             get("reason")
                 .and_then(|v| v.as_text().map(str::to_string))
                 .as_deref(),
-            Some(CODE_CHAIN_DEPTH_EXCEEDED),
+            Some(CODE_BOUNDS_EXCEEDED),
             "the suspension names the global depth as the cause (§8 anchor 1)"
+        );
+        assert_eq!(
+            get("code")
+                .and_then(|v| v.as_text().map(str::to_string))
+                .as_deref(),
+            Some(CODE_BOUNDS_EXCEEDED),
+            "§4.10(b) Ruling 3: the §3.9 depth-brake code is bounds_exceeded, so a \
+             self-referential caller's lost-error marker reason is bounds_exceeded"
         );
         // A resumable suspended entity was persisted at the reported path.
         let susp_path = get("suspended_path")
@@ -5761,6 +5852,159 @@ mod tests {
         );
     }
 
+    /// §3.9 cb2 mechanism (end-to-end): the depth brake's `429 bounds_exceeded`,
+    /// observed by a self-referential caller as a non-2xx forward dispatch,
+    /// binds a lost-error marker whose `{reason}` path segment is
+    /// `bounds_exceeded` — the exact observable
+    /// `continuation_bounds.cb2_self_referential_chain_brakes` keys on (a marker
+    /// under the lost sink with a depth-brake reason). Before this fix the brake
+    /// returned 200 with no `code`, so no marker surfaced and cb2 WARNed.
+    #[tokio::test]
+    async fn test_depth_brake_429_surfaces_bounds_exceeded_lost_marker() {
+        let h = make_handler();
+        let author = Hash::compute("test", b"cb2-author");
+        let cap = make_cap_entity_for_install(author, author, None);
+        let cap_hash = cap.content_hash;
+        let included: HashMap<Hash, Entity> = [(cap_hash, cap.clone())].into();
+
+        let path = format!("/{}/system/continuation/cb2-selfref", test_peer_id());
+        let install_params = make_install_params("app/target", "process", cap_hash, None, None);
+        let install_ctx = make_install_ctx(author, &path, install_params, included);
+        assert_eq!(h.handle(&install_ctx).await.unwrap().status, STATUS_OK);
+
+        // The forward dispatch reaches the §3.9 brake deep in the would-be
+        // recursion and returns `429 bounds_exceeded` — exactly the shape
+        // `suspended_result` now produces.
+        let mock: ExecuteFn = Arc::new(|_uri, _op, _params, _opts| {
+            Box::pin(async {
+                Ok(HandlerResult {
+                    status: STATUS_RATE_LIMITED,
+                    result: Entity::new(
+                        "system/continuation/advancement-result",
+                        entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+                            entity_ecf::text("code"),
+                            entity_ecf::text(CODE_BOUNDS_EXCEEDED),
+                        )])),
+                    )
+                    .unwrap(),
+                    included: HashMap::new(),
+                })
+            })
+        });
+
+        let adv_params = make_params(entity_ecf::Value::Map(vec![(
+            entity_ecf::text("result"),
+            entity_ecf::Value::Map(vec![(entity_ecf::text("k"), entity_ecf::text("v"))]),
+        )]));
+        let mut adv_ctx = make_install_ctx(author, &path, adv_params, HashMap::new());
+        adv_ctx.operation = "advance".to_string();
+        adv_ctx.execute_fn = Some(mock);
+
+        // Forward dispatch is fire-and-forget: the advance itself completes 200.
+        let r = h.handle(&adv_ctx).await.unwrap();
+        assert_eq!(r.status, STATUS_OK);
+
+        // The observable: a lost-error marker whose reason segment is
+        // `bounds_exceeded` surfaced under the lost sink.
+        let sink = format!("/{}/system/runtime/chain-errors/lost/", test_peer_id());
+        let entries = h.location_index.list(&sink);
+        assert!(
+            entries.iter().any(|e| e.path.contains("/bounds_exceeded/")),
+            "cb2: a depth-braked (429 bounds_exceeded) forward dispatch MUST surface a \
+             bounds_exceeded lost-error marker under {} (got {:?})",
+            sink,
+            entries.iter().map(|e| e.path.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// §3.9 cb2 mechanism (inbox-receive half): when the depth brake fires on a
+    /// **reactive-trigger** advance — the live cb2 self-delivery loop, where the
+    /// advance was reached by delivery and its `429` return goes to the delivery
+    /// layer (which binds no chain marker) — the brake MUST self-bind the
+    /// `bounds_exceeded` lost-error marker, else the observable never surfaces.
+    ///
+    /// This is the path the synchronous `test_depth_brake_429_surfaces_...` test
+    /// could not reach: that test mocks the caller observing the deep `429`; here
+    /// the REAL brake fires under a reactive trigger with no such caller. This is
+    /// exactly the gap core-go's live gate caught — the reason migration had
+    /// landed only on the direct-advance path.
+    #[tokio::test]
+    async fn test_reactive_depth_brake_self_binds_bounds_exceeded_marker() {
+        let h = make_handler();
+        let path = format!("/{}/system/continuation/cd-reactive-brake", test_peer_id());
+        let author = install_standing_cont(&h, &path).await;
+
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        // Parent at the ceiling → the next dispatch (MAX+1) trips the brake…
+        let mut ctx = advance_ctx_with_bounds(
+            author,
+            &path,
+            capturing_mock(captured.clone()),
+            Some(Bounds {
+                chain_id: Some("reactive-runaway".into()),
+                chain_depth: Some(MAX_CHAIN_DEPTH),
+                ..Default::default()
+            }),
+        );
+        // …reached by reactive delivery (the inbox-receive self-delivery loop):
+        // no synchronous caller will observe the 429 and bind the marker.
+        ctx.reactive_trigger = true;
+
+        let r = h.handle(&ctx).await.unwrap();
+        assert_eq!(
+            r.status, STATUS_RATE_LIMITED,
+            "the depth brake is still 429 on the reactive path"
+        );
+        assert!(
+            captured.lock().unwrap().is_none(),
+            "the chain MUST be stopped — no onward dispatch past the ceiling"
+        );
+
+        // The observable cb2 keys on: a `bounds_exceeded` lost-error marker
+        // under the lost sink — self-bound by the brake, since no caller could.
+        let sink = format!("/{}/system/runtime/chain-errors/lost/", test_peer_id());
+        let entries = h.location_index.list(&sink);
+        assert!(
+            entries.iter().any(|e| e.path.contains("/bounds_exceeded/")),
+            "reactive cb2: a depth-braked reactive advance MUST self-bind a \
+             bounds_exceeded lost-error marker under {} (got {:?})",
+            sink,
+            entries.iter().map(|e| e.path.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    /// The synchronous mirror of the above: on the direct forward-dispatch path
+    /// (`reactive_trigger == false`) the brake MUST NOT self-bind — the caller
+    /// advance observes the 429 and binds, so a brake self-bind would double it.
+    /// The real brake fires here (no mocked 429); the sink must stay empty.
+    #[tokio::test]
+    async fn test_synchronous_depth_brake_does_not_self_bind() {
+        let h = make_handler();
+        let path = format!("/{}/system/continuation/cd-sync-brake", test_peer_id());
+        let author = install_standing_cont(&h, &path).await;
+
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        // reactive_trigger defaults to false — a synchronous forward-dispatch
+        // advance whose caller will observe the 429 and bind the marker itself.
+        let ctx = advance_ctx_with_bounds(
+            author,
+            &path,
+            capturing_mock(captured.clone()),
+            Some(Bounds {
+                chain_id: Some("sync-runaway".into()),
+                chain_depth: Some(MAX_CHAIN_DEPTH),
+                ..Default::default()
+            }),
+        );
+
+        assert_eq!(h.handle(&ctx).await.unwrap().status, STATUS_RATE_LIMITED);
+        let sink = format!("/{}/system/runtime/chain-errors/lost/", test_peer_id());
+        assert!(
+            h.location_index.list(&sink).is_empty(),
+            "synchronous brake must NOT self-bind — the caller binds via §3.10.2"
+        );
+    }
+
     /// §3.7: `resume` is a fresh operator dispatch — it MUST root chain_depth at
     /// 0 even if reached from within a chain carrying ambient depth, else a
     /// chain resumed after `chain_depth_exceeded` re-suspends immediately.
@@ -5773,7 +6017,7 @@ mod tests {
             (entity_ecf::text("target"), entity_ecf::text("app/sink")),
             (
                 entity_ecf::text("reason"),
-                entity_ecf::text(CODE_CHAIN_DEPTH_EXCEEDED),
+                entity_ecf::text(CODE_BOUNDS_EXCEEDED),
             ),
         ]));
         let susp = Entity::new("system/continuation/suspended", susp_data).unwrap();

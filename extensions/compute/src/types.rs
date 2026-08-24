@@ -127,13 +127,27 @@ pub fn is_uint_tagged(v: &ComputeValue) -> bool {
     matches!(v, ComputeValue::Uint(_))
 }
 
-/// Strip an ephemeral uint cast tag (rule 11). Used by binding forms (let,
-/// closure args) so the tag does not flow through the binding. The value's
-/// bit pattern is preserved by reinterpreting the u64 as i64 — encoded
-/// canonically signed per rule 10.
+/// Strip the ephemeral uint cast tag (rule 11) at a binding/indirection
+/// boundary — `let`, closure args, and the `compute/if` branch trampoline — so
+/// the cast's unsigned-**op** intent does not flow through to make a *later*
+/// `div`/`mod`/`compare` unsigned (rule 11: cast is consumed at its point of
+/// use, not carried through the value).
+///
+/// The non-negative **magnitude is preserved** (`Integer::from(u)`, CBOR major
+/// type 0), NOT collapsed to `u as i64`. Rule 10's exception ("a value produced
+/// by numeric-cast → uint encodes major type 0") *always* applies, **including
+/// when the value is reached indirectly** — the through-if corpus vector
+/// (`…-through-if-materialized`) materializes byte-identically to the direct
+/// `construct{v: cast(-1,uint)}`. Collapsing to `u as i64` here re-signed the
+/// magnitude (2⁶⁴−1 → −1, major type 1) and was the exact tag-strip-vs-encoding
+/// conflation the corpus's seeded sweep caught. Signed-default `div`/`mod`/`lt`/
+/// `gt` still reinterpret operands via `as i64`, so operation semantics are
+/// unchanged; only the materialized encoding is fixed.
 pub fn strip_cast_tag(v: ComputeValue) -> ComputeValue {
     match v {
-        ComputeValue::Uint(u) => ComputeValue::Primitive(entity_ecf::integer(u as i64)),
+        ComputeValue::Uint(u) => {
+            ComputeValue::Primitive(Value::Integer(ciborium::value::Integer::from(u)))
+        }
         other => other,
     }
 }
@@ -435,7 +449,31 @@ impl ComputeError {
         }
     }
 
+    /// Materialized / canonical form of a `compute/error` (§2.4, amended — Q1):
+    /// the content-hashed content is `code` **alone**. This is the form that
+    /// enters a content hash — written to a `result_path`, placed in a
+    /// `construct` field, carried in a materialized subtree, encoded as a
+    /// collection element, bound in a scope, or used as a memo key.
+    /// `message`/`at`/`expression` MUST NOT enter the hash: they are
+    /// diagnostic-only and vary across implementations, so including them would
+    /// diverge the error's content-hash between independently-constructed peers
+    /// (the same silent dedup/cache/sync divergence class as F-1). The
+    /// human-facing `message` survives only in the dispatch-boundary
+    /// status-200 form — see `to_dispatch_entity`.
     pub fn to_entity(&self) -> Entity {
+        let data = entity_ecf::cbor_map! {
+            "code" => Value::Text(self.code().into())
+        };
+        let data_bytes = entity_ecf::to_ecf(&data);
+        Entity::new(TYPE_ERROR, data_bytes).expect("error entity")
+    }
+
+    /// Dispatch-boundary status-200 form (F10, §2.4 amended — Q1): when an
+    /// evaluated `compute/error` is returned to the caller *as a value* (not a
+    /// transport failure), it carries `message` for diagnostics. This is NOT
+    /// the canonical/stored form — a peer that stores or forwards this entity
+    /// must re-canonicalize to `to_entity` (code-only) for hash convergence.
+    pub fn to_dispatch_entity(&self) -> Entity {
         let data = entity_ecf::cbor_map! {
             "code" => Value::Text(self.code().into()),
             "message" => Value::Text(self.message())

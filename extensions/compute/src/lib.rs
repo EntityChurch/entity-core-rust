@@ -189,7 +189,11 @@ impl ComputeHandler {
         // by `result.type == "compute/error"`); 4xx is reserved for dispatch /
         // transport / auth failures, which are emitted earlier in this handler.
         match &result {
-            ComputeValue::Error(err) => Ok(HandlerResult::ok(err.to_entity())),
+            // F10 / §2.4 (amended): the status-200 error-as-value keeps its
+            // diagnostic `message` (dispatch form). The engine's own
+            // materialized writes (result_path, construct fields, subtrees) use
+            // the code-only `to_entity` for cross-peer hash convergence.
+            ComputeValue::Error(err) => Ok(HandlerResult::ok(err.to_dispatch_entity())),
             _ => Ok(HandlerResult::ok(
                 result.to_result_entity(&expression.content_hash),
             )),
