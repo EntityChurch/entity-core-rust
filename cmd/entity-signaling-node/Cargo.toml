@@ -1,0 +1,25 @@
+[package]
+name = "entity-signaling-node"
+version = "0.8.0"
+edition.workspace = true
+description = "The system/signaling connection node — a peer that runs the rendezvous + reflector and nothing else"
+
+[[bin]]
+name = "entity-signaling-node"
+path = "src/main.rs"
+
+[dependencies]
+entity-core.workspace = true
+entity-signaling.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+
+[dev-dependencies]
+ciborium.workspace = true
+entity-capability.workspace = true
+entity-hash.workspace = true
+entity-entity.workspace = true
+entity-ecf.workspace = true

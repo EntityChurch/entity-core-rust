@@ -8,8 +8,9 @@ use crate::transport::Connection as TransportConnection;
 use crate::{PeerError, PeerShared};
 use entity_entity::{EntityUri, Envelope};
 use entity_handler::{
-    ExecuteFn, ExecuteOptions, HandlerContext, HandlerError, STATUS_BAD_REQUEST, STATUS_FORBIDDEN,
-    STATUS_INTERNAL_ERROR, STATUS_NOT_FOUND, STATUS_NOT_SUPPORTED,
+    ExecuteFn, ExecuteOptions, HandlerContext, HandlerError, STATUS_AUTH_FAILED,
+    STATUS_BAD_REQUEST, STATUS_FORBIDDEN, STATUS_INTERNAL_ERROR, STATUS_NOT_FOUND,
+    STATUS_NOT_SUPPORTED,
 };
 use entity_protocol::{
     build_error_response, build_execute_response, build_execute_response_full, Connection,
@@ -742,6 +743,43 @@ pub(crate) async fn dispatch_request(
         }
     }
 
+    // RT-6 (§4.6, bucket-B): the issued handshake nonce is single-use. A
+    // same-connection `authenticate` replay MUST be rejected `401
+    // invalid_nonce`. `dispatch_request` only ever runs post-Established (the
+    // pre-Established hello/authenticate exchange in `handle_connection` /
+    // `dispatch_session_envelope` never reaches here), so ANY envelope
+    // arriving here targeting the connect handler's `authenticate` operation
+    // is definitionally a replay — reject it before generic verification,
+    // not after. This MUST run pre-verification: the oracle's replay resends
+    // the bare connect-EXECUTE shape (`uri`/`operation`/`request_id` only, no
+    // `author`/`capability` — the same shape `build_connect_execute` used for
+    // the original pre-Established authenticate), which `verify_request_with_ctx`
+    // would otherwise reject first with `401 authentication_failed` (missing
+    // author) — silently masking the replay as a generic auth failure and
+    // never reaching a post-verification special case (confirmed on the wire
+    // by `entity-core-go` `docs/validation/reports/`
+    // `2026-07-27-0.8.1-bucketB-revalidation-after-sibling-fixes.md`; a
+    // same-side test using a fully-authenticated EXECUTE didn't catch this
+    // because it never exercises the bare-shape path). `decode_execute_fields`
+    // only requires `uri`/`operation`/`request_id` (mandatory), so it
+    // succeeds regardless of whether `author`/`capability` are present.
+    if let Ok(fields) = entity_protocol::decode_execute_fields(&envelope.root.data) {
+        let local_pid = shared.keypair.peer_id();
+        let bare_path = EntityUri::extract_handler_path(&fields.uri);
+        let handler_path = EntityUri::qualify_path(bare_path, local_pid.as_str());
+        if handler_path == format!("/{}/{}", local_pid.as_str(), entity_protocol::CONNECT_PATH)
+            && fields.operation == "authenticate"
+        {
+            return build_error_response(
+                &fields.request_id,
+                STATUS_AUTH_FAILED,
+                "invalid_nonce",
+                "handshake nonce already consumed on this connection",
+            )
+            .unwrap_or_else(|_| Envelope::new(envelope.root.clone()));
+        }
+    }
+
     // Verify the request — V7.62 closeout F2 wires §5.2 Step 4
     // `is_revoked` into verify_request. `supports_revocation = true`
     // because Rust ships the full marker mechanism (capability handler
@@ -873,6 +911,9 @@ pub(crate) async fn dispatch_request(
     {
         return build_pong_response(envelope, &verified.request_id);
     }
+    // RT-6's `authenticate` intercept now runs pre-verification, above — see
+    // the comment there for why (the oracle's replay shape fails generic
+    // verification before ever reaching a post-verification check).
     let handler_authorized = verified.capability.grants.iter().any(|grant| {
         entity_capability::matches_scope(
             handler_path,

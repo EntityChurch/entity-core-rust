@@ -24,9 +24,9 @@ pub use response::{
 };
 pub use verify::{
     capability_path_for_scan, check_creator_authority, collect_authority_chain,
-    collect_chain_bundle, is_operator_class_for, is_revoked, verify_capability_chain,
-    verify_request, verify_request_with_ctx, ChainWalkError, CreatorAuthorityResult,
-    VerifiedRequest, VerifyContext, MAX_CHAIN_DEPTH,
+    collect_chain_bundle, decode_execute_fields, is_operator_class_for, is_revoked,
+    verify_capability_chain, verify_request, verify_request_with_ctx, ChainWalkError,
+    CreatorAuthorityResult, ExecuteFields, VerifiedRequest, VerifyContext, MAX_CHAIN_DEPTH,
 };
 
 #[derive(Debug, Error)]

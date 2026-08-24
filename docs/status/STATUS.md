@@ -1,6 +1,6 @@
 # entity-core-rust — status
 
-_Updated: 2026-07-18 · public: v0.8.0 (master)_
+_Updated: 2026-07-27 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -34,6 +34,147 @@ and tree semantics are interop-validated against the Go and Python peers, not
 just self-tested.
 
 ## Where we left off
+
+_2026-07-28 — STANDING-MODEL §4 O5 (sweep-all) landed — the last Rust-side §4 residual_
+(`docs/status/ROUTING-2026-07-28-standing-model-4-o5-sweep-all-rust.md`; answers
+`entity-core-go`'s `HANDOFF-2026-07-28-rust-py-finish-s4-residuals.md`, the one item routed
+to Rust — O4 and fire-partial were already correct per the handoff's own table). Ruled by
+arch (`PROPOSAL-CONTINUATION-STANDING-MODEL` §7 O5): converge on Go's sweep-all, since a
+standing deadline-join that goes silent while the peer stays continuation-active was reaped
+by Go but never by Rust's touched-only reap — a permanent cross-peer liveness-marker
+divergence. Extended (not replaced) the existing reap-on-touch: any continuation advance
+now runs a throttled (60s floor, matching Go's `joinSweepThrottle`) pass over every tracked
+deadline-carrying join (`join_paths`, filled from install + touch, matching Go's
+`noteJoinPath`) and reaps expired rounds via the existing `reap_join_round`. No background
+timer/goroutine — driven entirely by continuation traffic, same as Go.
+
+New test: `test_sweep_reaps_untouched_expired_join` — join A arms and expires with a slot
+missing, only join B is ever advanced again, B's advance sweep reaps A anyway (one
+`join_incomplete` marker, A's round reset, neither join fires).
+
+Gate: `cargo test -p entity-continuation` 72/72 (was 71/71). `cargo build --workspace`
+clean; `cargo build --target wasm32-unknown-unknown -p entity-peer` (CI feature set)
+clean; `cargo fmt --check -p entity-continuation` clean; clippy clean except the
+already-logged pre-existing `assertions_on_constants` failure (`docs/BACKLOG.md`).
+
+**§4 folds once Python lands O4 (`slot` key) + fire-partial + its own O5 and the live
+three-way (liveness/network/continuations/continuation_bounds) re-runs green** — nothing
+further gates on Rust.
+
+_2026-07-28 — STANDING-MODEL §4 Facet B (join completion policy) built from zero_
+(`docs/status/ROUTING-2026-07-28-standing-model-4-facet-rust.md`; answers
+`entity-core-go`'s `HANDOFF-2026-07-28-rust-py-convergence-standing-model-s3-s4.md` Item
+2). **Scope correction found before building:** the handoff assumed Rust already had §4
+mechanism 2 (deadline+abandon self-heal) and just needed the round_id addendum (§4.1) —
+Rust actually had none of §4 (confirmed by exhaustive grep: no `completion_deadline`,
+`on_incomplete`, `round_id`, or per-slot status tracking anywhere in
+`extensions/continuation`), matching the tracker's `⬜ zero-impl`, not the handoff's
+premise. Built the full facet in one pass rather than a partial addendum:
+
+- **Mechanism 2** — `completion_deadline_ms`/`on_incomplete` ("abandon" default |
+  "fire-partial") on the join entity; reaped via **lazy reap-on-touch** at the top of
+  `advance_join_slot` (at the time, Rust had no background sweep subsystem to extend, unlike
+  Go's `CollectExpired*` — documented as a deliberate tradeoff: a round with no further slot
+  arrivals is never proactively reaped, every §6 anchor scenario is itself a touch). O5,
+  landed the same day (see above), extends this to a sweep-all — the tradeoff above no
+  longer holds.
+- **Mechanism 1** — a non-2xx slot fills its slot and is preserved in a new
+  `received_status` map; the round still fires with the error payload passed through
+  untouched (matches Go's actual code, not the handoff's summary — a `join_error_slot`
+  lost marker is bound alongside so the failure is observable, and it's the target's job
+  to reject an error slot, not the join's).
+- **§4.1** — `round_id: u64` on the join (0/omitted-on-wire unless deadline-carrying),
+  optional `round_id` on the slot-advance request; a stale-round slot is dropped with a
+  `join_late` marker and a 200 `{advanced:false, dropped:"stale_round", slot,
+  targeted_round, current_round}` response, never accumulated.
+
+New tests (`extensions/continuation/src/lib.rs`): `test_join_self_heals_after_deadline`
+(anchor 3), `test_join_error_slot_preserved_and_marked` (anchor 4),
+`test_join_straggler_bleed_caught` (anchor 5, the load-bearing one — proves the fired
+round is stitched from a single generation), `test_join_untagged_advance_still_admitted`
+and `test_join_round_id_stays_zero_without_deadline` (no-silent-change),
+`test_join_fire_partial_dispatches_with_incomplete_marker`.
+
+Two pin candidates beyond the handoff's four §6-R3 pins, both confirmed by reading Go's
+actual source (not just the prose): the lost-marker body's `join_path`/`join_slots`
+fields (present in Go's real `ChainErrorLostData`, absent from the handoff's abbreviated
+list), and the drop-response's `"slot"` key alongside `advanced`/`dropped`/
+`targeted_round`/`current_round`.
+
+Gate: `cargo test -p entity-continuation -p entity-peer` 71/71 + 190/190, 0 failures;
+`cargo fmt --check` clean; `cargo build --workspace` clean; `entity-peer` clippy clean;
+`entity-continuation` clippy clean except the already-logged pre-existing
+`assertions_on_constants` failure (`docs/BACKLOG.md`).
+
+_2026-07-28 — STANDING-MODEL §3 authority (AT-1..AT-4) confirmed + pinned_
+(`docs/status/ROUTING-2026-07-28-standing-model-authority-at1234-rust.md`; answers
+`entity-core-go`'s `HANDOFF-2026-07-28-rust-py-convergence-standing-model-s3-s4.md` Item
+1). Go ran all three impls live and found the substrate already three-way GREEN
+(liveness 4/4, network 5/5, continuations 61/61, continuation_bounds 3/3); this closes the
+one dedicated-test gap the §3 fold gates on. Rust's architecture makes the split correct
+by construction — the reactive path (inbox delivery → internal `execute_fn`) never
+capability-checks the caller at all, while the administrative path is gated only at the
+wire dispatch seam (`connection.rs::dispatch_request`), never inside the continuation
+handler. Landed:
+
+- **AT-1** (reactive, no caller cap → advances) — already covered by pre-existing
+  `test_reactive_advance_runs_under_own_authority` (`extensions/continuation/src/lib.rs`).
+- **AT-2** (administrative, caller holds a cap but not `advance` → 403) and **AT-4/O1**
+  (administrative, caller holds nothing relevant → 403 fail-closed) — new two-peer wire
+  tests in `core/peer/src/lib.rs` (`test_standing_authority_at2_administrative_wrong_operation_denied`,
+  `test_standing_authority_at4_administrative_no_capability_denied`); `Peer::execute()`
+  can't exercise this gate at all (bypasses the wire seam), so both had to be full
+  connect+authenticate+EXECUTE tests, not handler-level.
+- **AT-3** (reactive reconnect, no advance rights) — Rust has exactly one
+  `reactive_trigger` production site (inbox delivery); no separate reconnect/browser-defer
+  mechanism exists, so AT-3 is the same code path as AT-1. Go's own oracle test pins it the
+  same way (byte-identical `setup()` as AT-1). Added
+  `test_reactive_reconnect_continuation_advances_at3` as the explicit pin rather than
+  inventing a second mechanism.
+
+Gate: `cargo test -p entity-peer -p entity-continuation` 190/190 + 65/65, 0 failures;
+`cargo fmt --check` clean; `entity-peer` clippy clean. `entity-continuation` clippy was
+already red pre-existing (unrelated `assertions_on_constants` lint, confirmed via
+`git stash` — logged in `docs/BACKLOG.md`, not fixed here). Next: STANDING-MODEL §4.1
+`round_id` join straggler guard (Item 2, genuinely new — no `round_id`/`completion_deadline`
+machinery exists yet in `extensions/continuation`).
+
+_2026-07-27 — 0.8.1 bucket-B (F40/RT-6/RT-13a/RT-13b/RT-14) landed_
+(`docs/status/HANDOFF-2026-07-27-core-rust-0.8.1-bucketB-fixes-and-selfreport.md`;
+answers arch's `entity-system-architecture`
+`HANDOFF-2026-07-27-cohort-0.8.1-bucketB-update-packet.md`, which Rust had not yet
+responded to). Two real conformance gaps fixed:
+
+- **F40 (§5.2 id-scope literal matching).** Rust had the same bug keystone found in
+  42/43 of the cohort — `operations`/`peers` routed through the §5.4 path-canonicalizing
+  matcher instead of a literal string compare. Added `matches_id_scope`
+  (`core/capability/src/lib.rs`) and switched `check_permission`,
+  `check_permission_with_grant`, and delegation-attenuation's `scope_subset_id` to use it.
+- **RT-6 (§4.6 nonce single-use).** Rust had *no* handling at all for a same-connection
+  `authenticate` replay (worse than Go's pre-fix 409). Added an explicit intercept in
+  `dispatch_request` (`core/peer/src/connection.rs`) returning `401 invalid_nonce`.
+- **RT-13a** attested trivial/exempt (not a manual-memory substrate); **RT-13b** confirmed
+  already-conformant (single-writer-task / mutex-held-writer serialization) with a new
+  peer-side atomicity attestation test added; **RT-14** confirmed already-conformant
+  (`Hash::to_hex()` is the only path-segment hex producer, lowercase by construction).
+
+_2026-07-27 (same day) — RT-6 relocated after cross-impl re-validation caught it dead on the
+wire._ `entity-core-go` re-validated the above on fresh peers (not the claims in the handoff)
+and found F40 genuinely closed (authz 10/10) but **RT-6 still WARN**: the intercept sat *after*
+`verify_request_with_ctx`, and the oracle's replay resends the bare connect-EXECUTE shape (no
+`author`/`capability`, same as the original pre-Established authenticate) — which fails generic
+verification first (`401 authentication_failed`) and never reaches a post-verification check.
+Rust's own regression test used a different (fully-authenticated) replay shape and didn't catch
+it. Fixed: moved the intercept to a pre-verification peek at `uri`/`operation` (via a newly
+`pub` `entity_protocol::decode_execute_fields`, which needs only the three mandatory
+`ExecuteFields` and succeeds regardless of `author`/`capability`); the unreachable
+post-verification duplicate was deleted. New test
+`test_rt6_bare_authenticate_replay_returns_401_invalid_nonce` reproduces the exact shape the
+oracle sends. Full detail in the "Correction" section of the same handoff doc.
+
+Owed: cross-impl `validate-peer` re-run to confirm RT-6 now PASSes on the wire (self-tested only
+so far — this is exactly the gap that bit the first landing); the F40 vector run; the RT-13b
+Part-A wire probe against a live Go peer; full-workspace `make check`/`make wasm` gate.
 
 _2026-07-16:_ NETWORK Amendment 12 **rung 3** landed on `dev` — the
 `system/network` maintain-peer reconnect lifecycle in a new

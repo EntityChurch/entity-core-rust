@@ -4,6 +4,10 @@ Cargo.lock
 # Per-user Claude Code local settings — never committed (leaks local paths).
 /.claude/settings.local.json
 
+# Ad-hoc parallel working trees (developer scratch). A `git worktree` checkout
+# parked on a feature branch so it can build alongside dev; never committed.
+/.claude/worktrees/
+
 # Local sibling-dev override (kept out of the committed manifest per
 # release convention; a lone clone builds from the git-pinned deps).
 /.cargo/config.toml.local

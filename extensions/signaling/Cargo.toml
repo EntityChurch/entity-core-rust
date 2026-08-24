@@ -1,0 +1,32 @@
+[package]
+name = "entity-signaling"
+version = "0.8.0"
+edition.workspace = true
+description = "system/signaling — the connection node (rendezvous + reflector): the four verbs plus the wrapped entity surface"
+
+[dependencies]
+# The entity wrapper's dependencies. `core.rs` uses NONE of these — see its
+# module doc: the verbs are specified without reference to the entity system,
+# and that separation is what makes the second (unwrapped) front end additive.
+entity-ecf.workspace = true
+entity-entity.workspace = true
+# The §2.2 derivation calls Hash::compute (unconditionally SHA-256) — the
+# substrate content-hash primitive, pinned to the floor format. Client-side only.
+entity-hash.workspace = true
+entity-types.workspace = true
+entity-capability.workspace = true
+entity-handler.workspace = true
+# Canonical {type, data, content_hash} entity codec for the opaque coordination
+# blobs — data embedded raw, never decode+re-encoded (byte fidelity).
+entity-wire.workspace = true
+async-trait.workspace = true
+ciborium.workspace = true
+thiserror.workspace = true
+# Node-internal dedup index for §1.1 pin 2 only; never on the wire.
+sha2.workspace = true
+# Exchange nonces (§3) only.
+rand.workspace = true
+web-time = "1.1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }

@@ -63,7 +63,9 @@ impl PathScope {
 
 /// Identifier-based scope for operations and peers.
 ///
-/// Same include/exclude semantics as PathScope but for identifiers.
+/// Unlike `PathScope`, id-scope patterns match the raw value as a **literal
+/// string** (§5.2) — no §5.4 path canonicalization. Exactly two wildcards:
+/// bare `*` (any) and a trailing `/*` (literal segment-prefix).
 #[derive(Debug, Clone, PartialEq)]
 pub struct IdScope {
     pub include: Vec<String>,
@@ -477,6 +479,41 @@ pub fn matches_pattern(path: &str, pattern: &str) -> bool {
     path == pattern
 }
 
+/// Check if a value matches an id-scope pattern (§5.2).
+///
+/// id-scope (`operations`, `peers`) matches the raw value as a **literal
+/// string** — no §5.4 path canonicalization (no leading-`/` universal scope,
+/// no `/*/` interior peer-wildcard, no peer-relative→`/{local}/…`
+/// qualification). Exactly two wildcards: bare `*` (any) and a trailing `/*`
+/// (literal segment-prefix, e.g. `compute/*` matches `compute/apply`).
+fn matches_id_pattern(value: &str, pattern: &str) -> bool {
+    if pattern == "*" {
+        return true;
+    }
+    if let Some(prefix) = pattern.strip_suffix("/*") {
+        return value.starts_with(prefix)
+            && value.len() > prefix.len()
+            && value.as_bytes()[prefix.len()] == b'/';
+    }
+    value == pattern
+}
+
+/// Check if a value matches an id-scope (include/exclude) (§5.2).
+///
+/// The value must match at least one include pattern and must not match any
+/// exclude pattern, both compared literally per [`matches_id_pattern`].
+pub fn matches_id_scope(value: &str, include: &[String], exclude: &[String]) -> bool {
+    if !include
+        .iter()
+        .any(|pattern| matches_id_pattern(value, pattern))
+    {
+        return false;
+    }
+    !exclude
+        .iter()
+        .any(|pattern| matches_id_pattern(value, pattern))
+}
+
 /// Check if a value matches a scope (include/exclude) (§5.4).
 ///
 /// The value must match at least one include pattern and must not
@@ -559,17 +596,16 @@ pub fn check_permission(
     local_peer_id: &str,
 ) -> bool {
     for grant in &capability.grants {
-        // Operations
-        if !matches_scope(
+        // Operations (id-scope, §5.2 — literal match, no canonicalization)
+        if !matches_id_scope(
             operation,
             &grant.operations.include,
             &grant.operations.exclude,
-            local_peer_id,
         ) {
             continue;
         }
 
-        // Handlers
+        // Handlers (path-scope, §5.4)
         if !matches_scope(
             handler_pattern,
             &grant.handlers.include,
@@ -579,10 +615,10 @@ pub fn check_permission(
             continue;
         }
 
-        // Peers
+        // Peers (id-scope, §5.2 — literal match, no canonicalization)
         let default_peers = IdScope::new(vec![local_peer_id.into()]);
         let peers = grant.peers.as_ref().unwrap_or(&default_peers);
-        if !matches_scope(target_peer, &peers.include, &peers.exclude, local_peer_id) {
+        if !matches_id_scope(target_peer, &peers.include, &peers.exclude) {
             continue;
         }
 
@@ -622,14 +658,15 @@ pub fn check_permission_with_grant(
     granter_peer_id: &str,
 ) -> Option<GrantEntry> {
     for grant in &capability.grants {
-        if !matches_scope(
+        // Operations (id-scope, §5.2 — literal match, no canonicalization)
+        if !matches_id_scope(
             operation,
             &grant.operations.include,
             &grant.operations.exclude,
-            local_peer_id,
         ) {
             continue;
         }
+        // Handlers (path-scope, §5.4)
         if !matches_scope(
             handler_pattern,
             &grant.handlers.include,
@@ -638,9 +675,10 @@ pub fn check_permission_with_grant(
         ) {
             continue;
         }
+        // Peers (id-scope, §5.2 — literal match, no canonicalization)
         let default_peers = IdScope::new(vec![local_peer_id.into()]);
         let peers = grant.peers.as_ref().unwrap_or(&default_peers);
-        if !matches_scope(target_peer, &peers.include, &peers.exclude, local_peer_id) {
+        if !matches_id_scope(target_peer, &peers.include, &peers.exclude) {
             continue;
         }
         if let Some(rt) = resource_target {
@@ -876,7 +914,7 @@ fn grant_subset(
     ) {
         return false;
     }
-    if !scope_subset_id(&child.operations, &parent.operations, local_peer_id) {
+    if !scope_subset_id(&child.operations, &parent.operations) {
         return false;
     }
     // Resources: §PR-8 per-link granter frame (child vs parent granter).
@@ -891,7 +929,7 @@ fn grant_subset(
     let default_peers = IdScope::new(vec![local_peer_id.into()]);
     let child_peers = child.peers.as_ref().unwrap_or(&default_peers);
     let parent_peers = parent.peers.as_ref().unwrap_or(&default_peers);
-    if !scope_subset_id(child_peers, parent_peers, local_peer_id) {
+    if !scope_subset_id(child_peers, parent_peers) {
         return false;
     }
 
@@ -979,31 +1017,21 @@ fn scope_subset_path(
     true
 }
 
-/// Check if child IdScope is a subset of parent IdScope.
-fn scope_subset_id(child: &IdScope, parent: &IdScope, local_peer_id: &str) -> bool {
+/// Check if child IdScope is a subset of parent IdScope (§5.2, §5.6).
+///
+/// id-scope compares literally — no canonicalization frame, unlike
+/// [`scope_subset_path`].
+fn scope_subset_id(child: &IdScope, parent: &IdScope) -> bool {
+    // Every child include must be covered by some parent include
     for ci in &child.include {
-        let cc = match canonicalize(ci, local_peer_id) {
-            Some(v) => v,
-            None => return false,
-        };
-        if !parent
-            .include
-            .iter()
-            .any(|pi| canonicalize(pi, local_peer_id).is_some_and(|cp| matches_pattern(&cc, &cp)))
-        {
+        if !parent.include.iter().any(|pi| matches_id_pattern(ci, pi)) {
             return false;
         }
     }
 
+    // Child must inherit ALL parent excludes
     for pe in &parent.exclude {
-        let cp = match canonicalize(pe, local_peer_id) {
-            Some(v) => v,
-            None => return false,
-        };
-        let child_has = child
-            .exclude
-            .iter()
-            .any(|ce| canonicalize(ce, local_peer_id).is_some_and(|cc| matches_pattern(&cp, &cc)));
+        let child_has = child.exclude.iter().any(|ce| matches_id_pattern(pe, ce));
         if !child_has {
             return false;
         }
@@ -1714,6 +1742,85 @@ mod tests {
             &["system/tree/*".into()],
             &["system/tree/secret".into()],
             LOCAL_PEER,
+        ));
+    }
+
+    // --- matches_id_scope (F40, §5.2) ---
+    //
+    // id-scope compares literally: a pattern carrying path syntax (`/*/get`)
+    // matches only as a literal string, never canonicalized against a peer
+    // frame the way path-scope is. These mirror the oracle's accept-path
+    // vectors (entity-core-go `f40_id_scope_exclude_literal` /
+    // `f40_id_scope_include_no_overgrant`).
+
+    #[test]
+    fn test_f40_id_scope_exclude_literal_does_not_block_real_operation() {
+        // A canonicalizing matcher would resolve "/*/get" to a peer-wildcard
+        // pattern and treat the literal operation "get" as matching it,
+        // wrongly excluding it. Literal matching: "get" != "/*/get".
+        assert!(matches_id_scope("get", &["*".into()], &["/*/get".into()]));
+    }
+
+    #[test]
+    fn test_f40_id_scope_include_no_overgrant() {
+        // A canonicalizing matcher would resolve "/*/get" to a peer-wildcard
+        // subtree pattern and let it authorize the bare operation "get".
+        // Literal matching: an include of "/*/get" never matches "get".
+        assert!(!matches_id_scope("get", &["/*/get".into()], &[]));
+        // It also doesn't over-grant via the segment-prefix wildcard reading
+        // ("/*/*" as "anything") — still a literal string comparison.
+        assert!(!matches_id_scope("get", &["/*/*".into()], &[]));
+    }
+
+    #[test]
+    fn test_f40_id_scope_trailing_wildcard_is_literal_segment_prefix() {
+        assert!(matches_id_scope(
+            "compute/apply",
+            &["compute/*".into()],
+            &[]
+        ));
+        assert!(!matches_id_scope("compute", &["compute/*".into()], &[]));
+        assert!(!matches_id_scope(
+            "computeextra",
+            &["compute/*".into()],
+            &[]
+        ));
+    }
+
+    #[test]
+    fn test_f40_id_scope_bare_star_matches_any() {
+        assert!(matches_id_scope("anything/at/all", &["*".into()], &[]));
+    }
+
+    #[test]
+    fn test_f40_check_permission_exclude_literal_does_not_block_real_get() {
+        // Same accept-path shape as the oracle vector, at the check_permission
+        // level: a grant excluding the literal pattern "/*/get" must not deny
+        // a real "get" operation.
+        let mut grant = make_grant(&["system/tree"], &["*"], &["*"]);
+        grant.operations = IdScope::with_exclude(vec!["*".into()], vec!["/*/get".into()]);
+        let token = make_token(vec![grant]);
+        assert!(check_permission(
+            "get",
+            "system/tree",
+            LOCAL_PEER,
+            None,
+            &token,
+            LOCAL_PEER
+        ));
+    }
+
+    #[test]
+    fn test_f40_check_permission_include_does_not_overgrant() {
+        let grant = make_grant(&["system/tree"], &["*"], &["/*/get"]);
+        let token = make_token(vec![grant]);
+        assert!(!check_permission(
+            "get",
+            "system/tree",
+            LOCAL_PEER,
+            None,
+            &token,
+            LOCAL_PEER
         ));
     }
 

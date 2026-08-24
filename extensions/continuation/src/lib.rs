@@ -3,7 +3,7 @@
 //! Implements forward continuations (§3.4) and join continuations (§3.5).
 //! Supports suspend/resume/abandon for paused execution chains.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -15,6 +15,7 @@ use entity_handler::{
 };
 use entity_hash::Hash;
 use entity_store::{CasError, ContentStore, LocationIndex};
+use web_time::Instant;
 
 // ---------------------------------------------------------------------------
 // Continuation engine error codes (EXTENSION-CONTINUATION v1.20 Appendix A).
@@ -131,6 +132,21 @@ const DEFAULT_CHAIN_TTL: u64 = 8 * MAX_CHAIN_DEPTH;
 /// string).
 const CODE_BOUNDS_EXCEEDED: &str = "bounds_exceeded";
 
+/// STANDING-MODEL §4 mechanism 2: a standing join's round exceeded its
+/// `completion_deadline_ms` with slots still missing and was abandoned
+/// (Go: `ChainErrorReasonJoinIncomplete`, `join_incomplete`).
+const CODE_JOIN_INCOMPLETE: &str = "join_incomplete";
+/// STANDING-MODEL §4 mechanism 1: a join round completed the barrier but at
+/// least one slot arrived carrying a non-2xx status — the round is
+/// observably failed even though it fired (Go: `ChainErrorReasonJoinErrorSlot`,
+/// `join_error_slot`).
+const CODE_JOIN_ERROR_SLOT: &str = "join_error_slot";
+/// STANDING-MODEL §4.1: a slot advance targeted a round the join has already
+/// left (a straggler from an abandoned or already-fired round), dropped
+/// loudly rather than admitted into the current round (Go:
+/// `ChainErrorReasonJoinLate`, `join_late`).
+const CODE_JOIN_LATE: &str = "join_late";
+
 /// §3.6 step 6: the bounds for a dispatch made out of an advance.
 ///
 /// Handing the execute seam `None` makes it inherit the parent's bounds and
@@ -195,7 +211,19 @@ pub struct ContinuationHandler {
     /// param that previously needed local-peer-id qualification.
     #[allow(dead_code)]
     local_peer_id: String,
+    /// STANDING-MODEL §4 O5: paths of deadline-carrying joins tracked for the
+    /// completion sweep (`maybe_sweep_joins`). Filled from install and touch
+    /// (`note_join_path`) — mirrors Go's `joinPaths`.
+    join_paths: tokio::sync::Mutex<HashSet<String>>,
+    /// Throttle state for the sweep: `None` until the first sweep runs.
+    /// Mirrors Go's `lastJoinSweep`.
+    last_join_sweep: tokio::sync::Mutex<Option<Instant>>,
 }
+
+/// STANDING-MODEL §4 O5: sweep throttle floor, matching Go's
+/// `joinSweepThrottle` — bounds a full pass over tracked joins to once per
+/// minute so a busy peer doesn't pay it per advance.
+const JOIN_SWEEP_THROTTLE_MS: u128 = 60_000;
 
 /// Path-safety sanitizer per EXTENSION-CONTINUATION v1.19 §3.10.5 (V7 §1.4
 /// path-segment rules). Code strings emitted by canonical homes are already
@@ -303,6 +331,8 @@ impl ContinuationHandler {
             join_locks: tokio::sync::Mutex::new(HashMap::new()),
             qualified_pattern,
             local_peer_id,
+            join_paths: tokio::sync::Mutex::new(HashSet::new()),
+            last_join_sweep: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -312,6 +342,93 @@ impl ContinuationHandler {
             .entry(path.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// STANDING-MODEL §4 O5: register a deadline-carrying join path as
+    /// sweepable. Called from install and from touch (`advance_join_slot`),
+    /// so the tracked set fills from ordinary traffic — mirrors Go's
+    /// `noteJoinPath`. A wait-forever join (no deadline) is never reapable
+    /// and is not tracked.
+    async fn note_join_path(&self, path: &str, join: &JoinData) {
+        if join.completion_deadline_ms.is_none() {
+            return;
+        }
+        self.join_paths.lock().await.insert(path.to_string());
+    }
+
+    async fn forget_join_path(&self, path: &str) {
+        self.join_paths.lock().await.remove(path);
+    }
+
+    /// STANDING-MODEL §4 O5: throttled pass over every tracked deadline-
+    /// carrying join, reaping any whose round has expired — not just the
+    /// join being touched by this advance. Bind-time and throttled like the
+    /// reap-on-touch it extends: no background timer/goroutine, so a
+    /// fully-quiescent peer is not swept (§O6, deferred). Mirrors Go's
+    /// `maybeSweepJoins`; reaped joins dispatch/mark under the sweeping
+    /// request's own `execute_fn`/`chain_err`.
+    async fn maybe_sweep_joins(&self, execute_fn: &ExecuteFn, chain_err: &ChainErr) {
+        let now = Instant::now();
+        {
+            let mut last = self.last_join_sweep.lock().await;
+            if let Some(prev) = *last {
+                if now.duration_since(prev).as_millis() < JOIN_SWEEP_THROTTLE_MS {
+                    return;
+                }
+            }
+            *last = Some(now);
+        }
+        let paths: Vec<String> = self.join_paths.lock().await.iter().cloned().collect();
+        let now_ms = capture_failure_timestamp_ms();
+        for path in paths {
+            self.sweep_one_join(execute_fn, &path, chain_err, now_ms)
+                .await;
+        }
+    }
+
+    /// Reaps a single tracked join under its own lock, dropping it from the
+    /// tracked set if it is no longer a deadline-carrying join at that path.
+    /// Mirrors Go's `sweepOneJoin`.
+    async fn sweep_one_join(
+        &self,
+        execute_fn: &ExecuteFn,
+        path: &str,
+        chain_err: &ChainErr,
+        now_ms: u64,
+    ) {
+        let lock = self.get_join_lock(path).await;
+        let _guard = lock.lock().await;
+
+        let join_hash = match self.location_index.get(path) {
+            Some(h) => h,
+            None => {
+                self.forget_join_path(path).await;
+                return;
+            }
+        };
+        let join_entity = match self.content_store.get(&join_hash) {
+            Some(e) => e,
+            None => {
+                self.forget_join_path(path).await;
+                return;
+            }
+        };
+        if join_entity.entity_type != entity_types::TYPE_CONTINUATION_JOIN {
+            self.forget_join_path(path).await; // exhausted, abandoned, or replaced
+            return;
+        }
+        let join = match decode_join(&join_entity) {
+            Ok(j) => j,
+            Err(_) => return, // undecodable: leave it alone rather than act on a guess
+        };
+        if join.completion_deadline_ms.is_none() {
+            self.forget_join_path(path).await;
+            return;
+        }
+        if join_round_incomplete(&join, now_ms) {
+            self.reap_join_round(execute_fn, path, join, chain_err, now_ms)
+                .await;
+        }
     }
 }
 
@@ -378,8 +495,9 @@ impl ContinuationHandler {
             "continuation advance"
         );
 
-        // Decode advance request: {result: bytes, status: optional uint}
-        let (result_bytes, status) = decode_advance_request(&ctx.params.data)?;
+        // Decode advance request: {result: bytes, status: optional uint,
+        // round_id: optional uint (STANDING-MODEL §4.1, join-slot-only)}
+        let (result_bytes, status, round_id) = decode_advance_request(&ctx.params.data)?;
         let status = status.unwrap_or(STATUS_OK);
 
         let execute_fn = ctx
@@ -408,12 +526,23 @@ impl ContinuationHandler {
             parent_bounds: ctx.bounds.clone(),
         };
 
+        // STANDING-MODEL §4 O5: extend the reap-on-touch above to a sweep of
+        // every tracked deadline-carrying join, not just the one this advance
+        // touches — a standing join that goes silent while the peer stays
+        // continuation-active must still self-heal, or it wedges forever and
+        // never emits the `join_incomplete` marker a peer that DOES sweep
+        // would. Throttled, no background timer; piggybacks on this advance's
+        // own execute_fn/chain_err, mirroring Go's `maybeSweepJoins` call at
+        // the top of `handleAdvance`.
+        self.maybe_sweep_joins(execute_fn, &chain_err).await;
+
         let result = self
             .advance_at_path(
                 execute_fn,
                 &path,
                 &result_bytes,
                 status,
+                round_id,
                 &chain_err,
                 &ctx.included,
                 ctx.reactive_trigger,
@@ -443,6 +572,7 @@ impl ContinuationHandler {
         path: &str,
         result_bytes: &[u8],
         status: u32,
+        round_id: Option<u64>,
         chain_err: &ChainErr,
         included: &HashMap<Hash, Entity>,
         reactive_trigger: bool,
@@ -491,6 +621,8 @@ impl ContinuationHandler {
                                 slot,
                                 &parent_entity,
                                 result_bytes,
+                                status,
+                                round_id,
                                 chain_err,
                             )
                             .await;
@@ -558,6 +690,39 @@ impl ContinuationHandler {
         timestamp_ms: u64,
         rejected_marker_hash: Option<Hash>,
     ) {
+        self.write_lost_error_marker_ext(
+            ce,
+            failed_uri,
+            original_status,
+            reason,
+            timestamp_ms,
+            rejected_marker_hash,
+            None,
+            &[],
+        )
+    }
+
+    /// STANDING-MODEL §4: the same lost-error marker as
+    /// [`Self::write_lost_error_marker`], extended with the two fields a join-
+    /// completion failure needs to be diagnosable (Go: `join_path`/
+    /// `join_slots`, §6 R3 pin candidate) — which join and which slot(s) the
+    /// failure names, distinct from `target_uri` (the join's dispatch
+    /// *target*, not the join itself). `original_status` doubles as the
+    /// targeted round number for `join_late` (mirrors Go's
+    /// `bindJoinLateMarker`, which reuses the status slot rather than adding
+    /// a fifth marker-body field for one reason code).
+    #[allow(clippy::too_many_arguments)]
+    fn write_lost_error_marker_ext(
+        &self,
+        ce: &ChainErr,
+        failed_uri: &str,
+        original_status: u32,
+        reason: &str,
+        timestamp_ms: u64,
+        rejected_marker_hash: Option<Hash>,
+        join_path: Option<&str>,
+        join_slots: &[String],
+    ) {
         let safe_reason = sanitize_reason_segment(reason);
         // Both coordinates originate on the wire (`bounds.chain_id` and the
         // request id), so neither may name a path segment unvetted (§1.4 /
@@ -608,6 +773,16 @@ impl ContinuationHandler {
             body_fields.push((
                 entity_ecf::text("rejected_marker_hash"),
                 entity_ecf::Value::Bytes(h.to_bytes().to_vec()),
+            ));
+        }
+        if let Some(jp) = join_path {
+            body_fields.push((entity_ecf::text("join_path"), entity_ecf::text(jp)));
+        }
+        if !join_slots.is_empty() {
+            let arr: Vec<entity_ecf::Value> = join_slots.iter().map(entity_ecf::text).collect();
+            body_fields.push((
+                entity_ecf::text("join_slots"),
+                entity_ecf::Value::Array(arr),
             ));
         }
         let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(body_fields));
@@ -1100,6 +1275,7 @@ impl ContinuationHandler {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn advance_join_slot(
         &self,
         execute_fn: &ExecuteFn,
@@ -1107,6 +1283,8 @@ impl ContinuationHandler {
         slot_name: &str,
         _join_entity: &Entity,
         result_bytes: &[u8],
+        status: u32,
+        round_id: Option<u64>,
         chain_err: &ChainErr,
     ) -> Result<HandlerResult, HandlerError> {
         // Acquire per-path lock
@@ -1122,7 +1300,8 @@ impl ContinuationHandler {
             .content_store
             .get(&join_hash)
             .ok_or_else(|| HandlerError::Internal("join entity not in store".into()))?;
-        let join = decode_join(&join_entity)?;
+        let mut join = decode_join(&join_entity)?;
+        self.note_join_path(parent_path, &join).await;
 
         // Validate slot is expected
         if !join.expected.contains(&slot_name.to_string()) {
@@ -1133,9 +1312,76 @@ impl ContinuationHandler {
             ));
         }
 
-        // Accumulate result
+        let now_ms = capture_failure_timestamp_ms();
+
+        // STANDING-MODEL §4 mechanism 2, reap-on-touch: if the PREVIOUS round
+        // blew its deadline while nothing was touching this join, fail it
+        // here before accumulating. Without this, the arriving slot would be
+        // counted into a dead round and the join would stay one slot short
+        // forever — the wedge §4 exists to close. This is the narrowest,
+        // cheapest reap (this join, this touch); O5's `maybe_sweep_joins`
+        // (called from `handle_advance`) extends the same policy to every
+        // OTHER tracked deadline-carrying join on any continuation advance,
+        // so a standing join that goes silent still self-heals off somebody
+        // else's traffic.
+        if join_round_incomplete(&join, now_ms) {
+            self.reap_join_round(execute_fn, parent_path, join.clone(), chain_err, now_ms)
+                .await;
+            // Re-read: the reap rebound (or deleted) the join.
+            let join_hash2 = match self.location_index.get(parent_path) {
+                Some(h) => h,
+                None => return Ok(advancement_not_found()),
+            };
+            let join_entity2 = self
+                .content_store
+                .get(&join_hash2)
+                .ok_or_else(|| HandlerError::Internal("join entity not in store".into()))?;
+            join = decode_join(&join_entity2)?;
+        }
+
+        // STANDING-MODEL §4.1 straggler guard (MUST): a slot advance
+        // targeting a round that is no longer current — a straggler from an
+        // abandoned (or already-fired) round — MUST NOT be admitted.
+        // Admitting it stitches two generations into one boundary hash:
+        // wrong, deterministic-looking, reproducible. Checked HERE, after
+        // the reap re-read above, so `join.round_id` is the current
+        // generation (the reap may have advanced it). Additive: only a
+        // deadline-carrying join turns rounds over, and only a slot that
+        // opted in by tagging `round_id` is checked — an untagged advance is
+        // admitted exactly as before §4.1.
+        if let Some(rid) = round_id {
+            if join.completion_deadline_ms.is_some() && rid != join.round_id {
+                self.write_lost_error_marker_ext(
+                    chain_err,
+                    &join.target,
+                    rid as u32,
+                    CODE_JOIN_LATE,
+                    now_ms,
+                    None,
+                    Some(parent_path),
+                    std::slice::from_ref(&slot_name.to_string()),
+                );
+                return Ok(join_slot_dropped_stale(slot_name, rid, join.round_id));
+            }
+        }
+
+        // Accumulate result. §4 mechanism 1: remember a slot that arrived
+        // carrying an error — sparse, so an all-good round never grows
+        // `received_status` and its entity bytes are unchanged from pre-§4.
         let mut received = join.received.clone();
         received.insert(slot_name.to_string(), result_bytes.to_vec());
+        let mut received_status = join.received_status.clone();
+        if !(200..300).contains(&status) {
+            received_status.insert(slot_name.to_string(), status);
+        } else {
+            received_status.remove(slot_name);
+        }
+        // Arm the round clock on its first slot (only where a deadline could
+        // ever consume it) — never on install/reset, so an idle standing
+        // join with no traffic never emits a marker.
+        let round_started_ms = join
+            .round_started_ms
+            .or(join.completion_deadline_ms.and(Some(now_ms)));
 
         // Check if all slots are filled
         let remaining: Vec<String> = join
@@ -1146,7 +1392,27 @@ impl ContinuationHandler {
             .collect();
 
         if remaining.is_empty() {
-            // All slots received — aggregate and dispatch
+            // All slots received — aggregate and dispatch. §4 mechanism 1:
+            // the barrier completes even with an error slot (a delivered
+            // non-2xx FILLS its slot); record the round as observably failed
+            // BEFORE dispatching, so the observation exists whether or not
+            // the target rejects. The dispatch still carries the error
+            // payload through untouched — it is the target (a determinism-
+            // critical stitch) that MUST reject an error slot, not the join.
+            let errored = join_error_slots(&join.expected, &received_status);
+            if !errored.is_empty() {
+                self.write_lost_error_marker_ext(
+                    chain_err,
+                    &join.target,
+                    0,
+                    CODE_JOIN_ERROR_SLOT,
+                    now_ms,
+                    None,
+                    Some(parent_path),
+                    &errored,
+                );
+            }
+
             let aggregated = encode_received_map(&received);
 
             // Build continuation data from join's dispatch fields
@@ -1197,6 +1463,13 @@ impl ContinuationHandler {
                 reactive_trigger: false,
             };
 
+            let join_before_reset = JoinData {
+                received,
+                received_status,
+                round_started_ms,
+                ..join
+            };
+
             match execute_fn(
                 cont.target.clone(),
                 cont.operation.clone(),
@@ -1206,31 +1479,7 @@ impl ContinuationHandler {
             .await
             {
                 Ok(_) => {
-                    // Handle lifecycle
-                    match join.remaining_executions {
-                        Some(n) if n <= 1 => {
-                            // Delete the join
-                            self.location_index.remove(parent_path);
-                            self.content_store.remove(&join_hash);
-                        }
-                        Some(n) => {
-                            // Decrement and reset received
-                            let updated = JoinData {
-                                remaining_executions: Some(n - 1),
-                                received: HashMap::new(),
-                                ..join
-                            };
-                            self.store_join(parent_path, &updated)?;
-                        }
-                        None => {
-                            // Standing join: reset received for next round
-                            let updated = JoinData {
-                                received: HashMap::new(),
-                                ..join
-                            };
-                            self.store_join(parent_path, &updated)?;
-                        }
-                    }
+                    self.finish_join_round(parent_path, join_before_reset)?;
                     Ok(advancement_result(true))
                 }
                 Err(e) => {
@@ -1281,28 +1530,7 @@ impl ContinuationHandler {
                                 None,
                             );
                         }
-                        // Handle lifecycle
-                        match join.remaining_executions {
-                            Some(n) if n <= 1 => {
-                                self.location_index.remove(parent_path);
-                                self.content_store.remove(&join_hash);
-                            }
-                            Some(n) => {
-                                let updated = JoinData {
-                                    remaining_executions: Some(n - 1),
-                                    received: HashMap::new(),
-                                    ..join
-                                };
-                                self.store_join(parent_path, &updated)?;
-                            }
-                            None => {
-                                let updated = JoinData {
-                                    received: HashMap::new(),
-                                    ..join
-                                };
-                                self.store_join(parent_path, &updated)?;
-                            }
-                        }
+                        self.finish_join_round(parent_path, join_before_reset)?;
                         Ok(advancement_result(true))
                     } else {
                         Err(e)
@@ -1311,7 +1539,12 @@ impl ContinuationHandler {
             }
         } else {
             // Not all slots: update join with accumulated received
-            let updated = JoinData { received, ..join };
+            let updated = JoinData {
+                received,
+                received_status,
+                round_started_ms,
+                ..join
+            };
             self.store_join(parent_path, &updated)?;
 
             // Return partial result
@@ -1331,6 +1564,141 @@ impl ContinuationHandler {
                 result,
                 included: std::collections::HashMap::new(),
             })
+        }
+    }
+
+    /// STANDING-MODEL §4 / EXTENSION-CONTINUATION §3.3: age a join after a
+    /// round fires (or is abandoned / fire-partialed) — decrement a counted
+    /// join (deleting it at zero) or reset a standing one for the next
+    /// round. Shared across the slot-driven fire, the on_error fire, and the
+    /// deadline-driven abandon/fire-partial paths so all four age the join
+    /// identically (a fire-partial that skipped this would let a counted
+    /// join fire more times than it was installed for).
+    fn finish_join_round(&self, parent_path: &str, join: JoinData) -> Result<(), HandlerError> {
+        match join.remaining_executions {
+            Some(n) if n <= 1 => {
+                if let Some(hash) = self.location_index.get(parent_path) {
+                    self.content_store.remove(&hash);
+                }
+                self.location_index.remove(parent_path);
+            }
+            Some(n) => {
+                let mut updated = reset_join_round(join);
+                updated.remaining_executions = Some(n - 1);
+                self.store_join(parent_path, &updated)?;
+            }
+            None => {
+                let updated = reset_join_round(join);
+                self.store_join(parent_path, &updated)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// STANDING-MODEL §4 mechanism 2: apply the completion policy to a join
+    /// whose round has exceeded its deadline with slots still missing.
+    /// Caller MUST hold the join lock (this reads-decides-rebinds).
+    async fn reap_join_round(
+        &self,
+        execute_fn: &ExecuteFn,
+        parent_path: &str,
+        join: JoinData,
+        chain_err: &ChainErr,
+        now_ms: u64,
+    ) {
+        let missing = join_missing_slots(&join);
+        if join.on_incomplete.as_deref() == Some("fire-partial") {
+            self.fire_partial_round(execute_fn, parent_path, join, &missing, chain_err)
+                .await;
+            return;
+        }
+        // abandon (default): the round failed and says so.
+        self.write_lost_error_marker_ext(
+            chain_err,
+            &join.target,
+            0,
+            CODE_JOIN_INCOMPLETE,
+            now_ms,
+            None,
+            Some(parent_path),
+            &missing,
+        );
+        if let Err(e) = self.finish_join_round(parent_path, join) {
+            tracing::warn!(
+                parent_path = %parent_path,
+                error = %e,
+                "STANDING-MODEL §4: join round reset FAILED after abandon — join may wedge",
+            );
+        }
+    }
+
+    /// STANDING-MODEL §4 mechanism 2 (opt-in): fire the target with the
+    /// partial `received` plus an explicit `incomplete` marker naming the
+    /// missing slots, riding IN the assembled params next to the slot values
+    /// (not beside them) — a target that opted into fire-partial and then
+    /// ignores the marker has chosen partial input by that choice. Best-
+    /// effort: an assembly or dispatch failure logs and still ages the join,
+    /// matching Go's `firePartialRound`.
+    async fn fire_partial_round(
+        &self,
+        execute_fn: &ExecuteFn,
+        parent_path: &str,
+        join: JoinData,
+        missing: &[String],
+        chain_err: &ChainErr,
+    ) {
+        let aggregated =
+            encode_received_map_with_incomplete(&join.received, missing, &join.expected);
+        let cont = ContinuationData {
+            target: join.target.clone(),
+            operation: join.operation.clone(),
+            resource: join.resource.clone(),
+            params: join.params.clone(),
+            result_field: join.result_field.clone(),
+            result_merge: false,
+            result_transform: None,
+            on_error: join.on_error.clone(),
+            deliver_to: join.deliver_to.clone(),
+            remaining_executions: join.remaining_executions,
+            dispatch_capability: join.dispatch_capability,
+        };
+        match assemble_params(&cont.params, &cont.result_field, &aggregated) {
+            Ok(params) => match Entity::new("primitive/any", params) {
+                Ok(params_entity) => {
+                    let dispatch_cap = self.resolve_dispatch_capability(&cont.dispatch_capability);
+                    let opts = ExecuteOptions {
+                        resource: cont.resource.clone(),
+                        capability: dispatch_cap,
+                        deliver_to: cont.deliver_to.clone(),
+                        bounds: dispatch_bounds(chain_err),
+                        reactive_trigger: false,
+                        ..Default::default()
+                    };
+                    if let Err(e) = execute_fn(
+                        cont.target.clone(),
+                        cont.operation.clone(),
+                        params_entity,
+                        opts,
+                    )
+                    .await
+                    {
+                        tracing::warn!(parent_path = %parent_path, error = %e, "STANDING-MODEL §4: fire-partial dispatch FAILED");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(parent_path = %parent_path, error = %e, "STANDING-MODEL §4: fire-partial params entity build FAILED");
+                }
+            },
+            Err(e) => {
+                tracing::warn!(parent_path = %parent_path, error = %e, "STANDING-MODEL §4: fire-partial params assembly FAILED");
+            }
+        }
+        if let Err(e) = self.finish_join_round(parent_path, join) {
+            tracing::warn!(
+                parent_path = %parent_path,
+                error = %e,
+                "STANDING-MODEL §4: join round reset FAILED after fire-partial — join may wedge",
+            );
         }
     }
 
@@ -1533,6 +1901,33 @@ impl ContinuationHandler {
                         "join continuation requires non-empty expected",
                     ));
                 }
+                // STANDING-MODEL §4, G1 fail-closed (same discipline as
+                // unknown_transform_op): an unrecognized on_incomplete is
+                // rejected at install rather than silently defaulting to
+                // abandon at the deadline — a typo'd policy the installer
+                // did not choose should not be discovered only once a round
+                // is already short.
+                if !matches!(data.on_incomplete.as_deref(), None | Some("abandon" | "fire-partial"))
+                {
+                    return Ok(error_result(
+                        STATUS_BAD_REQUEST,
+                        "invalid_continuation",
+                        &format!(
+                            "unrecognized on_incomplete '{}': expected 'abandon' or 'fire-partial'",
+                            data.on_incomplete.as_deref().unwrap_or("")
+                        ),
+                    ));
+                }
+                // A policy with no deadline can never fire — the round
+                // never ends. Reject rather than accept a join whose stated
+                // policy is inert.
+                if data.on_incomplete.is_some() && data.completion_deadline_ms.is_none() {
+                    return Ok(error_result(
+                        STATUS_BAD_REQUEST,
+                        "invalid_continuation",
+                        "on_incomplete requires completion_deadline_ms — without a deadline no round is ever incomplete",
+                    ));
+                }
                 match data.dispatch_capability {
                     Some(h) => h,
                     None => {
@@ -1605,11 +2000,43 @@ impl ContinuationHandler {
         // no separate construction step from a wrapper. Resource targets are
         // peer-qualified by dispatch, so the location-index key matches what
         // a subsequent advance/resume/abandon will look up.
+        //
+        // A join is the one exception: a fresh install starts a fresh round
+        // and MUST NOT inherit a round clock, per-slot statuses, or a round
+        // generation from the caller's params (STANDING-MODEL §4/§4.1) — a
+        // join installed pre-set to round 500 would silently reject every
+        // slot tagged for round 0 until the fan-out caught up. Re-encode
+        // with those three fields forced to their fresh-install defaults
+        // rather than persisting the caller's bytes verbatim.
+        let mut installed_join = None;
+        let install_entity = if kind == "join" {
+            let mut join_data = decode_join(&ctx.params)?;
+            join_data.round_started_ms = None;
+            join_data.received_status = HashMap::new();
+            join_data.round_id = 0;
+            let entity = Entity::new(
+                entity_types::TYPE_CONTINUATION_JOIN,
+                encode_join(&join_data),
+            )
+            .map_err(|e| HandlerError::Internal(e.to_string()))?;
+            installed_join = Some(join_data);
+            entity
+        } else {
+            ctx.params.clone()
+        };
         let cont_hash = self
             .content_store
-            .put(ctx.params.clone())
+            .put(install_entity)
             .map_err(|e| HandlerError::Internal(e.to_string()))?;
         self.location_index.set(&qualified_path, cont_hash);
+
+        // STANDING-MODEL §4 O5: register a fresh deadline-carrying join for
+        // the completion sweep immediately, so an installed-but-never-touched
+        // join is still reapable (mirrors Go's `noteJoinPath` call at
+        // install).
+        if let Some(join_data) = &installed_join {
+            self.note_join_path(&qualified_path, join_data).await;
+        }
 
         // Step 5: persist the embedded capability and its full authority chain
         // to the local content store so future advance() can resolve it
@@ -1891,6 +2318,31 @@ struct JoinData {
     deliver_to: Option<DeliverySpec>,
     remaining_executions: Option<u64>,
     dispatch_capability: Option<Hash>,
+    /// STANDING-MODEL §4 mechanism 2: per-round wall budget. Absent = wait
+    /// forever (pre-§4 behavior, no silent change) — the policy is opt-in
+    /// per join set by the substrate that installs it.
+    completion_deadline_ms: Option<u64>,
+    /// STANDING-MODEL §4 mechanism 2: `"abandon"` (default, also the meaning
+    /// of absent) or `"fire-partial"`. Only consulted when
+    /// `completion_deadline_ms` is set — without a deadline no round is ever
+    /// incomplete, because it never ends.
+    on_incomplete: Option<String>,
+    /// When the current round began accumulating (armed on the round's FIRST
+    /// slot, cleared with `received` on reset) — the deadline's reference
+    /// point. Not a proposal §4 field name; forced by the fact that a
+    /// deadline is unenforceable without a start (mirrors Go's
+    /// `RoundStartedMs`).
+    round_started_ms: Option<u64>,
+    /// STANDING-MODEL §4 mechanism 1: the advance status of any slot that
+    /// arrived carrying a non-2xx result. Sparse — an all-good round never
+    /// grows this map, so its entity bytes are unchanged from pre-§4.
+    received_status: HashMap<String, u32>,
+    /// STANDING-MODEL §4.1: the join's current round generation, incremented
+    /// on every round turnover (abandon-reset, fire-reset, fire-partial-reset)
+    /// — but ONLY for a deadline-carrying join (a wait-forever join never
+    /// turns a round over via abandon and stays at 0, so `encode_join` omits
+    /// it — no silent change to a pre-§4 join's wire bytes).
+    round_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -1914,7 +2366,11 @@ struct SuspendedData {
 // CBOR decode helpers
 // ---------------------------------------------------------------------------
 
-fn decode_advance_request(params_data: &[u8]) -> Result<(Vec<u8>, Option<u32>), HandlerError> {
+/// `(result_bytes, status, round_id)` — `round_id` is STANDING-MODEL §4.1's
+/// join-slot-only, optional field.
+type AdvanceRequestFields = (Vec<u8>, Option<u32>, Option<u64>);
+
+fn decode_advance_request(params_data: &[u8]) -> Result<AdvanceRequestFields, HandlerError> {
     let val: ciborium::Value = ciborium::from_reader(params_data)
         .map_err(|e| HandlerError::InvalidParams(format!("decode params: {}", e)))?;
     let map = val
@@ -1923,6 +2379,7 @@ fn decode_advance_request(params_data: &[u8]) -> Result<(Vec<u8>, Option<u32>), 
 
     let mut result_bytes = Vec::new();
     let mut status = None;
+    let mut round_id = None;
 
     for (pk, pv) in map {
         match pk.as_text() {
@@ -1939,11 +2396,17 @@ fn decode_advance_request(params_data: &[u8]) -> Result<(Vec<u8>, Option<u32>), 
             Some("status") => {
                 status = pv.as_integer().map(|i| i128::from(i) as u32);
             }
+            // STANDING-MODEL §4.1: the round this slot advance targets.
+            // Absent = untracked, admitted as before (§4.1's additive
+            // contract — only a fan-out that opts in by tagging is checked).
+            Some("round_id") => {
+                round_id = pv.as_integer().map(|i| i128::from(i) as u64);
+            }
             _ => {}
         }
     }
 
-    Ok((result_bytes, status))
+    Ok((result_bytes, status, round_id))
 }
 
 fn decode_continuation(entity: &Entity) -> Result<ContinuationData, HandlerError> {
@@ -2034,6 +2497,11 @@ fn decode_join(entity: &Entity) -> Result<JoinData, HandlerError> {
     let mut deliver_to = None;
     let mut remaining_executions = None;
     let mut dispatch_capability = None;
+    let mut completion_deadline_ms = None;
+    let mut on_incomplete = None;
+    let mut round_started_ms = None;
+    let mut received_status = HashMap::new();
+    let mut round_id = 0u64;
 
     for (k, v) in map {
         match k.as_text() {
@@ -2086,6 +2554,27 @@ fn decode_join(entity: &Entity) -> Result<JoinData, HandlerError> {
                     dispatch_capability = Hash::from_bytes(b).ok();
                 }
             }
+            Some("completion_deadline_ms") => {
+                completion_deadline_ms = v.as_integer().map(|i| i128::from(i) as u64);
+            }
+            Some("on_incomplete") => on_incomplete = v.as_text().map(|s| s.to_string()),
+            Some("round_started_ms") => {
+                round_started_ms = v.as_integer().map(|i| i128::from(i) as u64);
+            }
+            Some("received_status") => {
+                if let Some(status_map) = v.as_map() {
+                    for (sk, sv) in status_map {
+                        if let Some(name) = sk.as_text() {
+                            if let Some(status) = sv.as_integer().map(|i| i128::from(i) as u32) {
+                                received_status.insert(name.to_string(), status);
+                            }
+                        }
+                    }
+                }
+            }
+            Some("round_id") => {
+                round_id = v.as_integer().map(|i| i128::from(i) as u64).unwrap_or(0);
+            }
             _ => {}
         }
     }
@@ -2102,6 +2591,11 @@ fn decode_join(entity: &Entity) -> Result<JoinData, HandlerError> {
         deliver_to,
         remaining_executions,
         dispatch_capability,
+        completion_deadline_ms,
+        on_incomplete,
+        round_started_ms,
+        received_status,
+        round_id,
     })
 }
 
@@ -2481,6 +2975,40 @@ fn encode_join(join: &JoinData) -> Vec<u8> {
         fields.push((entity_ecf::text("result_field"), entity_ecf::text(rf)));
     }
     fields.push((entity_ecf::text("target"), entity_ecf::text(&join.target)));
+    if let Some(ms) = join.completion_deadline_ms {
+        fields.push((
+            entity_ecf::text("completion_deadline_ms"),
+            entity_ecf::integer(ms as i64),
+        ));
+    }
+    if let Some(ref oi) = join.on_incomplete {
+        fields.push((entity_ecf::text("on_incomplete"), entity_ecf::text(oi)));
+    }
+    if let Some(ms) = join.round_started_ms {
+        fields.push((
+            entity_ecf::text("round_started_ms"),
+            entity_ecf::integer(ms as i64),
+        ));
+    }
+    if !join.received_status.is_empty() {
+        let status_pairs: Vec<(entity_ecf::Value, entity_ecf::Value)> = join
+            .received_status
+            .iter()
+            .map(|(k, v)| (entity_ecf::text(k), entity_ecf::integer(*v as i64)))
+            .collect();
+        fields.push((
+            entity_ecf::text("received_status"),
+            entity_ecf::Value::Map(status_pairs),
+        ));
+    }
+    // §4.1 additive contract: omit when zero so a pre-§4 / deadline-less
+    // join's entity bytes stay identical to before this proposal.
+    if join.round_id != 0 {
+        fields.push((
+            entity_ecf::text("round_id"),
+            entity_ecf::integer(join.round_id as i64),
+        ));
+    }
 
     entity_ecf::to_ecf(&entity_ecf::Value::Map(fields))
 }
@@ -2576,6 +3104,135 @@ fn encode_received_map(received: &HashMap<String, Vec<u8>>) -> Vec<u8> {
         })
         .collect();
     entity_ecf::to_ecf(&entity_ecf::Value::Map(pairs))
+}
+
+/// The key under which a fire-partial dispatch carries its explicit
+/// incomplete marker into the assembled params, alongside the partial
+/// `received` (STANDING-MODEL §4 mechanism 2). Only ever present on a
+/// fire-partial round — a complete round assembles exactly the bytes it did
+/// before this proposal (Go: `JoinIncompleteField`, `"incomplete"`).
+const JOIN_INCOMPLETE_FIELD: &str = "incomplete";
+
+/// Same as [`encode_received_map`], with an `incomplete: {missing, expected}`
+/// field spliced in alongside the slot values — the fire-partial payload.
+fn encode_received_map_with_incomplete(
+    received: &HashMap<String, Vec<u8>>,
+    missing: &[String],
+    expected: &[String],
+) -> Vec<u8> {
+    let mut pairs: Vec<(entity_ecf::Value, entity_ecf::Value)> = received
+        .iter()
+        .map(|(k, v)| {
+            let val: ciborium::Value =
+                ciborium::from_reader(v.as_slice()).unwrap_or(ciborium::Value::Null);
+            (entity_ecf::text(k), val)
+        })
+        .collect();
+    let missing_arr: Vec<entity_ecf::Value> = missing.iter().map(entity_ecf::text).collect();
+    let expected_arr: Vec<entity_ecf::Value> = expected.iter().map(entity_ecf::text).collect();
+    pairs.push((
+        entity_ecf::text(JOIN_INCOMPLETE_FIELD),
+        entity_ecf::Value::Map(vec![
+            (
+                entity_ecf::text("missing"),
+                entity_ecf::Value::Array(missing_arr),
+            ),
+            (
+                entity_ecf::text("expected"),
+                entity_ecf::Value::Array(expected_arr),
+            ),
+        ]),
+    ));
+    entity_ecf::to_ecf(&entity_ecf::Value::Map(pairs))
+}
+
+/// STANDING-MODEL §4 mechanism 2: whether `join`'s current round has begun
+/// and exceeded its completion deadline at `now_ms` without filling every
+/// slot. False whenever no deadline is set (wait-forever), no round has
+/// started (an idle standing join has nothing to abandon), or the round is
+/// already complete.
+fn join_round_incomplete(join: &JoinData, now_ms: u64) -> bool {
+    let (Some(deadline), Some(started)) = (join.completion_deadline_ms, join.round_started_ms)
+    else {
+        return false;
+    };
+    if join.received.len() >= join.expected.len() {
+        return false;
+    }
+    now_ms > started + deadline
+}
+
+/// The expected slots absent from `received`, in `expected` order — the
+/// order every join read uses, so a marker naming them is stable.
+fn join_missing_slots(join: &JoinData) -> Vec<String> {
+    join.expected
+        .iter()
+        .filter(|s| !join.received.contains_key(*s))
+        .cloned()
+        .collect()
+}
+
+/// STANDING-MODEL §4 mechanism 1: the slots that arrived carrying a non-2xx
+/// status, in `expected` order.
+fn join_error_slots(expected: &[String], received_status: &HashMap<String, u32>) -> Vec<String> {
+    expected
+        .iter()
+        .filter(|s| received_status.contains_key(*s))
+        .cloned()
+        .collect()
+}
+
+/// STANDING-MODEL §4/§4.1: clear the round clock, per-slot statuses, and
+/// `received` together (never separately — a stale `round_started_ms` would
+/// let the NEXT round inherit this round's deadline and abandon itself
+/// early, and a non-advanced `round_id` would let a straggler from the round
+/// just closed pass the §4.1 guard into the next one), and advance the round
+/// generation — but only for a deadline-carrying join (the joins §4.1's
+/// abandon path applies to; a wait-forever join never turns a round over and
+/// stays byte-identical to pre-§4, `round_id` omitted on the wire).
+fn reset_join_round(join: JoinData) -> JoinData {
+    let bump = join.completion_deadline_ms.is_some();
+    JoinData {
+        received: HashMap::new(),
+        received_status: HashMap::new(),
+        round_started_ms: None,
+        round_id: if bump {
+            join.round_id + 1
+        } else {
+            join.round_id
+        },
+        ..join
+    }
+}
+
+/// STANDING-MODEL §4.1: the 200 response to a slot advance dropped as a
+/// stale-round straggler — 200, not a non-2xx, so the advancer does not
+/// retry-storm the same stale slot forever (the request was well-formed;
+/// the slot was just late).
+fn join_slot_dropped_stale(
+    slot_name: &str,
+    targeted_round: u64,
+    current_round: u64,
+) -> HandlerResult {
+    let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+        (entity_ecf::text("advanced"), entity_ecf::bool_val(false)),
+        (entity_ecf::text("dropped"), entity_ecf::text("stale_round")),
+        (entity_ecf::text("slot"), entity_ecf::text(slot_name)),
+        (
+            entity_ecf::text("targeted_round"),
+            entity_ecf::integer(targeted_round as i64),
+        ),
+        (
+            entity_ecf::text("current_round"),
+            entity_ecf::integer(current_round as i64),
+        ),
+    ]));
+    let result = Entity::new("system/continuation/advancement-result", data).unwrap();
+    HandlerResult {
+        status: STATUS_OK,
+        result,
+        included: std::collections::HashMap::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -6079,6 +6736,735 @@ mod tests {
         assert!(
             captured.lock().unwrap().is_some(),
             "the reactive advance dispatched (own dispatch_capability), no advance-cap required"
+        );
+    }
+
+    /// Standing-model §3 AT-3 (`entity-core-go`
+    /// `HANDOFF-2026-07-28-rust-py-convergence-standing-model-s3-s4.md`): "a
+    /// reactive reconnect continuation, no advance rights (browser-defer
+    /// signal)". Rust has exactly ONE reactive_trigger production site
+    /// (`extensions/inbox`'s continuation-delegation on message receive —
+    /// confirmed by exhaustive grep, no separate reconnect/browser-defer
+    /// mechanism exists anywhere in the workspace) — a reconnect redelivery
+    /// is itself an inbox delivery, so it reaches this exact same code path.
+    /// Go's own oracle test (`TestAdvanceAuthoritySplit_AT1234`,
+    /// `ext/continuation/advance_authority_split_test.go`) pins AT-3 with the
+    /// byte-identical `setup` call as AT-1, varying only the sub-test name —
+    /// there is no separate mechanism on their side either. This test is
+    /// that same duplicate-by-design pin: the surface answer is "AT-1 and
+    /// AT-3 are one code path," not a second one to build.
+    #[tokio::test]
+    async fn test_reactive_reconnect_continuation_advances_at3() {
+        let h = make_handler();
+        let path = format!("/{}/system/continuation/reconnect", test_peer_id());
+        let author = install_standing_cont(&h, &path).await;
+
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let mut ctx =
+            advance_ctx_with_bounds(author, &path, capturing_mock(captured.clone()), None);
+        ctx.reactive_trigger = true;
+        ctx.caller_capability = None;
+
+        let r = h.handle(&ctx).await.unwrap();
+        assert_eq!(
+            r.status, STATUS_OK,
+            "AT-3: a reactive reconnect redelivery advances under the continuation's own authority"
+        );
+        assert!(
+            captured.lock().unwrap().is_some(),
+            "AT-3: the reactive advance dispatched (own dispatch_capability), no advance-cap required"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PROPOSAL-CONTINUATION-STANDING-MODEL §4 (Facet B) — join completion
+    // policy: mechanism 2 (deadline -> abandon/fire-partial self-heal),
+    // mechanism 1 (delivered-error slot preserved), §4.1 (round_id straggler
+    // guard). Clock driven by backdating `round_started_ms` on the stored
+    // join rather than sleeping — `join_round_incomplete` takes `now_ms`
+    // explicitly, so a backdated round start is the same input a slow round
+    // produces.
+    // -----------------------------------------------------------------------
+
+    /// Install a join continuation at `path` with `expected` slots, dispatching
+    /// to `target`. `deadline_ms`/`on_incomplete` are STANDING-MODEL §4's
+    /// opt-in completion policy fields. Returns the author.
+    async fn install_join(
+        h: &ContinuationHandler,
+        path: &str,
+        target: &str,
+        expected: &[&str],
+        deadline_ms: Option<u64>,
+        on_incomplete: Option<&str>,
+    ) -> Hash {
+        let author = Hash::compute("test", path.as_bytes());
+        let cap = make_cap_entity_for_install(author, author, None);
+        let cap_hash = cap.content_hash;
+        let included: HashMap<Hash, Entity> = [(cap_hash, cap)].into();
+
+        let mut fields = vec![
+            (entity_ecf::text("operation"), entity_ecf::text("put")),
+            (entity_ecf::text("target"), entity_ecf::text(target)),
+            (
+                entity_ecf::text("dispatch_capability"),
+                entity_ecf::Value::Bytes(cap_hash.to_bytes().to_vec()),
+            ),
+            (
+                entity_ecf::text("expected"),
+                entity_ecf::Value::Array(expected.iter().map(|s| entity_ecf::text(*s)).collect()),
+            ),
+        ];
+        if let Some(ms) = deadline_ms {
+            fields.push((
+                entity_ecf::text("completion_deadline_ms"),
+                entity_ecf::integer(ms as i64),
+            ));
+        }
+        if let Some(oi) = on_incomplete {
+            fields.push((entity_ecf::text("on_incomplete"), entity_ecf::text(oi)));
+        }
+        let params = Entity::new(
+            entity_types::TYPE_CONTINUATION_JOIN,
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(fields)),
+        )
+        .unwrap();
+        let ctx = make_install_ctx(author, path, params, included);
+        assert_eq!(
+            h.handle(&ctx).await.unwrap().status,
+            STATUS_OK,
+            "join install must succeed"
+        );
+        author
+    }
+
+    /// Build an `advance` context targeting one join slot: `{result, status,
+    /// round_id?}` per STANDING-MODEL §4.1's advance-request shape.
+    fn join_slot_advance_ctx(
+        author: Hash,
+        slot_path: &str,
+        status: u32,
+        round_id: Option<u64>,
+        result: entity_ecf::Value,
+        mock: ExecuteFn,
+    ) -> HandlerContext {
+        let mut fields = vec![
+            (entity_ecf::text("result"), result),
+            (
+                entity_ecf::text("status"),
+                entity_ecf::integer(status as i64),
+            ),
+        ];
+        if let Some(rid) = round_id {
+            fields.push((
+                entity_ecf::text("round_id"),
+                entity_ecf::integer(rid as i64),
+            ));
+        }
+        let params = make_params(entity_ecf::Value::Map(fields));
+        let mut ctx = make_install_ctx(author, slot_path, params, HashMap::new());
+        ctx.operation = "advance".to_string();
+        ctx.execute_fn = Some(mock);
+        ctx
+    }
+
+    /// Records each dispatched params entity's raw CBOR bytes, then returns
+    /// 200 — lets a test decode and assert on what a join round dispatched.
+    fn capturing_params_mock(sink: Arc<std::sync::Mutex<Vec<Vec<u8>>>>) -> ExecuteFn {
+        Arc::new(move |_uri, _op, params: Entity, _opts: ExecuteOptions| {
+            sink.lock().unwrap().push(params.data.clone());
+            Box::pin(async {
+                Ok(HandlerResult {
+                    status: 200,
+                    result: Entity::new(
+                        "primitive/null",
+                        entity_ecf::to_ecf(&entity_ecf::Value::Null),
+                    )
+                    .unwrap(),
+                    included: HashMap::new(),
+                })
+            })
+        })
+    }
+
+    /// Read the stored join entity back out of the tree, decoded.
+    fn loaded_join(h: &ContinuationHandler, path: &str) -> JoinData {
+        let hash = h.location_index.get(path).expect("join present");
+        let entity = h.content_store.get(&hash).expect("join entity stored");
+        decode_join(&entity).expect("decode join")
+    }
+
+    /// Rewrite the stored join's `round_started_ms` to `ago_ms` in the past,
+    /// simulating a round that has been open that long — the same input a
+    /// slow round produces, without sleeping in the suite.
+    fn backdate_join_round(h: &ContinuationHandler, path: &str, ago_ms: u64) {
+        let mut join = loaded_join(h, path);
+        let started = join
+            .round_started_ms
+            .expect("backdate: round not armed — the first slot should have armed it");
+        join.round_started_ms = Some(started.saturating_sub(ago_ms));
+        let entity = Entity::new(entity_types::TYPE_CONTINUATION_JOIN, encode_join(&join)).unwrap();
+        let hash = h.content_store.put(entity).unwrap();
+        h.location_index.set(path, hash);
+    }
+
+    /// Decode every bound lost marker carrying `reason`.
+    fn lost_markers_with_reason(h: &ContinuationHandler, reason: &str) -> Vec<ciborium::Value> {
+        let prefix = format!("/{}/system/runtime/chain-errors/lost/", test_peer_id());
+        h.location_index
+            .list(&prefix)
+            .into_iter()
+            .filter_map(|entry| h.content_store.get(&entry.hash))
+            .filter_map(|ent| {
+                let v: ciborium::Value = ciborium::from_reader(ent.data.as_slice()).ok()?;
+                let m = v.as_map()?;
+                let r = m
+                    .iter()
+                    .find(|(k, _)| k.as_text() == Some("reason"))
+                    .and_then(|(_, v)| v.as_text());
+                (r == Some(reason)).then_some(v)
+            })
+            .collect()
+    }
+
+    /// Extract `join_slots` from a decoded lost-marker body.
+    fn marker_join_slots(marker: &ciborium::Value) -> Vec<String> {
+        marker
+            .as_map()
+            .and_then(|m| m.iter().find(|(k, _)| k.as_text() == Some("join_slots")))
+            .and_then(|(_, v)| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.as_text().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Decode a dispatched params entity's raw bytes into a text-keyed map,
+    /// for `dispatched[i]["slot"]`-style assertions.
+    fn decoded_params_map(raw: &[u8]) -> Vec<(ciborium::Value, ciborium::Value)> {
+        let v: ciborium::Value = ciborium::from_reader(raw).unwrap();
+        v.as_map().unwrap().clone()
+    }
+
+    fn map_get<'a>(
+        map: &'a [(ciborium::Value, ciborium::Value)],
+        key: &str,
+    ) -> Option<&'a ciborium::Value> {
+        map.iter()
+            .find(|(k, _)| k.as_text() == Some(key))
+            .map(|(_, v)| v)
+    }
+
+    /// §6 anchor 3: a standing join whose round blows its deadline one slot
+    /// short abandons that round with a `join_incomplete` lost marker and
+    /// fires CLEAN on the next round. Before §4 this wedged permanently.
+    #[tokio::test]
+    async fn test_join_self_heals_after_deadline() {
+        let h = make_handler();
+        let path = format!("/{}/system/continuation/join-heal", test_peer_id());
+        let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mock = capturing_params_mock(dispatched.clone());
+        let author = install_join(&h, &path, "app/sink", &["a", "b"], Some(50), None).await;
+
+        // Round 1: slot a arrives, b never does.
+        let ctx = join_slot_advance_ctx(
+            author,
+            &format!("{path}/a"),
+            200,
+            None,
+            entity_ecf::text("round1-a"),
+            mock.clone(),
+        );
+        assert_eq!(h.handle(&ctx).await.unwrap().status, STATUS_OK);
+        assert!(
+            dispatched.lock().unwrap().is_empty(),
+            "must not dispatch on an incomplete round"
+        );
+
+        backdate_join_round(&h, &path, 5_000); // 5s open against a 50ms budget
+
+        // Round 2 opens: slot a arrives again — the dead round must be
+        // reaped first or this slot lands in it and the join stays wedged.
+        let ctx = join_slot_advance_ctx(
+            author,
+            &format!("{path}/a"),
+            200,
+            None,
+            entity_ecf::text("round2-a"),
+            mock.clone(),
+        );
+        assert_eq!(h.handle(&ctx).await.unwrap().status, STATUS_OK);
+
+        let markers = lost_markers_with_reason(&h, CODE_JOIN_INCOMPLETE);
+        assert_eq!(
+            markers.len(),
+            1,
+            "expected exactly 1 join_incomplete marker"
+        );
+        assert_eq!(
+            marker_join_slots(&markers[0]),
+            vec!["b".to_string()],
+            "the abandoned round was short exactly b"
+        );
+        let join = loaded_join(&h, &path);
+        assert!(
+            !join.received.contains_key("b"),
+            "slot b survived the abandon — the round did not reset"
+        );
+        assert_eq!(
+            join.received.len(),
+            1,
+            "the fresh round holds only the new slot a"
+        );
+
+        // Round 2 completes: it must fire, and fire with ROUND 2's values only.
+        let ctx = join_slot_advance_ctx(
+            author,
+            &format!("{path}/b"),
+            200,
+            None,
+            entity_ecf::text("round2-b"),
+            mock.clone(),
+        );
+        assert_eq!(h.handle(&ctx).await.unwrap().status, STATUS_OK);
+
+        let dispatched = dispatched.lock().unwrap();
+        assert_eq!(dispatched.len(), 1, "the next round did not fire clean");
+        let map = decoded_params_map(&dispatched[0]);
+        assert_eq!(
+            map_get(&map, "a").and_then(|v| v.as_text()),
+            Some("round2-a"),
+            "a stale slot leaked across the abandon"
+        );
+        assert!(
+            map_get(&map, JOIN_INCOMPLETE_FIELD).is_none(),
+            "a COMPLETE round carried an incomplete marker"
+        );
+    }
+
+    /// STANDING-MODEL §4 O5 (sweep-all, RULED): a standing join whose round
+    /// expires while nothing ever touches it again must still self-heal —
+    /// not just the join being advanced. Join A arms a round and goes silent
+    /// (b never arrives); only join B is ever advanced again. B's advance
+    /// must trigger a sweep that reaps A's expired round anyway, or A wedges
+    /// forever and never emits `join_incomplete` — the permanent cross-peer
+    /// liveness divergence O5 exists to close.
+    #[tokio::test]
+    async fn test_sweep_reaps_untouched_expired_join() {
+        let h = make_handler();
+        let path_a = format!("/{}/system/continuation/join-sweep-a", test_peer_id());
+        let path_b = format!("/{}/system/continuation/join-sweep-b", test_peer_id());
+        let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mock = capturing_params_mock(dispatched.clone());
+
+        let author_a = install_join(&h, &path_a, "app/sink-a", &["a", "b"], Some(50), None).await;
+        let author_b = install_join(&h, &path_b, "app/sink-b", &["x", "y"], Some(50), None).await;
+
+        // Arm A's round with slot a; b never arrives. Let it expire.
+        let ctx = join_slot_advance_ctx(
+            author_a,
+            &format!("{path_a}/a"),
+            200,
+            None,
+            entity_ecf::text("a-arrives"),
+            mock.clone(),
+        );
+        assert_eq!(h.handle(&ctx).await.unwrap().status, STATUS_OK);
+        backdate_join_round(&h, &path_a, 5_000); // 5s open against a 50ms budget
+
+        // A's own arrival above already paid for one throttled sweep pass
+        // (a no-op — A had not armed yet at that point). Reset the throttle
+        // so B's advance below pays for a real one instead of waiting out
+        // the real-time floor, exactly like `backdate_join_round` fakes the
+        // round clock without sleeping.
+        *h.last_join_sweep.lock().await = None;
+
+        // The ONLY other advance in this test targets join B — join A is
+        // never touched again. The sweep B's advance triggers must reap A.
+        let ctx = join_slot_advance_ctx(
+            author_b,
+            &format!("{path_b}/x"),
+            200,
+            None,
+            entity_ecf::text("x-arrives"),
+            mock.clone(),
+        );
+        assert_eq!(h.handle(&ctx).await.unwrap().status, STATUS_OK);
+
+        let markers = lost_markers_with_reason(&h, CODE_JOIN_INCOMPLETE);
+        assert_eq!(
+            markers.len(),
+            1,
+            "the sweep triggered by B's advance must have reaped A's expired round"
+        );
+        assert_eq!(
+            marker_join_slots(&markers[0]),
+            vec!["b".to_string()],
+            "A's abandoned round was short exactly b"
+        );
+
+        let join_a = loaded_join(&h, &path_a);
+        assert!(
+            join_a.received.is_empty(),
+            "A's round must have been reset by the sweep, not left wedged"
+        );
+        assert!(
+            dispatched.lock().unwrap().is_empty(),
+            "neither A (abandoned) nor B (still short y) should have fired"
+        );
+    }
+
+    /// §6 anchor 5 (§4.1, the abandon straggler guard — a MUST): slot A
+    /// arrives round N; the deadline passes (B never arrives); round N is
+    /// abandoned; round N+1 opens and A arrives; THEN B *of round N* arrives
+    /// late. Without §4.1, B lands in round N+1's B slot and the round fires
+    /// stitched from two generations. With it, B is dropped loudly and round
+    /// N+1 fires clean from a single generation. This is the anchor
+    /// `test_join_self_heals_after_deadline` (anchor 3) passes straight
+    /// through — it never re-delivers the abandoned round's missing slot.
+    #[tokio::test]
+    async fn test_join_straggler_bleed_caught() {
+        let h = make_handler();
+        let path = format!("/{}/system/continuation/join-bleed", test_peer_id());
+        let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mock = capturing_params_mock(dispatched.clone());
+        let author = install_join(&h, &path, "app/sink", &["a", "b"], Some(50), None).await;
+
+        // Round 0: slot a arrives tagged round 0, b never does.
+        let ctx = join_slot_advance_ctx(
+            author,
+            &format!("{path}/a"),
+            200,
+            Some(0),
+            entity_ecf::text("round0-a"),
+            mock.clone(),
+        );
+        assert_eq!(h.handle(&ctx).await.unwrap().status, STATUS_OK);
+        assert_eq!(loaded_join(&h, &path).round_id, 0);
+
+        backdate_join_round(&h, &path, 5_000);
+
+        // Round 1 opens: slot a arrives tagged round 1. The touch reaps the
+        // dead round 0 (round_id 0->1), then a(round 1) accumulates.
+        let ctx = join_slot_advance_ctx(
+            author,
+            &format!("{path}/a"),
+            200,
+            Some(1),
+            entity_ecf::text("round1-a"),
+            mock.clone(),
+        );
+        assert_eq!(h.handle(&ctx).await.unwrap().status, STATUS_OK);
+        assert_eq!(
+            loaded_join(&h, &path).round_id,
+            1,
+            "abandon should have advanced the round to 1"
+        );
+
+        // THE STRAGGLER: b of the abandoned round 0 arrives late, still
+        // tagged round 0. It MUST NOT fill round 1's b slot.
+        let ctx = join_slot_advance_ctx(
+            author,
+            &format!("{path}/b"),
+            200,
+            Some(0),
+            entity_ecf::text("round0-b-STRAGGLER"),
+            mock.clone(),
+        );
+        let resp = h.handle(&ctx).await.unwrap();
+        let v: ciborium::Value = ciborium::from_reader(resp.result.data.as_slice()).unwrap();
+        let map = v.as_map().unwrap().clone();
+        assert_eq!(
+            map_get(&map, "advanced").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        assert_eq!(
+            map_get(&map, "dropped").and_then(|v| v.as_text()),
+            Some("stale_round")
+        );
+        assert!(
+            dispatched.lock().unwrap().is_empty(),
+            "a mixed-generation round FIRED — the straggler bled across"
+        );
+        assert!(
+            !loaded_join(&h, &path).received.contains_key("b"),
+            "the round-0 straggler b landed in round 1 — the §4.1 guard did not hold"
+        );
+        let late = lost_markers_with_reason(&h, CODE_JOIN_LATE);
+        assert_eq!(late.len(), 1);
+        assert_eq!(marker_join_slots(&late[0]), vec!["b".to_string()]);
+
+        // Round 1's real b (tagged round 1) arrives — fires CLEAN, stitched
+        // from a single generation.
+        let ctx = join_slot_advance_ctx(
+            author,
+            &format!("{path}/b"),
+            200,
+            Some(1),
+            entity_ecf::text("round1-b"),
+            mock.clone(),
+        );
+        assert_eq!(h.handle(&ctx).await.unwrap().status, STATUS_OK);
+        let dispatched = dispatched.lock().unwrap();
+        assert_eq!(
+            dispatched.len(),
+            1,
+            "round 1 did not fire clean after its own b"
+        );
+        let map = decoded_params_map(&dispatched[0]);
+        assert_eq!(
+            map_get(&map, "a").and_then(|v| v.as_text()),
+            Some("round1-a")
+        );
+        assert_eq!(
+            map_get(&map, "b").and_then(|v| v.as_text()),
+            Some("round1-b")
+        );
+    }
+
+    /// No-silent-change: an advance that does NOT tag a `round_id` (pre-§4.1
+    /// substrate) is admitted regardless of the join's current round — the
+    /// guard engages only when the fan-out opts in by tagging.
+    #[tokio::test]
+    async fn test_join_untagged_advance_still_admitted() {
+        let h = make_handler();
+        let path = format!("/{}/system/continuation/join-untagged", test_peer_id());
+        let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mock = capturing_params_mock(dispatched.clone());
+        // Large deadline: no spurious reap between back-to-back slots.
+        let author = install_join(&h, &path, "app/sink", &["a", "b"], Some(60_000), None).await;
+
+        // Round 0 fires cleanly (tagged slots) -> reset advances round_id to 1.
+        let ctx = join_slot_advance_ctx(
+            author,
+            &format!("{path}/a"),
+            200,
+            Some(0),
+            entity_ecf::text("r0-a"),
+            mock.clone(),
+        );
+        assert_eq!(h.handle(&ctx).await.unwrap().status, STATUS_OK);
+        let ctx = join_slot_advance_ctx(
+            author,
+            &format!("{path}/b"),
+            200,
+            Some(0),
+            entity_ecf::text("r0-b"),
+            mock.clone(),
+        );
+        assert_eq!(h.handle(&ctx).await.unwrap().status, STATUS_OK);
+        assert_eq!(dispatched.lock().unwrap().len(), 1, "round 0 did not fire");
+        assert_eq!(loaded_join(&h, &path).round_id, 1);
+
+        // Untagged slots must be admitted despite round_id=1.
+        let ctx = join_slot_advance_ctx(
+            author,
+            &format!("{path}/a"),
+            200,
+            None,
+            entity_ecf::text("untagged-a"),
+            mock.clone(),
+        );
+        assert_eq!(h.handle(&ctx).await.unwrap().status, STATUS_OK);
+        let ctx = join_slot_advance_ctx(
+            author,
+            &format!("{path}/b"),
+            200,
+            None,
+            entity_ecf::text("untagged-b"),
+            mock.clone(),
+        );
+        let resp = h.handle(&ctx).await.unwrap();
+        let v: ciborium::Value = ciborium::from_reader(resp.result.data.as_slice()).unwrap();
+        let map = v.as_map().unwrap().clone();
+        assert!(
+            map_get(&map, "dropped").is_none(),
+            "an untagged advance was dropped by the round guard"
+        );
+        assert_eq!(
+            dispatched.lock().unwrap().len(),
+            2,
+            "the untagged round did not fire (admitted)"
+        );
+        assert!(lost_markers_with_reason(&h, CODE_JOIN_LATE).is_empty());
+    }
+
+    /// No-silent-change: a deadline-less (wait-forever) join never turns a
+    /// round over — its `round_id` stays 0 even across a fire+reset.
+    #[tokio::test]
+    async fn test_join_round_id_stays_zero_without_deadline() {
+        let h = make_handler();
+        let path = format!("/{}/system/continuation/join-noddl-round", test_peer_id());
+        let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mock = capturing_params_mock(dispatched.clone());
+        let author = install_join(&h, &path, "app/sink", &["a", "b"], None, None).await;
+
+        let ctx = join_slot_advance_ctx(
+            author,
+            &format!("{path}/a"),
+            200,
+            None,
+            entity_ecf::text("va"),
+            mock.clone(),
+        );
+        assert_eq!(h.handle(&ctx).await.unwrap().status, STATUS_OK);
+        let ctx = join_slot_advance_ctx(
+            author,
+            &format!("{path}/b"),
+            200,
+            None,
+            entity_ecf::text("vb"),
+            mock.clone(),
+        );
+        assert_eq!(h.handle(&ctx).await.unwrap().status, STATUS_OK);
+
+        assert_eq!(dispatched.lock().unwrap().len(), 1);
+        assert_eq!(
+            loaded_join(&h, &path).round_id,
+            0,
+            "a deadline-less join advanced round_id on fire — must stay 0"
+        );
+    }
+
+    /// §6 anchor 4 (mechanism 1): a delivered non-2xx FILLS its slot, so the
+    /// barrier completes and the failure would otherwise vanish into the
+    /// stitch. The error payload reaches the target UNCOERCED, and the round
+    /// is observably failed via a `join_error_slot` lost marker.
+    #[tokio::test]
+    async fn test_join_error_slot_preserved_and_marked() {
+        let h = make_handler();
+        let path = format!("/{}/system/continuation/join-errslot", test_peer_id());
+        let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mock = capturing_params_mock(dispatched.clone());
+        let author = install_join(&h, &path, "app/sink", &["good", "bad"], None, None).await;
+
+        let ctx = join_slot_advance_ctx(
+            author,
+            &format!("{path}/good"),
+            200,
+            None,
+            entity_ecf::text("clean-value"),
+            mock.clone(),
+        );
+        assert_eq!(h.handle(&ctx).await.unwrap().status, STATUS_OK);
+
+        let err_payload = entity_ecf::Value::Map(vec![
+            (entity_ecf::text("code"), entity_ecf::text("compute_failed")),
+            (
+                entity_ecf::text("message"),
+                entity_ecf::text("shard 2 died"),
+            ),
+        ]);
+        let ctx = join_slot_advance_ctx(
+            author,
+            &format!("{path}/bad"),
+            500,
+            None,
+            err_payload,
+            mock.clone(),
+        );
+        assert_eq!(h.handle(&ctx).await.unwrap().status, STATUS_OK);
+
+        let dispatched = dispatched.lock().unwrap();
+        assert_eq!(
+            dispatched.len(),
+            1,
+            "the barrier did not fire — a delivered error still fills its slot"
+        );
+        let map = decoded_params_map(&dispatched[0]);
+        let bad = map_get(&map, "bad").expect("bad slot present").clone();
+        let bad_map = bad.as_map().unwrap();
+        let code = bad_map
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("code"))
+            .and_then(|(_, v)| v.as_text());
+        assert_eq!(code, Some("compute_failed"), "error payload lost its shape");
+        assert_eq!(
+            map_get(&map, "good").and_then(|v| v.as_text()),
+            Some("clean-value"),
+            "clean slot was disturbed by its errored sibling"
+        );
+
+        let markers = lost_markers_with_reason(&h, CODE_JOIN_ERROR_SLOT);
+        assert_eq!(markers.len(), 1);
+        assert_eq!(marker_join_slots(&markers[0]), vec!["bad".to_string()]);
+    }
+
+    /// Opt-in policy: at the deadline the target fires with the partial
+    /// `received` plus an explicit `incomplete` marker naming what is
+    /// missing. Never the default — a stitch assuming k fragments must ask
+    /// for this.
+    #[tokio::test]
+    async fn test_join_fire_partial_dispatches_with_incomplete_marker() {
+        let h = make_handler();
+        let path = format!("/{}/system/continuation/join-partial", test_peer_id());
+        let dispatched = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mock = capturing_params_mock(dispatched.clone());
+        let author = install_join(
+            &h,
+            &path,
+            "app/sink",
+            &["a", "b", "c"],
+            Some(50),
+            Some("fire-partial"),
+        )
+        .await;
+
+        let ctx = join_slot_advance_ctx(
+            author,
+            &format!("{path}/a"),
+            200,
+            None,
+            entity_ecf::text("va"),
+            mock.clone(),
+        );
+        assert_eq!(h.handle(&ctx).await.unwrap().status, STATUS_OK);
+
+        backdate_join_round(&h, &path, 5_000);
+
+        // Any subsequent touch reaps the expired round — here, slot "b" of
+        // the next (fresh) round.
+        let ctx = join_slot_advance_ctx(
+            author,
+            &format!("{path}/b"),
+            200,
+            None,
+            entity_ecf::text("vb"),
+            mock.clone(),
+        );
+        assert_eq!(h.handle(&ctx).await.unwrap().status, STATUS_OK);
+
+        let dispatched = dispatched.lock().unwrap();
+        assert_eq!(
+            dispatched.len(),
+            1,
+            "fire-partial did not dispatch at the deadline"
+        );
+        let map = decoded_params_map(&dispatched[0]);
+        assert_eq!(
+            map_get(&map, "a").and_then(|v| v.as_text()),
+            Some("va"),
+            "fire-partial dropped the slot it DID have"
+        );
+        let incomplete = map_get(&map, JOIN_INCOMPLETE_FIELD)
+            .expect("fire-partial dispatched without an incomplete marker")
+            .clone();
+        let incomplete_map = incomplete.as_map().unwrap();
+        let missing: Vec<String> = incomplete_map
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("missing"))
+            .and_then(|(_, v)| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|e| e.as_text().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            missing,
+            vec!["b".to_string(), "c".to_string()],
+            "missing slots in expected order"
         );
     }
 }

@@ -5448,6 +5448,528 @@ mod tests {
         run_dispatch_verify_cell(Ed448, Ed448).await;
     }
 
+    /// RT-6 (§4.6, bucket-B `entity-system-architecture`
+    /// `HANDOFF-2026-07-27-cohort-0.8.1-bucketB-update-packet.md`): the
+    /// handshake nonce is single-use. A second, well-formed, fully-
+    /// capability-authorized `authenticate` EXECUTE on
+    /// `system/protocol/connect`, sent through the ALREADY-Established
+    /// generic dispatch path on the SAME connection, MUST be rejected `401
+    /// invalid_nonce`. This exercises the intercept with a request that
+    /// *does* carry `author`/`capability` and passes generic verification —
+    /// [`test_rt6_bare_authenticate_replay_returns_401_invalid_nonce`] below
+    /// covers the other shape (no `author`/`capability`, the one the oracle's
+    /// vector actually sends), which is what the pre-verification placement
+    /// of the intercept exists for.
+    #[tokio::test]
+    async fn test_rt6_authenticate_replay_returns_401_invalid_nonce() {
+        use transport::{MemoryConnector, MemoryListener, MemoryTransportRegistry};
+        let registry = MemoryTransportRegistry::new();
+
+        let server = PeerBuilder::new()
+            .keypair(Keypair::from_seed([0x30u8; 32]))
+            .build()
+            .unwrap();
+        let server_pid = server.peer_id().to_string();
+
+        let listener = MemoryListener::bind(server_pid.clone(), registry.clone()).unwrap();
+        let shared = server.shared();
+        server.start_engines(&shared);
+        let shared_clone = shared.clone();
+        let server_handle = tokio::spawn(async move {
+            let _ = server::run(listener, shared_clone).await;
+        });
+        tokio::task::yield_now().await;
+
+        let client = matrix_id(entity_crypto::KeyType::Ed25519, 0x31);
+        let conn = MemoryConnector::new(registry.clone())
+            .connect(&format!("memory://{}", server_pid))
+            .await
+            .unwrap();
+        let remote = remote::perform_connect(conn, &client, entity_hash::HASH_ALGORITHM_SHA256)
+            .await
+            .unwrap();
+
+        let params = entity_entity::Entity::new(
+            "system/params",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![])),
+        )
+        .unwrap();
+        let uri = format!("/{}/{}", server_pid, entity_protocol::CONNECT_PATH);
+        let resp = remote::send_execute(
+            &remote,
+            &client,
+            &uri,
+            "authenticate",
+            &params,
+            None,
+            None,
+            None,
+            &std::collections::HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        server_handle.abort();
+
+        assert_eq!(
+            resp.status, 401,
+            "replayed authenticate must be 401, got {}: {:?}",
+            resp.status, resp.result
+        );
+        let v: ciborium::Value = ciborium::from_reader(resp.result.data.as_slice()).unwrap();
+        let code = v
+            .as_map()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("code"))
+            .and_then(|(_, v)| v.as_text());
+        assert_eq!(code, Some("invalid_nonce"));
+    }
+
+    /// RT-6, the shape the oracle's `handshake_nonce_single_use` vector
+    /// actually sends and the earlier (post-verification-only) fix missed:
+    /// a **bare** connect-EXECUTE — `uri`/`operation`/`request_id` only, no
+    /// `author`/`capability` — the same shape `build_connect_execute` uses
+    /// for the original pre-Established authenticate. Sent raw via
+    /// `dispatch_envelope` (bypassing `send_execute`'s auth-building, which
+    /// would produce the OTHER, already-covered shape). Confirmed on the
+    /// wire pre-fix by `entity-core-go`
+    /// `docs/validation/reports/2026-07-27-0.8.1-bucketB-revalidation-after-sibling-fixes.md`:
+    /// this shape fell through to generic verification and came back `401
+    /// authentication_failed` (missing author), not `invalid_nonce` — the
+    /// intercept sat on the wrong side of `verify_request_with_ctx`.
+    #[tokio::test]
+    async fn test_rt6_bare_authenticate_replay_returns_401_invalid_nonce() {
+        use remote::RemoteEndpoint;
+        use transport::{MemoryConnector, MemoryListener, MemoryTransportRegistry};
+        let registry = MemoryTransportRegistry::new();
+
+        let server = PeerBuilder::new()
+            .keypair(Keypair::from_seed([0x32u8; 32]))
+            .build()
+            .unwrap();
+        let server_pid = server.peer_id().to_string();
+
+        let listener = MemoryListener::bind(server_pid.clone(), registry.clone()).unwrap();
+        let shared = server.shared();
+        server.start_engines(&shared);
+        let shared_clone = shared.clone();
+        let server_handle = tokio::spawn(async move {
+            let _ = server::run(listener, shared_clone).await;
+        });
+        tokio::task::yield_now().await;
+
+        let client = matrix_id(entity_crypto::KeyType::Ed25519, 0x33);
+        let conn = MemoryConnector::new(registry.clone())
+            .connect(&format!("memory://{}", server_pid))
+            .await
+            .unwrap();
+        let remote = remote::perform_connect(conn, &client, entity_hash::HASH_ALGORITHM_SHA256)
+            .await
+            .unwrap();
+
+        // The bare connect-EXECUTE shape: no author, no capability — exactly
+        // what `verify_request_with_ctx` requires and this replay lacks.
+        let params = entity_entity::Entity::new(
+            "system/params",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![])),
+        )
+        .unwrap();
+        let request_id = remote.next_request_id();
+        let exec_entity =
+            entity_protocol::build_connect_execute(&request_id, "authenticate", &params).unwrap();
+        let envelope = entity_entity::Envelope::new(exec_entity);
+
+        let resp = remote
+            .dispatch_envelope(request_id, envelope)
+            .await
+            .unwrap();
+
+        server_handle.abort();
+
+        assert_eq!(
+            resp.status, 401,
+            "bare-shape replayed authenticate must be 401, got {}: {:?}",
+            resp.status, resp.result
+        );
+        let v: ciborium::Value = ciborium::from_reader(resp.result.data.as_slice()).unwrap();
+        let code = v
+            .as_map()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("code"))
+            .and_then(|(_, v)| v.as_text());
+        assert_eq!(
+            code,
+            Some("invalid_nonce"),
+            "must not fall through to generic verification's authentication_failed"
+        );
+    }
+
+    /// RT-13b Part B (§6.11 a′, bucket-B `entity-system-architecture`
+    /// `HANDOFF-2026-07-27-cohort-0.8.1-bucketB-update-packet.md`): frame-write
+    /// atomicity — on a connection carrying concurrent dispatch, the bytes of
+    /// two distinct frames MUST NOT interleave. This is the peer-side
+    /// attestation (the guarantee; a wire probe alone can't certify a race —
+    /// mirrors Go's `TestConnection_FrameWriteAtomicity_RT13b`).
+    ///
+    /// N=64 concurrent `system/tree` GETs of distinct, byte-filled 16 KB
+    /// payloads over ONE connection, ×3 windows. The accepted-connection side
+    /// exercises the mechanism under test: `handle_connection`'s single writer
+    /// task draining the per-connection `resp_tx` mpsc channel
+    /// (`connection.rs`) is the only call site that ever writes to the
+    /// socket, so concurrently-dispatched handler tasks can race to enqueue
+    /// but never to write — each response frame is demuxed by `request_id`
+    /// and checked byte-for-byte; a splice would corrupt a body or misroute
+    /// a length-prefixed frame boundary.
+    #[tokio::test]
+    async fn test_rt13b_frame_write_atomicity_no_interleave() {
+        use entity_capability::{GrantEntry, IdScope, PathScope, ResourceTarget};
+        use transport::{MemoryConnector, MemoryListener, MemoryTransportRegistry};
+
+        fn wildcard() -> Vec<(String, Vec<GrantEntry>)> {
+            vec![(
+                "default".to_string(),
+                vec![GrantEntry {
+                    handlers: PathScope::new(vec!["*".into()]),
+                    resources: PathScope::new(vec!["*".into()]),
+                    operations: IdScope::new(vec!["*".into()]),
+                    peers: None,
+                    constraints: None,
+                    allowances: None,
+                }],
+            )]
+        }
+
+        const N: usize = 64;
+        const BODY_LEN: usize = 16 * 1024;
+        const WINDOWS: usize = 3;
+
+        let registry = MemoryTransportRegistry::new();
+        let server = PeerBuilder::new()
+            .keypair(Keypair::from_seed([0x40u8; 32]))
+            .with_seed_policy(wildcard())
+            .build()
+            .unwrap();
+        let server_pid = server.peer_id().to_string();
+        let listener = MemoryListener::bind(server_pid.clone(), registry.clone()).unwrap();
+        let shared = server.shared();
+        server.start_engines(&shared);
+        let shared_clone = shared.clone();
+        let server_handle = tokio::spawn(async move {
+            let _ = server::run(listener, shared_clone).await;
+        });
+        tokio::task::yield_now().await;
+
+        // Seed N distinct 16 KB entities directly in the server's store —
+        // each body byte-filled with its own index so any splice/interleave
+        // (wrong length, wrong bytes, wrong response matched to the wrong
+        // request) is immediately detectable.
+        let mut paths = Vec::with_capacity(N);
+        for i in 0..N {
+            let body = vec![i as u8; BODY_LEN];
+            let entity = entity_entity::Entity::new(
+                "test/rt13b-payload",
+                entity_ecf::to_ecf(&entity_ecf::Value::Bytes(body)),
+            )
+            .unwrap();
+            let path = format!("/{}/rt13b/{}", server_pid, i);
+            shared.content_store.put(entity.clone()).unwrap();
+            shared.location_index.set(&path, entity.content_hash);
+            paths.push(path);
+        }
+
+        let client = matrix_id(entity_crypto::KeyType::Ed25519, 0x41);
+        let conn = MemoryConnector::new(registry.clone())
+            .connect(&format!("memory://{}", server_pid))
+            .await
+            .unwrap();
+        let remote = std::sync::Arc::new(
+            remote::perform_connect(conn, &client, entity_hash::HASH_ALGORITHM_SHA256)
+                .await
+                .unwrap(),
+        );
+
+        let empty_params = entity_entity::Entity::new(
+            "system/params",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![])),
+        )
+        .unwrap();
+
+        for window in 0..WINDOWS {
+            let mut tasks = Vec::with_capacity(N);
+            for path in &paths {
+                let remote = remote.clone();
+                let client = client.clone_identity();
+                let uri = format!("/{}/system/tree", server_pid);
+                let path = path.clone();
+                let params = empty_params.clone();
+                tasks.push(tokio::spawn(async move {
+                    let resource = ResourceTarget {
+                        targets: vec![path],
+                        exclude: vec![],
+                    };
+                    remote::send_execute(
+                        remote.as_ref(),
+                        &client,
+                        &uri,
+                        "get",
+                        &params,
+                        Some(&resource),
+                        None,
+                        None,
+                        &std::collections::HashMap::new(),
+                        None,
+                    )
+                    .await
+                }));
+            }
+
+            for (i, t) in tasks.into_iter().enumerate() {
+                let resp = t.await.unwrap().unwrap_or_else(|e| {
+                    panic!("window {window} idx {i}: send_execute failed: {e}")
+                });
+                assert_eq!(
+                    resp.status, 200,
+                    "window {window} idx {i}: status {} (result: {:?})",
+                    resp.status, resp.result
+                );
+                let v: ciborium::Value =
+                    ciborium::from_reader(resp.result.data.as_slice()).unwrap();
+                let bytes = v
+                    .as_bytes()
+                    .unwrap_or_else(|| panic!("window {window} idx {i}: result body not bytes"));
+                assert_eq!(
+                    bytes.len(),
+                    BODY_LEN,
+                    "window {window} idx {i}: length mismatch — frame interleave suspected"
+                );
+                assert!(
+                    bytes.iter().all(|&b| b == i as u8),
+                    "window {window} idx {i}: body corrupted — frame interleave suspected"
+                );
+            }
+        }
+
+        server_handle.abort();
+    }
+
+    /// Plant a standing continuation directly on `server`'s tree (author =
+    /// server's own identity, no capability check — this is fixture setup,
+    /// not the behavior under test). Mirrors
+    /// `entity_continuation`'s own `install_standing_cont` test helper, built
+    /// from the peer-crate side since a wire-level administrative-gate test
+    /// needs a *second*, unprivileged peer to send the `advance` EXECUTE.
+    #[cfg(feature = "continuation")]
+    async fn install_standing_continuation_on(server: &Peer, path: &str) {
+        let author = server.shared().identity_hash;
+        let cap = entity_entity::Entity::new(
+            "system/capability/token",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+                (entity_ecf::text("created_at"), entity_ecf::integer(0)),
+                (
+                    entity_ecf::text("grantee"),
+                    entity_ecf::Value::Bytes(author.to_bytes().to_vec()),
+                ),
+                (
+                    entity_ecf::text("granter"),
+                    entity_ecf::Value::Bytes(author.to_bytes().to_vec()),
+                ),
+                (entity_ecf::text("grants"), entity_ecf::Value::Array(vec![])),
+            ])),
+        )
+        .unwrap();
+        let cap_hash = cap.content_hash;
+        let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+            (entity_ecf::text("operation"), entity_ecf::text("process")),
+            (entity_ecf::text("target"), entity_ecf::text("app/sink")),
+            (
+                entity_ecf::text("dispatch_capability"),
+                entity_ecf::Value::Bytes(cap_hash.to_bytes().to_vec()),
+            ),
+        ]));
+        let params = entity_entity::Entity::new("system/continuation", data).unwrap();
+        let opts = entity_handler::ExecuteOptions {
+            resource: Some(entity_capability::ResourceTarget {
+                targets: vec![path.to_string()],
+                exclude: vec![],
+            }),
+            included: vec![cap],
+            ..Default::default()
+        };
+        let result = server
+            .execute_with_options("system/continuation", "install", params, opts)
+            .await
+            .unwrap();
+        assert_eq!(result.status, 200, "fixture setup: install must succeed");
+    }
+
+    /// STANDING-MODEL §3 AT-2 (`entity-core-go`
+    /// `HANDOFF-2026-07-28-rust-py-convergence-standing-model-s3-s4.md`): an
+    /// **administrative** `advance` (bare EXECUTE, not a reactive delivery
+    /// trigger) stays capability-gated. A caller whose connection grant
+    /// reaches the `system/continuation` handler but whose `operations`
+    /// scope does not include `advance` (only `resume`/`abandon`) MUST be
+    /// denied — the administrative gate bites even though the caller holds
+    /// *some* capability here, just not this operation.
+    #[cfg(feature = "continuation")]
+    #[tokio::test]
+    async fn test_standing_authority_at2_administrative_wrong_operation_denied() {
+        use entity_capability::{GrantEntry, IdScope, PathScope};
+        use transport::{MemoryConnector, MemoryListener, MemoryTransportRegistry};
+
+        let registry = MemoryTransportRegistry::new();
+        let server = PeerBuilder::new()
+            .keypair(Keypair::from_seed([0x50u8; 32]))
+            .with_seed_policy(vec![(
+                "default".to_string(),
+                vec![GrantEntry {
+                    handlers: PathScope::new(vec!["system/continuation".into()]),
+                    resources: PathScope::new(vec!["*".into()]),
+                    operations: IdScope::new(vec!["resume".into(), "abandon".into()]),
+                    peers: None,
+                    constraints: None,
+                    allowances: None,
+                }],
+            )])
+            .build()
+            .unwrap();
+        let server_pid = server.peer_id().to_string();
+        let path = format!("/{}/system/continuation/at2", server_pid);
+        install_standing_continuation_on(&server, &path).await;
+
+        let listener = MemoryListener::bind(server_pid.clone(), registry.clone()).unwrap();
+        let shared = server.shared();
+        server.start_engines(&shared);
+        let shared_clone = shared.clone();
+        let server_handle = tokio::spawn(async move {
+            let _ = server::run(listener, shared_clone).await;
+        });
+        tokio::task::yield_now().await;
+
+        let client = matrix_id(entity_crypto::KeyType::Ed25519, 0x51);
+        let conn = MemoryConnector::new(registry.clone())
+            .connect(&format!("memory://{}", server_pid))
+            .await
+            .unwrap();
+        let remote = remote::perform_connect(conn, &client, entity_hash::HASH_ALGORITHM_SHA256)
+            .await
+            .unwrap();
+
+        let uri = format!("/{}/system/continuation", server_pid);
+        let params = entity_entity::Entity::new(
+            "system/continuation/advance-request",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+                entity_ecf::text("result"),
+                entity_ecf::Value::Null,
+            )])),
+        )
+        .unwrap();
+        let resource = entity_capability::ResourceTarget {
+            targets: vec![path],
+            exclude: vec![],
+        };
+        let resp = remote::send_execute(
+            &remote,
+            &client,
+            &uri,
+            "advance",
+            &params,
+            Some(&resource),
+            None,
+            None,
+            &std::collections::HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        server_handle.abort();
+
+        assert_eq!(
+            resp.status, 403,
+            "AT-2: administrative advance without the advance operation grant must be denied, got {}: {:?}",
+            resp.status, resp.result
+        );
+    }
+
+    /// STANDING-MODEL §3 AT-4 / O1 (load-bearing, same handoff as AT-2): a
+    /// caller presenting no capability that grants anything on the
+    /// continuation path at all — the plain default connection grant, which
+    /// covers neither `system/continuation` nor `advance` — MUST be denied,
+    /// never allowed by omission. Go's handoff calls this out specifically
+    /// because a "no restriction found" formulation can silently invert into
+    /// allow; this pins the deny outcome on the wire.
+    #[cfg(feature = "continuation")]
+    #[tokio::test]
+    async fn test_standing_authority_at4_administrative_no_capability_denied() {
+        use transport::{MemoryConnector, MemoryListener, MemoryTransportRegistry};
+
+        let registry = MemoryTransportRegistry::new();
+        let server = PeerBuilder::new()
+            .keypair(Keypair::from_seed([0x52u8; 32]))
+            .build()
+            .unwrap();
+        let server_pid = server.peer_id().to_string();
+        let path = format!("/{}/system/continuation/at4", server_pid);
+        install_standing_continuation_on(&server, &path).await;
+
+        let listener = MemoryListener::bind(server_pid.clone(), registry.clone()).unwrap();
+        let shared = server.shared();
+        server.start_engines(&shared);
+        let shared_clone = shared.clone();
+        let server_handle = tokio::spawn(async move {
+            let _ = server::run(listener, shared_clone).await;
+        });
+        tokio::task::yield_now().await;
+
+        let client = matrix_id(entity_crypto::KeyType::Ed25519, 0x53);
+        let conn = MemoryConnector::new(registry.clone())
+            .connect(&format!("memory://{}", server_pid))
+            .await
+            .unwrap();
+        let remote = remote::perform_connect(conn, &client, entity_hash::HASH_ALGORITHM_SHA256)
+            .await
+            .unwrap();
+
+        let uri = format!("/{}/system/continuation", server_pid);
+        let params = entity_entity::Entity::new(
+            "system/continuation/advance-request",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+                entity_ecf::text("result"),
+                entity_ecf::Value::Null,
+            )])),
+        )
+        .unwrap();
+        let resource = entity_capability::ResourceTarget {
+            targets: vec![path],
+            exclude: vec![],
+        };
+        let resp = remote::send_execute(
+            &remote,
+            &client,
+            &uri,
+            "advance",
+            &params,
+            Some(&resource),
+            None,
+            None,
+            &std::collections::HashMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        server_handle.abort();
+
+        assert_eq!(
+            resp.status, 403,
+            "AT-4/O1: administrative advance with no relevant capability must fail closed, got {}: {:?}",
+            resp.status, resp.result
+        );
+    }
+
     #[cfg(feature = "websocket")]
     #[tokio::test]
     async fn test_cross_peer_ws_execute() {

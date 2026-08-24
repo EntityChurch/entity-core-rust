@@ -1047,7 +1047,12 @@ pub fn verify_capability_chain(
 // EXECUTE field decoding
 // ---------------------------------------------------------------------------
 
-pub(crate) struct ExecuteFields {
+/// Public so callers can peek at `uri`/`operation`/`request_id` — the three
+/// fields present on every EXECUTE, connect-shaped or generic — before
+/// deciding whether full verification (which requires `author`+`capability`)
+/// even applies. See `entity_peer::connection::dispatch_request`'s RT-6
+/// pre-verification intercept.
+pub struct ExecuteFields {
     pub request_id: String,
     pub uri: String,
     pub operation: String,
@@ -1055,7 +1060,7 @@ pub(crate) struct ExecuteFields {
     pub capability: Option<Hash>,
 }
 
-pub(crate) fn decode_execute_fields(data: &[u8]) -> Result<ExecuteFields, ProtocolError> {
+pub fn decode_execute_fields(data: &[u8]) -> Result<ExecuteFields, ProtocolError> {
     let value: ciborium::Value =
         ciborium::from_reader(data).map_err(|e| ProtocolError::Invalid(e.to_string()))?;
     let map = value

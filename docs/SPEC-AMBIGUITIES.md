@@ -3639,3 +3639,287 @@ three seats should agree on one *emit* shape so the wire is single-valued. Rust
 can switch its emit to bare null trivially if that is the ruling — the read path
 already accepts both either way. Low urgency (tolerance holds), but worth a pin
 so a future byte-exact `202` vector isn't ambiguous.
+
+---
+
+## ~~PROPOSAL-CONNECTION-NODE §1 — `collect` result: `[<hash>, ...]` or the blobs themselves?~~ RESOLVED
+
+> **RESOLVED 2026-07-28 — arch ruling 1**
+> (`ROUTING-2026-07-28-signaling-rulings-and-go-py-packet` §2), landed in
+> `PROPOSAL-CONNECTION-NODE` §1. **Blobs**, exactly as the interim shipped — no
+> Rust change. `[<hash>, ...]` was residue from a content-addressed sketch and is
+> unimplementable as written: a hash reply needs a fetch surface §1.3 denies the
+> node and §5.1 denies an unwrapped client, and it would make one verb
+> completable on one surface only — the precise divergence §2.1 rules out.
+
+**Date:** 2026-07-28. **Status:** interim choice landed (blobs); routed to arch.
+Surfaced building Stage 1 (`extensions/signaling`, `feat/signaling-connection-node`).
+
+**Spec:** `PROPOSAL-CONNECTION-NODE` (DRAFT 2026-07-28) §1 verb surface, read
+against §0 and §1.3.
+
+**Passage.** §1 gives the signature as
+
+> `system/signaling:collect(rendezvous_key)   → { messages: [<hash>, ...] }`
+
+while §0 describes the node as one that "holds an opaque blob at an opaque key
+for a few seconds **so the other peer can pick it up**."
+
+**Ambiguity.** Those read differently. If `messages` carries content **hashes**,
+`collect` is not self-sufficient — the caller needs a fetch surface to turn a
+hash into bytes, and the node has none to offer: §1.3 pins the state silhouette
+at "per-key TTL-reaped buckets and nothing else. No bulk storage," and §5.1 says
+a public node "is **not** an entity peer ... Clients hold no entity machinery to
+talk to it." A hash-only reply would leave the unwrapped surface with a verb it
+structurally cannot complete, which would contradict §2.1's pin that the two
+surfaces reach the *same* operations.
+
+**Interim choice.** `messages` is a CBOR array of **`bstr`** — the deposited
+blobs themselves (`CollectResult`, `extensions/signaling/src/data.rs`). This
+keeps `collect` self-sufficient on both surfaces, keeps the core entity-free per
+§2.1, and matches §0's "pick it up." Reading `[<hash>, ...]` as loose notation
+for "the opaque content-addressed thing that was deposited" is the reconciliation
+we assumed.
+
+**Question for arch.** Confirm the blob reading, or — if hashes really are
+intended — say what fetch surface the node exposes for them, and how that
+survives §5.1's "not an entity peer." This is a cross-peer-observable wire shape
+on a **single-impl server** (§1.2), so it is exactly the class §1.1 says must be
+pinned before code rather than settled in the Rust. Cheap to change now,
+expensive after the go/py clients are written against it.
+
+---
+
+## ~~PROPOSAL-CONNECTION-NODE §1 — `reflect` has no source of an observed address on the wrapped surface~~ RESOLVED
+
+> **RESOLVED 2026-07-28 — arch ruling 2**, landed in `PROPOSAL-CONNECTION-NODE`
+> §1.4 (new), §2.1, §5.1. **`reflect` is the unwrapped listener's verb, not one
+> of the core's operations** — the alternative this entry asked for (option (b),
+> plumb a source address) was rejected, and option (a) confirmed and generalized.
+> Not plumbed: *moved*.
+>
+> The reasoning went past the plumbing question. Even fully plumbed, a wrapped
+> `reflect` reports the **TCP/WS** mapping of an already-established entity
+> connection while the punch needs the **UDP** one — so it answers the wrong
+> question, and a peer concludes its NAT type from *agreement across reflectors*,
+> which makes a plausible-but-wrong address worse than none.
+>
+> **Rust delta (landed):** `ObservedAddressSource` and the 501
+> `observed_address_unavailable` are **deleted**; `SignalingCore::reflect`,
+> `Reflection`, its codecs, `SignalingClient::reflect`, `OP_REFLECT` and
+> `CAP_SIGNALING_REFLECT` with them. The core is three verbs, `OPERATIONS` is
+> three, and a `reflect` call is an ordinary unknown-operation 400. The two gate
+> tests were kept and their assertions flipped from *blocked pending plumbing* to
+> *not served here by design*.
+>
+> **The honest cost, recorded rather than dropped:** this shrinks Stage 1. It had
+> been credited with standalone NAT-type-detection value; that value moves to
+> Stage 2 with `reflect`. What it buys is that §2.1's "identical across surfaces"
+> becomes *exactly* true rather than nearly true — `reflect` was the one verb
+> that never could have been, because it was never an operation on the mailbox.
+
+**Date:** 2026-07-28. **Status:** Stage-1 limit; refuses loudly (501). Needs an
+arch call before `reflect` can ship on the wrapped surface at all.
+
+**Spec:** `PROPOSAL-CONNECTION-NODE` §1 (`reflect` → `{ observed_address, ... }`),
+§2 (the wrapped surface is "an ordinary entity handler operation"),
+`HANDOFF-2026-07-28-connection-node-staging-and-sequence` §8 sequence step 1
+("`reflect` first, then `offer`/`collect`").
+
+**Passage.** The build sequence puts `reflect` first in Stage 1, and Stage 1's
+handler shape is "plain dispatch, both sides" — i.e. `reflect` is expected to be
+servable over cross-peer `execute`.
+
+**The gap (verified in source at `ae93443`).** A handler cannot learn the
+caller's source address:
+
+- `Connection` carries it — `remote_addr: String`, set at accept time
+  (`core/peer/src/transport.rs`, both the TCP and WebSocket listeners).
+- The dispatch seam drops it. `handle_request` (`core/peer/src/connection.rs`)
+  derives only `session_peer_id` from `conn.remote_peer_id` and calls
+  `dispatch_request(envelope, shared, session_peer_id)`; `remote_addr` is in
+  scope at that call site and is not passed.
+- `HandlerContext` has no field for it, and its doc comment declares the
+  16-field count "a reviewed ceiling ... Reject convenience additions; if an
+  extension needs more, find a side channel."
+
+Adding a 17th field would be precisely the "new context field to paper over a
+gap" that `AGENTS.md` routes upstream instead of inventing, and would also break
+`PROPOSAL-CONNECTION-NODE` §3's isolation constraint ("no edits to shared core
+crates to accommodate it").
+
+**Interim choice.** The extension declares its own injected
+`ObservedAddressSource` trait (`extensions/signaling/src/handler.rs`) — the same
+shape RELAY uses for `RelayForwarder`, owned entirely by the extension. **Nothing
+in-tree can satisfy it over the wrapped surface**, so `cmd/entity-signaling-node`
+wires none and `reflect` returns **501 `observed_address_unavailable`**. A loud
+refusal, never a fabricated address: a peer derives its NAT type from *agreement
+across reflectors* (`PROPOSAL-NETWORK-REACHABILITY-FACTS` §0), so a plausible lie
+would be concluded on rather than discarded. `offer`/`collect`/`advertise` are
+unaffected and fully live.
+
+**The observation worth arch's attention.** This may not be a plumbing gap so
+much as `reflect` belonging to the **unwrapped** surface by nature. Its whole job
+is to report a transport-level source address — precisely the layer the entity
+wrapper exists to abstract away. Even fully plumbed, the wrapped surface could
+only ever report the *TCP/WebSocket* mapping of an already-established entity
+connection, while the punch needs the *UDP* mapping; §5.1 already names "plain
+STUN" as the obvious fit for `reflect`. If that is right, then §8's "reflect
+first" is the one Stage-1 item that is actually Stage-2 work, and Stage 1's
+honest deliverable is `offer`/`collect`/`advertise` — mechanism for the
+rendezvous, with NAT-type detection arriving with the unwrapped surface.
+
+**Question for arch.** Either (a) confirm `reflect` is unwrapped-surface-only and
+drop it from the Stage-1 gate, or (b) rule on how an observed source address
+legitimately reaches a handler — a decision about the handler abstraction's
+boundary, not about signaling, and plausibly in scope for
+`PROPOSAL-SDK-HANDLER-OWNED-SERVICES` (a handler that owns a listener owns the
+socket, and therefore the observation).
+
+---
+
+## ~~PROPOSAL-CONNECTION-NODE open item 3 — bucket TTL default has no number~~ RESOLVED
+
+> **RESOLVED 2026-07-28 — arch ruling 3**, landed as `PROPOSAL-CONNECTION-NODE`
+> §1.1 pin 6; open item 3 closed. **60 s**, exactly as the interim shipped — no
+> Rust change beyond documenting it as a pin. Node-configurable and published in
+> the `advertise` limits.
+>
+> The rationale arch attached is worth keeping, because it is not the one the
+> interim was chosen on: the TTL is bound by the lifetime of *what the blob
+> describes*, not by node memory. An `srflx` candidate dies with the NAT binding
+> that produced it (commonly 30–120 s), so a longer TTL only serves candidates
+> that are already unpunchable.
+
+**Date:** 2026-07-28. **Status:** interim value chosen; arch owns the number.
+
+**Spec:** `PROPOSAL-CONNECTION-NODE` §5 open item 3, which pins the TTL's
+*semantics* in §1.1 ("advisory to peers, binding on the node") and explicitly
+leaves the value open: "pinned advisory in §1.1; the default *value* still needs
+a number."
+
+**Interim choice.** `Limits::default().bucket_ttl_ms = 60_000` (60s), overridable
+via `--ttl-ms` (`extensions/signaling/src/core.rs`). Rationale: generous for a
+handshake with retries, short enough to keep §4's "transient ~1 KB per handshake"
+footprint honest. The sibling limits are interim on the same basis —
+`max_message_bytes = 4096` (§4 sizes a handshake at ~1 KB),
+`max_messages_per_key = 32` (`lobby`/`tag` are multi-party), `max_keys = 65_536`.
+
+**Why it matters slightly more than a tuning knob.** The TTL is published through
+`advertise`, so peers size their retry loops against it; and open item 2 (the
+public mode's rate-limit shape, where "the rate limiter is the *entire* admission
+story") will want to be set against the same capacity model. Worth one number
+from arch rather than three impls each picking their own.
+
+---
+
+## ~~PROPOSAL-REGISTRY-SERVICE-ADVERTISEMENT §3.1 — rendezvous-hash is pinned as a *rule*, but its weight function is unpinned bytes~~ RESOLVED
+
+> **RESOLVED 2026-07-28 — arch ruling 4**, landed as
+> `PROPOSAL-REGISTRY-SERVICE-ADVERTISEMENT` §3.1.1 (new). All four free variables
+> this entry enumerated are pinned to bytes:
+> `weight(k, endpoint) = SHA-256( k ‖ endpoint_bytes )`, argmax with weights
+> compared lexicographically, **highest** wins, ties to the **lower** endpoint;
+> `k` is the 33-byte key exactly as derived; `endpoint_bytes` are the advertised
+> string exactly as published (no normalization — same rule and reason as §2.2's
+> string inputs); no separator, *because* `k` is fixed-width; and a plain
+> SHA-256, explicitly **not** the substrate content-hash primitive, since a
+> format-carrying digest would reintroduce the home-format divergence §2.2 exists
+> to pin away.
+>
+> **One substantive change from the interim: `priority` partitions, it does not
+> weight.** "Tier the pool by weighting the hash" is withdrawn — a weighting
+> function is itself unpinned bytes, and stacking a second invented rule on the
+> first is worse than not tiering. The rule is now: take the **lowest `priority`
+> tier present**, then rendezvous-hash within it.
+>
+> **Rust delta (landed):** the construction was already right, including the
+> direction (this entry's write-up said "lexicographic" without saying which end
+> wins; the code picked highest, which is the pin). Added: the tier partition
+> ahead of the hash in both `select` and `select_top`, and tests for the
+> partition, the lowest-tier-**present** failover, and the argmax direction
+> checked against an independently recomputed digest.
+>
+> **The validation gap this entry flagged was accepted and acted on.**
+> `PROPOSAL-CONNECTION-NODE` §6 step 2 now requires a **two-instance pool** in
+> the gate, on the reasoning quoted from here: `argmax` over one member returns
+> that member whatever the weight computes, so §1.2's "three independent clients
+> converge" mitigation does not reach the selection rule. A second instance is a
+> second port on the same box (§1.3, stateless), so an unvalidatable pin became a
+> validated one for a config line. Landed locally as
+> `gate_step_2_pool_selection_converges_over_a_two_instance_pool`.
+
+**Date:** 2026-07-28. **Status:** interim construction landed; **routed to arch as
+the fourth §1.1-class question.** Surfaced building the Stage-1 client
+(`extensions/signaling/src/pool.rs`, `feat/signaling-connection-node`).
+
+**Spec:** `PROPOSAL-REGISTRY-SERVICE-ADVERTISEMENT` §3.1 (intra-pool selection),
+read with `PROPOSAL-CONNECTION-NODE` §2.1 (same-provider rule) and §1.2 (what to
+do with a question of this kind).
+
+**Passage.** §3.1 pins signaling's intra-pool selection as a **MUST**:
+
+> **client-side rendezvous-hash (MUST).** Both peers compute
+> `k = rendezvous_key(sorted(peer_a, peer_b))` and
+> `server = rendezvous_hash(k, pool)` (highest-random-weight) → **both
+> independently pick the *same* server** for the handshake. **NOT** lowest-`priority`.
+
+and states the failure it prevents: "Naive priority-order or a round-robin LB
+**splits the pair across servers** and the punch never completes."
+
+**Ambiguity.** §3.1 pins **that** selection is rendezvous-hash, and pins why. It
+does not pin **what bytes go into the weight**. "Highest-random-weight" names a
+family, not a function. At least four free variables, each of which two impls
+can resolve differently while both being "correct HRW":
+
+1. **Operand order** — `H(key ‖ endpoint)` vs `H(endpoint ‖ key)`.
+2. **The digest** — SHA-256 is the obvious floor, but nothing says so, and the
+   substrate's own hashes are format-carrying (the §2.2 trap, one layer up).
+3. **Member identity** — the advertised `endpoint` URL byte-for-byte, or the
+   node's `peer_id`, or a normalized URL. A peer that strips a trailing slash or
+   lowercases a host weights a different string.
+4. **Weight comparison** — the digest as a big-endian integer, little-endian, or
+   a truncated prefix; and how a tie breaks.
+
+**This is the same failure shape as §2.2, one layer out.** Two peers that derive
+a byte-identical rendezvous key and then select different pool members meet
+nobody — no error, no log, nothing to bisect. It is equally invisible to a
+same-impl test (one impl always agrees with itself, so a "both peers converge"
+test passes trivially), and it becomes load-bearing the moment a pool has more
+than one member. `PROPOSAL-CONNECTION-NODE` §1.2 says: "If a fourth question of
+the §1.1 kind surfaces during the build, it comes back here as a spec fix — it
+does not get settled in the Rust." **This is that fourth question.**
+
+**Interim choice (landed, explicitly not a pin).**
+`weight = SHA-256( key_bytes ‖ endpoint_utf8 )`, compared lexicographically over
+the 32 digest bytes (highest wins), ties broken on the lower endpoint string. No
+separator between operands — the key is a fixed 33 bytes, so the concatenation is
+self-delimiting and §2.2's `pair` ambiguity cannot arise. `priority` is **not**
+folded into the weight: §3.1 allows a pool to be tiered by weighting the hash,
+but that weighting is itself unpinned, so v0 ignores it rather than inventing a
+second unpinned rule on top of the first.
+
+Also implemented: §3.1's stale-pool-skew SHOULD as `select_top(key, pool, 2)`,
+with a test that two peers whose pools differ by one member still share a choice.
+
+**Urgency: not a Stage-1 blocker.** §4 deploys **one** instance, and against a
+single node there is nothing to select — a client can be pointed straight at it,
+and `argmax` over a one-member pool returns that member whatever the weight
+function computes. So Stage 1 ships regardless, and the Rust client's
+implementation is ahead of what Stage 1 needs rather than blocked on this.
+
+**But it is also not *validatable* by Stage 1, for the same reason.** Unlike §2.2
+— which the live cross-impl run genuinely settles — this one is invisible to the
+gate as sequenced (`HANDOFF-2026-07-28...` §8 step 4: go and py peers against one
+Rust node). Every HRW construction agrees on a single-member pool, so a green gate
+says nothing about it. Two impls first disagree at pool size ≥ 2.
+
+**Question for arch.** Pin the weight construction — the four variables above —
+**before the first deployment runs a signaling pool of two or more**, which is
+also before the go/py clients implement selection rather than a configured single
+endpoint. Since experiment can't settle it at Stage-1 scale, it wants pinning by
+inspection, or a deliberate two-node pool added to a later gate. Flagging the
+*validation* gap explicitly because §1.2's mitigation — "three independently
+-written clients hitting the server from outside is a real convergence signal" —
+does **not** reach this one: the clients converge trivially here no matter what
+they implement.

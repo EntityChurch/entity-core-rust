@@ -43,6 +43,11 @@ members = [
     "extensions/storage-substitute-sources",
     "extensions/storage-substitute-http",
     "extensions/local-files",
+    # The connection node (PROPOSAL-CONNECTION-NODE). Isolated and optional: no
+    # core crate depends on it, so it is off unless `cmd/entity-signaling-node`
+    # is built. Installed through the public `PeerBuilder::handler()` seam.
+    "extensions/signaling",
+    "cmd/entity-signaling-node",
     "bindings/ffi",
     "bindings/godot",
     "bindings/sdk",
@@ -99,6 +104,11 @@ default-members = [
     "extensions/storage-substitute-sources",
     "extensions/storage-substitute-http",
     "extensions/local-files",
+    # In default-members so CI compiles and tests the node — "optional" here
+    # means *no core crate depends on it* (a peer never links it unless the
+    # operator installs the handler), not "untested".
+    "extensions/signaling",
+    "cmd/entity-signaling-node",
 ]
 
 [workspace.package]
@@ -182,6 +192,7 @@ entity-content = { path = "extensions/content" }
 entity-storage-substitute-sources = { path = "extensions/storage-substitute-sources" }
 entity-storage-substitute-http = { path = "extensions/storage-substitute-http" }
 entity-local-files = { path = "extensions/local-files" }
+entity-signaling = { path = "extensions/signaling" }
 entity-sdk = { path = "bindings/sdk" }
 entity-shell = { path = "bindings/shell" }
 data-encoding = "2"
