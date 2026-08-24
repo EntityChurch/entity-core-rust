@@ -1,4 +1,19 @@
 #![cfg(target_arch = "wasm32")]
+// KNOWN DEBT — `clippy::await_holding_refcell_ref` fires on the eight
+// dispatched `handle_*` ops (get/put/list/has/remove/execute/query/count).
+// Each holds `state.borrow()` across its `.await` because the SDK op is a
+// `pub async fn(&self, ..)` on a borrowed accessor, so the future borrows the
+// `PeerContext` — and `PeerContext` is not `Clone`, so the borrow cannot be
+// released before the await without the detached-`'static`-future rework
+// tracked in `docs/BACKLOG.md` (AGENTS.md, "SDK 'static futures").
+//
+// This is NOT proven benign: `run_worker`'s onmessage `spawn_local`s every
+// request independently, so a concurrent `borrow_mut()` op (Init/CreatePeer/
+// SetMetadata) landing while one of these is parked at its await panics the
+// worker with `BorrowMutError`. Allowed here to keep the gate honest about
+// what it does check; removing this allow is the acceptance test for that
+// backlog item.
+#![allow(clippy::await_holding_refcell_ref)]
 //! Library that hosts an entity-core peer SDK inside a dedicated Web Worker.
 //!
 //! # Usage
@@ -60,10 +75,10 @@ use entity_peer::{DispatchEvent, DispatchPhase, PeerConfig, WireEvent};
 use entity_sdk::{ChangeType, EntitySDK, PeerContextBuilder, PeerMetadata, TreeChangeEvent};
 use entity_wasm_worker_protocol::{
     conversions::ConversionError, BindingKind, CasFailure, CasFailureKind, ConnectPeerOk,
-    CreatePeerOk, Event, InitParams, InspectFact, PROTOCOL_VERSION, Request, RequestId, Response,
-    SubId, WireCaps, WireDirection, WireEntity, WireError, WireErrorKind, WireExecuteOptions,
-    WireHandlerInfo, WireHandlerResult, WireHash, WireListingEntry, WirePeerMetadata,
-    WireQueryResults, WireTypeInfo,
+    CreatePeerOk, Event, InitParams, InspectFact, Request, RequestId, Response, SubId, WireCaps,
+    WireDirection, WireEntity, WireError, WireErrorKind, WireExecuteOptions, WireHandlerInfo,
+    WireHandlerResult, WireHash, WireListingEntry, WirePeerMetadata, WireQueryResults,
+    WireTypeInfo, PROTOCOL_VERSION,
 };
 use js_sys::Uint8Array;
 use std::cell::RefCell;
@@ -252,17 +267,41 @@ async fn dispatch(
 ) -> Response {
     match request {
         Request::Init { request_id, params } => handle_init(state, request_id, params).await,
-        Request::Get { request_id, peer_id, path } => handle_get(state, request_id, peer_id, path).await,
-        Request::Put { request_id, peer_id, path, entity } => {
-            handle_put(state, request_id, peer_id, path, entity).await
+        Request::Get {
+            request_id,
+            peer_id,
+            path,
+        } => handle_get(state, request_id, peer_id, path).await,
+        Request::Put {
+            request_id,
+            peer_id,
+            path,
+            entity,
+        } => handle_put(state, request_id, peer_id, path, entity).await,
+        Request::List {
+            request_id,
+            peer_id,
+            prefix,
+        } => handle_list(state, request_id, peer_id, prefix).await,
+        Request::Has {
+            request_id,
+            peer_id,
+            path,
+        } => handle_has(state, request_id, peer_id, path).await,
+        Request::Remove {
+            request_id,
+            peer_id,
+            path,
+        } => handle_remove(state, request_id, peer_id, path).await,
+        Request::Subscribe {
+            request_id,
+            sub_id,
+            peer_id,
+            prefix,
+        } => handle_subscribe(state, request_id, sub_id, peer_id, prefix, global.clone()).await,
+        Request::Unsubscribe { request_id, sub_id } => {
+            handle_unsubscribe(state, request_id, sub_id)
         }
-        Request::List { request_id, peer_id, prefix } => handle_list(state, request_id, peer_id, prefix).await,
-        Request::Has { request_id, peer_id, path } => handle_has(state, request_id, peer_id, path).await,
-        Request::Remove { request_id, peer_id, path } => handle_remove(state, request_id, peer_id, path).await,
-        Request::Subscribe { request_id, sub_id, peer_id, prefix } => {
-            handle_subscribe(state, request_id, sub_id, peer_id, prefix, global.clone()).await
-        }
-        Request::Unsubscribe { request_id, sub_id } => handle_unsubscribe(state, request_id, sub_id),
 
         // Phase 1.x — the wire format is in place; SDK dispatch is TODO.
         // Returning a typed error keeps the proxy's `proxy_method!` happy
@@ -271,21 +310,32 @@ async fn dispatch(
             request_id,
             result: Err(not_yet_wired("put_cas")),
         },
-        Request::Execute { request_id, peer_id, handler, operation, params, opts } => {
-            handle_execute(state, request_id, peer_id, handler, operation, params, opts).await
-        }
-        Request::Query { request_id, peer_id, expression } => {
-            handle_query(state, request_id, peer_id, expression).await
-        }
-        Request::Count { request_id, peer_id, expression } => {
-            handle_count(state, request_id, peer_id, expression).await
-        }
-        Request::EntityCount { request_id, peer_id } => {
-            handle_entity_count(state, request_id, peer_id)
-        }
-        Request::PathCount { request_id, peer_id } => {
-            handle_path_count(state, request_id, peer_id)
-        }
+        Request::Execute {
+            request_id,
+            peer_id,
+            handler,
+            operation,
+            params,
+            opts,
+        } => handle_execute(state, request_id, peer_id, handler, operation, params, opts).await,
+        Request::Query {
+            request_id,
+            peer_id,
+            expression,
+        } => handle_query(state, request_id, peer_id, expression).await,
+        Request::Count {
+            request_id,
+            peer_id,
+            expression,
+        } => handle_count(state, request_id, peer_id, expression).await,
+        Request::EntityCount {
+            request_id,
+            peer_id,
+        } => handle_entity_count(state, request_id, peer_id),
+        Request::PathCount {
+            request_id,
+            peer_id,
+        } => handle_path_count(state, request_id, peer_id),
         Request::InboxList { request_id, .. } => Response::InboxList {
             request_id,
             result: Err(not_yet_wired("inbox_list")),
@@ -294,30 +344,45 @@ async fn dispatch(
             request_id,
             result: Err(not_yet_wired("inbox_get")),
         },
-        Request::DiscoverHandlers { request_id, peer_id } => {
-            handle_discover_handlers(state, request_id, peer_id)
-        }
-        Request::DiscoverTypes { request_id, peer_id } => {
-            handle_discover_types(state, request_id, peer_id)
-        }
-        Request::RegisterBackendPeer { request_id, peer_id, label, listen_addresses } => {
-            handle_register_backend_peer(state, request_id, peer_id, label, listen_addresses)
-        }
-        Request::CreatePeer { request_id, label } => {
-            handle_create_peer(state, request_id, label)
-        }
-        Request::DeletePeer { request_id, peer_id } => {
-            handle_delete_peer(state, request_id, peer_id)
-        }
-        Request::SetMetadata { request_id, peer_id, metadata } => {
-            handle_set_metadata(state, request_id, peer_id, metadata)
-        }
-        Request::ConnectPeer { request_id, peer_id, address } => {
-            handle_connect_peer(state, request_id, peer_id, address).await
-        }
-        Request::SetInspectEnabled { request_id, peer_id, enabled } => {
-            handle_set_inspect_enabled(state, request_id, peer_id, enabled)
-        }
+        Request::DiscoverHandlers {
+            request_id,
+            peer_id,
+        } => handle_discover_handlers(state, request_id, peer_id),
+        Request::DiscoverTypes {
+            request_id,
+            peer_id,
+        } => handle_discover_types(state, request_id, peer_id),
+        Request::RegisterBackendPeer {
+            request_id,
+            peer_id,
+            label,
+            listen_addresses,
+        } => handle_register_backend_peer(state, request_id, peer_id, label, listen_addresses),
+        Request::CreatePeer { request_id, label } => handle_create_peer(state, request_id, label),
+        Request::DeletePeer {
+            request_id,
+            peer_id,
+        } => handle_delete_peer(state, request_id, peer_id),
+        Request::SetMetadata {
+            request_id,
+            peer_id,
+            metadata,
+        } => handle_set_metadata(state, request_id, peer_id, metadata),
+        Request::ConnectPeer {
+            request_id,
+            peer_id,
+            address,
+        } => handle_connect_peer(state, request_id, peer_id, address).await,
+        Request::DisconnectPeer {
+            request_id,
+            peer_id,
+            remote_peer_id,
+        } => handle_disconnect_peer(state, request_id, peer_id, remote_peer_id),
+        Request::SetInspectEnabled {
+            request_id,
+            peer_id,
+            enabled,
+        } => handle_set_inspect_enabled(state, request_id, peer_id, enabled),
     }
 }
 
@@ -492,11 +557,9 @@ fn build_per_peer_connector(
 ) -> Arc<dyn entity_peer::transport::Connector> {
     match control_client {
         Some(client) => {
-            let xworker: Arc<dyn entity_peer::transport::Connector> =
-                Arc::new(entity_peer::transport::MessagePortConnector::new(
-                    client.clone(),
-                    source_peer_id,
-                ));
+            let xworker: Arc<dyn entity_peer::transport::Connector> = Arc::new(
+                entity_peer::transport::MessagePortConnector::new(client.clone(), source_peer_id),
+            );
             let ws: Arc<dyn entity_peer::transport::Connector> =
                 Arc::new(entity_peer::transport::BrowserWebSocketConnector);
             let multi = entity_peer::transport::MultiConnector::new()
@@ -557,7 +620,8 @@ async fn handle_init(
     // the substrate hooks installed below capture the flag and the
     // worker's global handle so they can post `Event::Inspect` once
     // marshalling is flipped on via `Request::SetInspectEnabled`.
-    let global_for_hooks = match js_sys::global().dyn_into::<web_sys::DedicatedWorkerGlobalScope>() {
+    let global_for_hooks = match js_sys::global().dyn_into::<web_sys::DedicatedWorkerGlobalScope>()
+    {
         Ok(g) => g,
         Err(_) => {
             return Response::Init {
@@ -906,11 +970,21 @@ async fn handle_get(
         let st = state.borrow();
         let sdk = match st.sdk.as_ref() {
             Some(s) => s,
-            None => return Response::Get { request_id, result: Err(sdk_not_initialized()) },
+            None => {
+                return Response::Get {
+                    request_id,
+                    result: Err(sdk_not_initialized()),
+                }
+            }
         };
         let peer_ctx = match sdk.peer(&peer_id) {
             Some(p) => p,
-            None => return Response::Get { request_id, result: Err(peer_not_found(&peer_id)) },
+            None => {
+                return Response::Get {
+                    request_id,
+                    result: Err(peer_not_found(&peer_id)),
+                }
+            }
         };
         // SDK's get is `pub async fn get(&self, path: &str)` — the
         // returned future borrows the PeerContext. We must await before
@@ -940,18 +1014,33 @@ async fn handle_put(
     // Convert wire entity → SDK entity at the boundary.
     let sdk_entity = match entity_entity::Entity::try_from(entity) {
         Ok(e) => e,
-        Err(e) => return Response::Put { request_id, result: Err(conversion_error("put.entity", &e)) },
+        Err(e) => {
+            return Response::Put {
+                request_id,
+                result: Err(conversion_error("put.entity", &e)),
+            }
+        }
     };
 
     let result = {
         let st = state.borrow();
         let sdk = match st.sdk.as_ref() {
             Some(s) => s,
-            None => return Response::Put { request_id, result: Err(sdk_not_initialized()) },
+            None => {
+                return Response::Put {
+                    request_id,
+                    result: Err(sdk_not_initialized()),
+                }
+            }
         };
         let peer_ctx = match sdk.peer(&peer_id) {
             Some(p) => p,
-            None => return Response::Put { request_id, result: Err(peer_not_found(&peer_id)) },
+            None => {
+                return Response::Put {
+                    request_id,
+                    result: Err(peer_not_found(&peer_id)),
+                }
+            }
         };
         // SDK's put returns `impl Future + 'static`. We can extract and drop the borrow.
         let fut = peer_ctx.put(path, sdk_entity);
@@ -980,11 +1069,21 @@ async fn handle_list(
         let st = state.borrow();
         let sdk = match st.sdk.as_ref() {
             Some(s) => s,
-            None => return Response::List { request_id, result: Err(sdk_not_initialized()) },
+            None => {
+                return Response::List {
+                    request_id,
+                    result: Err(sdk_not_initialized()),
+                }
+            }
         };
         let peer_ctx = match sdk.peer(&peer_id) {
             Some(p) => p,
-            None => return Response::List { request_id, result: Err(peer_not_found(&peer_id)) },
+            None => {
+                return Response::List {
+                    request_id,
+                    result: Err(peer_not_found(&peer_id)),
+                }
+            }
         };
         peer_ctx.list(&prefix).await
     };
@@ -1031,17 +1130,33 @@ async fn handle_has(
         let st = state.borrow();
         let sdk = match st.sdk.as_ref() {
             Some(s) => s,
-            None => return Response::Has { request_id, result: Err(sdk_not_initialized()) },
+            None => {
+                return Response::Has {
+                    request_id,
+                    result: Err(sdk_not_initialized()),
+                }
+            }
         };
         let peer_ctx = match sdk.peer(&peer_id) {
             Some(p) => p,
-            None => return Response::Has { request_id, result: Err(peer_not_found(&peer_id)) },
+            None => {
+                return Response::Has {
+                    request_id,
+                    result: Err(peer_not_found(&peer_id)),
+                }
+            }
         };
         peer_ctx.has(&path).await
     };
     match result {
-        Ok(b) => Response::Has { request_id, result: Ok(b) },
-        Err(e) => Response::Has { request_id, result: Err(WireError::from(e)) },
+        Ok(b) => Response::Has {
+            request_id,
+            result: Ok(b),
+        },
+        Err(e) => Response::Has {
+            request_id,
+            result: Err(WireError::from(e)),
+        },
     }
 }
 
@@ -1055,17 +1170,33 @@ async fn handle_remove(
         let st = state.borrow();
         let sdk = match st.sdk.as_ref() {
             Some(s) => s,
-            None => return Response::Remove { request_id, result: Err(sdk_not_initialized()) },
+            None => {
+                return Response::Remove {
+                    request_id,
+                    result: Err(sdk_not_initialized()),
+                }
+            }
         };
         let peer_ctx = match sdk.peer(&peer_id) {
             Some(p) => p,
-            None => return Response::Remove { request_id, result: Err(peer_not_found(&peer_id)) },
+            None => {
+                return Response::Remove {
+                    request_id,
+                    result: Err(peer_not_found(&peer_id)),
+                }
+            }
         };
         peer_ctx.remove(&path).await
     };
     match result {
-        Ok(b) => Response::Remove { request_id, result: Ok(b) },
-        Err(e) => Response::Remove { request_id, result: Err(WireError::from(e)) },
+        Ok(b) => Response::Remove {
+            request_id,
+            result: Ok(b),
+        },
+        Err(e) => Response::Remove {
+            request_id,
+            result: Err(WireError::from(e)),
+        },
     }
 }
 
@@ -1098,11 +1229,21 @@ async fn handle_execute(
         let st = state.borrow();
         let sdk = match st.sdk.as_ref() {
             Some(s) => s,
-            None => return Response::Execute { request_id, result: Err(sdk_not_initialized()) },
+            None => {
+                return Response::Execute {
+                    request_id,
+                    result: Err(sdk_not_initialized()),
+                }
+            }
         };
         let peer_ctx = match sdk.peer(&peer_id) {
             Some(p) => p,
-            None => return Response::Execute { request_id, result: Err(peer_not_found(&peer_id)) },
+            None => {
+                return Response::Execute {
+                    request_id,
+                    result: Err(peer_not_found(&peer_id)),
+                }
+            }
         };
         // PeerContext::execute returns an owning future; extract and drop the
         // borrow before awaiting (matches handle_put's pattern).
@@ -1141,11 +1282,21 @@ async fn handle_query(
         let st = state.borrow();
         let sdk = match st.sdk.as_ref() {
             Some(s) => s,
-            None => return Response::Query { request_id, result: Err(sdk_not_initialized()) },
+            None => {
+                return Response::Query {
+                    request_id,
+                    result: Err(sdk_not_initialized()),
+                }
+            }
         };
         let peer_ctx = match sdk.peer(&peer_id) {
             Some(p) => p,
-            None => return Response::Query { request_id, result: Err(peer_not_found(&peer_id)) },
+            None => {
+                return Response::Query {
+                    request_id,
+                    result: Err(peer_not_found(&peer_id)),
+                }
+            }
         };
         let fut = peer_ctx.query(sdk_expression);
         drop(st);
@@ -1182,19 +1333,35 @@ async fn handle_count(
         let st = state.borrow();
         let sdk = match st.sdk.as_ref() {
             Some(s) => s,
-            None => return Response::Count { request_id, result: Err(sdk_not_initialized()) },
+            None => {
+                return Response::Count {
+                    request_id,
+                    result: Err(sdk_not_initialized()),
+                }
+            }
         };
         let peer_ctx = match sdk.peer(&peer_id) {
             Some(p) => p,
-            None => return Response::Count { request_id, result: Err(peer_not_found(&peer_id)) },
+            None => {
+                return Response::Count {
+                    request_id,
+                    result: Err(peer_not_found(&peer_id)),
+                }
+            }
         };
         let fut = peer_ctx.count(sdk_expression);
         drop(st);
         fut.await
     };
     match result {
-        Ok(n) => Response::Count { request_id, result: Ok(n) },
-        Err(e) => Response::Count { request_id, result: Err(WireError::from(e)) },
+        Ok(n) => Response::Count {
+            request_id,
+            result: Ok(n),
+        },
+        Err(e) => Response::Count {
+            request_id,
+            result: Err(WireError::from(e)),
+        },
     }
 }
 
@@ -1206,18 +1373,31 @@ fn handle_discover_handlers(
     let st = state.borrow();
     let sdk = match st.sdk.as_ref() {
         Some(s) => s,
-        None => return Response::DiscoverHandlers { request_id, result: Err(sdk_not_initialized()) },
+        None => {
+            return Response::DiscoverHandlers {
+                request_id,
+                result: Err(sdk_not_initialized()),
+            }
+        }
     };
     let peer_ctx = match sdk.peer(&peer_id) {
         Some(p) => p,
-        None => return Response::DiscoverHandlers { request_id, result: Err(peer_not_found(&peer_id)) },
+        None => {
+            return Response::DiscoverHandlers {
+                request_id,
+                result: Err(peer_not_found(&peer_id)),
+            }
+        }
     };
     let wire: Vec<WireHandlerInfo> = peer_ctx
         .discover_handlers()
         .into_iter()
         .map(WireHandlerInfo::from)
         .collect();
-    Response::DiscoverHandlers { request_id, result: Ok(wire) }
+    Response::DiscoverHandlers {
+        request_id,
+        result: Ok(wire),
+    }
 }
 
 fn handle_discover_types(
@@ -1228,18 +1408,31 @@ fn handle_discover_types(
     let st = state.borrow();
     let sdk = match st.sdk.as_ref() {
         Some(s) => s,
-        None => return Response::DiscoverTypes { request_id, result: Err(sdk_not_initialized()) },
+        None => {
+            return Response::DiscoverTypes {
+                request_id,
+                result: Err(sdk_not_initialized()),
+            }
+        }
     };
     let peer_ctx = match sdk.peer(&peer_id) {
         Some(p) => p,
-        None => return Response::DiscoverTypes { request_id, result: Err(peer_not_found(&peer_id)) },
+        None => {
+            return Response::DiscoverTypes {
+                request_id,
+                result: Err(peer_not_found(&peer_id)),
+            }
+        }
     };
     let wire: Vec<WireTypeInfo> = peer_ctx
         .discover_types()
         .into_iter()
         .map(WireTypeInfo::from)
         .collect();
-    Response::DiscoverTypes { request_id, result: Ok(wire) }
+    Response::DiscoverTypes {
+        request_id,
+        result: Ok(wire),
+    }
 }
 
 fn handle_entity_count(
@@ -1250,11 +1443,21 @@ fn handle_entity_count(
     let st = state.borrow();
     let sdk = match st.sdk.as_ref() {
         Some(s) => s,
-        None => return Response::EntityCount { request_id, result: Err(sdk_not_initialized()) },
+        None => {
+            return Response::EntityCount {
+                request_id,
+                result: Err(sdk_not_initialized()),
+            }
+        }
     };
     let peer_ctx = match sdk.peer(&peer_id) {
         Some(p) => p,
-        None => return Response::EntityCount { request_id, result: Err(peer_not_found(&peer_id)) },
+        None => {
+            return Response::EntityCount {
+                request_id,
+                result: Err(peer_not_found(&peer_id)),
+            }
+        }
     };
     Response::EntityCount {
         request_id,
@@ -1270,11 +1473,21 @@ fn handle_path_count(
     let st = state.borrow();
     let sdk = match st.sdk.as_ref() {
         Some(s) => s,
-        None => return Response::PathCount { request_id, result: Err(sdk_not_initialized()) },
+        None => {
+            return Response::PathCount {
+                request_id,
+                result: Err(sdk_not_initialized()),
+            }
+        }
     };
     let peer_ctx = match sdk.peer(&peer_id) {
         Some(p) => p,
-        None => return Response::PathCount { request_id, result: Err(peer_not_found(&peer_id)) },
+        None => {
+            return Response::PathCount {
+                request_id,
+                result: Err(peer_not_found(&peer_id)),
+            }
+        }
     };
     Response::PathCount {
         request_id,
@@ -1309,7 +1522,8 @@ fn handle_create_peer(
     // new peer's substrate hooks (PROTOCOL v9). Built via
     // PeerContextBuilder + insert_peer so the per-peer hooks are wired
     // before SDK ownership.
-    let global_for_hooks = match js_sys::global().dyn_into::<web_sys::DedicatedWorkerGlobalScope>() {
+    let global_for_hooks = match js_sys::global().dyn_into::<web_sys::DedicatedWorkerGlobalScope>()
+    {
         Ok(g) => g,
         Err(_) => {
             return Response::CreatePeer {
@@ -1327,12 +1541,8 @@ fn handle_create_peer(
         .keypair(keypair)
         .config(config)
         .connector(connector);
-    let builder = install_inspect_hooks_on_builder(
-        builder,
-        new_pid.clone(),
-        flag.clone(),
-        global_for_hooks,
-    );
+    let builder =
+        install_inspect_hooks_on_builder(builder, new_pid.clone(), flag.clone(), global_for_hooks);
     let ctx = match builder.build() {
         Ok(c) => c,
         Err(e) => {
@@ -1417,7 +1627,12 @@ fn handle_delete_peer(
     let mut st = state.borrow_mut();
     let sdk = match st.sdk.as_mut() {
         Some(s) => s,
-        None => return Response::DeletePeer { request_id, result: Some(sdk_not_initialized()) },
+        None => {
+            return Response::DeletePeer {
+                request_id,
+                result: Some(sdk_not_initialized()),
+            }
+        }
     };
     let removed = sdk.remove_peer(&peer_id);
 
@@ -1448,9 +1663,7 @@ fn handle_delete_peer(
         } else {
             Some(WireError {
                 kind: WireErrorKind::NotFound,
-                message: format!(
-                    "delete_peer: '{peer_id}' not found or is the primary peer"
-                ),
+                message: format!("delete_peer: '{peer_id}' not found or is the primary peer"),
                 detail: None,
             })
         },
@@ -1466,7 +1679,12 @@ fn handle_set_metadata(
     let mut st = state.borrow_mut();
     let sdk = match st.sdk.as_mut() {
         Some(s) => s,
-        None => return Response::SetMetadata { request_id, result: Some(sdk_not_initialized()) },
+        None => {
+            return Response::SetMetadata {
+                request_id,
+                result: Some(sdk_not_initialized()),
+            }
+        }
     };
     if sdk.peer(&peer_id).is_none() {
         return Response::SetMetadata {
@@ -1475,7 +1693,10 @@ fn handle_set_metadata(
         };
     }
     sdk.set_metadata(&peer_id, PeerMetadata::from(metadata));
-    Response::SetMetadata { request_id, result: None }
+    Response::SetMetadata {
+        request_id,
+        result: None,
+    }
 }
 
 async fn handle_connect_peer(
@@ -1527,7 +1748,13 @@ async fn handle_connect_peer(
             };
         }
     };
-    let remote = match entity_peer::remote::perform_connect(conn, &shared.keypair, shared.config.home_hash_format).await {
+    let remote = match entity_peer::remote::perform_connect(
+        conn,
+        &shared.keypair,
+        shared.config.home_hash_format,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(e) => {
             return Response::ConnectPeer {
@@ -1546,6 +1773,42 @@ async fn handle_connect_peer(
     Response::ConnectPeer {
         request_id,
         result: Ok(ConnectPeerOk { remote_peer_id }),
+    }
+}
+
+/// Evict the pooled outbound connection `peer_id → remote_peer_id`, so the
+/// next dial re-handshakes fresh (adopting any grant authored since). Purely
+/// local + synchronous — `RemoteState::remove` drops the pool entry; the last
+/// `Arc` drop closes the socket. Absent entry = success (idempotent).
+fn handle_disconnect_peer(
+    state: Rc<RefCell<WorkerState>>,
+    request_id: RequestId,
+    peer_id: String,
+    remote_peer_id: String,
+) -> Response {
+    let st = state.borrow();
+    let sdk = match st.sdk.as_ref() {
+        Some(s) => s,
+        None => {
+            return Response::DisconnectPeer {
+                request_id,
+                result: Some(sdk_not_initialized()),
+            };
+        }
+    };
+    let peer_ctx = match sdk.peer(&peer_id) {
+        Some(p) => p,
+        None => {
+            return Response::DisconnectPeer {
+                request_id,
+                result: Some(peer_not_found(&peer_id)),
+            };
+        }
+    };
+    peer_ctx.peer_shared().remote.remove(&remote_peer_id);
+    Response::DisconnectPeer {
+        request_id,
+        result: None,
     }
 }
 
@@ -1581,7 +1844,12 @@ fn handle_register_backend_peer(
     let mut st = state.borrow_mut();
     let sdk = match st.sdk.as_mut() {
         Some(s) => s,
-        None => return Response::RegisterBackendPeer { request_id, result: Some(sdk_not_initialized()) },
+        None => {
+            return Response::RegisterBackendPeer {
+                request_id,
+                result: Some(sdk_not_initialized()),
+            }
+        }
     };
     let ok = sdk.register_backend_peer(
         peer_id,
@@ -1634,7 +1902,12 @@ async fn handle_subscribe(
         let st = state.borrow();
         let sdk = match st.sdk.as_ref() {
             Some(s) => s,
-            None => return Response::Subscribe { request_id, result: Some(sdk_not_initialized()) },
+            None => {
+                return Response::Subscribe {
+                    request_id,
+                    result: Some(sdk_not_initialized()),
+                }
+            }
         };
         // v5→v6 backcompat: empty peer_id from old proxy → default peer.
         // The version handshake (R1) catches this at boot, but the
@@ -1650,7 +1923,12 @@ async fn handle_subscribe(
         };
         let peer_ctx = match sdk.peer(&target_peer_id) {
             Some(p) => p,
-            None => return Response::Subscribe { request_id, result: Some(peer_not_found(&target_peer_id)) },
+            None => {
+                return Response::Subscribe {
+                    request_id,
+                    result: Some(peer_not_found(&target_peer_id)),
+                }
+            }
         };
 
         let global_for_cb = global.clone();
@@ -1714,7 +1992,12 @@ async fn handle_subscribe(
     // event stream.
     let handle = match subscribe_future.await {
         Ok(h) => h,
-        Err(e) => return Response::Subscribe { request_id, result: Some(WireError::from(e)) },
+        Err(e) => {
+            return Response::Subscribe {
+                request_id,
+                result: Some(WireError::from(e)),
+            }
+        }
     };
 
     state.borrow_mut().subscriptions.insert(sub_id, handle);
@@ -1729,12 +2012,18 @@ async fn handle_subscribe(
     // Response, but the demultiplexer will have already routed the
     // Snapshot Event by then because both messages travel the same
     // postMessage channel in order.
-    send_event(&global, &Event::Snapshot {
-        sub_id,
-        entries: snapshot_entries,
-    });
+    send_event(
+        &global,
+        &Event::Snapshot {
+            sub_id,
+            entries: snapshot_entries,
+        },
+    );
 
-    Response::Subscribe { request_id, result: None }
+    Response::Subscribe {
+        request_id,
+        result: None,
+    }
 }
 
 /// Build the initial snapshot for a subscription. Thin wrapper around
@@ -1770,7 +2059,10 @@ fn handle_unsubscribe(
     // Removing the handle from the map drops it, which cancels the
     // SDK-side subscription.
     state.borrow_mut().subscriptions.remove(&sub_id);
-    Response::Unsubscribe { request_id, result: None }
+    Response::Unsubscribe {
+        request_id,
+        result: None,
+    }
 }
 
 // ---------------------------------------------------------------------------

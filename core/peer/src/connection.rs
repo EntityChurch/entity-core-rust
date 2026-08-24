@@ -2544,7 +2544,17 @@ pub fn make_execute_fn(
                     }
                     None => None,
                 };
-                let request_id = opts.request_id.unwrap_or_else(|| "internal".to_string());
+                // Ruling 9 / F1: `{step_index}` is the originating request ID,
+                // and a CONSTANT SENTINEL IS NOT CONFORMANT. This default was
+                // the literal `"internal"`, so every handler-to-handler
+                // dispatch shared one id and every marker they produced
+                // collided at `.../{chain}/internal/...`. A dispatch that has
+                // no id needs a real one, not a name for the category.
+                // (Callers that can name the dispatch better still should —
+                // `ExecuteOptions::request_id`.)
+                let request_id = opts
+                    .request_id
+                    .unwrap_or_else(|| format!("internal-{:016x}", rand::random::<u64>()));
 
                 // Bounds: explicit override from opts, or decrement parent bounds (§5.9)
                 let child_bounds = if let Some(b) = opts.bounds {
@@ -2999,7 +3009,15 @@ fn try_bind_rejected_marker(
         .unwrap_or(0);
 
     let requesting_peer_id = resolve_author_peer_id(envelope, author_hash);
-    let step_index = request_id.to_string();
+
+    // Both coordinates come off the wire, and this marker is bound precisely
+    // BECAUSE the sender's cap check failed — an unauthorized caller reaches
+    // here by construction, so nothing upstream vetted these. Sanitize before
+    // either value names a path segment (§1.4 / ruling 13). Sanitized once,
+    // ahead of the body, so a marker's recorded coordinate always matches
+    // where it is actually bound.
+    let chain_id = entity_entity::sanitize_path_segment(&chain_id).into_owned();
+    let step_index = entity_entity::sanitize_path_segment(request_id).into_owned();
 
     // §3.10.6 body fields (rejected kind): reason, timestamp, chain_id,
     // step_index, requesting_peer_id, attempted_uri.
@@ -3308,4 +3326,99 @@ fn extract_request_id(envelope: &Envelope) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod marker_injection_tests {
+    use super::*;
+
+    /// Ruling 13 / the `security.marker_path_injection_contained` probe.
+    ///
+    /// Go found a tree node literally named `..` in Rust's marker tree, put
+    /// there by an unauthorized peer, and confirmed it with `probe-peer`
+    /// before reporting
+    /// (`entity-core-go` `docs/validation/reports/`
+    /// `2026-07-16-marker-path-injection-cohort.md`). This drives the same
+    /// shape at the binding site.
+    ///
+    /// What makes this sharp rather than an input-validation nit: the
+    /// rejected marker is bound BECAUSE the sender's cap check failed, so an
+    /// unauthorized caller reaches this site by construction. No capability
+    /// is required to choose where the entity lands.
+    ///
+    /// The escape is NOT the leading-`../` form `clean_path` rejects — these
+    /// values land in the MIDDLE of the path, where a normalizer resolves the
+    /// interior `..` and walks the marker back OUT of the sink. So the
+    /// assertion is on the CLEANED path: `sink/{X}/..` is inside the sink by
+    /// string prefix while naming somewhere else.
+    #[tokio::test]
+    async fn rejected_marker_contains_wire_supplied_coordinates() {
+        let peer = crate::PeerBuilder::new()
+            .keypair(entity_crypto::Keypair::from_seed([0x9c; 32]))
+            .build()
+            .unwrap();
+        let shared = peer.shared();
+        let local_pid = shared.peer_id.as_str().to_string();
+
+        // The probe's exact hostile values, in both wire-supplied coordinates.
+        let hostile = "../../../../authority/keys";
+        let bounds_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+            entity_ecf::text("chain_id"),
+            entity_ecf::text(hostile),
+        )]));
+        let bounds_entity =
+            entity_entity::Entity::new("system/execution-bounds", bounds_data).unwrap();
+        let execute_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+            entity_ecf::text("bounds"),
+            entity_ecf::Value::Map(vec![
+                (
+                    entity_ecf::text("data"),
+                    entity_ecf::Value::Bytes(bounds_entity.data.clone()),
+                ),
+                (
+                    entity_ecf::text("type"),
+                    entity_ecf::text("system/execution-bounds"),
+                ),
+            ]),
+        )]));
+        let root = entity_entity::Entity::new("system/execute", execute_data).unwrap();
+        let envelope = Envelope::new(root);
+        let author = entity_hash::Hash::compute("test", b"unauthorized-peer");
+
+        let bound = try_bind_rejected_marker(
+            &shared,
+            &envelope,
+            hostile, // request_id -> {step_index}
+            &author,
+            "system/capability",
+        );
+        assert!(bound.is_some(), "a chain dispatch's 403 MUST bind a marker");
+
+        let sink = format!("/{}/system/runtime/chain-errors/", local_pid);
+        let paths: Vec<String> = shared
+            .location_index
+            .list(&sink)
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+        assert_eq!(paths.len(), 1, "expected exactly one marker: {:?}", paths);
+
+        // The load-bearing assertion: contained under CLEANING, not merely
+        // prefixed. Pre-fix this bound at `.../rejected/../../../../authority/keys/...`,
+        // which cleans out of the sink entirely.
+        let cleaned = EntityUri::clean_path(&paths[0]);
+        assert!(
+            cleaned.starts_with(&sink),
+            "MARKER PATH INJECTION: a wire-supplied coordinate escaped the \
+             chain-errors sink.\n  bound at:    {}\n  resolves to: {}",
+            paths[0],
+            cleaned,
+        );
+        // And no node named `..` anywhere in it — the shape probe-peer sees.
+        assert!(
+            !cleaned.split('/').any(|seg| seg == ".." || seg == "."),
+            "a dot token survived as a path segment: {}",
+            cleaned,
+        );
+    }
 }

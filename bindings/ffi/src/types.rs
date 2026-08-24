@@ -71,6 +71,6 @@ pub enum EntityCoreError {
 #[no_mangle]
 pub unsafe extern "C" fn entity_core_buffer_free(buf: EntityCoreBuffer) {
     if !buf.data.is_null() && buf.len > 0 {
-        let _ = unsafe { Box::from_raw(std::slice::from_raw_parts_mut(buf.data, buf.len)) };
+        let _ = unsafe { Box::from_raw(std::ptr::slice_from_raw_parts_mut(buf.data, buf.len)) };
     }
 }

@@ -43,6 +43,19 @@ pub mod conversions;
 
 /// Wire-protocol version. Bumped on any wire-shape change.
 ///
+/// **v10:** `Request::DisconnectPeer { peer_id, remote_peer_id }` (+ matching
+/// `Response::DisconnectPeer`) evicts a pooled outbound connection inside the
+/// worker so the next dial re-handshakes fresh — the way a peer adopts a
+/// capability grant authored *after* it connected (the granter re-mints at
+/// authenticate; a pooled reuse keeps the stale cap). Like
+/// `SetInspectEnabled`, it is NOT in `REQUEST_VARIANT_NAMES` — it has no SDK
+/// L1 counterpart (a worker-side connection control, not an SDK method).
+/// Bumped even though the variant introduces no new argument *types*: the
+/// proxy/host handshake compares versions for equality, so without a bump a
+/// proxy that sends `DisconnectPeer` and a host that has never heard of it
+/// both report `9` and the mismatch escapes the version check to fail at
+/// decode instead.
+///
 /// **v9:** Inspect-hook plumbing per the upstream inspect-worker-arm design.
 /// Adds `Event::Inspect { peer_id, fact }` carrying the marshalled
 /// `InspectFact` (Dispatch / Wire / Binding variants) and
@@ -114,7 +127,7 @@ pub mod conversions;
 /// `{ "Ok": null }`, the decoder rejects it. `Option<WireError>` round-trips
 /// cleanly (None = success, Some = failure). Documented in the Phase 3
 /// pilot status notes (§#1) with full hex evidence.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// `Request` variants that mirror an L1 SDK method. Ordering must match
 /// `entity_sdk::L1_WORKER_MIRRORED_SURFACE` — the [coverage check](crate)
@@ -202,7 +215,8 @@ const fn arrays_match(a: &[&str], b: &[&str]) -> bool {
     true
 }
 
-const _COVERAGE_CHECK_L1_SURFACE_MATCHES_PROTOCOL: () = assert!(
+const _COVERAGE_CHECK_L1_SURFACE_MATCHES_PROTOCOL: () =
+    assert!(
     arrays_match(entity_sdk::L1_WORKER_MIRRORED_SURFACE, REQUEST_VARIANT_NAMES),
     "wasm-worker-protocol Request variants do not match entity_sdk::L1_WORKER_MIRRORED_SURFACE. \
      See bindings/wasm-worker-protocol/CONTRIBUTING.md for the four-site checklist."
@@ -496,6 +510,18 @@ pub enum Request {
         address: String,
     },
 
+    /// Evict a pooled outbound connection from `peer_id` (local) to
+    /// `remote_peer_id`, closing the socket and dropping the pool entry.
+    /// The next `ConnectPeer`/`execute` re-dials and re-handshakes fresh —
+    /// which is how a peer adopts a capability grant authored *after* it
+    /// connected (the granter re-mints at authenticate; a pooled reuse keeps
+    /// the stale cap). No-op if no such connection is pooled. v6+.
+    DisconnectPeer {
+        request_id: RequestId,
+        peer_id: String,
+        remote_peer_id: String,
+    },
+
     // -- Tree dispatched (S1: peer_id on every variant) --
     Get {
         request_id: RequestId,
@@ -685,6 +711,13 @@ pub enum Response {
         result: Result<ConnectPeerOk, WireError>,
     },
 
+    /// `None` on success (connection evicted, or none was pooled — both are
+    /// success); `Some(err)` on unknown local peer_id or SDK rejection.
+    DisconnectPeer {
+        request_id: RequestId,
+        result: Option<WireError>,
+    },
+
     Get {
         request_id: RequestId,
         result: Result<Option<WireEntity>, WireError>,
@@ -827,10 +860,7 @@ pub enum Event {
     /// Worker → main signal that the proxy's subscription is gone (worker
     /// restart, transport drop). Proxy responds by invalidating cache and
     /// re-establishing subscriptions.
-    SubscriptionLost {
-        sub_id: SubId,
-        reason: String,
-    },
+    SubscriptionLost { sub_id: SubId, reason: String },
 
     /// Worker → main marshalled substrate hook fact for `peer_id` (v9+).
     /// Routed by the proxy to inspect sinks registered on that peer.
@@ -841,10 +871,7 @@ pub enum Event {
     /// flow control (§9 q4 — same regime as `Snapshot`/`Change`). Under
     /// sustained load consumers SHOULD detach the sink (which flips
     /// marshalling off) or filter inside `InspectSink::on_inspect`.
-    Inspect {
-        peer_id: String,
-        fact: InspectFact,
-    },
+    Inspect { peer_id: String, fact: InspectFact },
 }
 
 // ---------------------------------------------------------------------------

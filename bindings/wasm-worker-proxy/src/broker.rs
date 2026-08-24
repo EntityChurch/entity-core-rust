@@ -170,12 +170,7 @@ impl MessagePortBroker {
     }
 }
 
-fn handle_open_channel(
-    routing: &Routing,
-    from_peer: &str,
-    request_id: u64,
-    target_peer: &str,
-) {
+fn handle_open_channel(routing: &Routing, from_peer: &str, request_id: u64, target_peer: &str) {
     let routing_guard = routing.borrow();
     let target = match routing_guard.get(target_peer) {
         Some(t) => t.clone(),

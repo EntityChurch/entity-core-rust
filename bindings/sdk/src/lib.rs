@@ -186,6 +186,10 @@ pub use role::{
 /// prefill an extensions-checkbox grid before any peer exists. The
 /// per-peer method (`PeerContext::installed_extensions`) requires a
 /// PeerContext to call against; this entry point doesn't.
+// Each `push` is `#[cfg(feature = ...)]`-gated, so the lint's `vec![..]`
+// literal cannot express this — the set is decided at compile time per
+// feature subset.
+#[allow(clippy::vec_init_then_push)]
 pub fn installed_extensions() -> Vec<&'static str> {
     let mut out: Vec<&'static str> = Vec::new();
     #[cfg(feature = "attestation")]

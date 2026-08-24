@@ -5053,15 +5053,24 @@ mod tests {
         }
     }
 
-    /// Serializes tests that build peers with *different* home formats.
-    /// `PeerBuilder::build` sets the process home `content_hash_format`
-    /// global (V7 §1.2 — one home format per process). The test suite is
-    /// the only place that builds peers with differing home formats, and it
-    /// does so concurrently; this lock keeps a SHA-384 home window (M3, the
-    /// SHA-384 smoke) from racing a test that reads home-format identity
-    /// hashes under SHA-256 (M2). Production is unaffected: one peer, one
-    /// home format, one process.
-    static HOME_FORMAT_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    /// Guards the process home `content_hash_format` global (V7 §1.2 — one
+    /// home format per process). Only the SHA-384 smoke (M3) *writes* it
+    /// (`set_default_hash_format`), so it takes `write()`; every test that
+    /// *reads* the home format — by authoring an entity, deriving an identity
+    /// hash, or minting a capability whose grantee is a home-format identity
+    /// hash — takes `read()` and so may still run concurrently with its
+    /// peers, but never inside M3's SHA-384 window.
+    ///
+    /// A read guard is REQUIRED for any test whose peers author under the
+    /// home default: without it, M3 can flip the global mid-test, the peer
+    /// re-derives `peer_entity()` under SHA-384 while its connection
+    /// capability's `grantee` was minted under SHA-256, and the mismatch
+    /// surfaces as a 401 `unresolvable_grantee` (this bit the `a12_keepalive_*`
+    /// vectors — reproducible ~50% under `cargo test -p entity-peer --lib`,
+    /// never under `--test-threads=1`).
+    ///
+    /// Production is unaffected: one peer, one home format, one process.
+    static HOME_FORMAT_TEST_LOCK: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
     /// One cell of the MATRIX-M2 grid: a `server_kt` server and a
     /// `client_kt` client complete the real-wire TCP handshake and the
@@ -5158,9 +5167,9 @@ mod tests {
     async fn matrix_m2_cross_key_handshake_all_directions() {
         use entity_crypto::KeyType::{Ed25519, Ed448};
         // SHA-256-home test: reads `peer_identity_hash()` (home global) and
-        // asserts it equals the active-format grantee. Serialize against any
+        // asserts it equals the active-format grantee. Read-guard against any
         // concurrent SHA-384 home window so the global stays SHA-256 here.
-        let _guard = HOME_FORMAT_TEST_LOCK.lock().await;
+        let _guard = HOME_FORMAT_TEST_LOCK.read().await;
         run_matrix_m2_cell(Ed25519, Ed25519).await;
         run_matrix_m2_cell(Ed25519, Ed448).await;
         run_matrix_m2_cell(Ed448, Ed25519).await;
@@ -5270,8 +5279,9 @@ mod tests {
         // Set the process home default the way the CLI `run_peer` does, under
         // the lock so no SHA-256-home reader (M2) sees this SHA-384 window.
         // `build()` does not touch the global, so no concurrent build stomps
-        // it mid-test; restore the floor on exit.
-        let _guard = HOME_FORMAT_TEST_LOCK.lock().await;
+        // it mid-test; restore the floor on exit. Exclusive: no home-format
+        // reader may observe this SHA-384 window.
+        let _guard = HOME_FORMAT_TEST_LOCK.write().await;
         entity_hash::set_default_hash_format(S384);
 
         let peer = PeerBuilder::new()
@@ -6430,8 +6440,16 @@ mod tests {
         Arc<PeerShared>,
         String,
         entity_hash::Hash,
+        tokio::sync::RwLockReadGuard<'static, ()>,
     ) {
         use transport::{MemoryConnector, MemoryListener, MemoryTransportRegistry};
+        // These peers author identities under the home default and the server
+        // mints a cap whose `grantee` is the client's home-format identity
+        // hash, so they are home-format READERS: held for the caller's whole
+        // test, this guard keeps M3's SHA-384 window from flipping the global
+        // mid-test (→ 401 `unresolvable_grantee`). Returned, not dropped here
+        // — the client re-derives `peer_entity()` on every later request.
+        let home_format_guard = HOME_FORMAT_TEST_LOCK.read().await;
         let registry = MemoryTransportRegistry::new();
 
         let server = PeerBuilder::new()
@@ -6468,6 +6486,7 @@ mod tests {
             client_shared,
             server_pid,
             server_hash,
+            home_format_guard,
         )
     }
 
@@ -6482,7 +6501,7 @@ mod tests {
             enabled: false, // exercise the op directly, not the loop
             ..Default::default()
         };
-        let (_ss, server_handle, client, _cs, server_pid, _sh) =
+        let (_ss, server_handle, client, _cs, server_pid, _sh, _home_format_guard) =
             a12_keepalive_pair(0x64, disabled).await;
 
         let params = entity_entity::Entity::new(
@@ -6507,7 +6526,13 @@ mod tests {
             )
             .await
             .expect("ping round-trip");
-        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.status,
+            200,
+            "ping rejected: type={} body={:?}",
+            resp.result.entity_type,
+            String::from_utf8_lossy(&resp.result.data)
+        );
         assert_eq!(resp.result.entity_type, "system/network/pong");
         let value: ciborium::Value = ciborium::from_reader(resp.result.data.as_slice()).unwrap();
         let map = value.into_map().expect("pong data is a map");
@@ -6545,8 +6570,15 @@ mod tests {
             max_missed: 2,
             enabled: true,
         };
-        let (_ss, server_handle, client, client_shared, server_pid, server_hash) =
-            a12_keepalive_pair(0x66, short).await;
+        let (
+            _ss,
+            server_handle,
+            client,
+            client_shared,
+            server_pid,
+            server_hash,
+            _home_format_guard,
+        ) = a12_keepalive_pair(0x66, short).await;
 
         let baseline =
             liveness_status_of(&client_shared, &server_hash).expect("connected baseline missing");
@@ -6615,8 +6647,15 @@ mod tests {
             max_missed: 2,
             enabled: true,
         };
-        let (_ss, server_handle, _client, client_shared, server_pid, server_hash) =
-            a12_keepalive_pair(0x6a, short).await;
+        let (
+            _ss,
+            server_handle,
+            _client,
+            client_shared,
+            server_pid,
+            server_hash,
+            _home_format_guard,
+        ) = a12_keepalive_pair(0x6a, short).await;
 
         let conn_path = format!(
             "/{}/{}",
@@ -6680,8 +6719,15 @@ mod tests {
             max_missed: 3,
             enabled: true,
         };
-        let (_ss, server_handle, _client, client_shared, server_pid, server_hash) =
-            a12_keepalive_pair(0x68, short).await;
+        let (
+            _ss,
+            server_handle,
+            _client,
+            client_shared,
+            server_pid,
+            server_hash,
+            _home_format_guard,
+        ) = a12_keepalive_pair(0x68, short).await;
 
         let baseline =
             liveness_status_of(&client_shared, &server_hash).expect("connected baseline missing");
@@ -6878,10 +6924,13 @@ mod tests {
         };
         assert_eq!(get("peer_id").unwrap().as_text(), Some(server_pid.as_str()));
         assert!(!get("session_id").unwrap().as_text().unwrap().is_empty());
+        // §3.11: single path segment — the marker path embeds it verbatim.
+        // Shape only; the spelling is impl-defined and not the contract.
         let chain_id = get("chain_id").unwrap().as_text().unwrap();
+        assert!(!chain_id.is_empty(), "chain_id is empty");
         assert!(
-            chain_id.starts_with("network/maintain/"),
-            "chain_id {:?} lacks the scheme",
+            !chain_id.contains('/'),
+            "chain_id {:?} is not a single path segment",
             chain_id
         );
         let subs = get("subscriptions").unwrap().as_array().unwrap();
@@ -7120,6 +7169,165 @@ mod tests {
         );
 
         server2_handle.abort();
+    }
+
+    /// Retry survival against a peer that STAYS dead — the question
+    /// `a12_rung3_reconnect_lifecycle` cannot ask, because it restarts the
+    /// counterpart promptly and so needs exactly one retry to land.
+    ///
+    /// Retry-forever is normative (ruling 6), and the loop that delivers it
+    /// survives because the backoff continuation is STANDING (ruling 1).
+    ///
+    /// History: this vector was written `#[ignore]`d, asserting the stall it
+    /// measured (2 attempts where §2.2 predicted ~20) — Rust's independent
+    /// confirmation of the cohort-wide defect Go found on all three seats.
+    /// A one-shot cannot re-arm itself: the re-install lands INSIDE the
+    /// dispatch while the advance's consume runs AFTER it and deletes the
+    /// path. Ordering, not timing. Ruling 1 resolved it to standing; this
+    /// now asserts survival, which is what it was always for.
+    ///
+    /// Counts markers, not dials: every failed reconnect binds one §3.10
+    /// lost-error marker, and §3.10.6's timestamp gives each occurrence a
+    /// distinct `{marker_hash}`, so the marker count IS the attempt count.
+    /// (Ruling 3 will retire this observable — once the backoff continuation
+    /// carries an `on_error`, a failed retry routes there instead of binding
+    /// a marker, and a dead peer's marker tree goes empty. When that lands,
+    /// count dispatches instead. The `>= 4` claim is what must survive, not
+    /// the way it is counted.)
+    #[cfg(feature = "network")]
+    #[tokio::test]
+    async fn a12_retry_survives_outage() {
+        let registry = transport::MemoryTransportRegistry::new();
+        let short = keepalive::KeepaliveConfig {
+            interval_ms: 50,
+            timeout_ms: 60,
+            max_missed: 2,
+            enabled: true,
+        };
+        let (server, _ss, server_handle, server_pid, client, client_shared) =
+            rung3_pair(registry.clone(), 0x8a, 0x8b, short).await;
+        let client_pid = client_shared.peer_id.as_str().to_string();
+        let server_hash = server.shared().identity_hash;
+        let addr = format!("memory://{}", server_pid);
+
+        // min 60 / max 200: over the ~3s window below the §2.2 schedule
+        // predicts well over a dozen retries.
+        let maintain = {
+            let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+                (entity_ecf::text("address"), entity_ecf::text(&addr)),
+                (
+                    entity_ecf::text("backoff"),
+                    entity_ecf::Value::Map(vec![
+                        (entity_ecf::text("max_ms"), entity_ecf::integer(200)),
+                        (entity_ecf::text("min_ms"), entity_ecf::integer(60)),
+                    ]),
+                ),
+                (entity_ecf::text("peer_id"), entity_ecf::text(&server_pid)),
+            ]));
+            entity_entity::Entity::new(entity_network::TYPE_MAINTAIN_REQUEST, data).unwrap()
+        };
+        let resp = maintain_with_retry(&client, &client_pid, maintain).await;
+        assert_eq!(resp.status, 200, "maintain-peer baseline");
+        let session_chain = {
+            let v: ciborium::Value = ciborium::from_reader(resp.result.data.as_slice()).unwrap();
+            v.as_map()
+                .unwrap()
+                .iter()
+                .find(|(k, _)| k.as_text() == Some("chain_id"))
+                .and_then(|(_, v)| v.as_text())
+                .unwrap()
+                .to_string()
+        };
+        wait_liveness_status(&client_shared, &server_hash, "connected").await;
+
+        // Kill the counterpart and leave it dead.
+        server_handle.abort();
+        drop(server);
+        let mut demoted = false;
+        for _ in 0..400 {
+            if let Some(d) = liveness_status_of(&client_shared, &server_hash) {
+                if d.status != "connected" {
+                    demoted = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(demoted, "peer never demoted after kill");
+
+        // Let the retry loop run well past several backoff periods.
+        let marker_prefix = format!("/{}/system/runtime/chain-errors/lost/", client_pid);
+        tokio::time::sleep(std::time::Duration::from_millis(3000)).await;
+        // `{reason}` is a path segment (§3.10.5) — count only the reconnect
+        // failures, so an unrelated marker kind can't inflate the count.
+        let failures: Vec<String> = client_shared
+            .location_index
+            .list(&marker_prefix)
+            .into_iter()
+            .map(|e| e.path)
+            .filter(|p| p.contains("/connection_failed/"))
+            .collect();
+        let attempts = failures.len();
+
+        // Ruling 11 + ruling 9: the retry's coordinates must both MEAN
+        // something. The retries belong to the session's chain — the handler
+        // holds `network-maintain-{session}` and MUST set it, so the tree
+        // carries one node per relationship rather than forking once per
+        // attempt. And `{step_index}` is the originating request id: a
+        // constant sentinel (`internal`) is not conformant.
+        let retry_prefix = format!("{}{}/", marker_prefix, session_chain);
+        let retries: Vec<&String> = failures
+            .iter()
+            .filter(|p| p.starts_with(&retry_prefix))
+            .collect();
+        assert!(
+            retries.len() >= attempts - 1,
+            "retry markers are not on the session's chain {:?} — the handler \
+             holds it and MUST set bounds.chain_id (ruling 11); a fresh chain \
+             per attempt forks the tree once per retry.\n  {:#?}",
+            session_chain,
+            failures,
+        );
+        for p in &retries {
+            let step = p
+                .strip_prefix(&retry_prefix)
+                .and_then(|r| r.split('/').next())
+                .unwrap_or_default();
+            assert!(
+                !step.is_empty() && step != "internal" && step != "unknown",
+                "{{step_index}} is a constant sentinel, not a request id \
+                 (ruling 9 / F1): {}",
+                p,
+            );
+        }
+
+        // The standing resident is still there: nothing consumes it, so
+        // nothing races to re-create it (ruling 1).
+        let backoff_path = format!(
+            "/{}/system/network/peers/{}/on-reconnect-backoff",
+            client_pid, server_pid
+        );
+        let resident = client_shared.location_index.get(&backoff_path).is_some();
+        eprintln!(
+            "a12 retry survival: {} reconnect attempt(s) in 3000ms at \
+             min_ms=60/max_ms=200, backoff resident={}",
+            attempts, resident,
+        );
+
+        assert!(
+            attempts >= 4,
+            "retry loop stalled: only {} reconnect attempt(s) in 3s at \
+             min_ms=60/max_ms=200 — want >= 4 (retry-forever is normative, \
+             ruling 6). backoff resident={}",
+            attempts,
+            resident,
+        );
+        assert!(
+            resident,
+            "the standing backoff continuation was consumed — a one-shot \
+             cannot re-arm itself through the operation it dispatches \
+             (ruling 1)",
+        );
     }
 
     /// §4.2 release-peer: continuations deleted, lifecycle subscriptions

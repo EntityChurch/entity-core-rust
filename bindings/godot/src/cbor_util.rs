@@ -48,11 +48,11 @@ impl EntityCbor {
     /// Parse CBOR diagnostic notation into bytes.
     #[func]
     fn from_diag(diag: GString) -> PackedByteArray {
-        match cbor_diag::parse_diag(&diag.to_string()) {
+        match cbor_diag::parse_diag(diag.to_string()) {
             Ok(val) => {
                 let bytes = val.to_bytes();
                 let mut result = PackedByteArray::new();
-                result.extend(bytes.into_iter());
+                result.extend(bytes);
                 result
             }
             Err(e) => {
@@ -65,10 +65,10 @@ impl EntityCbor {
     /// Encode an ECF value from type + data to bytes.
     #[func]
     fn encode_text(text: GString) -> PackedByteArray {
-        let val = entity_ecf::text(&text.to_string());
+        let val = entity_ecf::text(text.to_string());
         let bytes = entity_ecf::to_ecf(&val);
         let mut result = PackedByteArray::new();
-        result.extend(bytes.into_iter());
+        result.extend(bytes);
         result
     }
 
@@ -106,7 +106,7 @@ impl EntityCbor {
             Ok(v) => {
                 let bytes = to_ecf(&v);
                 let mut result = PackedByteArray::new();
-                result.extend(bytes.into_iter());
+                result.extend(bytes);
                 result
             }
             Err(e) => {

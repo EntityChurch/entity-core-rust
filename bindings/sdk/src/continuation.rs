@@ -206,10 +206,8 @@ impl<'a> ContinuationOps<'a> {
            + 'static {
         let params = build_advance_params(result_bytes, status);
         let opts = path_resource_opts(path.into());
-        let fut = self
-            .ctx
-            .execute("system/continuation", "advance", params, opts);
-        async move { fut.await }
+        self.ctx
+            .execute("system/continuation", "advance", params, opts)
     }
 
     /// WASM variant — no `Send` bound, future is `!Send` for
@@ -224,10 +222,8 @@ impl<'a> ContinuationOps<'a> {
     {
         let params = build_advance_params(result_bytes, status);
         let opts = path_resource_opts(path.into());
-        let fut = self
-            .ctx
-            .execute("system/continuation", "advance", params, opts);
-        async move { fut.await }
+        self.ctx
+            .execute("system/continuation", "advance", params, opts)
     }
 
     /// `/{peer_id}/system/continuation/suspended/<id>`). Passed as the

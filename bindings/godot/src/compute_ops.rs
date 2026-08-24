@@ -43,7 +43,7 @@ use crate::entity_resource::EntityData;
 /// Convert a [`ComputeValue`] into the tagged Dictionary documented at
 /// the module level.
 pub(crate) fn compute_value_to_variant(value: ComputeValue) -> Variant {
-    let mut dict = Dictionary::new();
+    let mut dict = VarDictionary::new();
     match value {
         ComputeValue::Null => {
             dict.set("kind", "null");
@@ -89,7 +89,7 @@ pub(crate) fn compute_value_to_variant(value: ComputeValue) -> Variant {
             dict.set("value", pba);
         }
         ComputeValue::Array(arr) => {
-            let mut godot_arr = VariantArray::new();
+            let mut godot_arr = VarArray::new();
             for item in arr {
                 godot_arr.push(&compute_value_to_variant(item));
             }
@@ -97,9 +97,9 @@ pub(crate) fn compute_value_to_variant(value: ComputeValue) -> Variant {
             dict.set("value", godot_arr);
         }
         ComputeValue::Map(pairs) => {
-            let mut godot_arr = VariantArray::new();
+            let mut godot_arr = VarArray::new();
             for (k, v) in pairs {
-                let mut pair = VariantArray::new();
+                let mut pair = VarArray::new();
                 pair.push(&compute_value_to_variant(k));
                 pair.push(&compute_value_to_variant(v));
                 godot_arr.push(&pair.to_variant());
@@ -126,7 +126,7 @@ pub(crate) fn compute_value_to_variant(value: ComputeValue) -> Variant {
 /// Convert a `ComputeEvalResult` into the GDScript-facing Dictionary:
 ///   { value: <kind-dict>, result_entity: EntityData }
 pub(crate) fn compute_eval_result_to_variant(r: ComputeEvalResult) -> Variant {
-    let mut dict = Dictionary::new();
+    let mut dict = VarDictionary::new();
     let entity = EntityData::from_entity(&r.result_entity);
     dict.set("value", compute_value_to_variant(r.value));
     dict.set("result_entity", entity);
@@ -140,7 +140,7 @@ pub(crate) fn compute_eval_result_to_variant(r: ComputeEvalResult) -> Variant {
 /// Variant surface for now (callers that need it can re-eval). Surface
 /// when a panel actually needs it.
 pub(crate) fn compute_install_result_to_variant(r: ComputeInstallResult) -> Variant {
-    let mut dict = Dictionary::new();
+    let mut dict = VarDictionary::new();
     dict.set("subgraph_path", GString::from(r.subgraph_path.as_str()));
     dict.set("result_path", GString::from(r.result_path.as_str()));
     dict.to_variant()
@@ -148,8 +148,8 @@ pub(crate) fn compute_install_result_to_variant(r: ComputeInstallResult) -> Vari
 
 /// Convert an `InstalledSubgraph` metadata entry into a Dictionary.
 /// Used by `compute_list` / `compute_show` (sync L0 — no future).
-pub(crate) fn installed_subgraph_to_dict(s: &InstalledSubgraph) -> Dictionary {
-    let mut dict = Dictionary::new();
+pub(crate) fn installed_subgraph_to_dict(s: &InstalledSubgraph) -> VarDictionary {
+    let mut dict = VarDictionary::new();
     dict.set("subgraph_path", GString::from(&s.subgraph_path));
     let mut hash_pba = PackedByteArray::new();
     hash_pba.extend(s.metadata_hash.to_bytes().to_vec());

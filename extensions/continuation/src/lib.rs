@@ -9,8 +9,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use entity_entity::{Entity, EntityUri};
 use entity_handler::{
-    DeliverySpec, ExecuteFn, ExecuteOptions, Handler, HandlerContext, HandlerError, HandlerResult,
-    STATUS_BAD_REQUEST, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_OK,
+    Bounds, DeliverySpec, ExecuteFn, ExecuteOptions, Handler, HandlerContext, HandlerError,
+    HandlerResult, STATUS_BAD_REQUEST, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_OK,
 };
 use entity_hash::Hash;
 use entity_store::{CasError, ContentStore, LocationIndex};
@@ -58,8 +58,13 @@ const CODE_CAPABILITY_DENIED: &str = "capability_denied";
 /// (A.1 v1.10 and v1.13 / I-8). Threaded from `handle_advance` (which
 /// has the `HandlerContext`) down to the dispatch sites so a failed
 /// `on_error` delivery (A.1) or a no-`on_error` non-2xx (v1.13) can be
-/// recorded as an observation. `chain_id` falls back to the request id
-/// when bounds carry none, so the marker path is always well-formed.
+/// recorded as an observation. `chain_id` is the trigger's, or a freshly
+/// minted one when the trigger carried no chain (§3.6 step 6) — so the
+/// marker path is always well-formed AND names the chain the dispatch
+/// actually ran under. The pre-step-6 fallback here was the request id,
+/// which is the literal `"internal"` for every handler-to-handler dispatch
+/// (`ExecuteOptions::request_id`'s default) — every chain-less advance's
+/// markers collided in one meaningless `{chain_id}` slot.
 ///
 /// `step_index` is the **original request ID** for BOTH cases per
 /// CONTINUATION v1.9 (A.1) and v1.14 (v1.13 pin). The request ID is the
@@ -85,6 +90,37 @@ struct ChainErr {
     author: Option<Hash>,
     caller_capability: Option<Hash>,
     handler_grant: Option<Hash>,
+    /// The advancing EXECUTE's own bounds, threaded to the dispatch sites
+    /// so §3.6 step 6 can hand the child explicit bounds carrying
+    /// `chain_id` while still propagating the parent's ttl/budget.
+    parent_bounds: Option<Bounds>,
+}
+
+/// A fresh chain identifier (§3.6 step 6 `generate_id()`). MUST be a single
+/// path segment — it is one verbatim in the §3.10.1 marker path.
+fn new_chain_id() -> String {
+    format!("chain-{:016x}", rand::random::<u64>())
+}
+
+/// §3.6 step 6: the bounds for a dispatch made out of an advance.
+///
+/// Handing the execute seam `None` makes it inherit the parent's bounds and
+/// decrement ttl (§5.9) — but a trigger that carried no `chain_id` then
+/// dispatches chain-less, and every downstream marker binder falls down its
+/// own fallback ladder onto a coordinate of its own invention. So mint the
+/// chain here and pass it explicitly.
+///
+/// Because an explicit override bypasses the seam's inherit-and-decrement,
+/// the decrement happens here instead. On exhaustion, return `None` and let
+/// the seam re-derive it: the child dispatch then fails `ttl_exhausted` on
+/// exactly the terms it does today, rather than through a second code path.
+fn dispatch_bounds(chain_err: &ChainErr) -> Option<Bounds> {
+    let mut bounds = match chain_err.parent_bounds.as_ref() {
+        Some(parent) => parent.decrement().ok()?,
+        None => Bounds::default(),
+    };
+    bounds.chain_id = Some(chain_err.chain_id.clone());
+    Some(bounds)
 }
 
 /// The continuation handler: system/continuation with advance, resume, abandon.
@@ -105,10 +141,28 @@ pub struct ContinuationHandler {
 /// Path-safety sanitizer per EXTENSION-CONTINUATION v1.19 §3.10.5 (V7 §1.4
 /// path-segment rules). Code strings emitted by canonical homes are already
 /// path-safe; this guards against non-conformant handler-emitted codes
-/// reaching the path concat. Returns `unspecified_error` for any code that
-/// contains characters invalid in a single path segment.
+/// reaching the path concat. A remote handler's `result.data.code` is
+/// remote-controlled, so this is a wire boundary.
+///
+/// §3.10.5 is explicit about the shape here, and it differs from what
+/// `sanitize_path_segment` does for the other two coordinates: a non-path-safe
+/// code SHOULD be **sentinel-substituted** (`{reason}` = `unspecified_error`)
+/// "with the raw `code` preserved in the marker body's `code` field". So the
+/// collapse is prescribed, and it does not lose the event the way collapsing
+/// `chain_id` would — the body's `code` field carries the original verbatim.
+/// (Go hashes this coordinate instead, per ruling 13's general rule; that
+/// reads as a deviation from §3.10.5's SHOULD. Routed, not copied.)
+///
+/// The dot tokens are the gap this closes: `.` and `..` satisfy §1.4's
+/// enumerated rules (UTF-8, no null, non-empty, no `/`) and so passed through
+/// here verbatim, which is a traversal token in a path segment.
 fn sanitize_reason_segment(reason: &str) -> String {
     if reason.is_empty() {
+        return "unspecified_error".to_string();
+    }
+    // §1.4's enumeration does not name `.` / `..`; they are nonetheless
+    // traversal tokens once concatenated. Logged in docs/SPEC-AMBIGUITIES.md.
+    if reason == "." || reason == ".." {
         return "unspecified_error".to_string();
     }
     for b in reason.bytes() {
@@ -280,8 +334,9 @@ impl ContinuationHandler {
             .ok_or_else(|| HandlerError::Internal("execute_fn not available".into()))?;
 
         // §3.4 lost-error marker context (A.1 v1.10 + v1.13 / I-8).
-        // `chain_id` falls back to request_id so the marker path is
-        // always well-formed. `step_index` is the original request ID
+        // `chain_id` is the trigger's, else freshly minted per §3.6 step 6 —
+        // the same id this advance's dispatches then run under, so a marker
+        // names a chain that exists. `step_index` is the original request ID
         // for both cases (A.1 v1.9 + v1.13 v1.14 pin) — using the
         // request id as the key makes idempotent re-binding under retry
         // actually idempotent.
@@ -290,12 +345,13 @@ impl ContinuationHandler {
                 .bounds
                 .as_ref()
                 .and_then(|b| b.chain_id.clone())
-                .unwrap_or_else(|| ctx.request_id.clone()),
+                .unwrap_or_else(new_chain_id),
             request_id: ctx.request_id.clone(),
             step_index: ctx.request_id.clone(),
             author: ctx.author,
             caller_capability: ctx.capability_hash,
             handler_grant: ctx.handler_grant_hash,
+            parent_bounds: ctx.bounds.clone(),
         };
 
         let result = self
@@ -445,6 +501,12 @@ impl ContinuationHandler {
         rejected_marker_hash: Option<Hash>,
     ) {
         let safe_reason = sanitize_reason_segment(reason);
+        // Both coordinates originate on the wire (`bounds.chain_id` and the
+        // request id), so neither may name a path segment unvetted (ruling
+        // 13 / §1.4). Sanitized once, ahead of the body, so a marker's
+        // recorded coordinate always matches where it is actually bound.
+        let chain_id = entity_entity::sanitize_path_segment(&ce.chain_id);
+        let step_index = entity_entity::sanitize_path_segment(&ce.step_index);
         // §3.10.6 body fields. Reserved-across-both-kinds: reason, timestamp,
         // chain_id, step_index. Reserved on `lost`: target_uri (was
         // `failed_uri` in pre-v1.20 Rust), target_peer_id (best-effort
@@ -452,7 +514,10 @@ impl ContinuationHandler {
         // (when present): `rejected_marker_hash`.
         let target_peer_id = peer_id_from_uri(failed_uri).unwrap_or_default();
         let mut body_fields = vec![
-            (entity_ecf::text("chain_id"), entity_ecf::text(&ce.chain_id)),
+            (
+                entity_ecf::text("chain_id"),
+                entity_ecf::text(chain_id.as_ref()),
+            ),
             (entity_ecf::text("code"), entity_ecf::text(reason)),
             (entity_ecf::text("reason"), entity_ecf::text(&safe_reason)),
             (
@@ -461,7 +526,7 @@ impl ContinuationHandler {
             ),
             (
                 entity_ecf::text("step_index"),
-                entity_ecf::text(&ce.step_index),
+                entity_ecf::text(step_index.as_ref()),
             ),
             (
                 entity_ecf::text("target_peer_id"),
@@ -499,8 +564,8 @@ impl ContinuationHandler {
         let marker_path = format!(
             "/{}/system/runtime/chain-errors/lost/{}/{}/{}/{}",
             self.local_peer_id,
-            ce.chain_id,
-            ce.step_index,
+            chain_id,
+            step_index,
             safe_reason,
             entity.content_hash.to_hex(),
         );
@@ -688,7 +753,7 @@ impl ContinuationHandler {
             capability: dispatch_cap,
             deliver_to: cont.deliver_to.clone(),
             request_id: None,
-            bounds: None,
+            bounds: dispatch_bounds(chain_err),
             included: Vec::new(),
         };
 
@@ -882,7 +947,7 @@ impl ContinuationHandler {
                 capability: dispatch_cap,
                 deliver_to: cont.deliver_to.clone(),
                 request_id: None,
-                bounds: None,
+                bounds: dispatch_bounds(chain_err),
                 included: Vec::new(),
             };
 
@@ -4579,6 +4644,147 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
+    // §3.6 step 6 — dispatch with fresh bounds carrying the chain
+    // -----------------------------------------------------------------
+
+    /// Step 6 (`dispatch(execute, bounds: {chain_id: context.chain_id or
+    /// generate_id()})`). A dispatch out of an advance MUST carry a chain:
+    /// inherited when the trigger had one, freshly minted when it did not.
+    ///
+    /// Unimplemented, the dispatch went out chain-less and every downstream
+    /// marker binder invented a coordinate off its own fallback — which for
+    /// a handler-to-handler dispatch is the literal request id `"internal"`
+    /// (`ExecuteOptions::request_id`'s default), so every chain-less
+    /// advance's markers collided in one meaningless slot. Cross-impl: Go
+    /// landed on its own request id (`chain_id == step_index`), Python on
+    /// `"unknown"`. The sentinels were never the bug — this was.
+    #[tokio::test]
+    async fn step6_dispatch_bounds_carry_the_chain() {
+        // Trigger carries a chain → the dispatch runs under it, ttl
+        // decremented per §5.9 (an explicit override bypasses the execute
+        // seam's own decrement, so the advance owes it).
+        // (`chain_id` here is what `handle_advance` resolved off these same
+        // bounds — resolved once, so the marker and the dispatch cannot name
+        // different chains.)
+        let inherited = dispatch_bounds(&ChainErr {
+            chain_id: "chain-from-trigger".to_string(),
+            parent_bounds: Some(Bounds {
+                ttl: Some(4),
+                budget: Some(99),
+                chain_id: Some("chain-from-trigger".to_string()),
+                ..Default::default()
+            }),
+            ..marker_chainerr()
+        })
+        .expect("bounds for a live ttl");
+        assert_eq!(inherited.chain_id.as_deref(), Some("chain-from-trigger"));
+        assert_eq!(inherited.ttl, Some(3), "§5.9 ttl decrement");
+        assert_eq!(inherited.budget, Some(99), "budget rides the parent's");
+
+        // Trigger carries no chain at all → mint one. Never the request id:
+        // `"internal"` is not a chain, it is every internal dispatch.
+        let minted = dispatch_bounds(&ChainErr {
+            chain_id: new_chain_id(),
+            request_id: "internal".to_string(),
+            step_index: "internal".to_string(),
+            parent_bounds: None,
+            ..marker_chainerr()
+        })
+        .expect("a chain-less trigger still dispatches");
+        let chain_id = minted.chain_id.expect("step 6 mints on absence");
+        assert_ne!(chain_id, "internal");
+        assert!(!chain_id.is_empty());
+        // §3.11 / §3.10.1: the id is a path segment in the marker path.
+        assert!(
+            !chain_id.contains('/'),
+            "chain_id {:?} is not a single path segment",
+            chain_id
+        );
+        assert_ne!(
+            new_chain_id(),
+            new_chain_id(),
+            "a minted chain must be unique per advance"
+        );
+
+        // ttl already spent → hand the seam None so it raises
+        // ttl_exhausted itself, rather than a second code path here.
+        assert!(
+            dispatch_bounds(&ChainErr {
+                parent_bounds: Some(Bounds {
+                    ttl: Some(0),
+                    ..Default::default()
+                }),
+                ..marker_chainerr()
+            })
+            .is_none(),
+            "an exhausted ttl defers to the execute seam"
+        );
+    }
+
+    /// Step 6 end-to-end: drive a real `advance` whose trigger carries no
+    /// chain, and read the `chain_id` off the bounds the dispatch actually
+    /// went out with. This is the assertion that would have caught the gap —
+    /// the seam handed `bounds: None` straight through.
+    #[tokio::test]
+    async fn step6_chainless_advance_dispatches_under_a_minted_chain() {
+        let h = make_handler();
+        let author = Hash::compute("test", b"step6-author");
+        let cap = make_cap_entity_for_install(author, author, None);
+        let cap_hash = cap.content_hash;
+        h.content_store.put(cap.clone()).unwrap();
+        let included: HashMap<Hash, Entity> = [(cap_hash, cap)].into();
+
+        let path = format!("/{}/system/continuation/suspended/step6", test_peer_id());
+        let install_params = make_install_params("app/handler", "process", cap_hash, None, None);
+        let install_ctx = make_install_ctx(author, &path, install_params, included);
+        assert_eq!(h.handle(&install_ctx).await.unwrap().status, STATUS_OK);
+
+        // Capture the bounds the dispatch is made with.
+        let seen: Arc<std::sync::Mutex<Option<Bounds>>> = Arc::new(std::sync::Mutex::new(None));
+        let seen_in_mock = seen.clone();
+        let mock: ExecuteFn = Arc::new(move |_uri, _op, _params, opts| {
+            *seen_in_mock.lock().unwrap() = opts.bounds.clone();
+            Box::pin(async {
+                Ok(HandlerResult {
+                    status: 200,
+                    result: Entity::new(
+                        "primitive/null",
+                        entity_ecf::to_ecf(&entity_ecf::Value::Null),
+                    )
+                    .unwrap(),
+                    included: HashMap::new(),
+                })
+            })
+        });
+
+        let adv_params = make_params(entity_ecf::Value::Map(vec![(
+            entity_ecf::text("result"),
+            entity_ecf::Value::Bytes(entity_ecf::to_ecf(&entity_ecf::Value::Null)),
+        )]));
+        let mut adv_ctx = make_install_ctx(author, &path, adv_params, HashMap::new());
+        adv_ctx.operation = "advance".to_string();
+        adv_ctx.execute_fn = Some(mock);
+        // The shape a handler-to-handler advance actually arrives in: no
+        // bounds, and the default internal request id.
+        adv_ctx.request_id = "internal".to_string();
+        adv_ctx.bounds = None;
+
+        assert_eq!(h.handle(&adv_ctx).await.unwrap().status, STATUS_OK);
+
+        let bounds = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the dispatch carries bounds");
+        let chain_id = bounds.chain_id.expect("step 6 mints a chain on absence");
+        assert_ne!(
+            chain_id, "internal",
+            "the request id is not a chain — it is every internal dispatch"
+        );
+        assert!(!chain_id.contains('/'), "§3.11 single path segment");
+    }
+
+    // -----------------------------------------------------------------
     // v1.20 §3.10.1 + §3.10.6 — chain-error marker path scheme + timestamp
     // -----------------------------------------------------------------
 
@@ -4590,6 +4796,7 @@ mod tests {
             author: None,
             caller_capability: None,
             handler_grant: None,
+            parent_bounds: None,
         }
     }
 
@@ -5007,6 +5214,7 @@ mod tests {
             author: Some(author),
             caller_capability: Some(chain_cap),
             handler_grant: Some(handler_grant),
+            parent_bounds: None,
         };
         h.write_lost_error_marker(
             &ce,

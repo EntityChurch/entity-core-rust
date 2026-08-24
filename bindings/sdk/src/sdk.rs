@@ -729,7 +729,7 @@ fn build_history_query_params(
         ));
     }
     if let Some(ref events) = options.events {
-        let arr: Vec<ciborium::Value> = events.iter().map(|s| entity_ecf::text(s)).collect();
+        let arr: Vec<ciborium::Value> = events.iter().map(entity_ecf::text).collect();
         fields.push((entity_ecf::text("events"), ciborium::Value::Array(arr)));
     }
     let data = entity_ecf::to_ecf(&ciborium::Value::Map(fields));
@@ -1026,6 +1026,14 @@ impl SdkError {
 }
 
 /// Builder for PeerContext.
+/// Observe-only inspectability hooks (`GUIDE-INSPECTABILITY` v1.2 §2.1),
+/// each paired with the path it taps. Type-erased via `Arc<dyn Fn>` so one
+/// vec holds many heterogeneous closures; shared by `PeerContextBuilder` and
+/// `EntitySDKBuilder`, which registers the same shapes for the default peer.
+type DispatchHooks = Vec<(String, Arc<dyn Fn(&DispatchEvent) + Send + Sync>)>;
+type WireHooks = Vec<(String, Arc<dyn Fn(&WireEvent) + Send + Sync>)>;
+type BindingHooks = Vec<(String, Arc<dyn Fn(&TreeChangeEvent) + Send + Sync>)>;
+
 pub struct PeerContextBuilder {
     keypair: Option<Keypair>,
     config: Option<PeerConfig>,
@@ -1057,15 +1065,15 @@ pub struct PeerContextBuilder {
     /// `PeerBuilder::with_dispatch_hook` at build time. Type-erased
     /// via `Arc<dyn Fn>` so the builder can hold many heterogeneous
     /// closures.
-    dispatch_hooks: Vec<(String, Arc<dyn Fn(&DispatchEvent) + Send + Sync>)>,
+    dispatch_hooks: DispatchHooks,
     /// Observe-only wire-event hooks per `GUIDE-INSPECTABILITY` v1.2 §2.1 #5.
     /// **Security (audit §2.1):** events carry the full envelope bytes
     /// including capability tokens, signatures, and identity material.
     /// Consumer hooks retaining `frame_bytes` maintain a cap-token corpus
     /// and MUST be operator-controlled.
-    wire_hooks: Vec<(String, Arc<dyn Fn(&WireEvent) + Send + Sync>)>,
+    wire_hooks: WireHooks,
     /// Observe-only binding-event hooks per `GUIDE-INSPECTABILITY` v1.2 §2.1 #2.
-    binding_hooks: Vec<(String, Arc<dyn Fn(&TreeChangeEvent) + Send + Sync>)>,
+    binding_hooks: BindingHooks,
     /// When set via [`PeerContextBuilder::with_inspect_routing`], the
     /// build path installs three demuxer hooks that marshal substrate
     /// events into `InspectFact` and fan out to sinks registered on
@@ -1084,6 +1092,12 @@ pub struct PeerContextBuilder {
     /// way to install custom grant policy — they're stuck on the
     /// static fallback.
     grant_resolver: Option<entity_peer::GrantResolver>,
+}
+
+impl Default for PeerContextBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PeerContextBuilder {
@@ -2037,9 +2051,7 @@ impl EntitySDK {
             });
         }
         self.peers.insert(id.clone(), Arc::new(ctx));
-        self.metadata
-            .entry(id.clone())
-            .or_insert_with(PeerMetadata::default);
+        self.metadata.entry(id.clone()).or_default();
         Ok(id)
     }
 
@@ -2455,9 +2467,9 @@ pub struct EntitySDKBuilder {
     /// install hooks on additional peers use `PeerContextBuilder` +
     /// `EntitySDK::insert_peer` directly — only the default peer flows
     /// through this builder.
-    dispatch_hooks: Vec<(String, Arc<dyn Fn(&DispatchEvent) + Send + Sync>)>,
-    wire_hooks: Vec<(String, Arc<dyn Fn(&WireEvent) + Send + Sync>)>,
-    binding_hooks: Vec<(String, Arc<dyn Fn(&TreeChangeEvent) + Send + Sync>)>,
+    dispatch_hooks: DispatchHooks,
+    wire_hooks: WireHooks,
+    binding_hooks: BindingHooks,
     /// Enables consumer-side `InspectSink` routing on the default peer.
     /// Forwarded to `PeerContextBuilder::with_inspect_routing` at build
     /// time.
@@ -2467,6 +2479,12 @@ pub struct EntitySDKBuilder {
     /// `PeerContextBuilder::with_grant_resolver` at build time. Per
     /// Godot ask D2.
     grant_resolver: Option<entity_peer::GrantResolver>,
+}
+
+impl Default for EntitySDKBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EntitySDKBuilder {
@@ -2846,10 +2864,10 @@ impl PeerContext {
     /// continuation install time (EXTENSION-CONTINUATION §3.2 step 4)
     /// passes.
     ///
-    /// **Persistence and revocation.** The cap is content-addressed
-    /// + content-store-persisted; its signature lands as a sibling
-    /// entity. This helper does **not** bind the cap at a tree path
-    /// — use [`mint_chain_capability_bound`](Self::mint_chain_capability_bound)
+    /// **Persistence and revocation.** The cap is content-addressed and
+    /// content-store-persisted; its signature lands as a sibling entity.
+    /// This helper does **not** bind the cap at a tree path — use
+    /// [`mint_chain_capability_bound`](Self::mint_chain_capability_bound)
     /// when you need V7 §5.1 `is_revoked` walks to find the root.
     ///
     /// Returns `Err(SdkError::HandlerError(...))` for an empty
@@ -6287,6 +6305,9 @@ mod tests {
         // clone still resolves the entity — proves the handle is
         // callback-safe (no borrow of PeerContext retained).
         let lookup = ctx.store().content_lookup();
+        // `StoreAccess` has no `Drop` impl, so this is a borrow-scope
+        // assertion (the `&ctx` borrow ends here), not a destructor call.
+        #[allow(clippy::drop_non_drop)]
         drop(ctx.store());
         assert!(lookup.get_by_hash(&hash).is_some());
     }

@@ -1394,6 +1394,10 @@ pub async fn perform_connect_with_dispatch(
     // §6.11(b) dialer-side reentry: hand the reader a write handle + dispatch
     // context so it can answer inbound EXECUTEs over this same connection.
     let reentry_ctx = reentry.map(|shared| (shared, writer.clone()));
+    // `ReaderTaskHandle` is a `JoinHandle` natively but `()` on wasm32 (no
+    // abort — the reader ends at stream EOF), so this binding is a unit value
+    // there; it is still stored as the `reader_task` field on both targets.
+    #[allow(clippy::let_unit_value)]
     let reader_task =
         spawn_reader_loop(reader, pending.clone(), remote_peer_id.clone(), reentry_ctx);
 

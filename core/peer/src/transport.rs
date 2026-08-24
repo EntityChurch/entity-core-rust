@@ -588,26 +588,22 @@ mod wasm_websocket {
                 return Poll::Ready(Ok(()));
             }
 
-            loop {
-                match Stream::poll_next(Pin::new(self.inner.inner_mut()), cx) {
-                    Poll::Ready(Some(WsMessage::Binary(data))) => {
-                        let n = data.len().min(buf.remaining());
-                        buf.put_slice(&data[..n]);
-                        if n < data.len() {
-                            self.buf = data;
-                            self.pos = n;
-                        }
-                        return Poll::Ready(Ok(()));
+            match Stream::poll_next(Pin::new(self.inner.inner_mut()), cx) {
+                Poll::Ready(Some(WsMessage::Binary(data))) => {
+                    let n = data.len().min(buf.remaining());
+                    buf.put_slice(&data[..n]);
+                    if n < data.len() {
+                        self.buf = data;
+                        self.pos = n;
                     }
-                    Poll::Ready(Some(WsMessage::Text(_))) => {
-                        return Poll::Ready(Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "received text WebSocket message",
-                        )));
-                    }
-                    Poll::Ready(None) => return Poll::Ready(Ok(())),
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(()))
                 }
+                Poll::Ready(Some(WsMessage::Text(_))) => Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "received text WebSocket message",
+                ))),
+                Poll::Ready(None) => Poll::Ready(Ok(())),
+                Poll::Pending => Poll::Pending,
             }
         }
     }
@@ -1288,6 +1284,10 @@ mod message_port {
         IncomingChannel { from_peer: String, to_peer: String },
     }
 
+    /// In-flight outbound `OpenChannel` requests keyed by request id; each
+    /// resolves with the granted `MessagePort` (or the responder's error).
+    type PendingChannels = Rc<RefCell<HashMap<u64, oneshot::Sender<Result<MessagePort, String>>>>>;
+
     /// Per-Worker control-port handler shared by the connector and
     /// listener. Multiplexes outbound OpenChannel requests via a
     /// pending-map, demultiplexes inbound IncomingChannel notifications
@@ -1295,7 +1295,7 @@ mod message_port {
     pub struct ControlPortClient {
         port: SendWrapper<MessagePort>,
         next_request_id: RefCell<u64>,
-        pending: Rc<RefCell<HashMap<u64, oneshot::Sender<Result<MessagePort, String>>>>>,
+        pending: PendingChannels,
         /// Map of locally-bound listeners keyed by their endpoint
         /// (peer id). `MessagePortListener::bind` inserts; Drop
         /// removes. The onmessage closure looks up `to_peer` here on
@@ -1307,8 +1307,7 @@ mod message_port {
 
     impl ControlPortClient {
         pub fn new(port: MessagePort) -> Rc<Self> {
-            let pending: Rc<RefCell<HashMap<u64, oneshot::Sender<Result<MessagePort, String>>>>> =
-                Rc::new(RefCell::new(HashMap::new()));
+            let pending: PendingChannels = Rc::new(RefCell::new(HashMap::new()));
             let listeners: Rc<RefCell<HashMap<String, mpsc::UnboundedSender<Connection>>>> =
                 Rc::new(RefCell::new(HashMap::new()));
 

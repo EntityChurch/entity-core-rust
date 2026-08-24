@@ -71,6 +71,10 @@ impl EntityData {
     /// Rebuild an `entity_entity::Entity` from this EntityData. Used by
     /// binding methods that need to pass an Entity back into the SDK
     /// (e.g. `bundle_cross_peer_chain(leaf_cap)`).
+    // Large `Err` is core's public `EntityError`; boxing it here would either
+    // break that core API or wrap it in a shape callers must unwrap. Callers
+    // consume this at the binding edge and map it to a Godot error string.
+    #[allow(clippy::result_large_err)]
     pub fn to_entity(&self) -> Result<entity_entity::Entity, entity_entity::EntityError> {
         entity_entity::Entity::new(&self.entity_type.to_string(), self.data.to_vec())
     }

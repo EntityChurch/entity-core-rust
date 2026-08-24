@@ -162,32 +162,6 @@ struct BindingContextSnapshot {
     // consumer materializes. Add a clock subdict here when needed.
 }
 
-/// A Godot Node wrapping an Entity Core peer.
-///
-/// Properties:
-/// - `seed`: 32-byte PackedByteArray for deterministic keypair (start())
-/// - `peer_name`: user-chosen persistent peer name (boot())
-/// - `data_dir`: data root; GDScript sets this to
-///   `ProjectSettings.globalize_path("user://entity")` (boot())
-/// - `listen_address`: TCP address to listen on (default: "127.0.0.1:9000")
-///
-/// Methods:
-/// - `start()` — seed-based start (deterministic keypair, in-memory tree)
-/// - `boot()` — persistence-backed start: keypair + SQLite tree under
-///   `{data_dir}/peers/{peer_name}/` (GUIDE-PERSISTENCE.md §1)
-/// - `stop()` — stop the peer
-/// - `peer_id()` — get the PeerID string
-/// - `tree_get(path)` — L0 get an entity from the tree
-/// - `tree_put(path, type, data)` — L0 put an entity into the tree
-/// - `tree_has(path)` — L0 path existence check
-/// - `tree_remove(path)` — L0 path removal, returns true if removed
-/// - `tree_list(prefix)` — L0 list paths under a prefix
-/// - `generation()` — monotonic counter, bumped on every L0 mutation
-/// - `watch(prefix)` — path-prefix subscription returning EntitySubscription
-/// - `execute(handler, operation, params_type, params_data)` — local L1 handler dispatch
-///
-/// Signals:
-/// - `tree_changed(path, hash)` — emitted on every tree mutation (raw L0 stream)
 /// Runtime ownership discriminant for `EntityPeer`. Lets a single peer
 /// either own its own runtime (direct-instantiation back-compat) or
 /// borrow a handle injected by `EntityPeerManager` (Tier-2+ multi-peer
@@ -227,6 +201,32 @@ impl RuntimeRef {
     }
 }
 
+/// A Godot Node wrapping an Entity Core peer.
+///
+/// Properties:
+/// - `seed`: 32-byte PackedByteArray for deterministic keypair (start())
+/// - `peer_name`: user-chosen persistent peer name (boot())
+/// - `data_dir`: data root; GDScript sets this to
+///   `ProjectSettings.globalize_path("user://entity")` (boot())
+/// - `listen_address`: TCP address to listen on (default: "127.0.0.1:9000")
+///
+/// Methods:
+/// - `start()` — seed-based start (deterministic keypair, in-memory tree)
+/// - `boot()` — persistence-backed start: keypair + SQLite tree under
+///   `{data_dir}/peers/{peer_name}/` (GUIDE-PERSISTENCE.md §1)
+/// - `stop()` — stop the peer
+/// - `peer_id()` — get the PeerID string
+/// - `tree_get(path)` — L0 get an entity from the tree
+/// - `tree_put(path, type, data)` — L0 put an entity into the tree
+/// - `tree_has(path)` — L0 path existence check
+/// - `tree_remove(path)` — L0 path removal, returns true if removed
+/// - `tree_list(prefix)` — L0 list paths under a prefix
+/// - `generation()` — monotonic counter, bumped on every L0 mutation
+/// - `watch(prefix)` — path-prefix subscription returning EntitySubscription
+/// - `execute(handler, operation, params_type, params_data)` — local L1 handler dispatch
+///
+/// Signals:
+/// - `tree_changed(path, hash)` — emitted on every tree mutation (raw L0 stream)
 #[derive(GodotClass)]
 #[class(base=Node)]
 pub struct EntityPeer {
@@ -387,7 +387,7 @@ impl INode for EntityPeer {
             })
             .unwrap_or_default();
         for snap in dispatch_snaps {
-            let mut dict = Dictionary::new();
+            let mut dict = VarDictionary::new();
             dict.set("target_uri", GString::from(snap.target_uri.as_str()));
             dict.set("operation", GString::from(snap.operation.as_str()));
             let mut ph = PackedByteArray::new();
@@ -426,7 +426,7 @@ impl INode for EntityPeer {
             })
             .unwrap_or_default();
         for snap in binding_snaps {
-            let mut dict = Dictionary::new();
+            let mut dict = VarDictionary::new();
             dict.set("path", GString::from(snap.path.as_str()));
             let mut h = PackedByteArray::new();
             h.extend(snap.hash.into_iter());
@@ -443,7 +443,7 @@ impl INode for EntityPeer {
             dict.set("new_hash", new_arr);
             dict.set("change_type", GString::from(snap.change_type));
             if let Some(c) = snap.context {
-                let mut cdict = Dictionary::new();
+                let mut cdict = VarDictionary::new();
                 if let Some(s) = c.chain_id {
                     cdict.set("chain_id", GString::from(s.as_str()));
                 }
@@ -489,7 +489,7 @@ impl INode for EntityPeer {
             })
             .unwrap_or_default();
         for snap in wire_snaps {
-            let mut dict = Dictionary::new();
+            let mut dict = VarDictionary::new();
             dict.set("direction", GString::from(snap.direction));
             dict.set("request_id", GString::from(snap.request_id.as_str()));
             dict.set("frame_len", snap.frame_len as i64);
@@ -565,7 +565,7 @@ impl EntityPeer {
     /// is metadata-only — fetch the params entity through a separate
     /// auth-checked call if needed.
     #[signal]
-    fn dispatch_hook_fired(name: GString, event: Dictionary);
+    fn dispatch_hook_fired(name: GString, event: VarDictionary);
 
     /// Emitted once per registered binding hook per tree write at the
     /// post-mutation observer pass (GUIDE-INSPECTABILITY v1.2 §2.2
@@ -582,7 +582,7 @@ impl EntityPeer {
     ///                  null for engine/bootstrap writes lacking context.
     ///                  Clock state intentionally omitted (v1).
     #[signal]
-    fn binding_hook_fired(name: GString, event: Dictionary);
+    fn binding_hook_fired(name: GString, event: VarDictionary);
 
     /// Emitted once per server-side wire frame at the post-handshake
     /// message loop (Recv after decode_envelope succeeds OR fails; Send
@@ -601,7 +601,7 @@ impl EntityPeer {
     ///   peer_address: String — remote PeerID base58
     ///   timestamp_ms: int    — wall-clock unix ms at capture
     #[signal]
-    fn wire_hook_fired(name: GString, event: Dictionary);
+    fn wire_hook_fired(name: GString, event: VarDictionary);
 
     /// Fired once per invocation of a GDScript-registered handler.
     /// Connect ONE listener (typically in the panel that owns the
@@ -729,7 +729,7 @@ impl EntityPeer {
     ///   - "pattern_collision" if a handler is already registered
     ///   - "invalid_handler_spec" for malformed pattern/operations
     #[func]
-    fn register_handler(&mut self, spec: Dictionary) -> bool {
+    fn register_handler(&mut self, spec: VarDictionary) -> bool {
         let Some(ctx) = self.ctx.as_ref().cloned() else {
             godot_error!("EntityPeer.register_handler: peer not started");
             return false;
@@ -1632,7 +1632,7 @@ impl EntityPeer {
         match ctx.bundle_cross_peer_chain(&entity) {
             Ok(bundle) => {
                 for (hash, ent) in bundle {
-                    let mut pair = Dictionary::new();
+                    let mut pair = VarDictionary::new();
                     let mut hash_pba = PackedByteArray::new();
                     hash_pba.extend(hash.to_bytes().iter().copied());
                     pair.set("hash", hash_pba);
@@ -2194,6 +2194,10 @@ impl EntityPeer {
     /// All other args are identical to `execute_async_with_capability`.
     /// Existing callers should continue using the 6-arg form; this
     /// extended method is purely additive.
+    // The arg list is the GDScript-facing API: `#[func]` exports each
+    // parameter positionally, so collapsing them into a params struct would
+    // break every GDScript caller. Kept flat deliberately.
+    #[allow(clippy::too_many_arguments)]
     #[func]
     fn execute_async_with_options(
         &mut self,
@@ -3337,7 +3341,7 @@ impl EntityPeer {
     fn subscribe_l1_with_options(
         &mut self,
         prefix: GString,
-        options: Dictionary,
+        options: VarDictionary,
     ) -> Option<Gd<PeerOpFuture>> {
         if !self.check_async_preconditions("subscribe_l1_with_options") {
             return None;
@@ -3599,8 +3603,8 @@ impl EntityPeer {
     /// — the caller is expected to be the peer owner (or the peer
     /// would expose this via a typed handler op).
     #[func]
-    fn compute_list(&self) -> VariantArray {
-        let mut arr = VariantArray::new();
+    fn compute_list(&self) -> VarArray {
+        let mut arr = VarArray::new();
         let Some(ctx) = self.ctx.as_ref() else {
             return arr;
         };
@@ -3678,9 +3682,9 @@ impl EntityPeer {
     ///   { bootstrapped: bool, identity_hash: PBA,
     ///     quorum_id: PBA|null, peer_config_path: String|null }
     #[func]
-    fn bootstrap_status(&self) -> Dictionary {
+    fn bootstrap_status(&self) -> VarDictionary {
         let Some(ctx) = self.ctx.as_ref() else {
-            return Dictionary::new();
+            return VarDictionary::new();
         };
         crate::bootstrap_ops::bootstrap_status_to_dict(ctx.identity().bootstrap_status())
     }
@@ -4384,7 +4388,7 @@ fn build_history_config_data(
         (entity_ecf::text("enabled"), entity_ecf::bool_val(enabled)),
         (
             entity_ecf::text("events"),
-            entity_ecf::Value::Array(events.iter().map(|s| entity_ecf::text(s)).collect()),
+            entity_ecf::Value::Array(events.iter().map(entity_ecf::text).collect()),
         ),
     ];
     if let Some(d) = max_depth {
@@ -4497,7 +4501,7 @@ fn parse_grant_entries(grants: &VarArray) -> Result<Vec<entity_capability::Grant
             .get(i)
             .ok_or_else(|| format!("grants[{}] missing", i))?;
         let dict = item
-            .try_to::<Dictionary>()
+            .try_to::<VarDictionary>()
             .map_err(|_| format!("grants[{}] must be a Dictionary", i))?;
         let handlers = dict_get_str_array(&dict, "handlers")
             .ok_or_else(|| format!("grants[{}].handlers missing (Array of String)", i))?;
@@ -4525,7 +4529,7 @@ fn parse_grant_entries(grants: &VarArray) -> Result<Vec<entity_capability::Grant
 
 /// Pull an Array<String> value from a Godot Dictionary by string key.
 /// Accepts PackedStringArray, VarArray of String, or returns None.
-fn dict_get_str_array(dict: &Dictionary, key: &str) -> Option<Vec<String>> {
+fn dict_get_str_array(dict: &VarDictionary, key: &str) -> Option<Vec<String>> {
     let v = dict.get(GString::from(key).to_variant())?;
     if v.is_nil() {
         return None;
@@ -4567,7 +4571,7 @@ fn normalize_dial_addr(addr: &str) -> &str {
 }
 
 fn parse_handler_spec(
-    spec: &Dictionary,
+    spec: &VarDictionary,
 ) -> Result<entity_sdk::register_handler::HandlerSpec, String> {
     use entity_sdk::register_handler::{HandlerSpec, OperationSpec};
 
@@ -4603,7 +4607,7 @@ fn parse_handler_spec(
             .get(i)
             .ok_or_else(|| format!("operations[{}] missing", i))?;
         let op_dict = item
-            .try_to::<Dictionary>()
+            .try_to::<VarDictionary>()
             .map_err(|_| format!("operations[{}] must be a Dictionary", i))?;
         let op_name = dict_get_string(&op_dict, "name")
             .ok_or_else(|| format!("operations[{}].name missing", i))?;
@@ -4628,7 +4632,7 @@ fn parse_handler_spec(
 }
 
 /// Pull a String value from a Godot Dictionary by string key.
-fn dict_get_string(dict: &Dictionary, key: &str) -> Option<String> {
+fn dict_get_string(dict: &VarDictionary, key: &str) -> Option<String> {
     let v = dict.get(GString::from(key).to_variant())?;
     if v.is_nil() {
         return None;
@@ -4641,7 +4645,7 @@ fn dict_get_string(dict: &Dictionary, key: &str) -> Option<String> {
 /// keys are silently ignored (forward-compat); type mismatches fall
 /// back to defaults with a warning (matches the rest of the binding's
 /// permissive-input posture).
-fn parse_subscribe_options(opts: &Dictionary) -> entity_sdk::subscription::SubscribeOptions {
+fn parse_subscribe_options(opts: &VarDictionary) -> entity_sdk::subscription::SubscribeOptions {
     use entity_sdk::subscription::{SubscribeLimits, SubscribeOptions};
     let mut out = SubscribeOptions::default();
 

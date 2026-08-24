@@ -12,6 +12,12 @@ pub struct HandleMap<T> {
     map: RwLock<HashMap<u64, T>>,
 }
 
+impl<T> Default for HandleMap<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T> HandleMap<T> {
     pub fn new() -> Self {
         Self {

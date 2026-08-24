@@ -388,6 +388,7 @@ pub struct DelegationCaveats {
 /// connection.
 ///
 /// Rules:
+/// - `"entity://{peer}/{path}"` → `"/{peer}/{path}"` (address, not scheme)
 /// - `starts_with("/")` → pass through (already absolute)
 /// - `"*"` → `"/{local_peer_id}/*"` (peer-relative wildcard)
 /// - `"./..."` / `"../..."` → `None` (reserved)
@@ -401,6 +402,30 @@ pub fn canonicalize(path: &str, local_peer_id: &str) -> Option<String> {
     // Reject ambiguous bare */rest — must use /*/rest
     if path.starts_with("*/") {
         return None;
+    }
+    // Full entity URI → absolute path (arch ruling 24: `entity://{p}/x` and
+    // `/{p}/x` are the same address, and canonicalization is where they
+    // converge — dispatch routing already treats them as one).
+    //
+    // Without this, a cross-peer `deliver_uri`'s `entity://` form (the shape
+    // the spec uses, so the shape a deliver_token's `resources` scope
+    // carries) fell through to the bare-path arm below and came out as
+    // `/{local}/entity://{peer}/x` — which can never match the normalized
+    // request target, so every cross-peer delivery 403'd. Rust had this
+    // logged as a cross-impl question; the ruling is that it was never one —
+    // *cleaning* preserves the scheme (`EntityUri::clean_path`),
+    // *canonicalizing* resolves it to the address it names. Two different
+    // jobs that Rust had conflated. Mirrors Go's `capability.Canonicalize`.
+    if path.starts_with("entity://") {
+        if let Ok(uri) = entity_entity::EntityUri::parse(path) {
+            if !uri.peer_id.is_empty() {
+                return Some(if uri.path.is_empty() {
+                    format!("/{}", uri.peer_id)
+                } else {
+                    format!("/{}/{}", uri.peer_id, uri.path)
+                });
+            }
+        }
     }
     // Already absolute — pass through
     if path.starts_with('/') {
@@ -2218,5 +2243,76 @@ mod tests {
         )
         .unwrap();
         assert!(CapabilityToken::from_entity(&entity).is_err());
+    }
+}
+
+#[cfg(test)]
+mod canonicalize_entity_uri_tests {
+    use super::*;
+
+    const LOCAL: &str = "2KLocalPeerIdBase58xxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    const REMOTE: &str = "2KRemotePeerIdBase58xxxxxxxxxxxxxxxxxxxxxxxxxx";
+
+    /// Arch ruling 24: `entity://{p}/x` and `/{p}/x` are the same address, so
+    /// canonicalization MUST converge them. This was Rust's longest-standing
+    /// cross-impl blocker (logged in docs/SPEC-AMBIGUITIES.md) and the ruling
+    /// is that it was never a cross-impl question: *cleaning* preserves the
+    /// scheme, *canonicalizing* resolves it. Rust had conflated the two.
+    #[test]
+    fn entity_uri_canonicalizes_to_the_address_it_names() {
+        assert_eq!(
+            canonicalize(&format!("entity://{}/system/inbox", REMOTE), LOCAL),
+            Some(format!("/{}/system/inbox", REMOTE)),
+        );
+        // The two spellings of one address MUST converge — this is the whole
+        // point, and the property the 403 came from violating.
+        assert_eq!(
+            canonicalize(&format!("entity://{}/system/inbox", REMOTE), LOCAL),
+            canonicalize(&format!("/{}/system/inbox", REMOTE), LOCAL),
+        );
+        // Bare peer, no path.
+        assert_eq!(
+            canonicalize(&format!("entity://{}", REMOTE), LOCAL),
+            Some(format!("/{}", REMOTE)),
+        );
+    }
+
+    /// The regression this actually fixes: a cross-peer `deliver_token`'s
+    /// `resources` scope carries the `entity://` form (the shape the spec
+    /// uses for a cross-peer deliver_uri), and the delivery-time request
+    /// target is the normalized absolute path. Pre-ruling these could never
+    /// match, so every cross-peer delivery 403'd `operation permission
+    /// denied` — including the spec-model inbox delivery.
+    #[test]
+    fn entity_uri_scope_matches_normalized_delivery_target() {
+        let scope = canonicalize(&format!("entity://{}/system/inbox/*", REMOTE), LOCAL)
+            .expect("entity:// scope canonicalizes");
+        let target = canonicalize(&format!("/{}/system/inbox/msg-1", REMOTE), LOCAL)
+            .expect("delivery target canonicalizes");
+        assert!(
+            matches_pattern(&target, &scope),
+            "an entity:// deliver_token scope {:?} must cover its own \
+             delivery target {:?} — this mismatch was the cross-peer 403",
+            scope,
+            target,
+        );
+    }
+
+    /// Pre-ruling behavior, pinned so it cannot come back: the bare-path arm
+    /// swallowed the scheme and produced a path naming the LOCAL peer and a
+    /// literal `entity:` segment.
+    #[test]
+    fn entity_uri_is_not_mangled_into_a_local_path() {
+        let got = canonicalize(&format!("entity://{}/system/inbox", REMOTE), LOCAL).unwrap();
+        assert!(
+            !got.contains("entity:"),
+            "the scheme survived canonicalization: {}",
+            got
+        );
+        assert!(
+            !got.starts_with(&format!("/{}/entity", LOCAL)),
+            "a remote address canonicalized to a LOCAL path: {}",
+            got
+        );
     }
 }

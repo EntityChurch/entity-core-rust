@@ -63,6 +63,12 @@ pub struct PeerManager {
     connector_override: Option<Arc<dyn entity_peer::transport::Connector>>,
 }
 
+impl Default for PeerManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl PeerManager {
     /// Create a PeerManager with a single primary peer (generated keypair, no
     /// persisted peers loaded).
@@ -912,7 +918,7 @@ mod tests {
             "system/history/config",
             to_ecf(&Value::Map(vec![
                 (text("enabled"), bool_val(true)),
-                (text("pattern"), text(&format!("/{}/app/test/*", pid))),
+                (text("pattern"), text(format!("/{}/app/test/*", pid))),
             ])),
         )
         .unwrap();

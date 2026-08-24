@@ -754,9 +754,9 @@ mod tests {
             Value::Map(vec![(Value::Text("k".into()), Value::Text("b".repeat(30)))]),
         ]);
         let mut exp5 = hex_to_bytes("82a1616b7818");
-        exp5.extend(std::iter::repeat(0x61).take(24));
+        exp5.extend(std::iter::repeat_n(0x61, 24));
         exp5.extend(hex_to_bytes("a1616b781e"));
-        exp5.extend(std::iter::repeat(0x62).take(30));
+        exp5.extend(std::iter::repeat_n(0x62, 30));
         let got5 = to_ecf(&n5);
         println!("F29 nested.5: {}", bytes_to_hex(&got5));
         assert_eq!(got5, exp5, "nested.5 must match Go candidate");
@@ -767,7 +767,7 @@ mod tests {
             Value::Text("c".repeat(256)),
         )])]);
         let mut exp6 = hex_to_bytes("81a1616b790100");
-        exp6.extend(std::iter::repeat(0x63).take(256));
+        exp6.extend(std::iter::repeat_n(0x63, 256));
         let got6 = to_ecf(&n6);
         println!("F29 nested.6: {}", bytes_to_hex(&got6));
         assert_eq!(got6, exp6, "nested.6 must match Go candidate");

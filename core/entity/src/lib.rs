@@ -494,6 +494,59 @@ impl EntityUri {
     }
 }
 
+/// Reports whether `s` can be interpolated verbatim as ONE segment of a tree
+/// path: non-empty, slash-free, neither reserved dot token, and free of
+/// control characters (V7 §1.4).
+///
+/// [`EntityUri::clean_path`] only rejects a LEADING `./` or `../`, which a
+/// value interpolated into the MIDDLE of a path never is — so it is not a
+/// defense for this. `"sink/{X}/.."` is inside the sink by string prefix
+/// while naming somewhere else entirely.
+pub fn is_safe_path_segment(s: &str) -> bool {
+    if s.is_empty() || s == "." || s == ".." {
+        return false;
+    }
+    if s.contains('/') {
+        return false;
+    }
+    // Slashes are handled above; printable ASCII and high-bit Unicode bytes
+    // are fine (Unicode segments are accepted per §1.4).
+    !s.bytes().any(|b| b < 0x20 || b == 0x7F)
+}
+
+/// Returns `s` when it is safe as one path segment, else a deterministic
+/// synthetic segment `invalid-<first 8 bytes of sha256(s), hex>`.
+///
+/// For any value that arrives from the wire — `request_id`, `bounds.chain_id`,
+/// a remote handler's `result.data.code` — this is the boundary between "a
+/// caller names its own coordinate" and "a caller chooses where our entity
+/// lands". Callers MUST run every untrusted value through this BEFORE
+/// concatenating it into a path.
+///
+/// The §3.10.3 `rejected` marker is the sharp case: it is bound precisely
+/// BECAUSE the sender's cap check failed, so an unauthorized caller reaches
+/// the binding site by construction and no capability is required to choose
+/// where that entity lands.
+///
+/// Unsafe values are **hashed, not dropped or collapsed**: markers are
+/// observational, so dropping one loses the event, and collapsing them all to
+/// a constant merges distinct failures onto one coordinate. Hashing keeps
+/// distinct hostile values distinct while making them inert.
+///
+/// Safe values pass through byte-identical, so this changes no conformant
+/// coordinate and cannot de-converge a seat. Matches Go's
+/// `store.SanitizePathSegment` (`core/store/store.go`) byte-for-byte, so the
+/// synthetic segment converges cross-impl.
+pub fn sanitize_path_segment(s: &str) -> std::borrow::Cow<'_, str> {
+    use sha2::{Digest, Sha256};
+    if is_safe_path_segment(s) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    let digest = Sha256::digest(s.as_bytes());
+    let hex: String = digest[..8].iter().map(|b| format!("{:02x}", b)).collect();
+    std::borrow::Cow::Owned(format!("invalid-{}", hex))
+}
+
 impl std::fmt::Display for EntityUri {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.path.is_empty() {
@@ -1024,5 +1077,106 @@ mod tests {
         assert!(!EntityUri::is_reserved_path_word("Content"));
         assert!(!EntityUri::is_reserved_path_word("manifests"));
         assert!(!EntityUri::is_reserved_path_word(""));
+    }
+
+    /// A safe value MUST pass through byte-identical — this is the property
+    /// that makes sanitization unable to de-converge a seat or move any
+    /// conformant coordinate.
+    #[test]
+    fn sanitize_path_segment_passes_safe_values_through() {
+        for seg in [
+            "chain-abc123",
+            "req-1",
+            "capability_denied",
+            "network-maintain-e79c8bca6eec8a43",
+            "internal",
+            "a.b",
+            "...",
+            "..a",
+            "sub-1",
+            "0",
+            "é-unicode-is-fine",
+        ] {
+            assert_eq!(
+                sanitize_path_segment(seg),
+                seg,
+                "a safe value MUST pass through unchanged"
+            );
+        }
+    }
+
+    /// The hostile cases. `..` is the one Go's probe found live in our tree:
+    /// it is not the LEADING `../` form `clean_path` rejects — it lands in
+    /// the MIDDLE of the path, where a normalizer resolves it and walks the
+    /// marker back OUT of the chain-errors subtree.
+    #[test]
+    fn sanitize_path_segment_contains_unsafe_values() {
+        for seg in [
+            "..",
+            ".",
+            "",
+            "../../../../authority/keys",
+            "a/b",
+            "/",
+            "with\0null",
+            "with\nnewline",
+            "with\x7fdel",
+        ] {
+            let got = sanitize_path_segment(seg);
+            assert!(
+                is_safe_path_segment(&got),
+                "sanitize_path_segment({:?}) = {:?}, still not a safe segment",
+                seg,
+                got
+            );
+            assert!(
+                got.starts_with("invalid-"),
+                "sanitize_path_segment({:?}) = {:?}, want a visibly synthetic segment",
+                seg,
+                got
+            );
+            // The property that actually matters: assert on the CLEANED
+            // path, not the literal one. `sink/{X}/..` is inside the sink by
+            // string prefix while naming somewhere else.
+            let joined = format!("/peer1/system/runtime/chain-errors/rejected/{}", got);
+            assert!(
+                EntityUri::clean_path(&joined).starts_with("/peer1/system/runtime/chain-errors/"),
+                "{:?} escaped the sink under cleaning",
+                got
+            );
+        }
+    }
+
+    /// Distinct hostile values MUST NOT merge onto one coordinate — markers
+    /// are observational, so collapsing them to a constant would lose the
+    /// distinction between two different failures.
+    #[test]
+    fn sanitize_path_segment_keeps_distinct_values_distinct() {
+        assert_ne!(sanitize_path_segment(".."), sanitize_path_segment("."));
+        assert_ne!(
+            sanitize_path_segment("../../authority/keys"),
+            sanitize_path_segment("../../authority/other")
+        );
+        // Deterministic: the same hostile value always lands in the same
+        // place, so re-binding the same observation still dedupes.
+        assert_eq!(sanitize_path_segment(".."), sanitize_path_segment(".."));
+    }
+
+    /// Convergence with Go's `store.SanitizePathSegment` (`core/store/store.go`
+    /// @ `24d618c`) — same algorithm (`invalid-` + first 8 bytes of sha256,
+    /// hex), so a hostile coordinate lands at the same synthetic segment on
+    /// both seats rather than forking the tree two ways.
+    ///
+    /// These literals were read off a live Go run, not derived from its
+    /// source — the cheap version of this test asserts a shape and would pass
+    /// against a differing algorithm.
+    #[test]
+    fn sanitize_path_segment_converges_with_go() {
+        assert_eq!(sanitize_path_segment(".."), "invalid-5ec1f7e700f37c3d");
+        assert_eq!(sanitize_path_segment("."), "invalid-cdb4ee2aea69cc6a");
+        assert_eq!(
+            sanitize_path_segment("../../../../authority/keys"),
+            "invalid-c492f5b66018643e"
+        );
     }
 }

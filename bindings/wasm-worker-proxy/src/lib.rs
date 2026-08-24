@@ -113,7 +113,10 @@ pub enum ProxyError {
 
 impl From<entity_wasm_worker_protocol::WireError> for ProxyError {
     fn from(e: entity_wasm_worker_protocol::WireError) -> Self {
-        ProxyError::Worker { kind: e.kind, message: e.message }
+        ProxyError::Worker {
+            kind: e.kind,
+            message: e.message,
+        }
     }
 }
 
@@ -202,9 +205,7 @@ pub enum ChangeEvent {
     /// Consumer missed `count` events because the event channel was
     /// full. Mirror state in the proxy is still authoritative — resync
     /// via `cache_list` and continue consuming.
-    Lagged {
-        count: u64,
-    },
+    Lagged { count: u64 },
 }
 
 const EVENT_CHANNEL_CAPACITY: usize = 64;
@@ -252,8 +253,7 @@ pub struct InspectRouteRegistry {
     next_id: u64,
 }
 
-type InspectCallback =
-    std::rc::Rc<dyn Fn(&entity_wasm_worker_protocol::InspectFact)>;
+type InspectCallback = std::rc::Rc<dyn Fn(&entity_wasm_worker_protocol::InspectFact)>;
 
 /// Returned by [`WorkerProxy::install_inspect_sink`]. Drop unregisters
 /// the sink and, if it was the last sink for that peer, posts
@@ -292,8 +292,10 @@ impl<T: Transport + 'static> Drop for InspectSinkHandle<T> {
                 peer_id: self.peer_id.clone(),
                 enabled: false,
             };
-            // Don't await — drop must be sync.
-            let _ = self.proxy_transport.send_request(req);
+            // Don't await — drop must be sync. `send_request` posts the
+            // message synchronously and hands back only the response
+            // channel, so dropping it discards the reply, not the send.
+            drop(self.proxy_transport.send_request(req));
         }
     }
 }
@@ -323,7 +325,10 @@ impl<T: Transport + 'static> WorkerProxy<T> {
 
         // Init handshake.
         let request_id = proxy.alloc_request_id();
-        let init_request = Request::Init { request_id, params: init };
+        let init_request = Request::Init {
+            request_id,
+            params: init,
+        };
         let rx = proxy.transport.send_request(init_request);
         match rx.await {
             Ok(Response::Ready {
@@ -418,7 +423,9 @@ impl<T: Transport + 'static> WorkerProxy<T> {
                 peer_id: peer_id.clone(),
                 enabled: true,
             };
-            let _ = self.transport.send_request(req);
+            // Fire-and-forget: the send is synchronous inside
+            // `send_request`; we discard only the response channel.
+            drop(self.transport.send_request(req));
         }
         InspectSinkHandle {
             proxy_transport: self.transport.clone(),
@@ -483,7 +490,9 @@ fn try_send_event(entry: &mut SubscriptionEntry, ev: ChangeEvent) {
     // Flush pending lag before the new event so consumers learn about
     // the gap in the right order.
     if entry.pending_lag > 0 {
-        let lagged = ChangeEvent::Lagged { count: entry.pending_lag };
+        let lagged = ChangeEvent::Lagged {
+            count: entry.pending_lag,
+        };
         if tx.try_send(lagged).is_err() {
             // Still full — the new event also can't go through; tally
             // it and bail. `pending_lag` stays set.
@@ -528,7 +537,11 @@ async fn demultiplex(
                 // sub_id unknown → registry entry was removed (SubHandle
                 // dropped, or SubscriptionLost arrived earlier). Drop event.
             }
-            Event::Change { sub_id, path, new_entity } => {
+            Event::Change {
+                sub_id,
+                path,
+                new_entity,
+            } => {
                 if let Some(entry) = reg.entries.get_mut(&sub_id) {
                     if !entry.snapshot_received {
                         // Invariant #1: snapshot must arrive first.
@@ -827,10 +840,19 @@ impl<T: Transport> WorkerProxy<T> {
             return Err(ProxyError::Terminated);
         }
         let request_id = self.alloc_id();
-        let request = Request::PutCas { request_id, peer_id, path, entity, expected };
+        let request = Request::PutCas {
+            request_id,
+            peer_id,
+            path,
+            entity,
+            expected,
+        };
         let rx = self.transport.send_request(request);
         match rx.await {
-            Ok(Response::PutCas { request_id: _, result }) => result.map_err(ProxyError::from),
+            Ok(Response::PutCas {
+                request_id: _,
+                result,
+            }) => result.map_err(ProxyError::from),
             Ok(other) => Err(ProxyError::UnexpectedResponse(format!("{:?}", other))),
             Err(_) => Err(ProxyError::Cancelled),
         }
@@ -841,10 +863,7 @@ impl<T: Transport> WorkerProxy<T> {
     /// the worker installed. The seed is the consumer's responsibility
     /// to persist (typically via localStorage) for reload survival —
     /// the host does NOT retain it server-side.
-    pub async fn create_peer(
-        &self,
-        label: Option<String>,
-    ) -> Result<CreatePeerOk, ProxyError> {
+    pub async fn create_peer(&self, label: Option<String>) -> Result<CreatePeerOk, ProxyError> {
         if self.terminated.get() {
             return Err(ProxyError::Terminated);
         }
@@ -852,7 +871,10 @@ impl<T: Transport> WorkerProxy<T> {
         let request = Request::CreatePeer { request_id, label };
         let rx = self.transport.send_request(request);
         match rx.await {
-            Ok(Response::CreatePeer { request_id: _, result }) => result.map_err(ProxyError::from),
+            Ok(Response::CreatePeer {
+                request_id: _,
+                result,
+            }) => result.map_err(ProxyError::from),
             Ok(other) => Err(ProxyError::UnexpectedResponse(format!("{:?}", other))),
             Err(_) => Err(ProxyError::Cancelled),
         }
@@ -865,10 +887,16 @@ impl<T: Transport> WorkerProxy<T> {
             return Err(ProxyError::Terminated);
         }
         let request_id = self.alloc_id();
-        let request = Request::DeletePeer { request_id, peer_id };
+        let request = Request::DeletePeer {
+            request_id,
+            peer_id,
+        };
         let rx = self.transport.send_request(request);
         match rx.await {
-            Ok(Response::DeletePeer { request_id: _, result }) => match result {
+            Ok(Response::DeletePeer {
+                request_id: _,
+                result,
+            }) => match result {
                 None => Ok(()),
                 Some(e) => Err(ProxyError::from(e)),
             },
@@ -889,10 +917,17 @@ impl<T: Transport> WorkerProxy<T> {
             return Err(ProxyError::Terminated);
         }
         let request_id = self.alloc_id();
-        let request = Request::SetMetadata { request_id, peer_id, metadata };
+        let request = Request::SetMetadata {
+            request_id,
+            peer_id,
+            metadata,
+        };
         let rx = self.transport.send_request(request);
         match rx.await {
-            Ok(Response::SetMetadata { request_id: _, result }) => match result {
+            Ok(Response::SetMetadata {
+                request_id: _,
+                result,
+            }) => match result {
                 None => Ok(()),
                 Some(e) => Err(ProxyError::from(e)),
             },
@@ -915,10 +950,47 @@ impl<T: Transport> WorkerProxy<T> {
             return Err(ProxyError::Terminated);
         }
         let request_id = self.alloc_id();
-        let request = Request::ConnectPeer { request_id, peer_id, address };
+        let request = Request::ConnectPeer {
+            request_id,
+            peer_id,
+            address,
+        };
         let rx = self.transport.send_request(request);
         match rx.await {
-            Ok(Response::ConnectPeer { request_id: _, result }) => result.map_err(ProxyError::from),
+            Ok(Response::ConnectPeer {
+                request_id: _,
+                result,
+            }) => result.map_err(ProxyError::from),
+            Ok(other) => Err(ProxyError::UnexpectedResponse(format!("{:?}", other))),
+            Err(_) => Err(ProxyError::Cancelled),
+        }
+    }
+
+    /// Evict the pooled connection `peer_id → remote_peer_id` inside the
+    /// worker, so the next `connect_peer`/`execute` re-handshakes fresh.
+    /// This is how a peer picks up a capability grant authored *after* it
+    /// connected (the granter re-mints at authenticate; a pooled reuse keeps
+    /// the stale cap). Evicting an absent connection is success (idempotent).
+    pub async fn disconnect_peer(
+        &self,
+        peer_id: String,
+        remote_peer_id: String,
+    ) -> Result<(), ProxyError> {
+        if self.terminated.get() {
+            return Err(ProxyError::Terminated);
+        }
+        let request_id = self.alloc_id();
+        let request = Request::DisconnectPeer {
+            request_id,
+            peer_id,
+            remote_peer_id,
+        };
+        let rx = self.transport.send_request(request);
+        match rx.await {
+            Ok(Response::DisconnectPeer {
+                request_id: _,
+                result,
+            }) => result.map_or(Ok(()), |e| Err(ProxyError::from(e))),
             Ok(other) => Err(ProxyError::UnexpectedResponse(format!("{:?}", other))),
             Err(_) => Err(ProxyError::Cancelled),
         }
@@ -1057,8 +1129,13 @@ impl<T: Transport> Drop for SubHandle<T> {
         }
         let request_id = self.next_request_id.get();
         self.next_request_id.set(request_id.wrapping_add(1));
-        let req = Request::Unsubscribe { request_id, sub_id: self.sub_id };
-        let _ = self.transport.send_request(req);
+        let req = Request::Unsubscribe {
+            request_id,
+            sub_id: self.sub_id,
+        };
+        // Sync fire-and-forget in `Drop`: the post happens inside
+        // `send_request`; only the response channel is discarded.
+        drop(self.transport.send_request(req));
     }
 }
 
@@ -1172,11 +1249,19 @@ impl<T: Transport + 'static> WorkerProxy<T> {
         // Send the subscribe request. On failure, roll back the registry
         // entry so we don't leak a phantom subscription.
         let request_id = self.alloc_id();
-        let request = Request::Subscribe { request_id, sub_id, peer_id, prefix };
+        let request = Request::Subscribe {
+            request_id,
+            sub_id,
+            peer_id,
+            prefix,
+        };
         let rx = self.transport.send_request(request);
         let response = rx.await;
         match response {
-            Ok(Response::Subscribe { request_id: _, result }) => {
+            Ok(Response::Subscribe {
+                request_id: _,
+                result,
+            }) => {
                 if let Some(e) = result {
                     self.subscriptions.borrow_mut().entries.remove(&sub_id);
                     return Err(ProxyError::from(e));
@@ -1254,11 +1339,19 @@ impl<T: Transport + 'static> WorkerProxy<T> {
         }
 
         let request_id = self.alloc_id();
-        let request = Request::Subscribe { request_id, sub_id, peer_id, prefix };
+        let request = Request::Subscribe {
+            request_id,
+            sub_id,
+            peer_id,
+            prefix,
+        };
         let rx = self.transport.send_request(request);
         let response = rx.await;
         match response {
-            Ok(Response::Subscribe { request_id: _, result }) => {
+            Ok(Response::Subscribe {
+                request_id: _,
+                result,
+            }) => {
                 if let Some(e) = result {
                     self.subscriptions.borrow_mut().entries.remove(&sub_id);
                     return Err(ProxyError::from(e));
@@ -1281,7 +1374,11 @@ impl<T: Transport + 'static> WorkerProxy<T> {
             subscriptions: self.subscriptions.clone(),
             terminated: self.terminated.clone(),
         };
-        Ok((handle, NotifyChannel { rx: notify_rx }, EventChannel { rx: event_rx }))
+        Ok((
+            handle,
+            NotifyChannel { rx: notify_rx },
+            EventChannel { rx: event_rx },
+        ))
     }
 
     /// Tear down the worker.

@@ -293,7 +293,11 @@ impl NetworkHandler {
         let session_id = new_session_id();
         let session = Arc::new(Session {
             peer_id: peer_id.to_string(),
-            chain_id: format!("network/maintain/{}", session_id),
+            // §3.11: a chain_id is a SINGLE path segment — it IS a segment of
+            // the §3.10.6 marker path .../lost/{chain_id}/{step_index}/...,
+            // so §4.1's literal "network/maintain/{sid}" forks the marker tree
+            // into extra levels. The value is opaque (nothing parses it).
+            chain_id: format!("network-maintain-{}", session_id),
             session_id,
             state: Mutex::new(SessionState {
                 params,
@@ -377,6 +381,15 @@ impl NetworkHandler {
 
 fn new_session_id() -> String {
     format!("{:016x}", rand::random::<u64>())
+}
+
+/// Monotonic-ish discriminator for handler-named request ids (ruling 9 /
+/// F1 — a dispatch needs a real id, not a name for its category).
+fn now_nanos() -> u128 {
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------
@@ -882,14 +895,25 @@ impl NetworkHandler {
             None,
             grant_hash,
         )?;
-        // One-shot backoff resident re-EXECUTing maintain-peer with the
-        // session's original request bytes.
+        // Standing backoff resident re-EXECUTing maintain-peer with the
+        // session's original request bytes (arch ruling 1).
+        //
+        // Was one-shot per §4.1's literal, which stalled the retry loop at 2
+        // attempts on all three seats: a one-shot cannot re-arm itself, because
+        // the re-install lands inside the dispatch while the advance's consume
+        // runs after it and deletes the path. Ordering, not timing. Standing is
+        // coherent for Rust for the same reason it is for Go — the execution
+        // count was never our pacing authority; `schedule_backoff_advance`'s
+        // derived §2.2 timer is, and the continuation is only the dispatch
+        // vehicle it advances. Nothing consumes it, so nothing races to
+        // re-create it. Residency is bounded by the session: `release-peer`
+        // deletes the graph.
         self.bind_continuation(
             session,
             &self.backoff_path(&peer_id),
             "maintain-peer",
             raw,
-            Some(1),
+            None,
             grant_hash,
         )
     }
@@ -1065,8 +1089,9 @@ impl NetworkHandler {
 
     // --- §2.2 backoff pacing (impl-internal timer + attempt counter) ------
 
-    /// Re-installs the one-shot backoff continuation and schedules its
-    /// delayed advance per the session's §2.2 backoff config.
+    /// Re-installs the standing backoff continuation (idempotent — the
+    /// advance no longer consumes it, ruling 1) and schedules its delayed
+    /// advance per the session's §2.2 backoff config.
     fn arm_backoff_retry(
         &self,
         ctx: &HandlerContext,
@@ -1082,7 +1107,7 @@ impl NetworkHandler {
             &self.backoff_path(&session.peer_id),
             "maintain-peer",
             raw,
-            Some(1),
+            None,
             grant_hash,
         )?;
         self.schedule_backoff_advance(session, link);
@@ -1141,10 +1166,25 @@ impl NetworkHandler {
                 else {
                     return;
                 };
+                // Ruling 11: this dispatch belongs to a known chain — the
+                // session's — so the handler MUST say so rather than let the
+                // advance mint a fresh one per attempt. Without it, each
+                // retry's marker lands under a different {chain_id} and the
+                // tree forks once per attempt instead of carrying one node
+                // per relationship.
+                // The handler can name its own dispatch better than the
+                // seam's fallback can (ruling 9 / F1) — this is the retry's
+                // step, so `{step_index}` should say so. Mirrors Go's
+                // `network-{operation}-{nanos}` (`ext/network/wiring.go`).
                 let opts = ExecuteOptions {
                     resource: Some(entity_capability::ResourceTarget {
                         targets: vec![backoff_path.clone()],
                         exclude: Vec::new(),
+                    }),
+                    request_id: Some(format!("network-backoff-advance-{}", now_nanos())),
+                    bounds: Some(entity_handler::Bounds {
+                        chain_id: Some(session_for_task.chain_id.clone()),
+                        ..Default::default()
                     }),
                     ..Default::default()
                 };

@@ -155,7 +155,7 @@ pub(crate) struct RevisionVersionInfo {
 /// pair on the main thread.
 pub(crate) struct SubscriptionPayload {
     pub handle: entity_sdk::subscription::L1SubscriptionHandle,
-    pub queue: Arc<Mutex<std::collections::VecDeque<(String, Vec<u8>)>>>,
+    pub queue: crate::entity_subscription::EventQueue,
 }
 
 /// A handle for one in-flight async op. Emits `completed(result)` once

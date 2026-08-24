@@ -182,6 +182,24 @@ enum PeerAction {
         /// root. Matches Go peer's `--publish-descriptors`.
         #[arg(long)]
         publish_descriptors: bool,
+        /// EXTENSION-NETWORK §2.3 keepalive `interval_ms` for the §5.4
+        /// outbound ping loops (0 = spec default 30000). Short values
+        /// (e.g. 1500) make the suspect→disconnected escalation observable
+        /// in seconds — pair with `validate-peer -keepalive-envelope-ms`
+        /// for the liveness harness. Matches Go peer's
+        /// `-keepalive-interval-ms` and Python's `--keepalive-interval-ms`.
+        #[arg(long, default_value_t = 0)]
+        keepalive_interval_ms: u64,
+        /// EXTENSION-NETWORK §2.3 keepalive `timeout_ms` per ping
+        /// (0 = spec default 10000). Matches Go peer's
+        /// `-keepalive-timeout-ms`.
+        #[arg(long, default_value_t = 0)]
+        keepalive_timeout_ms: u64,
+        /// EXTENSION-NETWORK §2.3 consecutive misses before the
+        /// disconnected/keepalive-miss demotion (0 = spec default 3).
+        /// Matches Go peer's `-keepalive-max-missed`.
+        #[arg(long, default_value_t = 0)]
+        keepalive_max_missed: u32,
     },
     /// List all peers
     List,
@@ -302,6 +320,9 @@ async fn main() -> anyhow::Result<()> {
                     validate,
                     publish_root,
                     publish_descriptors,
+                    keepalive_interval_ms,
+                    keepalive_timeout_ms,
+                    keepalive_max_missed,
                 } => {
                     commands::peer::start(
                         &name,
@@ -322,6 +343,11 @@ async fn main() -> anyhow::Result<()> {
                         validate,
                         publish_root,
                         publish_descriptors,
+                        commands::peer::KeepaliveOverrides {
+                            interval_ms: keepalive_interval_ms,
+                            timeout_ms: keepalive_timeout_ms,
+                            max_missed: keepalive_max_missed,
+                        },
                     )
                     .await?
                 }

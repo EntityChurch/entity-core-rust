@@ -60,6 +60,14 @@ pub struct QueryResults {
     pub has_more: bool,
 }
 
+/// One `(subgraph_path, root_expression_path, status)` row per installed
+/// subgraph, as returned by [`PeerBinding::compute_list`].
+pub type ComputeListResult = Result<Vec<(String, String, String)>, String>;
+
+/// One subgraph's metadata as labeled `(name, value)` rows, or `None` when
+/// no subgraph is bound at the queried path ([`PeerBinding::compute_show`]).
+pub type ComputeShowResult = Result<Option<Vec<(String, String)>>, String>;
+
 /// Embedding adapter exposing peer-router state to crate-side verbs.
 ///
 /// The methods returning owned values (`Vec<String>`, `String`,
@@ -268,7 +276,7 @@ pub trait PeerBinding {
     fn compute_list(
         &self,
         _peer_id: &str,
-    ) -> crate::runtime::BoxFuture<'static, Result<Vec<(String, String, String)>, String>> {
+    ) -> crate::runtime::BoxFuture<'static, ComputeListResult> {
         Box::pin(async { Ok(Vec::new()) })
     }
 
@@ -281,7 +289,7 @@ pub trait PeerBinding {
         &self,
         _peer_id: &str,
         _subgraph_path: String,
-    ) -> crate::runtime::BoxFuture<'static, Result<Option<Vec<(String, String)>>, String>> {
+    ) -> crate::runtime::BoxFuture<'static, ComputeShowResult> {
         Box::pin(async { Ok(None) })
     }
 

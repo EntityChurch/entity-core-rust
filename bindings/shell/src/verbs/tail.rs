@@ -6,9 +6,9 @@
 //! `AppActionSink`:
 //!
 //! - `tail`   → `InstallTail { prefix }` request + dispatched-state
-//!              Info row.
+//!   Info row.
 //! - `tails`  → reads `AppActionSink::list_tails()`; renders as a
-//!              `Listing` with "active tails (N)" header.
+//!   `Listing` with "active tails (N)" header.
 //! - `untail` → `UninstallTail { target }` request + Message ack.
 //!
 //! Per `SHELL-EXTRACTION-PHASE-1-NOTES.md` KNOT F: the streaming-Lines

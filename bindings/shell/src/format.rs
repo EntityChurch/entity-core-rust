@@ -106,11 +106,10 @@ mod tests {
     #[test]
     fn entity_data_pretty_prints_cbor_map() {
         let mut bytes = Vec::new();
-        let mut pairs = Vec::new();
-        pairs.push((
+        let pairs = vec![(
             ciborium::Value::Text("name".into()),
             ciborium::Value::Text("alice".into()),
-        ));
+        )];
         ciborium::into_writer(&ciborium::Value::Map(pairs), &mut bytes).unwrap();
         let out = entity_data(&bytes);
         assert!(out.contains("\"name\": \"alice\""), "got: {}", out);

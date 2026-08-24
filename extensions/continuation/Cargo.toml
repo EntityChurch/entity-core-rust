@@ -15,6 +15,7 @@ entity-protocol.workspace = true
 entity-types.workspace = true
 async-trait.workspace = true
 ciborium.workspace = true
+rand.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { version = "1", features = ["sync"] }

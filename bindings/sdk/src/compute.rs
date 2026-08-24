@@ -72,7 +72,7 @@ pub const OP_UNINSTALL: &str = "uninstall";
 
 /// Tree path under which the install handler writes subgraph metadata
 /// (`system/compute/processes/{subgraph_id}`). Used by [`ComputeOps::list`]
-/// + [`ComputeOps::show`] to walk installed subgraphs without needing a
+/// and [`ComputeOps::show`] to walk installed subgraphs without needing a
 /// dedicated `list`/`show` handler op. Public so a consumer building the
 /// equivalent `list` as an L1 query (path-prefix scope) or a `show` get
 /// names the same prefix.

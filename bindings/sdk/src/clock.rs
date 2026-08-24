@@ -320,7 +320,7 @@ fn decode_clock_state(entity: &Entity) -> Result<ClockState, SdkError> {
                 });
             }
             Some("hlc") => {
-                hlc = v.as_map().and_then(|m| decode_hlc_fields(m));
+                hlc = v.as_map().and_then(decode_hlc_fields);
             }
             _ => {}
         }

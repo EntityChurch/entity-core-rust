@@ -30,7 +30,7 @@
 //! transport drops the closure and the worker; the worker is then
 //! garbage-collected by the browser.
 
-use entity_wasm_worker_protocol::{Event, Request, Response, RequestId};
+use entity_wasm_worker_protocol::{Event, Request, RequestId, Response};
 use futures::channel::{mpsc, oneshot};
 use js_sys::Uint8Array;
 use std::cell::RefCell;
@@ -224,6 +224,7 @@ fn request_request_id(req: &Request) -> RequestId {
         | Request::DeletePeer { request_id, .. }
         | Request::SetMetadata { request_id, .. }
         | Request::ConnectPeer { request_id, .. }
+        | Request::DisconnectPeer { request_id, .. }
         | Request::Get { request_id, .. }
         | Request::Put { request_id, .. }
         | Request::PutCas { request_id, .. }
@@ -254,6 +255,7 @@ fn response_request_id(resp: &Response) -> RequestId {
         | Response::DeletePeer { request_id, .. }
         | Response::SetMetadata { request_id, .. }
         | Response::ConnectPeer { request_id, .. }
+        | Response::DisconnectPeer { request_id, .. }
         | Response::Get { request_id, .. }
         | Response::Put { request_id, .. }
         | Response::PutCas { request_id, .. }
@@ -279,8 +281,8 @@ fn response_request_id(resp: &Response) -> RequestId {
 // WorkerProxy::spawn convenience
 // ---------------------------------------------------------------------------
 
-use entity_wasm_worker_protocol::InitParams;
 use crate::WorkerProxy;
+use entity_wasm_worker_protocol::InitParams;
 
 impl WorkerProxy<WebTransport> {
     /// Convenience wrapper: spawn a `Worker` from `worker_url` and run the
@@ -295,8 +297,8 @@ impl WorkerProxy<WebTransport> {
     /// `Worker::new_with_options` (e.g., `type: "module"` for ESM workers)
     /// or want to share a single `Worker` across multiple consumers.
     pub async fn spawn(worker_url: &str, init: InitParams) -> Result<Self, ProxyError> {
-        let worker = Worker::new(worker_url)
-            .map_err(|e| ProxyError::WorkerSpawn(format!("{e:?}")))?;
+        let worker =
+            Worker::new(worker_url).map_err(|e| ProxyError::WorkerSpawn(format!("{e:?}")))?;
         Self::new(WebTransport::new(worker), init).await
     }
 }

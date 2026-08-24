@@ -82,8 +82,8 @@ use crate::peer_node::EntityPeer;
 ///    `Gd<EntityPeer>`).
 ///
 /// Direct `EntityPeer` instantiation (test scaffolding that doesn't go
-/// through `spawn_peer`) keeps working — `EntityPeer::start()` builds
-/// + wraps its own `Arc` without SDK involvement (`peer_node.rs`
+/// through `spawn_peer`) keeps working — `EntityPeer::start()` builds and
+/// wraps its own `Arc` without SDK involvement (`peer_node.rs`
 /// `RuntimeRef::Owned` path also takes over when no handle has been
 /// injected). The SDK-mediated path is `spawn_peer`-only.
 ///
@@ -198,7 +198,7 @@ impl EntityPeerManager {
     /// on validation or build failure. The peer is added as a child
     /// of this manager so its `_process` runs.
     #[func]
-    fn spawn_peer(&mut self, config: Dictionary) -> Variant {
+    fn spawn_peer(&mut self, config: VarDictionary) -> Variant {
         let identity_source = dict_get_string(&config, "identity_source")
             .unwrap_or_else(|| "new_keypair".to_string());
         if identity_source != "new_keypair" {
@@ -499,9 +499,9 @@ impl EntityPeerManager {
     /// SDK's phantom primary, which the manager intentionally treats as
     /// not-a-real-peer for the Godot surface).
     #[func]
-    fn peer_metadata(&self, peer_id: GString) -> Dictionary {
+    fn peer_metadata(&self, peer_id: GString) -> VarDictionary {
         let pid = peer_id.to_string();
-        let mut out = Dictionary::new();
+        let mut out = VarDictionary::new();
         // Filter out the SDK phantom: only peers we have a Godot
         // EntityPeer for are user-visible.
         if !self.peers.contains_key(&pid) {
@@ -524,7 +524,7 @@ impl EntityPeerManager {
 
 /// Helper: pull a String value from a Godot Dictionary by string key.
 /// Returns `None` if the key is missing or the value isn't a String.
-fn dict_get_string(dict: &Dictionary, key: &str) -> Option<String> {
+fn dict_get_string(dict: &VarDictionary, key: &str) -> Option<String> {
     let v = dict.get(GString::from(key).to_variant())?;
     v.try_to::<GString>().ok().map(|g| g.to_string())
 }

@@ -1,6 +1,6 @@
 # entity-core-rust — status
 
-_Updated: 2026-06-30 · public: v0.8.0 (master)_
+_Updated: 2026-07-15 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -35,9 +35,21 @@ just self-tested.
 
 ## Where we left off
 
-Stable at the v0.8.0 research-preview line; no code or protocol changes are in
-flight. Next substantive work is cross-peer subscription delivery to a Rust
-subscriber.
+_2026-07-16:_ NETWORK Amendment 12 **rung 3** landed on `dev` — the
+`system/network` maintain-peer reconnect lifecycle in a new
+`extensions/network` crate, composed on the rungs-1+2 §A3 liveness floor
+(`docs/status/HANDOFF-2026-07-15-network-a12-rung3-rust.md`). Rust's rung-3
+anchor passes at the spec-default ~100s envelope. Since then, on `dev`:
+`entity peer start` gained the §2.3 `--keepalive-*-ms` overrides (Rust's half
+of the cohort's Ask B — test-speed tooling, not conformance); the
+wasm-worker stack gained `DisconnectPeer` connection eviction at protocol
+**v10**; and the lint gate was widened — `cargo clippy --workspace` is now
+`-D warnings` clean across every `bindings/*` crate for the first time
+(`make clippy` only ever covered default-members, which excludes them), with
+`cargo fmt --check` clean workspace-wide.
+
+Still queued: cross-peer subscription delivery to a Rust subscriber; the
+§7.2 second-half arch call and the rung-3 convergence pass (tracker #7).
 
 The most recent substantive engineering thread before the release was
 **cross-peer subscription delivery** (see Done recently / Waiting on): the

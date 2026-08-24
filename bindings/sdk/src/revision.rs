@@ -150,7 +150,7 @@ pub struct MergeResult {
 /// `system/envelope` carrier.
 ///
 /// Use case: a peer pulling a remote prefix wants the version chain
-/// + the roots so it can plan a `fetch-entities` follow-up for any
+/// and the roots so it can plan a `fetch-entities` follow-up for any
 /// missing leaves.
 #[derive(Debug, Clone)]
 pub struct RevisionFetch {
@@ -1688,18 +1688,13 @@ fn encode_revision_config(c: &RevisionConfigInput) -> ciborium::Value {
     if !c.exclude.is_empty() {
         fields.push((
             entity_ecf::text("exclude"),
-            ciborium::Value::Array(c.exclude.iter().map(|s| entity_ecf::text(s)).collect()),
+            ciborium::Value::Array(c.exclude.iter().map(entity_ecf::text).collect()),
         ));
     }
     if !c.exclude_types.is_empty() {
         fields.push((
             entity_ecf::text("exclude_types"),
-            ciborium::Value::Array(
-                c.exclude_types
-                    .iter()
-                    .map(|s| entity_ecf::text(s))
-                    .collect(),
-            ),
+            ciborium::Value::Array(c.exclude_types.iter().map(entity_ecf::text).collect()),
         ));
     }
     if let Some(ref mo) = c.merge_order {
@@ -1835,16 +1830,14 @@ fn decode_merge_config_result(entity: &Entity) -> Result<MergeConfigResult, SdkE
 /// decoder) and the decoded `included` entities. Mirrors the
 /// envelope-unwrap pattern in `decode_log_result` and
 /// `decode_fetch_diff_result`.
-fn decode_envelope(
-    entity: &Entity,
-    op_name: &str,
-) -> Result<
-    (
-        Vec<(ciborium::Value, ciborium::Value)>,
-        std::collections::HashMap<Hash, Entity>,
-    ),
-    SdkError,
-> {
+/// The decoded envelope body: the result map's key/value pairs (left to each
+/// caller's decoder) paired with the decoded `included` entities by hash.
+type DecodedEnvelope = (
+    Vec<(ciborium::Value, ciborium::Value)>,
+    std::collections::HashMap<Hash, Entity>,
+);
+
+fn decode_envelope(entity: &Entity, op_name: &str) -> Result<DecodedEnvelope, SdkError> {
     let val: ciborium::Value = ciborium::de::from_reader(entity.data.as_slice())
         .map_err(|e| SdkError::HandlerError(format!("decode {} envelope: {}", op_name, e)))?;
     let envelope_map = val

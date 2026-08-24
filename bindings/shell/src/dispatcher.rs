@@ -59,7 +59,7 @@ pub const VERBS: &[&str] = &[
 
 /// Returns `true` when `verb` is recognized by the crate's dispatcher.
 pub fn handles(verb: &str) -> bool {
-    VERBS.iter().any(|v| *v == verb)
+    VERBS.contains(&verb)
 }
 
 /// Parse a submitted line into `(verb, args)`. Returns `None` for

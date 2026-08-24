@@ -15,7 +15,7 @@ use entity_sdk::identity_bootstrap::{BootstrapResult, BootstrapStatus};
 ///                    quorum_id, controller_cert, peer_config_path,
 ///                    issued_caps: [PackedByteArray] }
 pub(crate) fn bootstrap_result_to_variant(r: BootstrapResult) -> Variant {
-    let mut dict = Dictionary::new();
+    let mut dict = VarDictionary::new();
     match r {
         BootstrapResult::AlreadyBootstrapped {
             identity_hash,
@@ -37,7 +37,7 @@ pub(crate) fn bootstrap_result_to_variant(r: BootstrapResult) -> Variant {
             dict.set("quorum_id", hash_to_pba(&quorum_id));
             dict.set("controller_cert", hash_to_pba(&controller_cert));
             dict.set("peer_config_path", GString::from(peer_config_path.as_str()));
-            let mut caps = VariantArray::new();
+            let mut caps = VarArray::new();
             for cap in issued_caps {
                 caps.push(&hash_to_pba(&cap).to_variant());
             }
@@ -51,8 +51,8 @@ pub(crate) fn bootstrap_result_to_variant(r: BootstrapResult) -> Variant {
 ///
 /// Shape: { bootstrapped: bool, identity_hash: PBA,
 ///          quorum_id: PBA|null, peer_config_path: String|null }
-pub(crate) fn bootstrap_status_to_dict(s: BootstrapStatus) -> Dictionary {
-    let mut dict = Dictionary::new();
+pub(crate) fn bootstrap_status_to_dict(s: BootstrapStatus) -> VarDictionary {
+    let mut dict = VarDictionary::new();
     dict.set("bootstrapped", s.bootstrapped);
     dict.set("identity_hash", hash_to_pba(&s.identity_hash));
     match s.quorum_id {

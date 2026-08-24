@@ -91,6 +91,11 @@ pub extern "C" fn entity_get_hash(handle: Handle) -> EntityCoreBuffer {
 }
 
 /// Validate an entity's content hash.
+// The large `Err` is `entity_entity::EntityError`, a core crate's public
+// typed error; boxing it to satisfy the lint would be an API break rippling
+// through every consumer, which this cold one-shot FFI validate does not
+// justify. The `Result` is consumed immediately below, never propagated.
+#[allow(clippy::result_large_err)]
 #[no_mangle]
 pub extern "C" fn entity_validate(handle: Handle) -> EntityCoreError {
     ffi_fn!(

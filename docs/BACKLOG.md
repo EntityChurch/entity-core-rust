@@ -175,6 +175,19 @@ is not `Clone`). Making them owning futures requires reworking those
 `Pin<Box<dyn Future + 'static>>` boundary (regression guard:
 `detached_futures_are_static_boxable` in `bindings/sdk/src/sdk.rs`).
 
+**A live consumer already hits this — it is no longer hypothetical.**
+`wasm-worker-host`'s eight dispatched ops (`handle_get`/`put`/`list`/`has`/
+`remove`/`execute`/`query`/`count`) must hold `state.borrow()` across their
+`.await`, because the SDK op borrows the `PeerContext` and `PeerContext` is
+not `Clone` — so the borrow cannot be released before the await. This is a
+**latent panic, not a lint nit**: `run_worker`'s `onmessage` `spawn_local`s
+every request independently, so a concurrent `borrow_mut()` op
+(`Init`/`CreatePeer`/`SetMetadata`) landing while one of these is parked at
+its await aborts the worker with `BorrowMutError`. Tracked in place as a
+crate-level `#![allow(clippy::await_holding_refcell_ref)]` in
+`bindings/wasm-worker-host/src/lib.rs`; **removing that allow is the
+acceptance test for this item.**
+
 ### Storage-concurrency posture docs + SQLite pool-split
 cross-impl Ask 3. `SqliteContentStore`/`SqliteLocationIndex` use
 `Arc<Mutex<Connection>>` — all reads serialize against all writes,

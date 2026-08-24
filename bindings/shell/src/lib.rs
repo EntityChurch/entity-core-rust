@@ -13,7 +13,7 @@
 //!
 //! Phase 3a-cd: `pwd` + `cd` lifted; `PeerBinding` + `SelectionSink`
 //! traits materialized against `cd`'s concrete needs (alias expansion
-//! + post-navigation publish). Subsequent verb lifts grow the
+//! and post-navigation publish). Subsequent verb lifts grow the
 //! `PeerBinding` surface (tree ops, dispatch, async query) without
 //! revisiting the trait boundary's shape.
 

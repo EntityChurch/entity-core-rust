@@ -539,7 +539,7 @@ impl PeerContext {
                     entity_ecf::text("updated"),
                     entity_ecf::text("deleted"),
                 ],
-                Some(es) => es.iter().map(|s| entity_ecf::text(s)).collect(),
+                Some(es) => es.iter().map(entity_ecf::text).collect(),
             };
             let mut params_map: Vec<(ciborium::Value, ciborium::Value)> = vec![
                 (
@@ -869,6 +869,12 @@ impl PeerContext {
     }
 }
 
+// Deliberate `-> impl Future + 'static` rather than `async fn`: the explicit
+// bound is the signature-level guarantee that this future outlives the
+// borrowed accessor, so a later borrowed param fails to compile instead of
+// silently producing a non-'static future the `BoxFuture<'static>` consumers
+// can't take (see AGENTS.md, "SDK 'static futures").
+#[allow(clippy::manual_async_fn)]
 fn unsubscribe_dispatch(
     shared: Arc<PeerShared>,
     subscription_id: String,
@@ -1644,7 +1650,7 @@ mod tests {
 
         // Let the engine flush deliveries.
         for _ in 0..50 {
-            if events.lock().unwrap().len() >= 1 {
+            if !events.lock().unwrap().is_empty() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;

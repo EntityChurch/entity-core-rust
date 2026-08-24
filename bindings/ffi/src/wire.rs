@@ -9,7 +9,7 @@ use crate::types::{EntityCoreBuffer, Handle};
 #[no_mangle]
 pub extern "C" fn entity_encode(handle: Handle) -> EntityCoreBuffer {
     ffi_fn!({
-        match ENTITIES.with(handle, |e| entity_wire::encode_entity(e)) {
+        match ENTITIES.with(handle, entity_wire::encode_entity) {
             Some(bytes) => EntityCoreBuffer::from_vec(bytes),
             None => {
                 set_last_error("invalid entity handle");

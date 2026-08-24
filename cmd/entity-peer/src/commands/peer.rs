@@ -4,7 +4,7 @@ use std::fs;
 
 use entity_core::crypto::IdentityKeypair;
 use entity_core::peer::transport::Listener;
-use entity_core::peer::{PeerBuilder, PeerConfig};
+use entity_core::peer::{keepalive, PeerBuilder, PeerConfig};
 
 use crate::config;
 
@@ -56,6 +56,41 @@ fn load_peer_config(name: &str) -> anyhow::Result<config::PeerToml> {
     Ok(peer_toml)
 }
 
+/// EXTENSION-NETWORK §2.3 keepalive overrides from the CLI.
+///
+/// Zero means "keep this field's spec default" — the override is per-field,
+/// not all-or-nothing, so `--keepalive-interval-ms 1500` alone shortens the
+/// ping cadence while `timeout_ms`/`max_missed` stay at their §2.3 defaults.
+/// This matches the Go peer's `-keepalive-*-ms` flags and Python's
+/// `--keepalive-*-ms`, which the cohort's peer-manager `--keepalive
+/// interval,timeout,max_missed` triple renders per dialect.
+pub struct KeepaliveOverrides {
+    pub interval_ms: u64,
+    pub timeout_ms: u64,
+    pub max_missed: u32,
+}
+
+impl KeepaliveOverrides {
+    /// Apply the non-zero fields onto the §2.3 defaults. Returns `None` when
+    /// nothing was set, so the caller leaves the builder untouched.
+    fn resolve(&self) -> Option<keepalive::KeepaliveConfig> {
+        if self.interval_ms == 0 && self.timeout_ms == 0 && self.max_missed == 0 {
+            return None;
+        }
+        let mut cfg = keepalive::KeepaliveConfig::default();
+        if self.interval_ms > 0 {
+            cfg.interval_ms = self.interval_ms;
+        }
+        if self.timeout_ms > 0 {
+            cfg.timeout_ms = self.timeout_ms;
+        }
+        if self.max_missed > 0 {
+            cfg.max_missed = self.max_missed;
+        }
+        Some(cfg)
+    }
+}
+
 /// Start a peer.
 #[allow(clippy::too_many_arguments)]
 pub async fn start(
@@ -77,6 +112,7 @@ pub async fn start(
     validate: bool,
     publish_root: bool,
     publish_descriptors: bool,
+    keepalive_overrides: KeepaliveOverrides,
 ) -> anyhow::Result<()> {
     // A serving scope is either a content namespace or closure-of-signed-root
     // (NETWORK §6.5.6 Amendment 10). Exactly one may be selected (clap enforces
@@ -176,6 +212,16 @@ pub async fn start(
     let mut builder = PeerBuilder::new()
         .identity_keypair(keypair)
         .config(peer_config);
+
+    // EXTENSION-NETWORK §2.3 keepalive overrides. Zero-valued fields keep
+    // their spec defaults, so an untouched CLI leaves the builder alone.
+    if let Some(ka) = keepalive_overrides.resolve() {
+        println!(
+            "Keepalive override (EXTENSION-NETWORK §2.3): interval_ms={}, timeout_ms={}, max_missed={}",
+            ka.interval_ms, ka.timeout_ms, ka.max_missed
+        );
+        builder = builder.keepalive(ka);
+    }
 
     // GUIDE-CONFORMANCE §7a opt-in (--validate). Registers the
     // system/validate/* wire-gate handlers so validate-peer can black-box

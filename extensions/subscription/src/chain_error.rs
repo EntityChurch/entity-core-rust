@@ -28,8 +28,18 @@ const REASON_PROTOCOL_ERROR: &str = "protocol_error";
 
 /// Path-safety sanitizer per EXTENSION-CONTINUATION v1.19 §3.10.5
 /// (V7 §1.4 path-segment rules). See note in module header re: duplication.
+///
+/// §3.10.5 prescribes sentinel-substitution here (raw code preserved in the
+/// body's `code` field), which is why `{reason}` collapses while the other
+/// two coordinates hash via `sanitize_path_segment` — see the continuation
+/// twin's doc comment for the full reasoning.
 pub(crate) fn sanitize_reason_segment(reason: &str) -> String {
     if reason.is_empty() {
+        return "unspecified_error".to_string();
+    }
+    // §1.4's enumeration does not name `.` / `..`; they are nonetheless
+    // traversal tokens once concatenated. Logged in docs/SPEC-AMBIGUITIES.md.
+    if reason == "." || reason == ".." {
         return "unspecified_error".to_string();
     }
     for b in reason.bytes() {
@@ -127,12 +137,20 @@ pub(crate) fn write_lost_error_marker(
     } else {
         chain_id
     };
+    // `chain_id` rides in from `bounds`, and a subscription_id can be
+    // caller-chosen — neither may name a path segment unvetted (ruling 13 /
+    // §1.4). Sanitized once, ahead of the body, so a marker's recorded
+    // coordinate always matches where it is actually bound. This site is NOT
+    // reachable by Go's probe (it needs subscription setup) — Go had the same
+    // defect at all three of its binding sites, so all three of ours are done.
+    let chain_id_segment = entity_entity::sanitize_path_segment(chain_id_segment);
+    let step_index = entity_entity::sanitize_path_segment(subscription_id);
     let target_peer_id = peer_id_from_uri(deliver_uri).unwrap_or_default();
 
     let body_fields = vec![
         (
             entity_ecf::text("chain_id"),
-            entity_ecf::text(chain_id_segment),
+            entity_ecf::text(chain_id_segment.as_ref()),
         ),
         (entity_ecf::text("code"), entity_ecf::text(reason)),
         (entity_ecf::text("reason"), entity_ecf::text(&safe_reason)),
@@ -142,7 +160,7 @@ pub(crate) fn write_lost_error_marker(
         ),
         (
             entity_ecf::text("step_index"),
-            entity_ecf::text(subscription_id),
+            entity_ecf::text(step_index.as_ref()),
         ),
         (
             entity_ecf::text("target_peer_id"),
@@ -174,7 +192,7 @@ pub(crate) fn write_lost_error_marker(
         "/{}/system/runtime/chain-errors/lost/{}/{}/{}/{}",
         local_peer_id,
         chain_id_segment,
-        subscription_id,
+        step_index,
         safe_reason,
         entity.content_hash.to_hex(),
     );

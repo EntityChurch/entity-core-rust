@@ -21,6 +21,10 @@ use godot::prelude::*;
 use entity_sdk::sdk::SubscriptionHandle;
 use entity_sdk::subscription::L1SubscriptionHandle;
 
+/// Pending `(path, content_hash)` events buffered for `poll()`, shared with
+/// the subscription callback that pushes into it.
+pub type EventQueue = Arc<Mutex<VecDeque<(String, Vec<u8>)>>>;
+
 /// Internal: which kind of subscription handle this wraps. We hold the
 /// handle only for its `Drop` side effect — never invoked beyond that —
 /// so an enum is the cleanest way to keep both flavors alive without a
@@ -45,7 +49,7 @@ enum SubKind {
 #[class(no_init, base=RefCounted)]
 pub struct EntitySubscription {
     base: Base<RefCounted>,
-    queue: Arc<Mutex<VecDeque<(String, Vec<u8>)>>>,
+    queue: EventQueue,
     /// Held to keep the underlying subscription alive. Drop = cancel.
     /// The `#[allow]` is because the field is read only by `Drop`.
     #[allow(dead_code)]
@@ -54,10 +58,7 @@ pub struct EntitySubscription {
 
 impl EntitySubscription {
     /// L0 constructor used by `EntityPeer::watch`.
-    pub fn new_gd_with_handle(
-        queue: Arc<Mutex<VecDeque<(String, Vec<u8>)>>>,
-        handle: SubscriptionHandle,
-    ) -> Gd<Self> {
+    pub fn new_gd_with_handle(queue: EventQueue, handle: SubscriptionHandle) -> Gd<Self> {
         Gd::from_init_fn(|base| Self {
             base,
             queue,
@@ -67,10 +68,7 @@ impl EntitySubscription {
 
     /// L1 constructor used by `EntityPeer::subscribe_l1` (through the
     /// `PeerOpFuture` completion path).
-    pub fn new_gd_with_l1(
-        queue: Arc<Mutex<VecDeque<(String, Vec<u8>)>>>,
-        handle: L1SubscriptionHandle,
-    ) -> Gd<Self> {
+    pub fn new_gd_with_l1(queue: EventQueue, handle: L1SubscriptionHandle) -> Gd<Self> {
         Gd::from_init_fn(|base| Self {
             base,
             queue,

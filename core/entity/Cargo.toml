@@ -9,6 +9,10 @@ entity-ecf.workspace = true
 entity-hash.workspace = true
 ciborium.workspace = true
 thiserror.workspace = true
+# `sanitize_path_segment`'s synthetic-segment digest (raw SHA-256 over the
+# rejected value — NOT an entity content hash, so `entity-hash` is the
+# wrong tool here).
+sha2.workspace = true
 
 [dev-dependencies]
 entity-crypto.workspace = true

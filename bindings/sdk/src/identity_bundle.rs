@@ -584,7 +584,7 @@ async fn run_restore_from_bundle(
     //    can call configure manually after restore.
     use entity_capability::{encode_grant_entry, GrantEntry, IdScope, PathScope};
     use entity_handler::ExecuteOptions;
-    let grants = vec![GrantEntry {
+    let grants = [GrantEntry {
         handlers: PathScope::new(vec!["*".into()]),
         resources: PathScope::new(vec!["*".into()]),
         operations: IdScope::new(vec!["*".into()]),

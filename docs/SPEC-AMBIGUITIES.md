@@ -8,6 +8,33 @@ passage, what is unclear, and the interim implementation choice (if any).
 
 ## CAPABILITY §5.5 / SUBSCRIPTION §4.2 — `entity://` deliver_uri vs capability-scope canonicalization
 
+> **RULED 2026-07-16 — arch ruling 24. RESOLVED; the core half is fixed
+> (`canonicalize`, `core/capability/src/lib.rs`).** The ruling: "Answered by
+> Go's code, no arch trip — **cleaning ≠ canonicalizing**. Rust unblocked."
+> Verified against `capability.Canonicalize` (`core/capability/check.go`),
+> which resolves `entity://{p}/x` → `/{p}/x`. So this was never a cross-impl
+> question — Rust had conflated two different jobs: `EntityUri::clean_path`
+> *preserves* the scheme (correctly — it cleans a URI **as** a URI), while
+> canonicalization must *resolve* it to the address it names, exactly as
+> dispatch routing already did. Rust's `canonicalize` simply had no
+> `entity://` branch, so the URI fell through to the bare-path arm and came
+> out as `/{local}/entity://{peer}/x` — unmatchable, hence the 403.
+> Pinned by `canonicalize_entity_uri_tests` (verified to fail pre-fix, with
+> the mangled scope in the failure output).
+>
+> **Lesson worth keeping:** this sat as a "cross-impl blocker pending Go/Python
+> alignment" while the answer was a branch in one function, readable in the
+> sibling's source the whole time. Logging an ambiguity is not free — it
+> deferred a fix by a cycle. The standard's "read the source, not memory"
+> applies to our own blockers too: check whether the sibling's code already
+> answers it before routing it as a question.
+>
+> **Still open (not this entry's):** the SDK-side `deliver_token`
+> grantee/signature/handler-scope mismatches behind this
+> (`bindings/sdk/src/subscription.rs`, `extensions/subscription/src/lib.rs`)
+> remain diagnosed-but-unlanded — the rest of the Rust-subscriber cross-peer
+> delivery stack.
+
 **Spec:** ENTITY-CORE-PROTOCOL-V7 §5.4/§5.5 (capability resource scoping +
 canonicalization) ⨯ EXTENSION-SUBSCRIPTION §4.2 / §1.2 (cross-peer
 `deliver_token` + `deliver_uri`).
@@ -3378,6 +3405,18 @@ AAD hex + pubkey-hash derivation are firm regardless.
 
 ## NETWORK §5.1 — keepalive ping authorization: no grant covers `system/protocol/connect`
 
+> **RULED 2026-07-16 — arch ruling 17 (`entity-system-architecture`
+> `docs/status/ROUTING-2026-07-16-arch-rulings-to-cohort.md`). Rust's interim
+> choice was ratified as written:** ping is **cap-free on an established
+> connection**, and the established-only gate (the inverse of
+> hello/authenticate) "is right". Option (a) — ping is protocol-level; §4.4's
+> default grant set does NOT grow. The connect manifest advertises `ping`
+> (`core/peer/src/lib.rs`, landed `33289bc` — the routing doc still lists this
+> as a Rust to-do; it is done, with `["authenticate", "hello", "ping"]` pinned
+> by a test). No code change owed. Retained for the reasoning trail; the
+> related §5.4 "is a 4xx a miss?" reading below is **still open** and belongs
+> to the convergence pass.
+
 **Spec:** EXTENSION-NETWORK §5.1–§5.4 (keepalive is an EXECUTE on
 `system/protocol/connect`, operation `ping`; §12.1 makes the exchange MUST) ⨯
 ENTITY-CORE-PROTOCOL-V7 §4.4 (default connection grants) ⨯ NETWORK §3.2
@@ -3416,3 +3455,49 @@ demonstrably answered a frame; also keeps the floor from killing live
 connections to impls that haven't built §5 yet, e.g. rung-1-only cohort
 members during the convergence build). If the cohort converges on "4xx is a
 miss," that's a one-line change in `keepalive.rs::ping`.
+
+---
+
+## V7 §1.4 / CONTINUATION §3.10.5 — path-segment rules don't name `.` or `..`
+
+**Spec:** ENTITY-CORE-PROTOCOL-V7 §1.4 (path-segment rules), as invoked by
+EXTENSION-CONTINUATION v1.19 §3.10.5: "Codes used as `{reason}` path segments
+MUST conform to ENTITY-CORE-PROTOCOL.md §1.4 path-segment rules (UTF-8; no
+null bytes; no empty segments; no embedded `/`)."
+
+**Ambiguity.** That enumeration does not name the reserved dot tokens, so `.`
+and `..` are "path-safe" by its letter — non-empty, UTF-8, slash-free, no
+nulls. They are nonetheless traversal tokens the moment they are concatenated
+into a path. Rust's `{reason}` sanitizer implemented §3.10.5's enumeration
+faithfully and therefore passed `..` through verbatim; the same blind spot in
+the `{chain_id}` / `{step_index}` coordinates is the live defect Go's
+`security.marker_path_injection_contained` probe found in Rust's and Python's
+trees (a tree node literally named `..`, bound by an unauthorized peer —
+`entity-core-go` `docs/validation/reports/2026-07-16-marker-path-injection-cohort.md`).
+§1.4 is a general rule, so any spec passage deferring to it inherits the gap;
+the chain-error marker path is simply where an untrusted value reaches it
+first.
+
+**Interim choice.** Reject `.` and `..` as path segments everywhere untrusted
+values are interpolated (`entity_entity::sanitize_path_segment`,
+`core/entity/src/lib.rs`), and treat §1.4's enumeration as non-exhaustive
+rather than as the definition of safe. Suggest §1.4 state the dot tokens
+explicitly (and ideally state the rule as a positive grammar rather than a
+list of prohibitions, so the next reserved token isn't a third finding).
+
+**Second, narrower question — `{reason}` diverges cross-impl today.** §3.10.5
+prescribes **sentinel-substitution** for a non-path-safe code (`{reason}` =
+`unspecified_error`, raw code preserved in the marker body's `code` field).
+Rust does that. Go instead hashes this coordinate to `invalid-<8 bytes of
+sha256>` under arch ruling 13's general "hash, don't collapse" rule
+(`store.SanitizePathSegment`, applied to `reason` at
+`ext/continuation/advance.go`), which reads as a deviation from §3.10.5's
+SHOULD. Both are defensible: the sentinel loses the distinction between two
+hostile codes but §3.10.5 recovers it in the body, whereas ruling 13's
+rationale ("collapsing merges distinct failures onto one coordinate") was
+written for `chain_id`, where nothing preserves the original. Rust holds the
+spec's shape and routes the conflict rather than picking. **Arch: does ruling
+13 override §3.10.5's sentinel for `{reason}`, or is `{reason}` deliberately
+the exception because its raw value survives in the body?** Whichever way it
+lands, one of Go and Rust changes — this is a live cross-impl divergence on a
+coordinate, not a style question.
