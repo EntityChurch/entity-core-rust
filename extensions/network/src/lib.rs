@@ -68,6 +68,8 @@ pub const TYPE_RELEASE_RESULT: &str = "system/network/release-result";
 pub const TYPE_NETWORK_STATUS: &str = "system/network/status";
 pub const TYPE_CLOSE_REQUEST: &str = "system/network/close-request";
 pub const TYPE_OBSERVE_ADDRESS_RESULT: &str = "system/network/observe-address-result";
+pub const TYPE_CHECK_REACHABILITY_RESULT: &str = "system/network/check-reachability-result";
+pub const TYPE_CANDIDATE: &str = "system/network/candidate";
 
 // ---------------------------------------------------------------------------
 // §6.7.1 observed-address reflection — the CLIENT half
@@ -75,6 +77,16 @@ pub const TYPE_OBSERVE_ADDRESS_RESULT: &str = "system/network/observe-address-re
 
 /// §6.7.1 (Amendment 13). Ask a reflector what source address it sees us at.
 pub const OP_OBSERVE_ADDRESS: &str = "observe-address";
+
+/// §6.7.2 (Amendment 13). Ask a peer to dial us back at the address it observes
+/// us at, and report whether the dial arrived — "am I publicly dialable?".
+///
+/// Like [`OP_OBSERVE_ADDRESS`] this operation **declares no input**, and for a
+/// sharper reason: the dial-back target is the responder's own observation of
+/// our source, and §6.7.2 makes it a MUST that a body-supplied address is never
+/// honoured. An input type would be a field a conformant responder must refuse
+/// to read. Send [`observe_address_params`] (the zero-field entity).
+pub const OP_CHECK_REACHABILITY: &str = "check-reachability";
 
 /// Params for [`OP_OBSERVE_ADDRESS`] — **the operation declares no input.**
 ///
@@ -175,6 +187,42 @@ impl ObserveAddressResult {
     }
 }
 
+/// Decoded `system/network/check-reachability-result` (§6.7.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckReachabilityResult {
+    /// Did the responder's dial-back to `address_tested` arrive?
+    pub reachable: bool,
+    /// The address the responder actually dialed — its own observation of our
+    /// source, echoed so we learn *which* address was proved instead of
+    /// assuming it was the one we had in mind.
+    pub address_tested: String,
+}
+
+impl CheckReachabilityResult {
+    /// Decode the `data` of a `system/network/check-reachability-result` entity.
+    pub fn from_result_data(data: &[u8]) -> Result<Self, String> {
+        let val: ciborium::Value = ciborium::from_reader(data)
+            .map_err(|e| format!("check-reachability-result: undecodable: {}", e))?;
+        let map = val
+            .as_map()
+            .ok_or("check-reachability-result: not a map (§6.7.2)")?;
+        let reachable = map
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("reachable"))
+            .and_then(|(_, v)| v.as_bool())
+            .ok_or("check-reachability-result: no bool `reachable` field (§6.7.2)")?;
+        let address_tested = decode_text_field(data, "address_tested")
+            .ok_or("check-reachability-result: no string `address_tested` field (§6.7.2)")?;
+        if address_tested.is_empty() {
+            return Err("check-reachability-result: empty `address_tested` (§6.7.2)".to_string());
+        }
+        Ok(Self {
+            reachable,
+            address_tested,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // PeerLink — the imperative seam core/peer injects (§A4: reuse, don't rebuild)
 // ---------------------------------------------------------------------------
@@ -213,6 +261,29 @@ pub trait PeerLink: Send + Sync {
         peer_id: &str,
         address: Option<&str>,
     ) -> Result<ConnectedPeer, String>;
+
+    /// §6.7.2 dial-back probe: open a bare transport connection to `address`,
+    /// prove it arrived, and drop it. Returns whether the dial succeeded.
+    ///
+    /// Deliberately **not** [`ensure_connected`](Self::ensure_connected). That
+    /// one is peer-shaped — it resolves profiles, handshakes, pools the binding
+    /// and starts keepalive. A dial-back is address-shaped and answers exactly
+    /// one question ("did a connection from me to there arrive?"), so it must
+    /// not pool, must not handshake, and must not be reachable through anything
+    /// that writes durable per-peer address state: §6.7.1 MUST 2 and §6.7.3
+    /// both forbid an observed/ephemeral address ever landing in a
+    /// `system/peer/transport/*` profile or `system/connection.address`, and the
+    /// cheap implementation — "just call ensure_connected with the observed
+    /// address" — is precisely the one that would write it there.
+    ///
+    /// The probe carries **no payload** beyond the connect itself, which
+    /// satisfies §6.7.2's fixed-size requirement with the smallest possible
+    /// constant: there is no amplification factor when the response to a
+    /// request is one TCP handshake.
+    ///
+    /// `address` is the requester's observed transport source (`ip:port`), never
+    /// a value from the request body.
+    async fn probe_address(&self, address: &str) -> bool;
 
     /// Evict the pooled outbound binding. The §5.4 keepalive loop exits by
     /// itself once the binding is gone (weak-pool discipline).
@@ -551,6 +622,12 @@ pub struct NetworkHandler {
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     /// §6.7.4 per-requester budget for `observe-address`.
     reflect_limiter: ReflectLimiter,
+    /// §6.7.2 per-requester budget for `check-reachability`. Deliberately much
+    /// tighter than [`reflect_limiter`](Self::reflect_limiter): reflection
+    /// answers from state we already hold, whereas a dial-back makes *this*
+    /// peer emit traffic at an address, so its per-requester ceiling is the
+    /// amplification bound and not a fairness knob.
+    dialback_limiter: ReflectLimiter,
 }
 
 /// A per-requester token budget over a fixed window (§6.7.4).
@@ -568,9 +645,13 @@ struct ReflectLimiter {
 
 impl ReflectLimiter {
     fn new() -> Self {
+        Self::with(1_000, 20)
+    }
+
+    fn with(window_ms: u64, max_per_window: u32) -> Self {
         Self {
-            window_ms: 1_000,
-            max_per_window: 20,
+            window_ms,
+            max_per_window,
             seen: Mutex::new(HashMap::new()),
         }
     }
@@ -603,6 +684,11 @@ impl NetworkHandler {
             local_peer_id,
             qualified_pattern,
             reflect_limiter: ReflectLimiter::new(),
+            // One dial-back per requester per 5s. A requester learns its
+            // reachability once and then has no honest reason to ask again at
+            // speed; anything faster is the amplification the §6.7.2 MUST
+            // exists to bound.
+            dialback_limiter: ReflectLimiter::with(5_000, 1),
             link: RwLock::new(None),
             self_weak: RwLock::new(Weak::new()),
             sessions: Mutex::new(HashMap::new()),
@@ -808,6 +894,7 @@ impl Handler for NetworkHandler {
             "reconnect" => self.handle_reconnect(ctx).await,
             "restore-subscriptions" => self.handle_restore_subscriptions(ctx).await,
             OP_OBSERVE_ADDRESS => self.handle_observe_address(ctx).await,
+            OP_CHECK_REACHABILITY => self.handle_check_reachability(ctx).await,
             other => Ok(error_result(
                 STATUS_BAD_REQUEST,
                 "unknown_operation",
@@ -830,6 +917,15 @@ impl Handler for NetworkHandler {
         // advertise what you dispatch. `restore-subscriptions` is
         // dispatched by the spec's own pseudocode yet missing from the
         // spec's §3.1 manifest (Go spec-issue item 3, corroborated here).
+        //
+        // The two §6.7 reachability operations are advertised on the same §A5
+        // rule. §12.3 makes offering them a deployment choice — but this peer
+        // offers both, and a peer that dispatches an operation it does not
+        // advertise forces every caller to discover it by trying, which is the
+        // failure mode discovery exists to remove. (`check-reachability` is
+        // still gated: it needs `network-dialback`, which the default
+        // connection grant withholds, so advertising it promises reachability
+        // of the operation and not authority over it.)
         &[
             "maintain-peer",
             "release-peer",
@@ -837,6 +933,8 @@ impl Handler for NetworkHandler {
             "close",
             "reconnect",
             "restore-subscriptions",
+            OP_OBSERVE_ADDRESS,
+            OP_CHECK_REACHABILITY,
         ]
     }
 
@@ -1921,6 +2019,90 @@ impl NetworkHandler {
         Ok(HandlerResult::ok(result))
     }
 
+    /// §6.7.2 `check-reachability` — dial the requester back at the address we
+    /// observe it at and report whether the dial arrived.
+    ///
+    /// The whole operation is one MUST wearing a thin coat of plumbing:
+    ///
+    /// > *"The dial-back targets the **requesting peer's own observed source
+    /// > address** — the address the asked peer itself observed on the request
+    /// > connection — and **never an address supplied in the request body.**"*
+    ///
+    /// So `ctx.params` is never read. Not "read and validated", not "read as a
+    /// hint" — never read, because the spec pins this as a MUST rather than a
+    /// SHOULD exactly to close the reading where a body field is honoured "when
+    /// it agrees with the observation". A body-supplied target makes every
+    /// dial-back peer a DDoS reflector, and that divergence lives at the peer
+    /// boundary where prose review does not catch it. Same rule as STUN's
+    /// binding response and libp2p AutoNAT.
+    ///
+    /// The other three §6.7.2/§6.7.4 obligations, in order below: the operation
+    /// is capability-gated (`system/capability/network-dialback`, which
+    /// `default_connection_grants` deliberately does **not** include — reaching
+    /// this function at all means a peer chose to grant it), rate-limited per
+    /// requester, and carries a fixed-size payload (a bare connect: no payload
+    /// at all, so the amplification factor is structurally 1).
+    async fn handle_check_reachability(
+        &self,
+        ctx: &HandlerContext,
+    ) -> Result<HandlerResult, HandlerError> {
+        let requester = ctx
+            .session_peer_id
+            .clone()
+            .unwrap_or_else(|| "<local>".to_string());
+        // §6.7.2 MUST: rate-limited per requester. Checked BEFORE the source
+        // lookup so a flood costs one map probe rather than a dial each.
+        if !self.dialback_limiter.allow(&requester) {
+            return Ok(error_result(
+                429,
+                "rate_limited",
+                "check-reachability is rate-limited per requester (§6.7.2)",
+            ));
+        }
+
+        // The dial-back target — and the ONLY admissible one.
+        let Some(observed) = accept_source::current() else {
+            return Ok(error_result(
+                STATUS_BAD_REQUEST,
+                "no_transport_source",
+                "check-reachability requires a live accepted connection; there is no observable \
+                 transport source to dial back for an in-process dispatch",
+            ));
+        };
+
+        let Some(link) = self.link.read().unwrap().clone() else {
+            return Ok(error_result(
+                500,
+                "not_bound",
+                "check-reachability requires the connection substrate; handler is not bound",
+            ));
+        };
+
+        tracing::debug!(
+            requester = %requester,
+            address_tested = %observed,
+            "§6.7.2: dialing back the observed source"
+        );
+        let reachable = link.probe_address(&observed).await;
+
+        // `address_tested` is echoed so the requester learns WHICH address was
+        // proved instead of inferring it — the value is ours, and echoing our
+        // own observation closes the loop without ever accepting one.
+        let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+            (
+                entity_ecf::text("address_tested"),
+                entity_ecf::text(&observed),
+            ),
+            (
+                entity_ecf::text("reachable"),
+                entity_ecf::bool_val(reachable),
+            ),
+        ]));
+        let result = Entity::new(TYPE_CHECK_REACHABILITY_RESULT, data)
+            .map_err(|e| HandlerError::Internal(e.to_string()))?;
+        Ok(HandlerResult::ok(result))
+    }
+
     async fn handle_status(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let _ = ctx;
         // Subscription counts per delivery peer, one scan (§2.8: active
@@ -2281,6 +2463,265 @@ mod tests {
 
     fn observed_of(result: &HandlerResult) -> Option<String> {
         decode_text_field(&result.result.data, "observed_address")
+    }
+
+    fn reachable_of(result: &HandlerResult) -> Option<bool> {
+        let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).ok()?;
+        val.as_map()?
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("reachable"))
+            .and_then(|(_, v)| v.as_bool())
+    }
+
+    // -----------------------------------------------------------------
+    // §6.7.2 check-reachability — the dial-back responder.
+    //
+    // The operation is one MUST with plumbing around it, so the vectors
+    // are aimed at the MUST: whatever else changes, the address this peer
+    // dials MUST be the transport source it observed and MUST NOT be
+    // anything the requester said. `ProbeSpy` exists to make the dialed
+    // address *observable* — asserting on the returned `address_tested`
+    // alone would pass even if the implementation echoed the observation
+    // back while dialing the attacker's address.
+    // -----------------------------------------------------------------
+
+    /// Records every address `probe_address` is asked to dial, and answers
+    /// with a canned verdict. Every other `PeerLink` method is unreachable
+    /// from the dial-back path and says so rather than pretending.
+    struct ProbeSpy {
+        dialed: Mutex<Vec<String>>,
+        verdict: bool,
+    }
+
+    impl ProbeSpy {
+        fn new(verdict: bool) -> Arc<Self> {
+            Arc::new(Self {
+                dialed: Mutex::new(Vec::new()),
+                verdict,
+            })
+        }
+        fn dialed(&self) -> Vec<String> {
+            self.dialed.lock().unwrap().clone()
+        }
+    }
+
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    impl PeerLink for ProbeSpy {
+        async fn probe_address(&self, address: &str) -> bool {
+            self.dialed.lock().unwrap().push(address.to_string());
+            self.verdict
+        }
+        async fn ensure_connected(
+            &self,
+            _peer_id: &str,
+            _address: Option<&str>,
+        ) -> Result<ConnectedPeer, String> {
+            unreachable!("the §6.7.2 dial-back path must never pool a connection")
+        }
+        fn evict(&self, _peer_id: &str) {}
+        fn is_connected(&self, _peer_id: &str) -> bool {
+            false
+        }
+        fn identity_hash_of(&self, _peer_id: &str) -> Option<Hash> {
+            None
+        }
+        async fn self_execute(
+            &self,
+            _uri: &str,
+            _operation: &str,
+            _params: Entity,
+            _opts: ExecuteOptions,
+        ) -> Result<HandlerResult, HandlerError> {
+            unreachable!("dial-back dispatches nothing")
+        }
+        fn mint_deliver_token(
+            &self,
+            _deliver_uri: &str,
+        ) -> Result<(Entity, Entity, Entity), String> {
+            unreachable!("dial-back mints nothing")
+        }
+        fn write_released(&self, _peer_id: &str, _identity_hash: &Hash) {}
+        fn write_retry_exhausted(&self, _p: &str, _i: &Hash, _f: u64) {}
+        fn mark_connection_closed(&self, _identity_hash: &Hash) {}
+        fn schedule(&self, _delay_ms: u64, _task: ScheduledTask) {}
+    }
+
+    fn dialback_handler(spy: Arc<ProbeSpy>) -> Arc<NetworkHandler> {
+        let store = Arc::new(entity_store::MemoryContentStore::new());
+        let index = Arc::new(entity_store::MemoryLocationIndex::new());
+        let h = Arc::new(NetworkHandler::new(store, index, "TestPeer".to_string()));
+        h.bind(spy);
+        h
+    }
+
+    fn dialback_ctx(params: Entity) -> HandlerContext {
+        let execute = Entity::new("system/protocol/execute", vec![0xa0]).unwrap();
+        entity_handler::HandlerContext::builder(execute, params)
+            .pattern(HANDLER_PATTERN)
+            .operation(OP_CHECK_REACHABILITY)
+            .session_peer_id("CallerPeer")
+            .build()
+    }
+
+    /// Happy path: the dial goes to the observed source, and the result is
+    /// the §6.7.2 type carrying the verdict plus the address actually tested.
+    #[tokio::test]
+    async fn dials_back_the_observed_source_and_reports_the_verdict() {
+        let spy = ProbeSpy::new(true);
+        let h = dialback_handler(spy.clone());
+        let out = accept_source::scope("203.0.113.7:51820".to_string(), async {
+            h.handle(&dialback_ctx(observe_address_params().unwrap()))
+                .await
+                .unwrap()
+        })
+        .await;
+
+        assert_eq!(out.status, STATUS_OK);
+        assert_eq!(out.result.entity_type, TYPE_CHECK_REACHABILITY_RESULT);
+        assert_eq!(spy.dialed(), vec!["203.0.113.7:51820".to_string()]);
+        assert_eq!(
+            decode_text_field(&out.result.data, "address_tested").as_deref(),
+            Some("203.0.113.7:51820")
+        );
+        assert_eq!(reachable_of(&out), Some(true));
+    }
+
+    /// An unreachable requester gets an honest `false`, not an error. The
+    /// operation succeeded — the answer is simply "no".
+    #[tokio::test]
+    async fn an_unreachable_requester_is_a_false_not_a_failure() {
+        let spy = ProbeSpy::new(false);
+        let h = dialback_handler(spy.clone());
+        let out = accept_source::scope("203.0.113.7:51820".to_string(), async {
+            h.handle(&dialback_ctx(observe_address_params().unwrap()))
+                .await
+                .unwrap()
+        })
+        .await;
+
+        assert_eq!(
+            out.status, STATUS_OK,
+            "a failed dial-back is a successful check-reachability reporting reachable=false"
+        );
+        assert_eq!(reachable_of(&out), Some(false));
+    }
+
+    /// **The load-bearing MUST (§6.7.2).** A request naming its own target
+    /// must be dialed at the *observed* source, never the named one.
+    ///
+    /// This is the DDoS-reflector seam. If the body were honoured, an
+    /// attacker points this peer at a victim and every granted peer in the
+    /// network becomes a dial-on-demand cannon — and the give-away is that
+    /// the operation still returns a perfectly well-formed result. So the
+    /// assertion is on what was *dialed*, not on what was returned: an
+    /// implementation that dials the attacker's address and echoes ours
+    /// would pass a response-shaped test.
+    #[tokio::test]
+    async fn a_body_supplied_target_is_never_dialed() {
+        let spy = ProbeSpy::new(true);
+        let h = dialback_handler(spy.clone());
+        let attacker = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+            (
+                entity_ecf::text("address_tested"),
+                entity_ecf::text("198.51.100.66:80"),
+            ),
+            (
+                entity_ecf::text("address"),
+                entity_ecf::text("198.51.100.66:80"),
+            ),
+            (
+                entity_ecf::text("target"),
+                entity_ecf::text("198.51.100.66:80"),
+            ),
+        ]));
+        let params = Entity::new("primitive/any", attacker).unwrap();
+
+        let out = accept_source::scope("203.0.113.7:51820".to_string(), async {
+            h.handle(&dialback_ctx(params)).await.unwrap()
+        })
+        .await;
+
+        assert_eq!(out.status, STATUS_OK);
+        assert_eq!(
+            spy.dialed(),
+            vec!["203.0.113.7:51820".to_string()],
+            "§6.7.2 MUST: the dial-back targets the observed source and NEVER a \
+             body-supplied address — honoring the body makes every dial-back peer \
+             a DDoS reflector"
+        );
+        assert!(
+            !spy.dialed().iter().any(|a| a.contains("198.51.100.66")),
+            "the attacker's address must never be dialed under any field name"
+        );
+    }
+
+    /// §6.7.2 MUST: rate-limited per requester. The budget is one dial per
+    /// window, so the second immediate ask is refused — and refused
+    /// *before* dialing, or the limit would bound the answer rather than
+    /// the traffic it is there to bound.
+    #[tokio::test]
+    async fn dial_backs_are_rate_limited_per_requester() {
+        let spy = ProbeSpy::new(true);
+        let h = dialback_handler(spy.clone());
+        let first = accept_source::scope("203.0.113.7:51820".to_string(), async {
+            h.handle(&dialback_ctx(observe_address_params().unwrap()))
+                .await
+                .unwrap()
+        })
+        .await;
+        let second = accept_source::scope("203.0.113.7:51820".to_string(), async {
+            h.handle(&dialback_ctx(observe_address_params().unwrap()))
+                .await
+                .unwrap()
+        })
+        .await;
+
+        assert_eq!(first.status, STATUS_OK);
+        assert_eq!(second.status, 429);
+        assert_eq!(
+            decode_text_field(&second.result.data, "code").as_deref(),
+            Some("rate_limited")
+        );
+        assert_eq!(
+            spy.dialed().len(),
+            1,
+            "the refused request MUST NOT have dialed — a rate limit checked after the \
+             dial bounds the response and not the amplification"
+        );
+    }
+
+    /// An in-process dispatch has no transport source, so there is no
+    /// admissible dial-back target. Same refusal as §6.7.1, same reason:
+    /// the alternative is inventing the fact the operation reports.
+    #[tokio::test]
+    async fn no_live_connection_is_a_refusal_not_a_loopback_dial() {
+        let spy = ProbeSpy::new(true);
+        let h = dialback_handler(spy.clone());
+        let out = h
+            .handle(&dialback_ctx(observe_address_params().unwrap()))
+            .await
+            .unwrap();
+
+        assert_eq!(out.status, STATUS_BAD_REQUEST);
+        assert_eq!(
+            decode_text_field(&out.result.data, "code").as_deref(),
+            Some("no_transport_source")
+        );
+        assert!(
+            spy.dialed().is_empty(),
+            "with no observed source there is no admissible target — dialing anything \
+             here (loopback, an advertised address) invents the fact under test"
+        );
+    }
+
+    /// §A5: the two §6.7 operations this handler dispatches are advertised.
+    #[test]
+    fn the_reachability_operations_are_advertised() {
+        let h = reflect_handler();
+        let ops = h.operations();
+        assert!(ops.contains(&OP_OBSERVE_ADDRESS));
+        assert!(ops.contains(&OP_CHECK_REACHABILITY));
     }
 
     /// The happy path: the address reported is the one the accept-side

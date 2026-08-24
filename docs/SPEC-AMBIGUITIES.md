@@ -4596,3 +4596,122 @@ operator entry carrying one, entry-wide and silently. Split out as `grant_axes_s
 behavior is unchanged. Go reached the same split (`coversFourAxes`) for the same reason.
 
 </details>
+
+---
+
+## ~~`EXTENSION-DURABILITY` §5 — `durability/result.handle` is typed `system/path`, which is not a type~~ RESOLVED
+
+**Resolution (arch `c78b3dc`, 2026-08-07):** the ask was taken as filed —
+`EXTENSION-DURABILITY.md` §5 now reads `handle: {type_ref: "system/tree/path", optional: true}`.
+It was a typo, and both impls had already read through it. Rust needs no further change: we
+moved to `system/tree/path` in `69324cd`, ahead of the ruling, and `entity-core-go` was already
+there — so the descriptors agree and §1.5 invariant 4 is satisfiable again.
+
+The original entry is kept below as filed.
+
+---
+
+
+**Spec:** `EXTENSION-DURABILITY.md` §5, the `system/durability/result` shape:
+
+> ```
+> handle:        {type_ref: "system/path", optional: true}
+> ```
+
+**The ambiguity:** there is no `system/path` type. The naming-space address type is
+`system/tree/path` — one of the six bootstrap meta-types (`ENTITY-SYSTEM-REFERENCE` §4:
+*"The entity system has two typed address spaces: `system/hash` for content-space and
+`system/tree/path` for naming-space"*), with its own row in the §8 core-type table. An
+exhaustive search of `specs/` finds the string `system/path` at this one site and nowhere
+else — no definition, no other reference.
+
+So the field is declared against a name that resolves to nothing, and §1.5's graph-integrity
+invariant 4 (a type is sound iff every type reachable via `type_ref` resolves) is unsatisfiable
+for `system/durability/result` as written.
+
+**Interim choice:** read it as the typo it evidently is and publish
+`handle: {type_ref: "system/tree/path", optional: true}`. The prose supports this directly —
+§6 says the handle *"carries the absolute tree path of the durable entry"* and *"the sender
+reads it as any tree path — `tree:get` / sync / subscription"*.
+
+**Cross-impl state:** neither impl adopted the literal text. `entity-core-go` publishes
+`system/tree/path?`; we published `primitive/string?` behind a comment claiming it matched Go's
+registry declaration for hash agreement — the claim was stale and had never been re-checked
+(core-go's `compare-types` surfaced the divergence, 2026-08-07). We have moved to
+`system/tree/path?`, so the two now agree. Since `system/tree/path` extends `primitive/string`,
+this narrows the descriptor without changing what any conformant value looks like on the wire.
+
+**Ask:** a wording fix — `system/path` → `system/tree/path`. Routed in
+`ROUTING-2026-08-07-the-flag-day-is-closed-and-6.7-is-built-both-halves-to-cohort.md` §4.1.
+
+---
+
+## ~~`EXTENSION-NETWORK` §12.3 vs the ratified type table — are §6.7's types mandatory when §6.7 is not?~~ RESOLVED
+
+**Resolution (arch `c78b3dc`, 2026-08-07):** ruled **(b)** — *the types follow the section*.
+`EXTENSION-NETWORK.md` §12.3 gains a MUST, stated generally rather than about §6.7: **a type is
+owed by the surface that uses it**, so a peer that declines an OPTIONAL section does not owe that
+section's types in its `--profile full` publication. It follows core `ENTITY-CORE-PROTOCOL.md`
+§9.5 (*"absence of extension handlers means absence of their types"*) one level down, at the
+section. The competing reading — ours, (a) — was recorded as coherent but resting on §6.13(a),
+which governs a **mandatory** handler where publication sits beneath a required behavior; §6.7 has
+no required behavior to sit beneath. Arch credits the question as routed independently by us and by
+`entity-core-go` the same day.
+
+**Consequence for Rust: none, and that is not luck — it is why the interim choice was safe.** We
+implement both §6.7 operations, so we *are* the surface that uses those types and we owe all three
+(`system/network/candidate`, `observe-address-result`, `check-reachability-result`). We publish all
+three. What the ruling changes is the reason: we publish them because we offer the section, not
+because the §13 table lists them.
+
+**The related pushback resolved with it.** `entity-core-go`'s `validate-peer` reported
+`check-reachability returned 400 unknown_operation` as a FAIL; §12.3's *"or an unimplemented
+response"* said otherwise. That is now moot for us from both ends — Go's `section67TypesOnly`
+suppresses rather than merely annotates as of their `2305008`, and we implement the operation as of
+`1db5b02`, so we answer 200/403 and never 400. The ruling also pins the **consumer** half: a
+consumer MUST NOT infer support from the type registry — the discovery signal is the operation's
+response.
+
+**Also folded, from the same commit:** §6.7.5 is recorded **PARTIALLY DISCHARGED**, not closed. Its
+reflect half is cross-impl 4/4; the dial-back half across a real NAT is un-run, and arch classes it
+with the §11.5 S5 and §10.3 seam gates as **missing cohort infrastructure — not implementation debt
+against any repo.** That matches what we said at closeout: our §6.7.5 gate proves the mechanism, not
+the traversal.
+
+The original entry is kept below as filed.
+
+---
+
+
+**Spec:** §12.3 makes the section optional as a whole:
+
+> **Reachability facts (§6.7, Amendment 13)** — a peer MAY offer `observe-address`,
+> `check-reachability`, both, or neither. Offering neither is fully conformant: a requester that
+> gets a 403 **or an unimplemented response** proceeds to another reflector [...]
+
+while §13's ratified type table lists `system/network/candidate` and
+`system/network/check-reachability-result` alongside every mandatory core type, with no marker
+distinguishing them as conditional.
+
+**The ambiguity:** a peer that conformantly declines §6.7 entirely still publishes no descriptor
+for either type — and so fails a `types_all_present`-style check that reads the §13 table as the
+mandatory set. Two readings, both defensible:
+
+(a) **Types are mandatory independently of the operations.** The registry is the machine-readable
+spec; publishing a descriptor costs nothing and says "this is what the shape *would* be", which
+is useful to a caller deciding whether to ask. Declining an operation is not the same as denying
+its vocabulary.
+
+(b) **The types follow the section.** A peer advertising types for operations it does not serve
+invites a caller to conclude it serves them, and §12.3's whole point is that offering is a
+deployment choice.
+
+**Interim choice:** (a) — we publish both descriptors and implement both operations, so the
+question does not bind us either way. Logged because it *will* bind the next impl that declines
+§6.7, and because the answer should be deliberate rather than inherited from whichever validator
+ran first.
+
+**Related, and the reason this surfaced:** `entity-core-go`'s `validate-peer` currently reports
+`check-reachability returned 400 code "unknown_operation"` as a FAIL on the stated grounds that
+*"nothing else is conformant"* besides 200 or 403. §12.3's "or an unimplemented response" says
+otherwise. Routed to core-go in the same routing doc, §3.

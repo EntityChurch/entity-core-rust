@@ -202,10 +202,7 @@ impl ContinuationSpec {
             ));
         }
         if let Some(res) = &self.resource {
-            fields.push((
-                entity_ecf::text("resource"),
-                encode_resource_target(res),
-            ));
+            fields.push((entity_ecf::text("resource"), encode_resource_target(res)));
         }
         if let Some(rf) = &self.result_field {
             fields.push((entity_ecf::text("result_field"), entity_ecf::text(rf)));
@@ -213,10 +210,7 @@ impl ContinuationSpec {
         if let Some(ex) = &self.result_extract {
             fields.push((
                 entity_ecf::text("result_transform"),
-                entity_ecf::Value::Map(vec![(
-                    entity_ecf::text("extract"),
-                    entity_ecf::text(ex),
-                )]),
+                entity_ecf::Value::Map(vec![(entity_ecf::text("extract"), entity_ecf::text(ex))]),
             ));
         }
         Entity::new(
@@ -230,7 +224,10 @@ impl ContinuationSpec {
 /// Encode a `DeliverySpec` as the `{operation, uri}` map the handler decodes.
 fn delivery_spec_value(d: &DeliverySpec) -> entity_ecf::Value {
     entity_ecf::Value::Map(vec![
-        (entity_ecf::text("operation"), entity_ecf::text(&d.operation)),
+        (
+            entity_ecf::text("operation"),
+            entity_ecf::text(&d.operation),
+        ),
         (entity_ecf::text("uri"), entity_ecf::text(&d.uri)),
     ])
 }

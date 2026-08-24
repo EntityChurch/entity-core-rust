@@ -167,22 +167,11 @@ pub trait RemoteEndpoint: Send + Sync {
     fn originating_capability(&self) -> Option<Entity> {
         Some(self.capability().clone())
     }
-    /// The supporting entities a §6.5 reciprocal originating cap needs to
-    /// verify at the far side — the cap's own signature (signer = granter) and
-    /// the granter's identity. A single-sig root cap is rejected with
-    /// `missing_signature` without them (`verify_capability_chain`), and an
-    /// acceptor endpoint's `auth_included` is empty, so they must ride here.
-    /// Default empty: a dialed endpoint's cap chain already travels via
-    /// `auth_included`. See `docs/PROPOSAL-SYMMETRIC-REENTRY-MUTUAL-MINTING.md`.
-    fn originating_chain_bundle(&self) -> Vec<Entity> {
-        Vec::new()
-    }
-    /// Install an originating capability (and its supporting chain entities)
-    /// acquired *after* construction — the §6.5 reciprocal reentry grant (mutual
-    /// minting). Default no-op: only an acceptor endpoint
-    /// (`InboundReentryEndpoint`) has an authority slot to fill; a dialed endpoint
-    /// already carries the grant the remote issued it.
-    fn set_originating_capability(&self, _cap: Entity, _chain: Vec<Entity>) {}
+    /// Install an originating capability acquired *after* construction — the
+    /// §6.5 reciprocal reentry grant (mutual minting). Default no-op: only an
+    /// acceptor endpoint (`InboundReentryEndpoint`) has an authority slot to
+    /// fill; a dialed endpoint already carries the grant the remote issued it.
+    fn set_originating_capability(&self, _cap: Entity) {}
     fn auth_included(&self) -> &HashMap<Hash, Entity>;
     fn next_request_id(&self) -> String;
     fn transport_type(&self) -> &'static str;
@@ -408,16 +397,16 @@ pub struct InboundReentryEndpoint {
     /// §6.5 mutual minting: the reciprocal reentry capability the *remote* (the
     /// dialer) minted FOR us after the handshake — `granter = the dialer`,
     /// `grantee = us` — paired with its supporting chain entities (the cap's
-    /// signature and the granter's identity, without which a single-sig cap is
-    /// rejected `missing_signature`). `None` until the `reentry-grant` frame
-    /// arrives; once set,
+    /// signature and the granter's identity — which do NOT travel with our
+    /// dispatches: wielding is by reference, and the granter resolves the cap
+    /// from the ledger it minted it into). `None` until the `reentry-grant`
+    /// frame arrives; once set,
     /// [`originating_capability`](RemoteEndpoint::originating_capability) returns
-    /// the cap and [`originating_chain_bundle`](RemoteEndpoint::originating_chain_bundle)
-    /// its support, giving this acceptor authority to originate spontaneously
-    /// back over the one §6.5 data channel (trigger (b)). Interior-mutable
-    /// because the endpoint is shared as `Arc<dyn RemoteEndpoint>` and the grant
-    /// lands after construction. See PROPOSAL-SYMMETRIC-REENTRY-MUTUAL-MINTING.
-    held_grant: Mutex<Option<(Entity, Vec<Entity>)>>,
+    /// the cap, giving this acceptor authority to originate spontaneously back
+    /// over the one §6.5 data channel (trigger (b)). Interior-mutable because
+    /// the endpoint is shared as `Arc<dyn RemoteEndpoint>` and the grant lands
+    /// after construction. See PROPOSAL-SYMMETRIC-REENTRY-MUTUAL-MINTING.
+    held_grant: Mutex<Option<Entity>>,
     /// Monotonic counter in a distinct `reentry-N` namespace so these IDs
     /// never collide with the inbound EXECUTE `request_id`s the remote chose
     /// (which we never place in `pending`).
@@ -466,22 +455,10 @@ impl RemoteEndpoint for InboundReentryEndpoint {
     /// The §7a.2a reentry flow is unaffected: it passes the caller-minted cap
     /// explicitly as `dispatch_cap`, which takes precedence over this.
     fn originating_capability(&self) -> Option<Entity> {
-        self.held_grant
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|(cap, _)| cap.clone())
+        self.held_grant.lock().unwrap().clone()
     }
-    fn originating_chain_bundle(&self) -> Vec<Entity> {
-        self.held_grant
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|(_, chain)| chain.clone())
-            .unwrap_or_default()
-    }
-    fn set_originating_capability(&self, cap: Entity, chain: Vec<Entity>) {
-        *self.held_grant.lock().unwrap() = Some((cap, chain));
+    fn set_originating_capability(&self, cap: Entity) {
+        *self.held_grant.lock().unwrap() = Some(cap);
     }
     fn auth_included(&self) -> &HashMap<Hash, Entity> {
         &self.auth_included
@@ -1963,10 +1940,29 @@ pub async fn perform_connect_with_dispatch(
                         // "minted AND delivered". A mint that failed to send is
                         // authority the counterpart never received, and it must
                         // not become wieldable by being named.
-                        shared.minted_reentry_grants.lock().unwrap().insert(
-                            remote_peer_id.clone(),
-                            grant.included.values().cloned().collect(),
-                        );
+                        //
+                        // Keyed by the cap's content hash — the value the
+                        // counterpart names in its EXECUTE `capability` field
+                        // when it wields by reference (§6.5 ruling 2026-08-07).
+                        match reciprocal_cap_hash(&grant) {
+                            Some(cap_hash) => {
+                                shared.minted_reentry_grants.lock().unwrap().record(
+                                    remote_peer_id.clone(),
+                                    cap_hash,
+                                    grant.included.values().cloned().collect(),
+                                );
+                            }
+                            // Unreachable against our own builder; if a future
+                            // change to it stops carrying exactly one cap, record
+                            // nothing rather than key the ledger on the wrong
+                            // entity. Fails closed — the counterpart's wielding
+                            // is refused, not mis-authorized.
+                            None => tracing::error!(
+                                remote_peer = %remote_peer_id,
+                                "§6.5: reentry grant carries no unique capability — \
+                                 not recording it as minted-and-delivered"
+                            ),
+                        }
                         tracing::debug!(
                             remote_peer = %remote_peer_id,
                             "§6.5: sent reciprocal reentry grant — acceptor may now originate"
@@ -2102,6 +2098,26 @@ pub(crate) fn build_reentry_grant_envelope(
     envelope.include(cap_sig_entity);
     envelope.include(local_identity);
     Ok(envelope)
+}
+
+/// Pick the capability token out of a grant frame built by
+/// [`build_reentry_grant_envelope`] — the §6.5 ledger's resolution key.
+///
+/// That builder includes exactly one; the second-hit guard keeps a future change
+/// to it from silently registering the wrong entity as the wieldable cap.
+/// Mirrors `entity-core-go`'s `reciprocalCapEntity`.
+pub(crate) fn reciprocal_cap_hash(grant: &Envelope) -> Option<Hash> {
+    let mut found = None;
+    for entity in grant.included.values() {
+        if entity.entity_type != entity_types::TYPE_CAP_TOKEN {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(entity.content_hash);
+    }
+    found
 }
 
 /// Reader task body. Loops reading frames off the connection's read half,
@@ -2538,35 +2554,22 @@ pub async fn send_execute(
         }
     };
 
-    // §6.5 mutual minting: when we originate under an acceptor endpoint's
-    // reciprocal cap (the `None`/`originating_capability` path), its signature +
-    // granter identity are NOT in `auth_included` (that map is empty for a
-    // reentry endpoint) — they ride in the endpoint's originating chain bundle.
-    // Merge them into the transported set so the single-sig cap verifies at the
-    // far side instead of failing `missing_signature`.
-    let mut merged_bundle;
-    let effective_bundle: &HashMap<Hash, Entity> = {
-        let extra = if dispatch_cap.is_none() {
-            conn.originating_chain_bundle()
-        } else {
-            Vec::new()
-        };
-        if extra.is_empty() {
-            chain_bundle
-        } else {
-            merged_bundle = chain_bundle.clone();
-            for e in extra {
-                merged_bundle.entry(e.content_hash).or_insert(e);
-            }
-            &merged_bundle
-        }
-    };
-
+    // §6.5 mutual minting: wielding a reciprocal cap is **by reference**. The
+    // envelope's `capability` field carries the cap hash and that field IS the
+    // reference — we do NOT inline the cap's signature or the granter identity
+    // into the transported set. The granter is the only peer that ever needs to
+    // resolve them, and it minted the cap into its own delivered-grant ledger,
+    // so it resolves from there (a reciprocal cap is never in the content
+    // store). Inlining would work too, but it masks a receiver that cannot do
+    // the ledger walk — which is exactly how our own double-walk revocation bug
+    // survived until core-go flipped its sender. Settled cross-impl by
+    // entity-system-architecture `cbe9dff` ("EXECUTE-root, not §7a.2a triple":
+    // no new fields, no triple, no included-set chain).
     let envelope = build_authenticated_execute(
         keypair,
         effective_cap,
         conn.auth_included(),
-        effective_bundle,
+        chain_bundle,
         &request_id,
         uri,
         operation,

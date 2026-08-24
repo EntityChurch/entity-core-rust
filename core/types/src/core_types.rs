@@ -26,6 +26,51 @@ fn opt_map(value: FieldSpec) -> FieldSpec {
     FieldSpec::optional_map(value, None)
 }
 
+// EXTENSION-TYPE v1.1 §3.3/§4 — field constraints on spec-defined built-ins.
+//
+// A constraint is part of the descriptor and therefore part of its content
+// hash, so publishing a field without the constraint the spec declares for it
+// is a real divergence and not a cosmetic one: `violation.kind` is a closed set
+// of three values and `reconcile.strategy` of three, and a peer advertising
+// those fields bare is telling anything that validates against the *descriptor*
+// — rather than against the prose — that any string will do.
+//
+// Under the arch Q4 ruling (v7.78 erratum candidate) this is a SHOULD for
+// spec-defined built-ins; user-defined types stay divergence-tolerant per §1.5
+// Invariant 5. Reported by core-go's cross-impl differ once it started
+// comparing constraints (`compareFieldConstraints`) — before that, a descriptor
+// differing only in its constraints hashed differently while showing zero
+// structural diffs, and the mismatch was misattributed to a CBOR encoder edge
+// that did not exist.
+
+/// `system/type/constraint/one-of` over a closed set of string values.
+fn one_of(values: &[&str]) -> crate::ConstraintRef {
+    crate::ConstraintRef::new(
+        crate::TYPE_CONSTRAINT_ONE_OF,
+        entity_ecf::Value::Map(vec![(
+            entity_ecf::text("values"),
+            entity_ecf::Value::Array(values.iter().map(|v| entity_ecf::text(*v)).collect()),
+        )]),
+    )
+}
+
+/// `system/type/constraint/min-count` over an array/map field.
+fn min_count(n: u64) -> crate::ConstraintRef {
+    crate::ConstraintRef::new(
+        crate::TYPE_CONSTRAINT_MIN_COUNT,
+        entity_ecf::Value::Map(vec![(
+            entity_ecf::text("min_count"),
+            entity_ecf::integer(n as i64),
+        )]),
+    )
+}
+
+/// Attach constraints to a field spec.
+fn constrained(mut spec: FieldSpec, constraints: Vec<crate::ConstraintRef>) -> FieldSpec {
+    spec.constraints = constraints;
+    spec
+}
+
 // ============================================================================
 // Bootstrap types (11 total per spec §4.4)
 // ============================================================================
@@ -599,6 +644,45 @@ fn system_network_observe_address_result() -> TypeDefinition {
         .build()
 }
 
+/// `system/network/check-reachability-result` — EXTENSION-NETWORK §6.7.2
+/// (Amendment 13), the dial-back outcome.
+///
+/// `reachable` says whether the responder's dial-back to `address_tested`
+/// arrived. `address_tested` is echoed back so the requester learns *which*
+/// address was proved rather than inferring it — and the value is always the
+/// responder's own observation, the same one `observe-address` would return on
+/// this connection. The requester never gets to name the target: §6.7.2's
+/// load-bearing MUST is that the dial-back goes to the observed source and
+/// never to a body-supplied address, because the alternative reading turns
+/// every dial-back peer into a DDoS reflector.
+fn system_network_check_reachability_result() -> TypeDefinition {
+    TypeDefBuilder::new("system/network/check-reachability-result")
+        .field("reachable", t("primitive/bool"))
+        .field("address_tested", t("primitive/string"))
+        .build()
+}
+
+/// `system/network/candidate` — EXTENSION-NETWORK §6.7.3 (Amendment 13), one
+/// address a peer might be reached at, typed and prioritised.
+///
+/// `type` is `host` | `srflx` | `relay`, tried in that order (cheapest first);
+/// `substrate` is the transport the candidate is punchable on (`tcp` | `quic` |
+/// `webrtc`). Candidates are **session-scoped and ephemeral** — §6.7.3 makes it
+/// a MUST that they are never written as durable `system/peer/transport/*`
+/// profiles, for the same reason an observed address is never persisted: §10
+/// dispatch reads those fields as dialable endpoints.
+///
+/// This is the gathering/typing shape only. Exchanging candidates between peers
+/// is the punch-coordination protocol, which EXTENSION-NETWORK deliberately
+/// leaves out of scope (it lives in EXTENSION-SIGNALING §6.1).
+fn system_network_candidate() -> TypeDefinition {
+    TypeDefBuilder::new("system/network/candidate")
+        .field("address", t("primitive/string"))
+        .field("type", t("primitive/string"))
+        .field("substrate", t("primitive/string"))
+        .build()
+}
+
 /// `system/peer/published-root` — the signed static anchor for a peer's
 /// current tree root (PROPOSAL-PEER-MANIFEST-STATIC-HANDSHAKE §4,
 /// NORMATIVE-LOCKED). `peer_id` is the Base58 id `system/peer-id`
@@ -978,7 +1062,13 @@ fn system_type_validate_result() -> TypeDefinition {
 fn system_type_violation() -> TypeDefinition {
     TypeDefBuilder::new("system/type/violation")
         .field("field", t("primitive/string"))
-        .field("kind", t("primitive/string"))
+        .field(
+            "kind",
+            constrained(
+                t("primitive/string"),
+                vec![one_of(&["structural", "constraint", "unknown_constraint"])],
+            ),
+        )
         .field("constraint", opt("system/type/name"))
         .field("reason", t("primitive/string"))
         .build()
@@ -1122,7 +1212,13 @@ fn system_type_compatible_request() -> TypeDefinition {
     TypeDefBuilder::new("system/type/compatible-request")
         .field("type_a", t("system/tree/path"))
         .field("type_b", t("system/tree/path"))
-        .field("direction", t("primitive/string"))
+        .field(
+            "direction",
+            constrained(
+                t("primitive/string"),
+                vec![one_of(&["forward", "backward", "bidirectional"])],
+            ),
+        )
         .build()
 }
 
@@ -1131,7 +1227,19 @@ fn system_type_compatibility_report() -> TypeDefinition {
         .field("type_a_path", t("system/tree/path"))
         .field("type_b_path", t("system/tree/path"))
         .field("direction", t("primitive/string"))
-        .field("level", t("primitive/string"))
+        .field(
+            "level",
+            constrained(
+                t("primitive/string"),
+                vec![one_of(&[
+                    "fully_compatible",
+                    "forward_only",
+                    "backward_only",
+                    "partially_compatible",
+                    "incompatible",
+                ])],
+            ),
+        )
         .field("shared_fields", arr(t("primitive/string")))
         .field(
             "incompatible_fields",
@@ -1178,9 +1286,26 @@ fn system_durability_result() -> TypeDefinition {
         .field("max_available", opt("primitive/string"))
         .field("reason", opt("primitive/string"))
         // §6 / Amendment 1 — absolute tree path where the durable entry can
-        // be read; present when applied != none. Typed `primitive/string` to
-        // match Go's registry declaration (cross-impl hash agreement).
-        .field("handle", opt("primitive/string"))
+        // be read; present when applied != none.
+        //
+        // `system/tree/path`, not `primitive/string`. This field used to be
+        // typed `primitive/string` with a comment claiming it matched Go's
+        // registry declaration for cross-impl hash agreement; Go publishes
+        // `system/tree/path?` and the claim no longer holds (whether it ever
+        // did, or whether Go moved, is not recoverable from here — the note was
+        // simply not re-checked).
+        //
+        // The spec text says `system/path`, which is not a registered type name
+        // anywhere in the ecosystem — the naming-space address type is
+        // `system/tree/path` (ENTITY-SYSTEM-REFERENCE §4, one of the six
+        // bootstrap meta-types). Read as the typo it is, both impls now agree.
+        // Routed to arch as an EXTENSION-DURABILITY §5 wording fix.
+        //
+        // The narrowing is also the honest type: `handle` is a tree path the
+        // sender reads with `tree:get` (§6), and `system/tree/path` extends
+        // `primitive/string`, so this tightens the descriptor without changing
+        // what any conformant value looks like on the wire.
+        .field("handle", opt("system/tree/path"))
         .build()
 }
 
@@ -2469,6 +2594,8 @@ pub fn all_core_types() -> Vec<TypeDefinition> {
         system_network_peer_summary(),
         system_network_close_request(),
         system_network_observe_address_result(),
+        system_network_check_reachability_result(),
+        system_network_candidate(),
         system_peer_published_root(),
         system_signature(),
         system_handler(),
@@ -3533,14 +3660,26 @@ fn system_type_adopt_request() -> TypeDefinition {
 
 fn system_type_converge_request() -> TypeDefinition {
     TypeDefBuilder::new("system/type/converge-request")
-        .field("type_paths", arr(t("system/tree/path")))
+        .field(
+            "type_paths",
+            constrained(arr(t("system/tree/path")), vec![min_count(2)]),
+        )
         .build()
 }
 
 fn system_type_reconcile_request() -> TypeDefinition {
     TypeDefBuilder::new("system/type/reconcile-request")
-        .field("type_paths", arr(t("system/tree/path")))
-        .field("strategy", t("primitive/string"))
+        .field(
+            "type_paths",
+            constrained(arr(t("system/tree/path")), vec![min_count(2)]),
+        )
+        .field(
+            "strategy",
+            constrained(
+                t("primitive/string"),
+                vec![one_of(&["intersect", "union", "prefer"])],
+            ),
+        )
         .build()
 }
 
@@ -3577,6 +3716,94 @@ mod tests {
             "Expected at least 101 types, got {}",
             types.len()
         );
+    }
+
+    /// EXTENSION-TYPE v1.1 §3.3/§4 — the constraints a spec-defined built-in
+    /// declares MUST survive into the **published** descriptor, not merely into
+    /// the builder call.
+    ///
+    /// This asserts on `to_entity()` rather than on the `TypeDefinition`
+    /// because that is where the defect lives: constraints are part of the
+    /// descriptor and therefore part of its content hash, so a declaration that
+    /// is dropped on the way to the wire produces a peer advertising a bare
+    /// field while its own source says otherwise. core-go shipped exactly that
+    /// — `min_count(2)` declared, then a later `OverrideField` replaced the
+    /// whole `FieldSpec` constraint-free — and no Go-only run could catch it,
+    /// because both sides of a same-impl round trip agree on the wrong shape.
+    /// It took a sibling publishing the constraint Go did not.
+    #[test]
+    fn declared_field_constraints_survive_into_published_descriptors() {
+        // (type, field, constraint type path) — every constraint EXTENSION-TYPE
+        // declares on a built-in this peer publishes.
+        let expected = [
+            (
+                "system/type/violation",
+                "kind",
+                crate::TYPE_CONSTRAINT_ONE_OF,
+            ),
+            (
+                "system/type/compatible-request",
+                "direction",
+                crate::TYPE_CONSTRAINT_ONE_OF,
+            ),
+            (
+                "system/type/compatibility-report",
+                "level",
+                crate::TYPE_CONSTRAINT_ONE_OF,
+            ),
+            (
+                "system/type/reconcile-request",
+                "strategy",
+                crate::TYPE_CONSTRAINT_ONE_OF,
+            ),
+            (
+                "system/type/reconcile-request",
+                "type_paths",
+                crate::TYPE_CONSTRAINT_MIN_COUNT,
+            ),
+            (
+                "system/type/converge-request",
+                "type_paths",
+                crate::TYPE_CONSTRAINT_MIN_COUNT,
+            ),
+        ];
+
+        let types = all_core_types();
+        for (type_name, field_name, constraint_path) in expected {
+            let td = types
+                .iter()
+                .find(|t| t.name == type_name)
+                .unwrap_or_else(|| panic!("{} is not registered", type_name));
+
+            // 1. Declared on the definition.
+            let spec = td
+                .fields
+                .get(field_name)
+                .unwrap_or_else(|| panic!("{}.{} is not declared", type_name, field_name));
+            assert!(
+                spec.constraints
+                    .iter()
+                    .any(|c| c.constraint_type == constraint_path),
+                "{}.{} must declare {} (EXTENSION-TYPE v1.1 §3.3/§4)",
+                type_name,
+                field_name,
+                constraint_path
+            );
+
+            // 2. And still present after publication — the leg that actually
+            // reaches a sibling, and the one Go's OverrideField broke.
+            let entity = td.to_entity().expect("descriptor encodes");
+            let encoded = String::from_utf8_lossy(&entity.data).to_string();
+            assert!(
+                encoded.contains(constraint_path),
+                "{}.{}: {} was declared but is absent from the published \
+                 descriptor — the constraint is part of the content hash, so \
+                 dropping it here advertises an unconstrained field",
+                type_name,
+                field_name,
+                constraint_path
+            );
+        }
     }
 
     #[test]

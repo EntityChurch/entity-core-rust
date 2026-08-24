@@ -107,6 +107,7 @@ pub mod role;
 
 // Convenience re-exports of the most-used types so consumers can write
 // `entity_sdk::PeerContext` rather than `entity_sdk::sdk::PeerContext`.
+pub use follow::{FollowHandle, FollowMode, FollowOptions};
 pub use inspect::{
     InspectBindingKind, InspectFact, InspectSinkFn, InspectSinkHandle, InspectSinkRegistry,
     InspectWireFrameDirection,
@@ -121,7 +122,6 @@ pub use sdk::{
 pub use subscription::{
     RawSubscriptionHandle, SubscribeLimits, SubscribeOptions, SubscriptionInfo, SubscriptionOps,
 };
-pub use follow::{FollowHandle, FollowMode, FollowOptions};
 
 #[cfg(feature = "attestation")]
 pub use attestation::{

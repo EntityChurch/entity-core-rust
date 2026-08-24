@@ -153,6 +153,95 @@ impl Default for PeerConfig {
 /// `default_connection_grants`).
 pub type GrantResolver = Arc<dyn Fn(&PeerId, &Hash) -> Option<Vec<GrantEntry>> + Send + Sync>;
 
+/// The §6.5 (b) minted-and-delivered reciprocal-grant ledger: the caps this
+/// peer minted **and put on the wire**, with the entities a chain walk over
+/// each one needs (the cap, its signature, and our identity — the §7a.2a
+/// triple).
+///
+/// This is the supply side of the ruled two-phase carriage (Q1): an acceptor
+/// wielding our reciprocal grant sends the cap **by reference**, and we resolve
+/// it here rather than requiring it re-inlined in an envelope we authored
+/// ourselves.
+///
+/// **The resolution key is the cap's content hash**
+/// (`EXTENSION-SIGNALING` §6.5, *"The ledger's resolution key is the cap hash"*,
+/// ruling 2026-08-07). The wielding EXECUTE's root `capability` field *is* the
+/// reference, so the hash is the only key guaranteed present at the resolution
+/// site. Recipient peer-id is kept as a secondary **index** — which that ruling
+/// permits — but MUST NOT be the sole key: a wielder's peer-id equals the
+/// delivery recipient's only while the cap is wielded by exactly the peer it was
+/// delivered to, so a recipient-keyed-only ledger resolves nothing the moment a
+/// cap is wielded by a **delegate** and fails closed with `403` on valid
+/// authority. (Rust keyed on recipient peer-id alone until this ruling; the
+/// divergence was reported by `entity-core-go` and by us, and arch pinned it to
+/// Go's hash-keyed shape before `entity-core-py` builds a third one.)
+///
+/// **Deliberately not a content-store lookup**, which is the trap in reading
+/// "resolves from its own content store" literally: the store also holds caps
+/// we minted and never sent, and every cap we hold for any reason — so naming a
+/// cap would become as good as holding one. Scoped to minted-**and-delivered**,
+/// written only after the frame write succeeds. `grantee == author` still binds
+/// the cap to the peer it names, so hash resolution is not third-party
+/// escalation; what it must not do is erase the difference between "we minted
+/// this for you" and "you hold it", which is the distinction the §6.5 (b) send
+/// path depends on.
+///
+/// A re-mint to the same recipient does **not** evict the previous cap: a
+/// delivered cap stays delivered, and dropping it would fail closed on
+/// authority the counterpart legitimately holds. `entity-core-go`'s
+/// `authoredGrantSet` retains likewise.
+#[derive(Default)]
+pub struct MintedGrantLedger {
+    /// cap content hash → the entities a chain walk over that cap needs.
+    by_cap: std::collections::HashMap<Hash, Vec<entity_entity::Entity>>,
+    /// recipient peer-id → the most recent cap minted for it. An index onto
+    /// `by_cap`, never a store of its own.
+    by_recipient: std::collections::HashMap<String, Hash>,
+}
+
+impl MintedGrantLedger {
+    /// Register a grant we minted **and sent**. `cap_hash` is the minted cap's
+    /// content hash — the value the counterpart puts in its EXECUTE's
+    /// `capability` field when it wields by reference.
+    pub fn record(
+        &mut self,
+        recipient_peer_id: String,
+        cap_hash: Hash,
+        supporting: Vec<entity_entity::Entity>,
+    ) {
+        if supporting.is_empty() {
+            return;
+        }
+        self.by_cap.insert(cap_hash, supporting);
+        self.by_recipient.insert(recipient_peer_id, cap_hash);
+    }
+
+    /// Resolve by cap hash — the ruled key.
+    pub fn by_cap(&self, cap_hash: &Hash) -> Option<&Vec<entity_entity::Entity>> {
+        self.by_cap.get(cap_hash)
+    }
+
+    /// Resolve by recipient peer-id — the permitted secondary index.
+    pub fn by_recipient(&self, recipient_peer_id: &str) -> Option<&Vec<entity_entity::Entity>> {
+        self.by_recipient
+            .get(recipient_peer_id)
+            .and_then(|h| self.by_cap.get(h))
+    }
+
+    /// Resolve the supporting set for a wielding frame: the cap hash the frame
+    /// names first (§6.5's MUST), the recipient index second.
+    pub fn supply(
+        &self,
+        cap_hash: Option<&Hash>,
+        recipient_peer_id: Option<&str>,
+    ) -> Option<Vec<entity_entity::Entity>> {
+        cap_hash
+            .and_then(|h| self.by_cap(h))
+            .or_else(|| recipient_peer_id.and_then(|p| self.by_recipient(p)))
+            .cloned()
+    }
+}
+
 /// Shared state passed to connection tasks (Arc'd).
 pub struct PeerShared {
     pub keypair: IdentityKeypair,
@@ -206,28 +295,9 @@ pub struct PeerShared {
     /// same map — dedup state is per-peer, not per-connection.
     pub preserved_requests:
         Arc<std::sync::Mutex<std::collections::HashMap<(String, String), String>>>,
-    /// `remote_peer_id → the §6.5 (b) reentry grant we minted **and delivered**
-    /// to that peer` (the cap, its signature, and our identity — the §7a.2a
-    /// triple).
-    ///
-    /// This is the supply side of the ruled two-phase carriage (Q1): an
-    /// acceptor wielding our reciprocal grant may send the triple **as
-    /// references**, and we resolve them here rather than requiring them
-    /// re-inlined in an envelope we authored ourselves.
-    ///
-    /// **Deliberately not a content-store lookup**, which is the trap in
-    /// reading "resolves from its own content store" literally: the store also
-    /// holds caps we minted and never sent, and every cap we hold for any
-    /// reason — so naming a cap would become as good as holding one. Scoped to
-    /// minted-and-delivered, keyed by the peer we delivered it to, written only
-    /// after the frame write succeeds. `grantee == author` still binds the cap
-    /// to the named peer independently, so widening this would not be
-    /// third-party escalation — it would erase the difference between "we
-    /// minted this for you" and "you hold it", which is the distinction the
-    /// §6.5 (b) send path depends on. `entity-core-go` reached the same
-    /// scoping and pinned it the same way.
-    pub minted_reentry_grants:
-        Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<entity_entity::Entity>>>>,
+    /// The §6.5 (b) minted-and-delivered grant ledger — see
+    /// [`MintedGrantLedger`].
+    pub minted_reentry_grants: Arc<std::sync::Mutex<MintedGrantLedger>>,
     /// Observe-only dispatch hooks registered via `PeerBuilder::with_dispatch_hook`.
     /// Fired in registration order at request-entry (before `handler.handle`)
     /// and request-exit (after the handler returns) per GUIDE-INSPECTABILITY
@@ -299,12 +369,11 @@ pub struct Peer {
     /// `shared()` snapshots so dedup applies peer-wide
     /// (EXTENSION-DURABILITY §5 / Amendment 1).
     preserved_requests: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), String>>>,
-    /// `remote_peer_id` → the §6.5 (b) reentry grant minted and delivered to
-    /// it. Shared across all `shared()` snapshots: the mint happens on the dial
-    /// task and the supply happens on a spawned dispatch, so a per-snapshot map
-    /// would record in one place and be read in another.
-    minted_reentry_grants:
-        Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<entity_entity::Entity>>>>,
+    /// The §6.5 (b) reentry grants minted and delivered, keyed by cap hash
+    /// ([`MintedGrantLedger`]). Shared across all `shared()` snapshots: the mint
+    /// happens on the dial task and the supply happens on a spawned dispatch, so
+    /// a per-snapshot ledger would record in one place and be read in another.
+    minted_reentry_grants: Arc<std::sync::Mutex<MintedGrantLedger>>,
     /// `local/files` handler instance — held so reverse-write can be
     /// wired in `start_engines` and so external callers can register
     /// root mappings.
@@ -2568,9 +2637,7 @@ impl PeerBuilder {
             #[cfg(feature = "network")]
             network_handler,
             preserved_requests: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            minted_reentry_grants: Arc::new(
-                std::sync::Mutex::new(std::collections::HashMap::new()),
-            ),
+            minted_reentry_grants: Arc::new(std::sync::Mutex::new(MintedGrantLedger::default())),
             #[cfg(all(feature = "local-files", not(target_arch = "wasm32")))]
             local_files_handler,
             dispatch_hooks: self.dispatch_hooks,
@@ -7301,9 +7368,17 @@ mod tests {
         );
 
         // S ORIGINATES back to C over the reentry endpoint with no explicit
-        // dispatch_cap — so it authors under the reciprocal cap and its bundled
-        // signature + granter identity. `get` on C's own `system/tree` returns
-        // the handler descriptor (200), the same shape the rung-1 rig sees.
+        // dispatch_cap — so it authors under the reciprocal cap, wielded **by
+        // reference**: the envelope carries the cap hash and nothing else, no
+        // inlined signature or granter identity (arch `cbe9dff`). That makes
+        // this the native gate on the whole references-only round trip — S's
+        // sender emits a bare reference, and C must resolve the cap from the
+        // ledger it minted it into, because a reciprocal cap is never in the
+        // content store. Before the sender flip this path inlined the chain,
+        // which is precisely what hid our double-walk revocation bug (`f227df8`)
+        // until core-go flipped first and V3 direction B went 200 -> 403.
+        // `get` on C's own `system/tree` returns the handler descriptor (200),
+        // the same shape the rung-1 rig sees.
         let empty_params = entity_entity::Entity::new(
             "system/params",
             entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![])),
@@ -7707,33 +7782,51 @@ mod tests {
              cannot quietly turn this into a different rejection"
         );
 
-        // 3. Recorded against a DIFFERENT counterpart — still refused. Written
-        //    before the positive case so a supplier that ignores the key cannot
-        //    pass by having been primed correctly first.
-        shared
-            .minted_reentry_grants
-            .lock()
-            .unwrap()
-            .insert("2KsomeOtherCounterparty".to_string(), bundle.clone());
-        let wrong_peer =
+        // 3. A DIFFERENT cap in the ledger — the wielded one still refused.
+        //    Written before the positive case so a supplier that ignores the key
+        //    cannot pass by having been primed correctly first.
+        //
+        //    Since arch's 2026-08-07 ruling the ledger resolves by CAP HASH, so
+        //    what this pins is the scoping that actually survives: only what we
+        //    minted AND delivered is suppliable. It is emphatically not a store
+        //    lookup — a cap absent from the ledger stays unresolvable even when
+        //    the ledger holds some other cap for the very peer that is asking.
+        let third_party = IdentityKeypair::from(Keypair::from_seed([83u8; 32]));
+        let other_grant = remote::build_reentry_grant_envelope(
+            &shared.keypair,
+            third_party
+                .peer_entity()
+                .expect("third-party identity")
+                .content_hash,
+            fmt,
+            entity_capability::default_connection_grants(),
+        )
+        .expect("the third-party grant mints");
+        shared.minted_reentry_grants.lock().unwrap().record(
+            acceptor_pid.clone(),
+            remote::reciprocal_cap_hash(&other_grant).expect("one cap in the grant"),
+            other_grant.included.values().cloned().collect(),
+        );
+        let wrong_cap =
             connection::dispatch_request(&wield, shared.clone(), Some(&acceptor_pid)).await;
         assert_eq!(
             (
-                status_of(&wrong_peer),
-                carries(&wrong_peer, "missing_signature")
+                status_of(&wrong_cap),
+                carries(&wrong_cap, "missing_signature")
             ),
             (403, true),
-            "resolution widened: a grant we minted for someone ELSE was \
-             supplied to this peer. The supplier has become a store lookup, \
-             and naming a cap is now as good as holding one"
+            "resolution widened: a cap we never recorded as minted-and-delivered \
+             was supplied. The supplier has become a store lookup, and naming a \
+             cap is now as good as holding one"
         );
 
-        // 2. Recorded as delivered to this peer — the same bytes verify.
+        // 2. Recorded as delivered — the same bytes verify.
+        let cap_hash = remote::reciprocal_cap_hash(&grant_env).expect("one cap in the grant");
         shared
             .minted_reentry_grants
             .lock()
             .unwrap()
-            .insert(acceptor_pid.clone(), bundle);
+            .record(acceptor_pid.clone(), cap_hash, bundle);
         let accepted =
             connection::dispatch_request(&wield, shared.clone(), Some(&acceptor_pid)).await;
         assert!(
@@ -7741,6 +7834,29 @@ mod tests {
             "§7a.2a: the acceptor wielded a grant WE minted and delivered to it, \
              by reference. Re-carrying our own entities back to us is the waste \
              the two-phase carriage exists to delete"
+        );
+
+        // 4. The ruling itself (EXTENSION-SIGNALING §6.5, *"The ledger's
+        //    resolution key is the cap hash"*, 2026-08-07): the SAME frame
+        //    resolves when the session peer-id is not the delivery recipient.
+        //
+        //    That is the delegation shape. A recipient-keyed-only ledger — what
+        //    this impl had until the ruling — resolves nothing here and fails
+        //    CLOSED: `403` on valid authority, the same wrong answer as the
+        //    store-only revocation walk, arriving by a different route. Both
+        //    impls caught a wrong wielder today, which is why neither filed it;
+        //    the divergence is only visible at this cross-peer seam.
+        let delegated = connection::dispatch_request(
+            &wield,
+            shared.clone(),
+            Some("2KsomeDelegateWieldingOurCap"),
+        )
+        .await;
+        assert!(
+            !carries(&delegated, "missing_signature"),
+            "the ledger resolved nothing for a wielder whose peer-id is not the \
+             delivery recipient's — recipient peer-id is still the sole key, and \
+             a delegated wield fails closed on valid authority"
         );
     }
 
@@ -7920,6 +8036,192 @@ mod tests {
         }
 
         server_handle.abort();
+    }
+
+    /// **The §6.7.5 gate, local half: a real reflect + a real dial-back over
+    /// real sockets.** Arch records this gate as never having run in any
+    /// implementation; this is the loopback case of it, end to end.
+    ///
+    /// A binds a listener, then dials B *from that same port* through
+    /// `reuseport` — which is the §6.7.3 MUST in action, and also the only
+    /// arrangement in which the answer means anything: dial back an ephemeral
+    /// source and you learn nothing about the endpoint the punch will fire
+    /// from. B observes A's source, dials it, reaches A's listener, and reports
+    /// `reachable: true` with the address it actually tested.
+    ///
+    /// The `address_tested` assertion is the one that would catch a lazy
+    /// implementation: a responder that returned `reachable: true` without
+    /// dialing, or that dialed something other than what it observed, still
+    /// produces a well-formed 200. Pinning the echoed address to A's real
+    /// listening port is what makes the pass mean the dial arrived *there*.
+    #[cfg(all(
+        feature = "signaling",
+        feature = "network",
+        not(target_arch = "wasm32")
+    ))]
+    #[tokio::test]
+    async fn test_s675_reflect_and_dial_back_over_real_sockets() {
+        // --- B, the responder. Grants check-reachability, which the §6.7.4
+        // default floor deliberately withholds (`network-dialback` is the
+        // restricted one). Granting it here is the deployment choice §12.3
+        // describes, and without it this test would measure a conformant 403.
+        let responder = PeerBuilder::new()
+            .keypair(Keypair::from_seed([90u8; 32]))
+            .listen_addr("127.0.0.1:0")
+            .build()
+            .unwrap();
+        let mut responder = responder;
+        responder.set_grant_resolver(std::sync::Arc::new(|_peer, _hash| {
+            let mut grants = entity_capability::default_connection_grants();
+            grants.push(entity_capability::GrantEntry {
+                handlers: entity_capability::PathScope::new(vec!["system/network".into()]),
+                resources: entity_capability::PathScope::new(vec![]),
+                operations: entity_capability::IdScope::new(vec![
+                    entity_network::OP_CHECK_REACHABILITY.into(),
+                ]),
+                peers: None,
+                constraints: None,
+                allowances: None,
+            });
+            Some(grants)
+        }));
+        let responder_listener = responder.listen().await.unwrap();
+        let responder_addr = responder_listener.socket_addr();
+        let responder_shared = responder.shared();
+        responder.start_engines(&responder_shared);
+        let responder_shared_for_task = responder_shared.clone();
+        let responder_handle = tokio::spawn(async move {
+            let _ = server::run(responder_listener, responder_shared_for_task).await;
+        });
+
+        // --- A, the requester. Its endpoint is the thing under test, and it
+        // has to be bound with SO_REUSEPORT: the §6.7.3 MUST is that the probe
+        // dials *from* the same local port the endpoint listens on, and a plain
+        // `bind` refuses the second bind with EADDRINUSE. `listen_reuseport` is
+        // the same call the punch path uses for exactly this reason.
+        //
+        // A bare acceptor rather than a full peer server, deliberately: a §6.7.2
+        // dial-back is a bare connect that the responder drops the instant it
+        // lands (that IS the fixed-size payload), so what has to be listening is
+        // a socket, not a protocol. Standing a peer up here would test the
+        // handshake as well and blur what a pass means.
+        let requester_key = Keypair::from_seed([91u8; 32]);
+        let requester_keypair = IdentityKeypair::Ed25519(requester_key.clone_inner());
+        let requester_listener = crate::reuseport::listen_reuseport("127.0.0.1:0".parse().unwrap())
+            .expect("bind A's probe endpoint with SO_REUSEPORT");
+        let requester_addr = requester_listener.local_addr().unwrap();
+        let requester_handle =
+            tokio::spawn(async move { while requester_listener.accept().await.is_ok() {} });
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        let probe = crate::srflx::check_reachability_at(
+            &responder_addr.to_string(),
+            requester_addr,
+            &requester_keypair,
+            entity_hash::HASH_ALGORITHM_SHA256,
+        )
+        .await
+        .expect("§6.7.2: the probe itself must not error against a granting responder");
+
+        match probe {
+            crate::srflx::ReachabilityProbe::Answered(result) => {
+                assert!(
+                    result.reachable,
+                    "§6.7.2: B dialed A's own listening port on loopback — the dial-back \
+                     MUST have arrived (got address_tested={})",
+                    result.address_tested
+                );
+                assert_eq!(
+                    result.address_tested,
+                    requester_addr.to_string(),
+                    "§6.7.2: the echoed address MUST be the source B observed, which — \
+                     because A dialed from its listener via reuseport — is A's listening \
+                     address. A different value means B dialed something it did not observe."
+                );
+            }
+            crate::srflx::ReachabilityProbe::Refused(status) => panic!(
+                "the responder granted network-dialback, so this must be answered, not \
+                 refused with {}",
+                status
+            ),
+        }
+
+        responder_handle.abort();
+        requester_handle.abort();
+    }
+
+    /// The other half of the same gate: **without** the grant, the dial-back is
+    /// refused — and refused *before* any traffic is emitted.
+    ///
+    /// This is what makes `network-dialback` restricted rather than merely
+    /// documented as restricted. §6.7.4 puts it opposite `network-reflect`
+    /// precisely because reflection answers from state already held while a
+    /// dial-back makes this peer emit traffic at an address; if the default
+    /// floor let it through, every peer offering §6.7 would be a dial-on-demand
+    /// cannon for anyone who could open a connection. The peer here is built
+    /// with no grant resolver at all, so it carries exactly
+    /// `default_connection_grants` — the floor a real deployment starts from.
+    #[cfg(all(
+        feature = "signaling",
+        feature = "network",
+        not(target_arch = "wasm32")
+    ))]
+    #[tokio::test]
+    async fn test_s674_dial_back_is_refused_without_the_restricted_grant() {
+        let responder = PeerBuilder::new()
+            .keypair(Keypair::from_seed([92u8; 32]))
+            .listen_addr("127.0.0.1:0")
+            .build()
+            .unwrap();
+        let responder_listener = responder.listen().await.unwrap();
+        let responder_addr = responder_listener.socket_addr();
+        let responder_shared = responder.shared();
+        responder.start_engines(&responder_shared);
+        let responder_shared_for_task = responder_shared.clone();
+        let responder_handle = tokio::spawn(async move {
+            let _ = server::run(responder_listener, responder_shared_for_task).await;
+        });
+
+        let requester_key = Keypair::from_seed([93u8; 32]);
+        let requester_keypair = IdentityKeypair::Ed25519(requester_key.clone_inner());
+        let requester_listener =
+            crate::reuseport::listen_reuseport("127.0.0.1:0".parse().unwrap()).unwrap();
+        let requester_addr = requester_listener.local_addr().unwrap();
+        let requester_handle = tokio::spawn(async move {
+            loop {
+                if requester_listener.accept().await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+
+        let probe = crate::srflx::check_reachability_at(
+            &responder_addr.to_string(),
+            requester_addr,
+            &requester_keypair,
+            entity_hash::HASH_ALGORITHM_SHA256,
+        )
+        .await
+        .expect("a conformant refusal is an answer, not a client-side error");
+
+        match probe {
+            crate::srflx::ReachabilityProbe::Refused(status) => assert_eq!(
+                status, 403,
+                "§6.7.4: check-reachability is gated by network-dialback, which \
+                 default_connection_grants withholds — an ungranted caller MUST be refused"
+            ),
+            crate::srflx::ReachabilityProbe::Answered(r) => panic!(
+                "the default grant floor MUST NOT authorize a dial-back; got reachable={} \
+                 against {}",
+                r.reachable, r.address_tested
+            ),
+        }
+
+        responder_handle.abort();
+        requester_handle.abort();
     }
 
     /// Read the `system/peer/status` entity `holder` keeps for the peer

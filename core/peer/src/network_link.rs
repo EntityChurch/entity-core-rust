@@ -85,6 +85,59 @@ impl PeerLink for PeerNetworkLink {
         })
     }
 
+    /// §6.7.2 dial-back probe. A bare `Connector::connect` to the observed
+    /// source, dropped the instant it succeeds.
+    ///
+    /// Everything this does NOT do is the point. No `get_or_connect`: that
+    /// pools the binding, runs the handshake, writes the §3.13 `connected`
+    /// status and starts keepalive — turning a one-shot reachability question
+    /// into a durable relationship with an ephemeral address, and writing that
+    /// address into exactly the per-peer fields §6.7.1 MUST 2 forbids it to
+    /// reach. No entry in `shared.remote` either, so a later real dispatch to
+    /// that peer still resolves its profiles normally.
+    ///
+    /// The address arrives as bare `ip:port` (that is the shape
+    /// `accept_source` carries), which `TcpConnector` accepts directly
+    /// alongside the `tcp://` wire shape.
+    async fn probe_address(&self, address: &str) -> bool {
+        // Bound the wait: the interesting negative answer — a NAT'd requester
+        // whose mapping we cannot dial — is usually a black hole rather than a
+        // refusal, so without a deadline the honest `reachable: false` never
+        // gets sent. 3s is well inside any caller's patience and long enough
+        // that a real listener on a slow path still answers.
+        #[cfg(not(target_arch = "wasm32"))]
+        let attempt = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            self.shared.connector.connect(address),
+        )
+        .await;
+        // On wasm32 there is no raw-socket connector to race a timer against —
+        // the browser connector rejects an unsupported scheme immediately — so
+        // the connect resolves on its own. Shaped as `Result<Result<_, _>, _>`
+        // to keep one match arm below.
+        #[cfg(target_arch = "wasm32")]
+        let attempt: Result<_, ()> = Ok(self.shared.connector.connect(address).await);
+
+        match attempt {
+            Ok(Ok(conn)) => {
+                // Proven. Close immediately — the connect IS the payload, which
+                // is how §6.7.2's fixed-size requirement is met with an
+                // amplification factor of exactly 1.
+                drop(conn);
+                tracing::debug!(address = %address, "§6.7.2: dial-back arrived");
+                true
+            }
+            Ok(Err(e)) => {
+                tracing::debug!(address = %address, error = %e, "§6.7.2: dial-back refused");
+                false
+            }
+            Err(_) => {
+                tracing::debug!(address = %address, "§6.7.2: dial-back timed out");
+                false
+            }
+        }
+    }
+
     fn evict(&self, peer_id: &str) {
         self.shared.remote.remove(peer_id);
     }

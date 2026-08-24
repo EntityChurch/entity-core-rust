@@ -1,6 +1,6 @@
 # entity-core-rust — status
 
-_Updated: 2026-08-05 · public: v0.8.0 (master)_
+_Updated: 2026-08-07 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -35,6 +35,79 @@ just self-tested.
 
 ## Where we left off
 
+_2026-08-07 — **the flag day is closed, and §6.7 is built on both halves.**_
+(`ROUTING-2026-08-07-the-flag-day-is-closed-and-6.7-is-built-both-halves-to-cohort.md`.)
+
+Five changes, answering core-go `4ecb139` (three validation reports) and browser-rust `50a2361`.
+
+- **The sender flip — the flag day is over.** We were the last impl still inlining the reciprocal
+  cap's signature + granter identity into the transported chain bundle; arch `cbe9dff` settled the
+  carriage as references-only and core-go flipped at `9741eed`. A delete in three places, and the
+  now-dead `originating_chain_bundle` accessor went with it. The point is not that inlining was
+  broken — it worked — but that it **masks a receiver that cannot resolve from its minted ledger**,
+  which is precisely how our own double-walk revocation bug (`f227df8`) survived every test we had.
+  `test_s65_acceptor_originates_after_reciprocal_grant` now proves the strict path with no new test:
+  the tell that the old one was measuring the lenient one. **core-py is warned** — we could not find
+  a minted-grant resolver in their tree, and they will meet a bare reference the first time they
+  cross with rust on acceptor-originated dispatch.
+- **§6.7 `check-reachability`, responder and client.** The responder never reads `ctx.params` — the
+  §6.7.2 MUST is that the dial-back targets the observed source and never a body-supplied address,
+  and the alternative reading makes every dial-back peer a DDoS reflector. Rate-limited per requester
+  (checked *before* the dial), capability-gated on `network-dialback` (which the §4.4 floor
+  withholds), payload-free so amplification is structurally 1. The probe rides a new
+  `PeerLink::probe_address` seam rather than `ensure_connected`, because the peer-shaped call would
+  pool the binding and write an ephemeral address into the durable per-peer fields §6.7.1 MUST 2
+  forbids it to reach. Client half in `srflx.rs` — the leg that turns a *claimed* srflx candidate
+  into a *proved* one.
+- **The §6.7.5 gate ran** — arch records it as never having run in any impl. Loopback half now in CI:
+  a real reflect + a real dial-back over real sockets (A dials from its own listening port via
+  `reuseport`, so the answer is about the endpoint the punch would use), plus the negative that pins
+  `network-dialback` as genuinely restricted (bare default grants → **403**). A dial-back across a
+  real NAT is still unrun by anyone.
+- **Six field constraints + two type descriptors.** The `one-of`/`min-count` set core-go's differ
+  surfaced once it started comparing constraints, taken verbatim from EXTENSION-TYPE v1.1, with a
+  survival test asserting on the **published** descriptor rather than the builder call — that is
+  where Go's own `OverrideField` bug lived. `system/network/candidate` and
+  `check-reachability-result` now publish.
+- **`durability/result.handle`: `primitive/string?` → `system/tree/path?`.** We were wrong and Go was
+  right; the comment claiming we matched Go's declaration was stale and had never been re-checked.
+
+**Two things routed out.** (1) To core-go: `reachability_dialback_posture` asserts "nothing else is
+conformant" against a section §12.3 makes optional — *"a requester that gets a 403 or an unimplemented
+response proceeds to another reflector"* — so the pre-change FAIL was misattributed. We implemented
+§6.7 anyway, because we are a reference peer, but the check should be retargeted before it false-FAILs
+the next impl. (2) To arch: `EXTENSION-DURABILITY` §5 declares `handle` as `system/path`, **a type
+that exists nowhere in the ecosystem** (the bootstrap type is `system/tree/path`) — both impls read
+through the typo and neither adopted it. Also routed: the Go/rust supplier-keying divergence (cap hash
+vs recipient peer id — same verdict, different enforcement point) before py invents a third answer.
+
+Green at `make test` / `make clippy` / `make fmt` / `make wasm`.
+
+_2026-08-06 — **the SDK follow() primitive, the Direct WebRTC arm, and obligation 5.**_
+Six commits (`f486b0f`..`e17c2ad`), driven by `entity-browser-rust` standing the first real WebRTC leg
+up. No routing doc of their own; recorded here.
+
+- **`follow()` — the subtree-mirror SDK helper**, with `FollowMode::Continuation` (a revision-free
+  server-side follow chain) and `ContinuationSpec`, the typed builder for system/continuation
+  entities.
+- **A stale claim corrected, and it is the useful part.** The blocker was believed to be "the memory
+  harness can't push notifications back." That was wrong — a **test-setup artifact**: B's engines
+  were never started (the free `server::run` does not call `start_engines`; only the `Peer::run`
+  method does), and a plain dial-by-address mints no §6.5 reciprocal grant, so the acceptor could
+  never originate. Establish through a rendezvous seam and the memory transport pushes fine. Four
+  native deterministic tests now isolate `follow()`'s own contribution — including bidirectional
+  delivery over **one** symmetric channel, which retires "the A3 asymmetry is an authorization
+  limit." The e2e's unconditional poll had been masking all of it.
+- **`f486b0f` — the A1 Direct-arm WebRTC establisher** plus an additive SDK install seam.
+- **`e17c2ad` — NETWORK §10.3 obligation 5, single-flight establishment per peer.** browser-rust
+  found the cold-WebRTC path opened a channel only by brute force: ~470 concurrent pool-misses each
+  spawning a fresh negotiation, piling deposits into the rendezvous bucket until two happened to
+  overlap. Arch folded it as a MUST (`4c0803c`) with §11.5 gate teeth. A per-peer async gate held
+  across `get_or_connect`, with a `DialGuard` that GCs the map entry so a hub does not leak gates.
+  **~470 → 4 deposits/side, channel at t=1s (was ~29 s)** in browser-rust's real two-browser e2e.
+  Confirmed sound from core-go's seat: the V3 crossing still completes at `reciprocal_reach_status:
+  200` after it. See the 2026-08-07 routing doc §5 for where our gate boundary differs from Go's.
+
 _2026-08-05 — **the §6.5 (b) reciprocal-grant arc, in one place.**_ Four routing docs cover it; this
 is the thread, newest first. (`ROUTING-2026-08-05-direction-b-was-our-driver-and-q2-is-folded-to-go.md`,
 `…-the-narrowing-is-in-and-the-discriminator-confirmed-to-arch.md`,
@@ -59,9 +132,22 @@ spec gap, a proposal, four arch rulings, and a cross-impl crossing. Where it sta
   bare `perform_connect`, so it carried neither the dispatch stack nor the classification and minted
   nothing however symmetric the punch was. Fixed; the driver now reports `reciprocal_grant_sent` so
   the cell is scorable from its output line. **Go re-runs B.**
-- **Open, routed, not guessed:** the Q2(a) advertisement filter's matching rule (logged in
-  `docs/SPEC-AMBIGUITIES.md`); Q1's carriage sentence (core-go's push-back — this repo ships the same
-  shape they do and would ratify it).
+- **Cross-impl, second round:** core-go re-ran V3 against our push — **`8·0F @ e968ed1`**, both
+  directions PASS, crossing closed. **Reach** was the open edge and is now built on both seats: their
+  responder originates back (`26fd7b7`), ours does too, and our initiator lingers 2s after its pong so
+  the acceptor's reach-back is not severed mid-flight (the mirror of a bug they fixed for us on
+  2026-08-01, one role over). Rust↔Rust reach measures `200`. **The cross-impl reach run is theirs.**
+- **Arch closed both routed gaps (`977667f`) — and both land work here.** (a) The advertisement-filter
+  matching rule is ruled: four-axis `scope_subset`, entry ⊆ advertised, **drop not narrow**, governing
+  the §4.4 inbound assembly identically — so it lands in the one extracted function. (b) Q1's carriage
+  is a two-phase shape — deliver the cap's **content hash**, wield **as a reference** resolved at the
+  dialer — which is **not** what either shipped impl did at the time. A **flag day with core-go**, not
+  a unilateral fix.
+  (`ROUTING-2026-08-05-reach-is-built-both-seats-and-two-new-musts-land-on-us.md`.)
+  **Both shipped — see the 2026-08-07 entry.** (a) landed as `2243d65`; (b) landed in three commits
+  across both impls and closed on 2026-08-07. The §7a.2a framing in the original ruling was
+  subsequently **corrected** by arch `cbe9dff`: the triple gates nothing here, and wielding is an
+  ordinary EXECUTE rooted at `capability` = the cap hash. No triple, no included-set chain.
 
 _2026-08-04 (late) — **the live cross-impl sealed §6.1 punch ran; `PUNCH_TRUST` is `Require`.**_
 (`docs/status/ROUTING-2026-08-04-the-live-sealed-punch-ran-and-require-is-on-to-go.md`.)

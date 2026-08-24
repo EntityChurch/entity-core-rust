@@ -72,7 +72,8 @@ use async_trait::async_trait;
 use entity_crypto::IdentityKeypair;
 use entity_network::nat_type::{classify_mapping, MappingAssessment, MappingClass, Observation};
 use entity_network::{
-    observe_address_params, ObserveAddressResult, HANDLER_PATTERN, OP_OBSERVE_ADDRESS,
+    observe_address_params, CheckReachabilityResult, ObserveAddressResult, HANDLER_PATTERN,
+    OP_CHECK_REACHABILITY, OP_OBSERVE_ADDRESS, TYPE_CHECK_REACHABILITY_RESULT,
     TYPE_OBSERVE_ADDRESS_RESULT,
 };
 use entity_signaling::coordination::{
@@ -208,6 +209,110 @@ async fn observe_at(
         ));
     }
     Ok(ObserveAddressResult::from_result_data(&resp.result.data)?.observed_address)
+}
+
+/// §6.7.2 **client half** — ask `responder_addr` to dial us back at whatever
+/// source it observes, and report whether the dial arrived.
+///
+/// This is the half that turns a *claimed* candidate into a *proved* one.
+/// [`observe_at`] tells a peer what address it appears to come from; nothing in
+/// §6.7.1 says anyone can get back to it. A peer that publishes a `srflx`
+/// candidate on reflection alone is advertising an address it has never tested,
+/// and the failure surfaces as a punch that silently never completes — long
+/// after the candidate was chosen.
+///
+/// Bound to `local_addr` through [`crate::reuseport`] for the same §6.7.3 reason
+/// [`observe_at`] is: the reachability of an ephemeral socket says nothing about
+/// the endpoint the punch will actually fire from, so the probe has to run on
+/// the punch's own port or it proves the wrong thing.
+///
+/// # Two conformant refusals, deliberately distinguished
+///
+/// §6.7.4 makes `network-dialback` a **restricted** grant, and §12.3 makes the
+/// whole of §6.7 optional — so a `403` (the responder restricts the operation)
+/// and a `400 unknown_operation` (it does not offer it) are both conformant
+/// answers and neither is an error in *this* peer. They are reported as
+/// [`DialBackRefused`](ReachabilityProbe::Refused) so a caller can move to the
+/// next responder exactly as it would for an unreachable one, instead of
+/// treating a legitimate posture as a fault.
+pub async fn check_reachability_at(
+    responder_addr: &str,
+    local_addr: SocketAddr,
+    keypair: &IdentityKeypair,
+    home_format: u8,
+) -> Result<ReachabilityProbe, String> {
+    let remote_addr: SocketAddr = responder_addr
+        .strip_prefix("tcp://")
+        .unwrap_or(responder_addr)
+        .parse()
+        .map_err(|_| {
+            format!(
+                "check-reachability: bad responder address {}",
+                responder_addr
+            )
+        })?;
+
+    // §6.7.3: the probe must run on the endpoint the punch will use.
+    let stream = crate::reuseport::dial_reuseport(local_addr, remote_addr, || {})
+        .await
+        .map_err(|e| format!("check-reachability: dial {}: {}", responder_addr, e))?;
+
+    let conn = remote::perform_connect(PeerPunchIo::wrap(stream), keypair, home_format)
+        .await
+        .map_err(|e| format!("check-reachability: handshake: {}", e))?;
+
+    let uri = format!("/{}/{}", conn.remote_peer_id, HANDLER_PATTERN);
+    // The operation declares no input: the target is the responder's own
+    // observation and §6.7.2 forbids honouring a body-supplied one, so there is
+    // nothing to send. Same zero-field entity `observe-address` uses.
+    let params = observe_address_params()?;
+    let resp = remote::send_execute(
+        &conn,
+        keypair,
+        &uri,
+        OP_CHECK_REACHABILITY,
+        &params,
+        None,
+        None,
+        None,
+        &std::collections::HashMap::new(),
+        None,
+    )
+    .await
+    .map_err(|e| format!("check-reachability: {}", e))?;
+
+    match resp.status {
+        200 => {
+            if resp.result.entity_type != TYPE_CHECK_REACHABILITY_RESULT {
+                return Err(format!(
+                    "check-reachability: result type {:?}, want {:?} (§6.7.2)",
+                    resp.result.entity_type, TYPE_CHECK_REACHABILITY_RESULT
+                ));
+            }
+            Ok(ReachabilityProbe::Answered(
+                CheckReachabilityResult::from_result_data(&resp.result.data)?,
+            ))
+        }
+        // Restricted (§6.7.4) or not offered (§12.3) — both conformant.
+        403 | 400 => Ok(ReachabilityProbe::Refused(resp.status)),
+        429 => Ok(ReachabilityProbe::Refused(429)),
+        other => Err(format!(
+            "check-reachability: responder returned status {} (§6.7.2 admits 200, and \
+             §6.7.4/§12.3 admit 403/400 as postures; anything else is not a conformant answer)",
+            other
+        )),
+    }
+}
+
+/// The outcome of a §6.7.2 probe against one responder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReachabilityProbe {
+    /// The responder ran the dial-back and reported an outcome.
+    Answered(CheckReachabilityResult),
+    /// The responder declined — restricted grant (403), operation not offered
+    /// (400), or rate-limited (429). Not a fault: §12.3 makes offering §6.7 a
+    /// deployment choice, so a caller consults the next responder.
+    Refused(u32),
 }
 
 impl SrflxGatherer {

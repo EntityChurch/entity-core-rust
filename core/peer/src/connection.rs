@@ -476,18 +476,13 @@ fn accept_reentry_grant(
         );
         return;
     }
-    // The cap's supporting entities travel in the same grant: its signature
-    // (signer = granter) and the granter's identity. A single-sig cap is rejected
-    // `missing_signature` without them, and our reentry endpoint's `auth_included`
-    // is empty — so capture them here (everything in `included` except the cap
-    // itself) and hand them to the endpoint to inject when it originates.
-    let supporting: Vec<_> = envelope
-        .included
-        .values()
-        .filter(|e| e.content_hash != cap.content_hash)
-        .cloned()
-        .collect();
-    endpoint.set_originating_capability(cap, supporting);
+    // Only the cap is retained. Its supporting entities (the granter signature
+    // and identity) travel in this grant frame and are consumed by the
+    // `verify_grant_signature` check just above — they are deliberately NOT
+    // stored for re-injection, because we wield this cap **by reference**: the
+    // envelope's `capability` hash is the reference, and the granter resolves
+    // the cap from the ledger it minted it into (arch `cbe9dff`).
+    endpoint.set_originating_capability(cap);
     tracing::info!(
         remote_peer = %remote_peer_id,
         "§6.5: accepted reciprocal reentry grant — this acceptor may now originate"
@@ -1120,16 +1115,23 @@ pub(crate) async fn dispatch_request(
     // resolver. That does not weaken the additive property: this map is read
     // only by the revocation walk, the first verification attempt still sees
     // the unaugmented envelope, and the entities added are exactly the ones
-    // we minted AND delivered to this very peer.
+    // we minted AND delivered under the cap this frame names.
+    //
+    // The frame's root `capability` field IS the reference (§6.5 Carriage), so
+    // it is the ledger's resolution key. Resolving by the *session* peer-id
+    // alone — which is what this did until arch's 2026-08-07 ruling — holds only
+    // while the wielder is the very peer we delivered to, and resolves nothing
+    // the moment the cap is wielded by a delegate.
+    let wielded_cap = entity_protocol::decode_execute_fields(&envelope.root.data)
+        .ok()
+        .and_then(|f| f.capability);
     let mut included_for_resolve = envelope.included.clone();
-    if let Some(bundle) = session_peer_id.and_then(|peer| {
-        shared
-            .minted_reentry_grants
-            .lock()
-            .unwrap()
-            .get(peer)
-            .cloned()
-    }) {
+    if let Some(bundle) = shared
+        .minted_reentry_grants
+        .lock()
+        .unwrap()
+        .supply(wielded_cap.as_ref(), session_peer_id)
+    {
         for e in bundle {
             included_for_resolve.entry(e.content_hash).or_insert(e);
         }
@@ -1190,15 +1192,11 @@ pub(crate) async fn dispatch_request(
     ) {
         Ok(v) => v,
         Err(first_err) => {
-            let supply = session_peer_id
-                .and_then(|peer| {
-                    shared
-                        .minted_reentry_grants
-                        .lock()
-                        .unwrap()
-                        .get(peer)
-                        .cloned()
-                })
+            let supply = shared
+                .minted_reentry_grants
+                .lock()
+                .unwrap()
+                .supply(wielded_cap.as_ref(), session_peer_id)
                 .filter(|bundle| {
                     // Only worth a retry if the bundle actually adds something
                     // the envelope did not already carry.

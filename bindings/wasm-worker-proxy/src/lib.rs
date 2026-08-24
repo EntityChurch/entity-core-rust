@@ -77,12 +77,12 @@ mod web_transport;
 /// negotiation, driven on behalf of a worker that cannot reach the API.
 mod webrtc_session;
 pub use broker::MessagePortBroker;
-pub use main_thread_establish::MainThreadWebRtcEstablisher;
-pub use web_transport::WebTransport;
 /// Re-exported so a caller installing [`MainThreadWebRtcEstablisher`] can name
 /// its required verification posture without depending on `entity-signaling`
 /// directly — the same courtesy `worker_webrtc` extends for the Worker arm.
 pub use entity_signaling::webrtc::VerificationPolicy;
+pub use main_thread_establish::MainThreadWebRtcEstablisher;
+pub use web_transport::WebTransport;
 
 use entity_wasm_worker_protocol::{
     CasFailure, ConnectPeerOk, CreatePeerOk, Event, InitParams, Request, RequestId, Response,

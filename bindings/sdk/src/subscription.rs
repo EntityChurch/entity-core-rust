@@ -321,8 +321,13 @@ impl Drop for RawSubscriptionHandle {
                 None,
                 None,
             );
-            let _ = execute_fn(unsub_target, "unsubscribe".into(), params, ExecuteOptions::default())
-                .await;
+            let _ = execute_fn(
+                unsub_target,
+                "unsubscribe".into(),
+                params,
+                ExecuteOptions::default(),
+            )
+            .await;
         };
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -1562,7 +1567,8 @@ mod tests {
             "bundled entity's hash matches the event's new_hash"
         );
         assert_eq!(
-            bundled, &make_entity("t", "payload-body"),
+            bundled,
+            &make_entity("t", "payload-body"),
             "bundled entity is the one that was written"
         );
     }

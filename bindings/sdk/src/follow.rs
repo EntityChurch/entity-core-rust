@@ -236,8 +236,9 @@ impl PeerContext {
         remote_peer_id: impl Into<String>,
         prefix: impl Into<String>,
         options: FollowOptions,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<FollowHandle, SdkError>> + 'static>>
-    {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<FollowHandle, SdkError>> + 'static>,
+    > {
         let remote = remote_peer_id.into();
         let prefix = ensure_trailing_slash(prefix.into());
         match options.mode {
@@ -391,7 +392,9 @@ impl PeerContext {
         // built) so the async block holds no &self borrow.
         let plan = built.map(|(merge_body, extract_body)| {
             let install_merge = self.continuation().install(merge_path.clone(), merge_body);
-            let install_extract = self.continuation().install(extract_path.clone(), extract_body);
+            let install_extract = self
+                .continuation()
+                .install(extract_path.clone(), extract_body);
             let subscribe = self.subscribe_raw_at(
                 remote.clone(),
                 subtree_wildcard(&prefix),
@@ -440,9 +443,14 @@ impl PeerContext {
                     }
                 }
                 Ok(hr) => {
-                    tracing::warn!(status = hr.status, "follow continuation: bootstrap extract non-200")
+                    tracing::warn!(
+                        status = hr.status,
+                        "follow continuation: bootstrap extract non-200"
+                    )
                 }
-                Err(e) => tracing::warn!(error = %e, "follow continuation: bootstrap extract failed"),
+                Err(e) => {
+                    tracing::warn!(error = %e, "follow continuation: bootstrap extract failed")
+                }
             }
 
             Ok(FollowHandle {
@@ -486,7 +494,10 @@ fn slugify(prefix: &str) -> String {
 fn merge_params_cbor(prefix: &str) -> Vec<u8> {
     entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
         (entity_ecf::text("source_prefix"), entity_ecf::text(prefix)),
-        (entity_ecf::text("strategy"), entity_ecf::text("source-wins")),
+        (
+            entity_ecf::text("strategy"),
+            entity_ecf::text("source-wins"),
+        ),
         (entity_ecf::text("target_prefix"), entity_ecf::text(prefix)),
     ]))
 }
@@ -508,7 +519,10 @@ fn bootstrap_merge_params(envelope: &Entity, prefix: &str) -> Entity {
     let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
         (entity_ecf::text("source_envelope"), source_envelope),
         (entity_ecf::text("source_prefix"), entity_ecf::text(prefix)),
-        (entity_ecf::text("strategy"), entity_ecf::text("source-wins")),
+        (
+            entity_ecf::text("strategy"),
+            entity_ecf::text("source-wins"),
+        ),
         (entity_ecf::text("target_prefix"), entity_ecf::text(prefix)),
     ]));
     Entity::new("system/tree/merge-params", data)
@@ -546,7 +560,9 @@ impl MirrorWriter {
         if ev.event == "deleted" {
             match build_remove_params() {
                 Ok(params) => self.local_tree_put(&path, params).await,
-                Err(e) => tracing::warn!(path = %path, error = %e, "follow mirror: build remove params"),
+                Err(e) => {
+                    tracing::warn!(path = %path, error = %e, "follow mirror: build remove params")
+                }
             }
             return;
         }
@@ -584,7 +600,9 @@ impl MirrorWriter {
             Ok(r) if (200..300).contains(&r.status) => {
                 self.generation.fetch_add(1, Ordering::Relaxed);
             }
-            Ok(r) => tracing::warn!(path = %path, status = r.status, "follow mirror: local put non-2xx"),
+            Ok(r) => {
+                tracing::warn!(path = %path, status = r.status, "follow mirror: local put non-2xx")
+            }
             Err(e) => tracing::warn!(path = %path, error = %e, "follow mirror: local put dispatch"),
         }
     }
