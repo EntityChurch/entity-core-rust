@@ -43,6 +43,46 @@ pub mod conversions;
 
 /// Wire-protocol version. Bumped on any wire-shape change.
 ///
+/// **v12:** the establisher-install report, so "I asked for WebRTC and the
+/// worker installed it" stops being an inference. `WireCaps.webrtc_peers:
+/// Vec<String>` names the Init-time peers that got a §6.5 establisher;
+/// `CreatePeerOk.webrtc_active: bool` reports the same for a peer created
+/// later. Both `#[serde(default)]`.
+///
+/// A **list**, not the worker-level bool that was proposed: v11 made the
+/// enable decision per-peer, so a single flag cannot say "the primary has it,
+/// this additional peer does not" — and answering a per-peer question with one
+/// worker-wide value is the v6 Subscribe collapse restated. On `CreatePeerOk`
+/// a bool *is* right, because that response is about exactly one peer.
+///
+/// This is a report, not a new failure mode: `webrtc_enabled` that cannot be
+/// honoured still fails Init/CreatePeer loudly (v11). What was missing is the
+/// affirmative signal in the **success** path — the same reason `opfs_active`
+/// exists at v8, and the reason `entity-browser-rust` could not observe the
+/// install at all.
+///
+/// **v11:** `InitParams.webrtc: Option<WireWebRtcConfig>` and per-peer
+/// `webrtc_enabled: bool`. Provisions the §6.5 WebRTC establisher at the
+/// §10.3 seam: signaling-node target, ICE servers, negotiation tunables.
+/// Absent = unchanged v10 behaviour (no establisher installed). Enable is
+/// per-peer and defaults to false — never inferred from config presence,
+/// per the v6 lesson. v10 proxies fail fast via the `PROTOCOL_VERSION`
+/// handshake.
+///
+/// Ruled with `entity-browser-rust`
+/// (`docs/status/ROUTING-2026-08-03-provisioning-payload-for-codesign-to-browser-rust.md`
+/// → their provisioning ruling): Init-time only, no
+/// `Request::ProvisionWebRtc` — `live_establish` is installed at peer
+/// **build**, and enabling WebRTC on an already-built peer would mean
+/// mutating §10.3 policy while a dispatch could be consulting it. If a
+/// "user toggles P2P on" flow ever lands, the path is destroy+recreate the
+/// peer webrtc-enabled, not a mutate-in-place setter.
+///
+/// Note this bump is independent of `CONTROL_PROTOCOL_VERSION`, which went
+/// 1 → 2 in the same change to carry `ice_servers` on `WebRtcOpen`. Two
+/// planes, two versions: this one is app → worker, that one is worker →
+/// broker.
+///
 /// **v10:** `Request::DisconnectPeer { peer_id, remote_peer_id }` (+ matching
 /// `Response::DisconnectPeer`) evicts a pooled outbound connection inside the
 /// worker so the next dial re-handshakes fresh — the way a peer adopts a
@@ -127,7 +167,7 @@ pub mod conversions;
 /// `{ "Ok": null }`, the decoder rejects it. `Option<WireError>` round-trips
 /// cleanly (None = success, Some = failure). Documented in the Phase 3
 /// pilot status notes (§#1) with full hex evidence.
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// `Request` variants that mirror an L1 SDK method. Ordering must match
 /// `entity_sdk::L1_WORKER_MIRRORED_SURFACE` — the [coverage check](crate)
@@ -366,6 +406,74 @@ pub struct PersistedPeer {
     #[serde(with = "serde_bytes")]
     pub keypair_seed: Vec<u8>,
     pub label: Option<String>,
+    /// v11. Install the §6.5 WebRTC establisher at this peer's §10.3 seam.
+    ///
+    /// **Explicit, per-peer, and defaults to false** — never inferred from
+    /// "`InitParams.webrtc` is present" and never "the primary gets it."
+    /// This is the v6 Subscribe lesson applied before it can bite: that bug
+    /// was a host hardcoding `default_peer_id` regardless of which peer a
+    /// request targeted, with every visible step still reporting success. A
+    /// worker-wide config that silently installed an establisher on every
+    /// peer is the same shape, and the thing it would silently confer is a
+    /// dependency on a signaling node.
+    ///
+    /// Requires `InitParams.webrtc` to be `Some`; true with no config is a
+    /// provisioning error the host reports rather than ignores.
+    #[serde(default)]
+    pub webrtc_enabled: bool,
+}
+
+/// v11. Worker-level provisioning for the §6.5 WebRTC establisher.
+///
+/// Carried on [`InitParams`]; which peers actually get an establisher is the
+/// separate per-peer [`PersistedPeer::webrtc_enabled`] decision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireWebRtcConfig {
+    /// The signaling node's peer-id. Required — the carrier authenticates
+    /// the node, so an address alone would be an unauthenticated rendezvous.
+    pub node_peer_id: String,
+    /// Its address, browser-reachable (`ws://` / `wss://`). A browser cannot
+    /// open a raw TCP socket, so a node that binds TCP only is unreachable
+    /// here no matter what this says — see the node's `--ws-listen`.
+    pub node_addr: String,
+    /// ICE servers for the browser's own ICE agent.
+    ///
+    /// **Empty is legal and means host-candidates-only** — a LAN-only
+    /// deployment — rather than "use a default". A silent public-STUN
+    /// default would enroll a third party on the operator's behalf,
+    /// invisibly; keeping the emptiness on the wire makes it a stated
+    /// deployment fact instead of an inferred one.
+    ///
+    /// This is the browser analogue of the native reflector/relay pool and
+    /// **only** an analogue: a browser ICE agent speaks `stun:`/RFC 5389 and
+    /// cannot be pointed at our entity `observe-address` node. Two browsers
+    /// across real NATs need a real STUN server — operator infra, the
+    /// browser leg's equivalent of native G4.
+    #[serde(default)]
+    pub ice_servers: Vec<WireIceServer>,
+    /// §6.5 negotiation tunables. Absent = the impl's defaults.
+    #[serde(default)]
+    pub poll_interval_ms: Option<u64>,
+    /// Ceiling for one negotiation. §10.3's deadline is the caller's, so
+    /// this only ever *shortens* what `EstablishCtx` already allows.
+    #[serde(default)]
+    pub max_deadline_ms: Option<u64>,
+}
+
+/// v11. One ICE server for the browser's ICE agent.
+///
+/// Structurally parallel to `entity_peer::transport::WireIceServer`, which is
+/// what actually reaches `RTCConfiguration` on the control plane. Kept
+/// separate rather than shared because this crate is a deliberately decoupled
+/// serializable shadow of the SDK surface; the host converts at the boundary.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct WireIceServer {
+    /// `stun:` / `turn:` / `turns:` URLs for one logical server.
+    pub urls: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -396,6 +504,13 @@ pub struct CreatePeerOk {
     #[serde(with = "serde_bytes")]
     pub keypair_seed: Vec<u8>,
     pub metadata: WirePeerMetadata,
+    /// v12. Whether this peer got a §6.5 WebRTC establisher.
+    ///
+    /// A bool is the right shape *here* — unlike [`WireCaps::webrtc_peers`],
+    /// this response is about exactly one peer, so there is no "which one?"
+    /// left to be silent about.
+    #[serde(default)]
+    pub webrtc_active: bool,
 }
 
 /// Success payload for `Request::ConnectPeer`. Carries the remote peer's
@@ -428,6 +543,13 @@ pub struct InitParams {
     /// PROTOCOL_VERSION handshake before any field is consulted.
     #[serde(default)]
     pub opfs_root: Option<String>,
+    /// v11. Worker-level WebRTC provisioning.
+    ///
+    /// `None` = no establisher is installed on any peer, which is exactly
+    /// v10 behaviour. Present-but-no-peer-enabled is also legal and inert:
+    /// the config is the *capability*, `webrtc_enabled` is the *decision*.
+    #[serde(default)]
+    pub webrtc: Option<WireWebRtcConfig>,
 }
 
 /// Reports which optional kernel features actually wired up inside the
@@ -446,6 +568,27 @@ pub struct WireCaps {
     /// completed (which implies OPFS handle acquisition succeeded —
     /// failure would have produced `Response::Init` with an error).
     pub opfs_active: bool,
+    /// v12. The peer-ids that actually had a §6.5 WebRTC establisher
+    /// installed at their §10.3 seam.
+    ///
+    /// **A list and not a bool, because the capability is per-peer.** A
+    /// worker-level `webrtc_active: bool` cannot express "the primary has it,
+    /// this additional peer does not" — and answering a per-peer question with
+    /// one worker-wide flag is the exact collapse the v6 Subscribe bug was
+    /// (a host answering "which peer?" with "the default one"). v11 made the
+    /// enable decision per-peer; the report has to be per-peer or it cannot be
+    /// checked against what was asked.
+    ///
+    /// The consumer knows which peers it flagged, so this is diffable: a peer
+    /// in your `webrtc_enabled` set and absent here did not get one. Today
+    /// that set difference is always empty — the host refuses Init outright
+    /// rather than installing nothing — but "it cannot happen" is precisely
+    /// the claim a report exists to stop having to take on faith.
+    ///
+    /// Init-time peers only. A peer created later reports via
+    /// [`CreatePeerOk::webrtc_active`].
+    #[serde(default)]
+    pub webrtc_peers: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -479,6 +622,14 @@ pub enum Request {
     CreatePeer {
         request_id: RequestId,
         label: Option<String>,
+        /// v11. Whether this newly-created peer gets the §6.5 establisher.
+        ///
+        /// On `CreatePeer` as well as `PersistedPeer` deliberately: a peer
+        /// created after Init opts in at *its* creation and cannot inherit a
+        /// capability nobody asked for. That is the whole reason the enable
+        /// decision is per-peer rather than worker-wide.
+        #[serde(default)]
+        webrtc_enabled: bool,
     },
 
     /// Delete a peer by id. Returns false-equivalent (in `Response::DeletePeer.result`)
@@ -965,4 +1116,350 @@ pub enum BindingKind {
     /// with cache-layer marshal sites.
     Snapshot,
     CacheInvalidate,
+}
+
+/// v11 wire-shape tests — the additivity claims in the `PROTOCOL_VERSION`
+/// ladder, pinned.
+///
+/// # These do not run under `make test`, and saying so is the point
+///
+/// This crate is `#![cfg(target_arch = "wasm32")]`, so natively it compiles to
+/// nothing and native `cargo test` has no tests here to skip — it has none to
+/// find. They are `wasm_bindgen_test`s and need a wasm runner; being pure serde
+/// over plain structs, they need no browser, so the node runner is enough.
+/// `cargo clippy --target wasm32-unknown-unknown --all-targets` type-checks
+/// them today, which is compile-verification and **not** evidence they pass.
+///
+/// What they are for: the ladder entry claims "absent = unchanged v10
+/// behaviour," and that claim rests entirely on `#[serde(default)]` being right
+/// on four fields. A same-side round-trip cannot prove the *shape* is what
+/// `entity-browser-rust` expects — encoder and decoder agree even when both are
+/// wrong — but it can prove the *additivity*, because that is a property of one
+/// decoder meeting an older encoder, which is exactly what is simulated here by
+/// hand-building v10 CBOR rather than round-tripping our own types.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod v11_wire_shape {
+    use super::*;
+    use ciborium::Value;
+    use wasm_bindgen_test::*;
+
+    fn roundtrip<T: Serialize + for<'de> Deserialize<'de>>(v: &T) -> T {
+        let mut buf = Vec::new();
+        ciborium::into_writer(v, &mut buf).expect("encode");
+        ciborium::from_reader(buf.as_slice()).expect("decode")
+    }
+
+    fn decode<T: for<'de> Deserialize<'de>>(v: &Value) -> T {
+        let mut buf = Vec::new();
+        ciborium::into_writer(v, &mut buf).expect("encode");
+        ciborium::from_reader(buf.as_slice()).expect("decode")
+    }
+
+    fn txt(s: &str) -> Value {
+        Value::Text(s.into())
+    }
+
+    #[wasm_bindgen_test]
+    fn the_version_is_eleven() {
+        assert_eq!(PROTOCOL_VERSION, 11);
+    }
+
+    /// The ladder entry claims "absent = unchanged v10 behaviour". That claim
+    /// is only true if a payload from a v10 sender — which has never heard of
+    /// `webrtc` or `webrtc_enabled` — still decodes. A missing `#[serde(default)]`
+    /// would make it a hard decode error, and the ladder entry a lie.
+    ///
+    /// The handshake would reject a real v10 proxy before any field is read;
+    /// this pins the *field-level* additivity underneath that, which is what
+    /// makes the bump additive rather than a break.
+    #[wasm_bindgen_test]
+    fn a_v10_init_payload_still_decodes_and_means_no_webrtc() {
+        let v10 = Value::Map(vec![
+            (
+                txt("primary_peer"),
+                Value::Map(vec![
+                    (txt("peer_id"), txt("peer-a")),
+                    (txt("keypair_seed"), Value::Bytes(vec![7u8; 32])),
+                    (txt("label"), Value::Null),
+                ]),
+            ),
+            (txt("additional_peers"), Value::Array(vec![])),
+            (txt("handlers"), Value::Array(vec![])),
+            (txt("opfs_root"), Value::Null),
+        ]);
+
+        let params: InitParams = decode(&v10);
+        assert!(
+            params.webrtc.is_none(),
+            "a v10 sender names no config, so no establisher is provisioned"
+        );
+        assert!(
+            !params.primary_peer.webrtc_enabled,
+            "and no peer opts in — the default is false, never inherited"
+        );
+    }
+
+    /// Same additivity on the request plane: `CreatePeer` from a v10 sender
+    /// must not fail to decode, and must not create a webrtc-enabled peer.
+    #[wasm_bindgen_test]
+    fn a_v10_create_peer_defaults_to_disabled() {
+        let v10 = Value::Map(vec![
+            (txt("op"), txt("CreatePeer")),
+            (txt("request_id"), Value::Integer(1.into())),
+            (txt("label"), txt("scratch")),
+        ]);
+
+        match decode::<Request>(&v10) {
+            Request::CreatePeer {
+                webrtc_enabled,
+                label,
+                ..
+            } => {
+                assert_eq!(label.as_deref(), Some("scratch"));
+                assert!(!webrtc_enabled, "opt-in is never implied by omission");
+            }
+            other => panic!("expected CreatePeer, got {other:?}"),
+        }
+    }
+
+    /// Config present with nothing enabled is legal and inert: the config is
+    /// the capability, the per-peer flag is the decision. These are two axes
+    /// and collapsing them is exactly the v6 Subscribe bug's shape.
+    #[wasm_bindgen_test]
+    fn config_present_does_not_enable_any_peer() {
+        let params = InitParams {
+            primary_peer: PersistedPeer {
+                peer_id: "peer-a".into(),
+                keypair_seed: vec![1u8; 32],
+                label: None,
+                webrtc_enabled: false,
+            },
+            additional_peers: vec![],
+            handlers: vec![],
+            opfs_root: None,
+            webrtc: Some(WireWebRtcConfig {
+                node_peer_id: "node-1".into(),
+                node_addr: "ws://node.example:9000".into(),
+                ice_servers: vec![],
+                poll_interval_ms: None,
+                max_deadline_ms: None,
+            }),
+        };
+
+        let back = roundtrip(&params);
+        assert!(back.webrtc.is_some());
+        assert!(!back.primary_peer.webrtc_enabled);
+    }
+
+    /// Empty `ice_servers` is a value, not a gap. It must survive the wire as
+    /// empty so the host provisions host-candidates-only rather than reaching
+    /// for a public STUN default nobody named.
+    #[wasm_bindgen_test]
+    fn empty_ice_servers_survives_as_empty() {
+        let cfg = WireWebRtcConfig {
+            node_peer_id: "node-1".into(),
+            node_addr: "wss://node.example".into(),
+            ice_servers: vec![],
+            poll_interval_ms: Some(250),
+            max_deadline_ms: Some(15_000),
+        };
+
+        let back = roundtrip(&cfg);
+        assert!(
+            back.ice_servers.is_empty(),
+            "empty means LAN-only, and nothing substitutes for it"
+        );
+        assert_eq!(back.poll_interval_ms, Some(250));
+        assert_eq!(back.max_deadline_ms, Some(15_000));
+    }
+
+    /// An absent `ice_servers` decodes to the same empty vector — the two
+    /// spellings agree, so a sender that omits the key cannot mean anything
+    /// other than host-candidates-only.
+    #[wasm_bindgen_test]
+    fn absent_ice_servers_decodes_as_empty_not_as_a_default() {
+        let cfg: WireWebRtcConfig = decode(&Value::Map(vec![
+            (txt("node_peer_id"), txt("node-1")),
+            (txt("node_addr"), txt("ws://node.example:9000")),
+        ]));
+
+        assert!(cfg.ice_servers.is_empty());
+        assert_eq!(cfg.poll_interval_ms, None);
+        assert_eq!(cfg.max_deadline_ms, None);
+    }
+
+    /// TURN credentials round-trip, and a STUN server carries neither.
+    /// `username`/`credential` are `skip_serializing_if` so an absent one is a
+    /// missing key rather than an explicit null — the same "optional fields
+    /// SHOULD be absent" discipline the entity wire carries.
+    #[wasm_bindgen_test]
+    fn ice_server_credentials_are_absent_rather_than_null() {
+        let servers = vec![
+            WireIceServer {
+                urls: vec!["stun:stun.example:3478".into()],
+                username: None,
+                credential: None,
+            },
+            WireIceServer {
+                urls: vec!["turns:turn.example:5349".into()],
+                username: Some("u".into()),
+                credential: Some("p".into()),
+            },
+        ];
+
+        let back = roundtrip(&servers);
+        assert_eq!(back[0].urls, servers[0].urls);
+        assert!(back[0].username.is_none() && back[0].credential.is_none());
+        assert_eq!(back[1].username.as_deref(), Some("u"));
+        assert_eq!(back[1].credential.as_deref(), Some("p"));
+
+        // The STUN entry must not have written the keys at all.
+        let mut buf = Vec::new();
+        ciborium::into_writer(&servers[0], &mut buf).expect("encode");
+        let decoded: Value = ciborium::from_reader(buf.as_slice()).expect("decode");
+        let Value::Map(entries) = decoded else {
+            panic!("expected a map")
+        };
+        let keys: Vec<_> = entries
+            .iter()
+            .filter_map(|(k, _)| k.as_text().map(str::to_owned))
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["urls".to_string()],
+            "absent optional fields are missing keys, not nulls"
+        );
+    }
+
+    /// Per-peer enable is carried on every peer that can be named, including
+    /// additional peers — a peer listed at Init opts in at its own listing.
+    #[wasm_bindgen_test]
+    fn each_peer_carries_its_own_enable() {
+        let params = InitParams {
+            primary_peer: PersistedPeer {
+                peer_id: "peer-a".into(),
+                keypair_seed: vec![1u8; 32],
+                label: None,
+                webrtc_enabled: false,
+            },
+            additional_peers: vec![PersistedPeer {
+                peer_id: "peer-b".into(),
+                keypair_seed: vec![2u8; 32],
+                label: Some("b".into()),
+                webrtc_enabled: true,
+            }],
+            handlers: vec![],
+            opfs_root: None,
+            webrtc: Some(WireWebRtcConfig {
+                node_peer_id: "node-1".into(),
+                node_addr: "ws://node.example:9000".into(),
+                ice_servers: vec![],
+                poll_interval_ms: None,
+                max_deadline_ms: None,
+            }),
+        };
+
+        let back = roundtrip(&params);
+        assert!(!back.primary_peer.webrtc_enabled);
+        assert!(back.additional_peers[0].webrtc_enabled);
+    }
+}
+
+/// v12 capability-report tests. Same non-execution caveat as
+/// [`v11_wire_shape`] — `wasm_bindgen_test`, no runner in this repo.
+#[cfg(all(test, target_arch = "wasm32"))]
+mod v12_capability_report {
+    use super::*;
+    use ciborium::Value;
+    use wasm_bindgen_test::*;
+
+    fn roundtrip<T: Serialize + for<'de> Deserialize<'de>>(v: &T) -> T {
+        let mut buf = Vec::new();
+        ciborium::into_writer(v, &mut buf).expect("encode");
+        ciborium::from_reader(buf.as_slice()).expect("decode")
+    }
+
+    #[wasm_bindgen_test]
+    fn the_version_is_twelve() {
+        assert_eq!(PROTOCOL_VERSION, 12);
+    }
+
+    /// The report is per-peer, which is the whole reason it is a list. A
+    /// worker-level bool could not distinguish these two peers, and answering
+    /// "which peer?" with one worker-wide value is the v6 Subscribe collapse.
+    #[wasm_bindgen_test]
+    fn the_report_names_which_peers_got_one() {
+        let caps = WireCaps {
+            opfs_active: false,
+            webrtc_peers: vec!["peer-a".into()],
+        };
+
+        let back = roundtrip(&caps);
+        assert_eq!(back.webrtc_peers, vec!["peer-a".to_string()]);
+        assert!(
+            !back.webrtc_peers.contains(&"peer-b".to_string()),
+            "a peer that got no establisher must be absent, not merely falsy"
+        );
+    }
+
+    /// Nobody enabled it → an empty list, which is a complete answer, not a
+    /// missing one. Distinguishable from "the worker never reported" only by
+    /// `actual_capabilities` being `None`, which is the anomaly path.
+    #[wasm_bindgen_test]
+    fn nobody_enabled_reports_empty_rather_than_absent() {
+        let caps = WireCaps {
+            opfs_active: true,
+            webrtc_peers: vec![],
+        };
+        let back = roundtrip(&caps);
+        assert!(back.webrtc_peers.is_empty());
+        assert!(back.opfs_active);
+    }
+
+    /// A v11 host's `WireCaps` (no `webrtc_peers`) still decodes — the field
+    /// is additive, so the report degrades to "reported nothing" rather than
+    /// to a decode error.
+    #[wasm_bindgen_test]
+    fn a_v11_wirecaps_still_decodes() {
+        let v11 = Value::Map(vec![(Value::Text("opfs_active".into()), Value::Bool(true))]);
+        let mut buf = Vec::new();
+        ciborium::into_writer(&v11, &mut buf).expect("encode");
+        let caps: WireCaps = ciborium::from_reader(buf.as_slice()).expect("decode");
+        assert!(caps.opfs_active);
+        assert!(caps.webrtc_peers.is_empty());
+    }
+
+    /// On `CreatePeerOk` a bool IS the right shape — one response, one peer,
+    /// nothing left to be silent about.
+    #[wasm_bindgen_test]
+    fn create_peer_reports_its_single_peer_as_a_bool() {
+        let ok = CreatePeerOk {
+            peer_id: "peer-c".into(),
+            keypair_seed: vec![3u8; 32],
+            metadata: WirePeerMetadata::default(),
+            webrtc_active: true,
+        };
+        assert!(roundtrip(&ok).webrtc_active);
+
+        // And a v11 payload without the field decodes as false.
+        let v11 = Value::Map(vec![
+            (Value::Text("peer_id".into()), Value::Text("peer-c".into())),
+            (
+                Value::Text("keypair_seed".into()),
+                Value::Bytes(vec![3u8; 32]),
+            ),
+            (
+                Value::Text("metadata".into()),
+                Value::Map(vec![
+                    (Value::Text("label".into()), Value::Null),
+                    (Value::Text("persisted".into()), Value::Bool(false)),
+                    (Value::Text("listen_addresses".into()), Value::Array(vec![])),
+                ]),
+            ),
+        ]);
+        let mut buf = Vec::new();
+        ciborium::into_writer(&v11, &mut buf).expect("encode");
+        let ok: CreatePeerOk = ciborium::from_reader(buf.as_slice()).expect("decode");
+        assert!(!ok.webrtc_active);
+    }
 }

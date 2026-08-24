@@ -78,7 +78,7 @@ use entity_wasm_worker_protocol::{
     CreatePeerOk, Event, InitParams, InspectFact, Request, RequestId, Response, SubId, WireCaps,
     WireDirection, WireEntity, WireError, WireErrorKind, WireExecuteOptions, WireHandlerInfo,
     WireHandlerResult, WireHash, WireListingEntry, WirePeerMetadata, WireQueryResults,
-    WireTypeInfo, PROTOCOL_VERSION,
+    WireTypeInfo, WireWebRtcConfig, PROTOCOL_VERSION,
 };
 use js_sys::Uint8Array;
 use std::cell::RefCell;
@@ -125,6 +125,7 @@ pub fn run_worker(factories: Vec<HandlerFactory>) {
         pending_control_port: None,
         control_client: None,
         inspect_enabled: HashMap::new(),
+        webrtc: None,
     }));
 
     let global = js_sys::global()
@@ -170,6 +171,11 @@ struct WorkerState {
     /// main-thread side. Consumers flip it via `Request::SetInspectEnabled`.
     /// Keys are local peer ids (primary + additional + dynamic).
     inspect_enabled: HashMap<String, Arc<AtomicBool>>,
+    /// Worker-level WebRTC provisioning from `InitParams.webrtc` (PROTOCOL
+    /// v11). Retained after Init so `handle_create_peer` can install an
+    /// establisher on a peer created later — the per-peer enable flag rides
+    /// `Request::CreatePeer` and this is the config it names.
+    webrtc: Option<WireWebRtcConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -358,7 +364,11 @@ async fn dispatch(
             label,
             listen_addresses,
         } => handle_register_backend_peer(state, request_id, peer_id, label, listen_addresses),
-        Request::CreatePeer { request_id, label } => handle_create_peer(state, request_id, label),
+        Request::CreatePeer {
+            request_id,
+            label,
+            webrtc_enabled,
+        } => handle_create_peer(state, request_id, label, webrtc_enabled),
         Request::DeletePeer {
             request_id,
             peer_id,
@@ -572,6 +582,97 @@ fn build_per_peer_connector(
     }
 }
 
+/// Default §6.5 carrier poll interval when `WireWebRtcConfig` names none.
+///
+/// The carrier is polled for the counterpart's offer/answer/candidates, so
+/// this is load on the operator's signaling node, once per interval per
+/// in-flight negotiation. 250ms is slow enough not to hammer a shared node and
+/// fast enough that a negotiation is not dominated by poll latency.
+const DEFAULT_WEBRTC_POLL_INTERVAL_MS: u64 = 250;
+
+/// Default ceiling for one §6.5 negotiation when the config names none.
+///
+/// A **ceiling**, never a grant: §10.3's deadline belongs to the caller, and
+/// `BrowserWebRtcEstablisher` takes the smaller of this and `ctx.remaining()`.
+/// Raising it cannot make a dispatch wait longer than the dispatch allows.
+const DEFAULT_WEBRTC_MAX_DEADLINE_MS: u64 = 15_000;
+
+/// Build the §6.5 establisher for one peer, or say why it cannot be built.
+///
+/// # Why this can fail, and why that is reported rather than skipped
+///
+/// The Worker arm reaches `RTCPeerConnection` through the broker on the main
+/// thread, which means it needs a control port. A peer asked to enable WebRTC
+/// in a Worker that booted without one has no path to a `RTCPeerConnection` at
+/// all — and the failure would otherwise be invisible: the peer builds fine,
+/// dispatches fine, and simply never establishes anything. That is the same
+/// silent-success shape as the v6 Subscribe bug, so an explicit
+/// `webrtc_enabled: true` that cannot be honoured is an Init/CreatePeer error,
+/// not a warning and not a no-op.
+///
+/// `carrier_keypair` is the peer's own identity, rebuilt from the same seed
+/// the peer was built from: the carrier authenticates to the signaling node
+/// **as this peer**, which is what makes the §6.1 coordination attributable.
+fn build_webrtc_establisher(
+    cfg: &WireWebRtcConfig,
+    carrier_keypair: entity_crypto::IdentityKeypair,
+    self_peer_id: &str,
+    connector: Arc<dyn entity_peer::transport::Connector>,
+    control_client: Option<&std::rc::Rc<entity_peer::transport::ControlPortClient>>,
+    home_format: u8,
+) -> Result<Arc<dyn entity_peer::live_establish::LiveEstablish>, String> {
+    let control = control_client.ok_or_else(|| {
+        format!(
+            "peer '{self_peer_id}' requested webrtc_enabled but this Worker booted \
+             without a control port; the §6.5 Worker arm reaches RTCPeerConnection \
+             through the main-thread broker and has no path without one"
+        )
+    })?;
+
+    let carrier = entity_peer::carrier::PeerCarrier::new(
+        cfg.node_peer_id.clone(),
+        cfg.node_addr.clone(),
+        carrier_keypair,
+        connector,
+        home_format,
+    );
+
+    // Structurally parallel types across a deliberately decoupled crate
+    // boundary — the worker-protocol crate is a serializable shadow and
+    // `core/peer` must not depend on it — so the conversion happens here,
+    // once, at the boundary that owns both.
+    let ice_servers = cfg
+        .ice_servers
+        .iter()
+        .map(|s| entity_peer::transport::WireIceServer {
+            urls: s.urls.clone(),
+            username: s.username.clone(),
+            credential: s.credential.clone(),
+        })
+        .collect();
+
+    Ok(Arc::new(
+        entity_peer::worker_webrtc::BrowserWebRtcEstablisher::new(
+            carrier,
+            self_peer_id,
+            control.clone(),
+            cfg.poll_interval_ms
+                .unwrap_or(DEFAULT_WEBRTC_POLL_INTERVAL_MS),
+            cfg.max_deadline_ms
+                .unwrap_or(DEFAULT_WEBRTC_MAX_DEADLINE_MS),
+            // §6.3 specifies the identity checks but no container to carry a
+            // signature, so `Require` cannot currently succeed. Naming the
+            // pre-container variant here rather than defaulting to it is what
+            // keeps "the browser leg ships with no identity binding" a stated
+            // fact instead of something a reader has to infer. **This is the
+            // call site the §6.3 container lands on** — the first and, today,
+            // only production choice of this policy.
+            entity_peer::worker_webrtc::VerificationPolicy::AllowUnverifiedPreContainer,
+            ice_servers,
+        ),
+    ))
+}
+
 /// Bind a `MessagePortListener` for `peer_id` against the given
 /// control client, start the peer's engines, and spawn its accept
 /// loop. No-op if the peer is missing from the SDK. Engines start is
@@ -678,6 +779,13 @@ async fn handle_init(
 
     let primary_connector = build_per_peer_connector(control_client.as_ref(), &primary_pid);
 
+    // PROTOCOL v12: the peers that actually got a §6.5 establisher, reported on
+    // `Ready`. Accumulated at the install sites rather than recomputed from
+    // `webrtc_enabled` afterwards — a report derived from the request instead
+    // of from the outcome would agree with the request by construction and
+    // could never contradict it, which is the one thing it exists to do.
+    let mut webrtc_installed: Vec<String> = Vec::new();
+
     // Build the SDK with the primary peer's keypair. Apply `.opfs(root)` if
     // the consumer requested durable storage; build_async() awaits OPFS
     // handle acquisition when applicable and is a sync passthrough when
@@ -750,6 +858,54 @@ async fn handle_init(
     if let Some(root) = params.opfs_root.as_deref() {
         builder = builder.opfs(root);
     }
+
+    // PROTOCOL v11 — the §6.5 establisher at the primary peer's §10.3 seam.
+    //
+    // Gated on the peer's OWN `webrtc_enabled`, not on `params.webrtc.is_some()`:
+    // config present with nothing enabled is legal and inert. The config is the
+    // capability; the flag is the decision.
+    if params.primary_peer.webrtc_enabled {
+        let Some(cfg) = params.webrtc.as_ref() else {
+            return Response::Init {
+                request_id,
+                result: Some(WireError {
+                    kind: WireErrorKind::InvalidParams,
+                    message: format!(
+                        "primary peer '{primary_pid}' has webrtc_enabled but InitParams.webrtc \
+                         is absent; there is no signaling node to provision it against"
+                    ),
+                    detail: None,
+                }),
+            };
+        };
+        // The carrier authenticates to the node as this peer, so it needs the
+        // peer's identity — rebuilt from the same seed rather than shared,
+        // since the original was moved into the builder.
+        match build_webrtc_establisher(
+            cfg,
+            Keypair::from_seed(primary_seed).into(),
+            &primary_pid,
+            build_per_peer_connector(control_client.as_ref(), &primary_pid),
+            control_client.as_ref(),
+            PeerConfig::default().home_hash_format,
+        ) {
+            Ok(seam) => {
+                builder = builder.with_live_establish(seam);
+                webrtc_installed.push(primary_pid.clone());
+            }
+            Err(message) => {
+                return Response::Init {
+                    request_id,
+                    result: Some(WireError {
+                        kind: WireErrorKind::InvalidParams,
+                        message,
+                        detail: None,
+                    }),
+                };
+            }
+        }
+    }
+
     let mut sdk = match builder.build_async().await {
         Ok(sdk) => sdk,
         Err(e) => {
@@ -821,12 +977,53 @@ async fn handle_init(
                 ..PeerConfig::default()
             })
             .connector(pp_connector);
-        let pp_builder = install_inspect_hooks_on_builder(
+        let mut pp_builder = install_inspect_hooks_on_builder(
             pp_builder,
             pp_pid.clone(),
             pp_flag.clone(),
             global_for_hooks.clone(),
         );
+        // PROTOCOL v11 — same per-peer gate as the primary. An additional peer
+        // enables WebRTC at its own listing or not at all; it never inherits.
+        if pp.webrtc_enabled {
+            let Some(cfg) = params.webrtc.as_ref() else {
+                return Response::Init {
+                    request_id,
+                    result: Some(WireError {
+                        kind: WireErrorKind::InvalidParams,
+                        message: format!(
+                            "additional peer '{}' has webrtc_enabled but InitParams.webrtc \
+                             is absent; there is no signaling node to provision it against",
+                            pp.peer_id
+                        ),
+                        detail: None,
+                    }),
+                };
+            };
+            match build_webrtc_establisher(
+                cfg,
+                Keypair::from_seed(seed).into(),
+                &pp_pid,
+                build_per_peer_connector(control_client.as_ref(), &pp_pid),
+                control_client.as_ref(),
+                PeerConfig::default().home_hash_format,
+            ) {
+                Ok(seam) => {
+                    pp_builder = pp_builder.with_live_establish(seam);
+                    webrtc_installed.push(pp_pid.clone());
+                }
+                Err(message) => {
+                    return Response::Init {
+                        request_id,
+                        result: Some(WireError {
+                            kind: WireErrorKind::InvalidParams,
+                            message,
+                            detail: None,
+                        }),
+                    };
+                }
+            }
+        }
         let ctx = match pp_builder.build() {
             Ok(c) => c,
             Err(e) => {
@@ -891,6 +1088,9 @@ async fn handle_init(
         let mut st = state.borrow_mut();
         st.control_client = control_client.clone();
         st.inspect_enabled.extend(new_inspect_flags);
+        // PROTOCOL v11: retained so a peer created later can be provisioned
+        // against the same signaling node this Worker was initialized with.
+        st.webrtc = params.webrtc.clone();
     }
 
     // Handler registration — Phase 1.x.
@@ -941,6 +1141,7 @@ async fn handle_init(
         sdk_version: env!("CARGO_PKG_VERSION").to_string(),
         actual_capabilities: Some(WireCaps {
             opfs_active: params.opfs_root.is_some(),
+            webrtc_peers: webrtc_installed,
         }),
     }
 }
@@ -1499,6 +1700,7 @@ fn handle_create_peer(
     state: Rc<RefCell<WorkerState>>,
     request_id: RequestId,
     label: Option<String>,
+    webrtc_enabled: bool,
 ) -> Response {
     // Generate keypair inside the worker — `getrandom`'s `js` feature
     // is enabled, so this works in the browser. Seed bytes round-trip to
@@ -1540,9 +1742,52 @@ fn handle_create_peer(
     let builder = PeerContextBuilder::new()
         .keypair(keypair)
         .config(config)
-        .connector(connector);
-    let builder =
+        .connector(connector.clone());
+    let mut builder =
         install_inspect_hooks_on_builder(builder, new_pid.clone(), flag.clone(), global_for_hooks);
+
+    // PROTOCOL v11 — a peer created after Init opts in at ITS creation. This
+    // is the third and last build site, and the reason `webrtc_enabled` rides
+    // `Request::CreatePeer` rather than living only on `PersistedPeer`:
+    // without it, a dynamically-created peer could only ever inherit, which is
+    // the silent-default shape the per-peer flag exists to prevent.
+    if webrtc_enabled {
+        let cfg = state.borrow().webrtc.clone();
+        let Some(cfg) = cfg else {
+            return Response::CreatePeer {
+                request_id,
+                result: Err(WireError {
+                    kind: WireErrorKind::InvalidParams,
+                    message: "CreatePeer requested webrtc_enabled but this Worker was \
+                              initialized without InitParams.webrtc; there is no signaling \
+                              node to provision it against"
+                        .into(),
+                    detail: None,
+                }),
+            };
+        };
+        match build_webrtc_establisher(
+            &cfg,
+            Keypair::from_seed(seed).into(),
+            &new_pid,
+            connector,
+            control_client.as_ref(),
+            PeerConfig::default().home_hash_format,
+        ) {
+            Ok(seam) => builder = builder.with_live_establish(seam),
+            Err(message) => {
+                return Response::CreatePeer {
+                    request_id,
+                    result: Err(WireError {
+                        kind: WireErrorKind::InvalidParams,
+                        message,
+                        detail: None,
+                    }),
+                };
+            }
+        }
+    }
+
     let ctx = match builder.build() {
         Ok(c) => c,
         Err(e) => {
@@ -1611,6 +1856,10 @@ fn handle_create_peer(
             peer_id,
             keypair_seed: seed.to_vec(),
             metadata: WirePeerMetadata::from(metadata),
+            // v12. True only on the path that actually installed a seam: the
+            // `Err` arm above returns before here, so this cannot report an
+            // install that did not happen.
+            webrtc_active: webrtc_enabled,
         }),
     }
 }

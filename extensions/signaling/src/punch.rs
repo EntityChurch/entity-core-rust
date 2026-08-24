@@ -11,7 +11,7 @@
 //! The choreography is **substrate-agnostic** (§7.3.1: "the coordination layer
 //! above — carrier, rendezvous key, candidate exchange, `fire_at`, roles — is
 //! substrate-agnostic and shared by all three"). So the transport arrives
-//! through [`PunchIo`] and the carrier through [`Carrier`], and this module
+//! through [`crate::punch::PunchIo`] and the carrier through [`crate::punch::Carrier`], and this module
 //! compiles without `tokio`, without sockets, and on wasm32. A browser peer
 //! driving a WebRTC data channel plugs into the same two traits a native peer
 //! drives TCP through.
@@ -30,8 +30,8 @@
 //!
 //! | Layer | One attempt is | Who pays | Field |
 //! |---|---|---|---|
-//! | **Crossing** | one more dial at the counterpart's known candidate | only the two peers | [`PunchParty::crossing_retries`] |
-//! | **Exchange** | fresh nonce + fresh gather + fresh carrier round trip | **third parties** — reflector, carrier | [`PunchParty::exchange_attempts`] |
+//! | **Crossing** | one more dial at the counterpart's known candidate | only the two peers | [`crate::punch::PunchParty::crossing_retries`] |
+//! | **Exchange** | fresh nonce + fresh gather + fresh carrier round trip | **third parties** — reflector, carrier | [`crate::punch::PunchParty::exchange_attempts`] |
 //!
 //! The §7.2.1 MUST binds the **exchange** layer only. The MUST NOT forbids
 //! cutting the crossing count to satisfy it. *The distinguishing question: does
@@ -40,7 +40,7 @@
 //! **This binds Rust where it does not bind Go.** Go's `Establish` runs one
 //! exchange by construction, so nesting is structurally impossible there. This
 //! implementation loops the exchange, so a §4.1-driven consultation MUST arrive
-//! with [`PunchParty::exchange_attempts`] set to 1 — see
+//! with [`crate::punch::PunchParty::exchange_attempts`] set to 1 — see
 //! `EstablishCtx::caller_owns_retry` on the `core/peer` side.
 
 use async_trait::async_trait;

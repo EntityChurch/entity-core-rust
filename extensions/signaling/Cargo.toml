@@ -9,6 +9,12 @@ description = "system/signaling — the connection node (rendezvous + reflector)
 # module doc: the verbs are specified without reference to the entity system,
 # and that separation is what makes the second (unwrapped) front end additive.
 entity-ecf.workspace = true
+# Node-side diagnostics only (`handler.rs` offer/collect). The rendezvous key
+# each verb touched is the one fact that distinguishes "the two peers disagree
+# on a bucket" from "they agree and the bucket is empty" — and it is invisible
+# from either peer, because each can only see its own half. `core.rs` stays
+# dependency-free; this is the entity-wrapper front end's dep.
+tracing.workspace = true
 entity-entity.workspace = true
 # The §2.2 derivation calls Hash::compute (unconditionally SHA-256) — the
 # substrate content-hash primitive, pinned to the floor format. Client-side only.

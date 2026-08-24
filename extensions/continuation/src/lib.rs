@@ -5669,10 +5669,16 @@ mod tests {
             Some(DEFAULT_CHAIN_TTL),
             "root chain seeds the default ttl"
         );
-        assert!(
-            DEFAULT_CHAIN_TTL > MAX_CHAIN_DEPTH,
-            "the seeded ttl MUST exceed the depth ceiling so ttl never masks the depth brake"
-        );
+        // A `const` block, because both operands are consts: this is a
+        // compile-time invariant about the two ceilings, not a runtime
+        // observation about `minted`. Written as a runtime `assert!` it also
+        // trips `clippy::assertions_on_constants` under `-D warnings`.
+        const {
+            assert!(
+                DEFAULT_CHAIN_TTL > MAX_CHAIN_DEPTH,
+                "the seeded ttl MUST exceed the depth ceiling so ttl never masks the depth brake"
+            )
+        };
 
         // ttl already spent → hand the seam None so it raises
         // ttl_exhausted itself, rather than a second code path here.

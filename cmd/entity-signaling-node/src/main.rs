@@ -39,6 +39,24 @@ struct Args {
     #[arg(long, default_value = "0.0.0.0:4050")]
     listen: String,
 
+    /// **Additionally** listen for WebSocket connections here — the browser's
+    /// only way in.
+    ///
+    /// A browser cannot open a raw TCP socket, so without this a browser peer
+    /// cannot reach the carrier **at all** and §6.5 coordination never starts —
+    /// no offer is ever deposited, regardless of what WebRTC would have done
+    /// afterwards. `--listen` alone serves native peers only.
+    ///
+    /// This is additive, not a replacement: both listeners feed the same peer
+    /// through `run_multi`, so a native peer on `--listen` and a browser peer
+    /// on `--ws-listen` rendezvous in the same buckets. That is the whole point
+    /// — a browser and a native peer must be able to find each other.
+    ///
+    /// Off by default: a node that binds a second port without being asked is
+    /// a deployment surprise, and the native cross-impl gates do not need it.
+    #[arg(long = "ws-listen", value_name = "ADDR")]
+    ws_listen: Option<String>,
+
     /// The endpoint this node publishes via `advertise`. Defaults to `--listen`,
     /// which is wrong behind NAT or a load balancer — set it explicitly in any
     /// real deployment, since peers dial what this says.
@@ -174,9 +192,28 @@ async fn main() -> anyhow::Result<()> {
         .build()?;
 
     let listener = peer.listen().await?;
+    // Bound before the banner so a bad `--ws-listen` fails at startup rather
+    // than leaving a node that looks healthy and is unreachable from the one
+    // client class the flag exists for.
+    let ws_listener = match &args.ws_listen {
+        Some(addr) => Some(
+            entity_core::peer::transport::WebSocketListener::bind(addr)
+                .await
+                .map_err(|e| anyhow::anyhow!("--ws-listen {}: {}", addr, e))?,
+        ),
+        None => None,
+    };
+
     println!("signaling node started");
     println!("  peer_id:   {}", peer.peer_id());
     println!("  tcp:       {}", listener.socket_addr());
+    match &ws_listener {
+        Some(ws) => println!("  websocket: {} (browsers connect here)", ws.socket_addr()),
+        None => println!(
+            "  websocket: not bound — NO browser peer can reach this node.\n             \
+             Pass --ws-listen <addr> to serve browsers (§6.5's carrier)."
+        ),
+    }
     println!("  endpoint:  {}", endpoint);
     println!(
         "  limits:    ttl={}s max_blob={}B per_bucket={} keys={}",
@@ -226,7 +263,13 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let listeners: Vec<Box<dyn Listener>> = vec![Box::new(listener)];
+    // Both listeners feed the SAME peer, so a browser and a native peer land in
+    // the same rendezvous buckets and can find each other. That is the point of
+    // running them together rather than standing up a separate browser node.
+    let mut listeners: Vec<Box<dyn Listener>> = vec![Box::new(listener)];
+    if let Some(ws) = ws_listener {
+        listeners.push(Box::new(ws));
+    }
     tokio::select! {
         result = peer.run_multi(listeners) => {
             if let Err(e) = result {

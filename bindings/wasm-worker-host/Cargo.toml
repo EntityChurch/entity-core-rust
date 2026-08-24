@@ -28,7 +28,14 @@ entity-entity = { path = "../../core/entity" }
 entity-hash = { path = "../../core/hash" }
 entity-handler = { path = "../../core/handler" }
 entity-crypto = { path = "../../core/crypto" }
-entity-peer = { path = "../../core/peer", default-features = false }
+# `signaling` + `network` carry the §6.5 browser leg: `carrier` (the §7.3.1
+# coordination half, shared by every punch substrate) and `worker_webrtc`
+# (the Worker-arm §10.3 establisher). Both are socket-free, so what wasm32
+# builds here is the carrier half, not the TCP punch — see AGENTS.md.
+entity-peer = { path = "../../core/peer", default-features = false, features = [
+    "signaling",
+    "network",
+] }
 
 serde = { workspace = true, features = ["derive"] }
 ciborium.workspace = true

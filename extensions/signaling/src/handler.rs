@@ -76,6 +76,15 @@ impl SignalingHandler {
             Err(e) => return error(STATUS_BAD_REQUEST, CODE_INVALID_PARAMS, &e.to_string()),
         };
 
+        // Which bucket, and who. See `handle_collect` for why this pair of
+        // lines is the node's job and nobody else's.
+        tracing::debug!(
+            caller = ctx.session_peer_id.as_deref().unwrap_or("<unauthenticated>"),
+            rendezvous_key = ?req.rendezvous_key,
+            message_bytes = req.message.len(),
+            "signaling offer: deposit"
+        );
+
         // `Stored` and `Duplicate` are both `ok` on the wire — a retry is
         // idempotent by §1.1 pin 2, so there is nothing here for a peer to
         // branch on.
@@ -104,6 +113,28 @@ impl SignalingHandler {
         let result = CollectResult {
             messages: self.core.collect(&req.rendezvous_key, now_ms),
         };
+
+        // The node is the ONLY vantage point that sees both halves of a
+        // rendezvous.
+        //
+        // Each peer can log the key it derived, but neither can see the
+        // other's, so from a peer "my counterpart never showed up" and "we are
+        // looking in two different buckets" are the same observation:
+        // `included_count=0`. Here they are trivially distinguishable — the
+        // offer line and the collect line either carry the same
+        // `rendezvous_key` or they do not.
+        //
+        // `entity-browser-rust`'s two-browser rig spent a container harness and
+        // a four-way encoding proof-table on a question these two lines answer
+        // directly, and asked for exactly this. `debug!` because a busy node
+        // polls at interval — enable with
+        // `RUST_LOG=entity_signaling=debug`.
+        tracing::debug!(
+            caller = ctx.session_peer_id.as_deref().unwrap_or("<unauthenticated>"),
+            rendezvous_key = ?req.rendezvous_key,
+            included_count = result.messages.len(),
+            "signaling collect"
+        );
         match result.to_entity() {
             Ok(e) => HandlerResult::ok(e),
             Err(e) => internal(&e.to_string()),

@@ -70,12 +70,15 @@
 
 mod broker;
 mod web_transport;
+/// The main-thread half of the §6.5 negotiation — one `RTCPeerConnection` per
+/// negotiation, driven on behalf of a worker that cannot reach the API.
+mod webrtc_session;
 pub use broker::MessagePortBroker;
 pub use web_transport::WebTransport;
 
 use entity_wasm_worker_protocol::{
     CasFailure, ConnectPeerOk, CreatePeerOk, Event, InitParams, Request, RequestId, Response,
-    SubId, WireEntity, WireExecuteOptions, WireHandlerInfo, WireHandlerResult, WireHash,
+    SubId, WireCaps, WireEntity, WireExecuteOptions, WireHandlerInfo, WireHandlerResult, WireHash,
     WireListingEntry, WirePeerMetadata, WireQueryResults, WireTypeInfo, PROTOCOL_VERSION,
 };
 use futures::channel::{mpsc, oneshot};
@@ -243,6 +246,15 @@ pub struct WorkerProxy<T: Transport> {
     /// worker. `Rc<Cell<_>>` so `SubHandle::drop`'s fire-and-forget
     /// unsubscribe path can read it cheaply.
     terminated: Rc<Cell<bool>>,
+    /// What the worker reported on `Response::Ready` — which optional
+    /// capabilities actually came up (v8 `opfs_active`, v12 `webrtc_peers`).
+    ///
+    /// Retained rather than discarded. It was previously destructured to `_`
+    /// at the Init handshake, so the affirmative signal the field exists to
+    /// carry never reached the consumer — `entity-browser-rust` could not
+    /// observe whether a WebRTC establisher had been installed on the peers it
+    /// flagged. Read via [`WorkerProxy::capabilities`].
+    capabilities: Rc<RefCell<Option<WireCaps>>>,
 }
 
 /// Per-peer registry of inspect-sink callbacks. WASM-only =
@@ -321,6 +333,7 @@ impl<T: Transport + 'static> WorkerProxy<T> {
             subscriptions: Rc::new(RefCell::new(SubscriptionRegistry::default())),
             inspect_routes: Rc::new(RefCell::new(InspectRouteRegistry::default())),
             terminated: Rc::new(Cell::new(false)),
+            capabilities: Rc::new(RefCell::new(None)),
         };
 
         // Init handshake.
@@ -335,7 +348,7 @@ impl<T: Transport + 'static> WorkerProxy<T> {
                 request_id: _,
                 protocol_version,
                 sdk_version: _,
-                actual_capabilities: _,
+                actual_capabilities,
             }) => {
                 if protocol_version != PROTOCOL_VERSION {
                     return Err(ProxyError::VersionMismatch {
@@ -343,6 +356,9 @@ impl<T: Transport + 'static> WorkerProxy<T> {
                         actual: protocol_version,
                     });
                 }
+                // Version check first: a mismatched worker's capability report
+                // is not a report about a shape we speak.
+                *proxy.capabilities.borrow_mut() = actual_capabilities;
             }
             Ok(Response::Init {
                 request_id: _,
@@ -858,17 +874,48 @@ impl<T: Transport> WorkerProxy<T> {
         }
     }
 
+    /// What the worker reported actually came up, from `Response::Ready`.
+    ///
+    /// `None` only when the worker answered Init without posting `Ready` (the
+    /// anomaly path this proxy already warns about) — not when a capability is
+    /// absent, which is `Some` with the field empty or false.
+    ///
+    /// Use it to check the install against what you asked for:
+    /// `WireCaps::webrtc_peers` names the peers that got a §6.5 establisher, so
+    /// a peer you flagged `webrtc_enabled` and that is missing here did not get
+    /// one. Today that difference is always empty — the host refuses Init
+    /// rather than installing nothing — and checking it anyway is what keeps
+    /// that a verified property instead of a remembered one.
+    pub fn capabilities(&self) -> Option<WireCaps> {
+        self.capabilities.borrow().clone()
+    }
+
     /// Create a new peer inside the worker. Returns the new peer's id,
     /// the freshly-generated keypair seed (32 bytes), and the metadata
     /// the worker installed. The seed is the consumer's responsibility
     /// to persist (typically via localStorage) for reload survival —
     /// the host does NOT retain it server-side.
-    pub async fn create_peer(&self, label: Option<String>) -> Result<CreatePeerOk, ProxyError> {
+    ///
+    /// `webrtc_enabled` (v11) installs the §6.5 establisher at this peer's
+    /// §10.3 seam. It is an explicit argument rather than an inherited default
+    /// precisely so a peer created after Init cannot silently acquire a
+    /// signaling-node dependency nobody asked for. `true` requires the Worker
+    /// to have been initialized with `InitParams.webrtc`; the host answers with
+    /// an error rather than a silent no-op if it wasn't.
+    pub async fn create_peer(
+        &self,
+        label: Option<String>,
+        webrtc_enabled: bool,
+    ) -> Result<CreatePeerOk, ProxyError> {
         if self.terminated.get() {
             return Err(ProxyError::Terminated);
         }
         let request_id = self.alloc_id();
-        let request = Request::CreatePeer { request_id, label };
+        let request = Request::CreatePeer {
+            request_id,
+            label,
+            webrtc_enabled,
+        };
         let rx = self.transport.send_request(request);
         match rx.await {
             Ok(Response::CreatePeer {

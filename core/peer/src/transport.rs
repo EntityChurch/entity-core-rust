@@ -1071,6 +1071,67 @@ impl Connector for MultiConnector {
 }
 
 // ---------------------------------------------------------------------------
+// §6.5 split-peer byte preservation
+// ---------------------------------------------------------------------------
+//
+// Deliberately OUTSIDE the wasm32-gated `message_port` module below, even
+// though the only caller is in it. These two functions carry a `[security —
+// MUST]`, and gating them to wasm32 would put the one security-relevant piece
+// of the worker crossing in the one place `make test` cannot reach. Pure
+// input/output, so there is nothing about them that needs a browser.
+
+/// SHA-256 over the SDP bytes exactly as they cross the worker boundary.
+///
+/// Arch's §6.5 `[security — MUST]` says the bytes **signed** equal the bytes
+/// **produced** and the bytes **consumed** equal the bytes **verified** — the
+/// crossing carries the payload verbatim and MUST NOT re-encode, canonicalize,
+/// or reconstruct it. They also flagged that MUST **single-impl-invisible**: a
+/// same-implementation run marshals identically at both ends and cannot expose
+/// a mangled crossing. That is the property that hid `fire_at` and the
+/// handshake role.
+///
+/// Computing the digest on the side that signed or verified and checking it on
+/// the side that consumes turns that invisible MUST into a locally detectable
+/// one, in one implementation, today. It is negotiation-rate work — a few
+/// hundred bytes hashed once per connection.
+///
+/// **Not** an entity content hash: `entity_hash::Hash::compute` ECF-wraps
+/// `{type, data}`, which would be a different input and would imply a
+/// wire-visible entity. This is raw bytes.
+pub fn sdp_digest(sdp: &[u8]) -> Vec<u8> {
+    use sha2::Digest;
+    sha2::Sha256::digest(sdp).to_vec()
+}
+
+/// Accept SDP that crossed the worker boundary, or refuse it.
+///
+/// Refuses rather than repairs. A digest mismatch means something between
+/// `setLocalDescription` and here altered the bytes, and §6.5's whole discharge
+/// of §7.4 rests on the SDP we sign being the SDP whose DTLS `a=fingerprint` we
+/// actually present. A "helpful" normalization at this seam would verify one
+/// SDP and hand `setRemoteDescription` another.
+pub fn verified_sdp_from_bytes(sdp: &[u8], got_digest: &[u8]) -> Result<String, String> {
+    let want = sdp_digest(sdp);
+    if got_digest != want.as_slice() {
+        return Err(format!(
+            "sdp_digest mismatch across the worker boundary: the crossing re-encoded, \
+             canonicalized, or reconstructed the payload (§6.5 split-peer byte \
+             preservation). got={} want={}",
+            hex_lower(got_digest),
+            hex_lower(&want)
+        ));
+    }
+    // SDP is UTF-8 by RFC 8866. A non-UTF-8 body means the crossing corrupted
+    // it — which the digest above would normally have caught first, so this is
+    // a second refusal rather than a conversion step.
+    String::from_utf8(sdp.to_vec()).map_err(|e| format!("SDP is not valid UTF-8: {e}"))
+}
+
+fn hex_lower(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+// ---------------------------------------------------------------------------
 // MessagePort transport (browser WASM cross-Worker)
 // ---------------------------------------------------------------------------
 
@@ -1218,11 +1279,32 @@ mod message_port {
         }
     }
 
-    /// Wrap a single MessagePort as a Connection. Installs an
-    /// onmessage handler that forwards binary payloads into a queue
-    /// drained by the reader. The same port is used for outbound
-    /// writes (MessagePort is bidirectional).
+    /// Wrap a single MessagePort as a Connection, labelled `xworker`.
+    ///
+    /// For a port whose far end is something other than another Worker — a
+    /// `RTCDataChannel` pumped by the broker, say — use
+    /// [`connection_from_port_typed`] so the connection reports what it
+    /// actually is.
     pub fn connection_from_port(port: MessagePort, remote_addr: String) -> Connection {
+        connection_from_port_typed(port, remote_addr, "xworker")
+    }
+
+    /// Wrap a single MessagePort as a Connection with an explicit
+    /// `transport_type`. Installs an onmessage handler that forwards binary
+    /// payloads into a queue drained by the reader. The same port is used for
+    /// outbound writes (MessagePort is bidirectional).
+    ///
+    /// **Why the label is a parameter.** Every brokered connection arrives as
+    /// a `MessagePort`, so the port alone cannot say whether it came from
+    /// another Worker or from a WebRTC data channel — and at the S5 gate that
+    /// is the first question anyone asks of a connection. Hardcoding
+    /// `"xworker"` made a WebRTC connection report the one transport it
+    /// definitively was not.
+    pub fn connection_from_port_typed(
+        port: MessagePort,
+        remote_addr: String,
+        transport_type: &'static str,
+    ) -> Connection {
         let (tx, rx) = mpsc::unbounded::<Vec<u8>>();
 
         let tx_for_closure = tx.clone();
@@ -1263,13 +1345,53 @@ mod message_port {
             reader: Box::new(reader),
             writer: Box::new(writer),
             remote_addr,
-            transport_type: "xworker",
+            transport_type,
         }
     }
 
     // -----------------------------------------------------------------
     // Control plane — shared between MessagePortConnector / Listener
     // -----------------------------------------------------------------
+
+    /// Version of the **control plane** (`ControlMessage`), bumped on any
+    /// wire-shape change to any variant — the same rule
+    /// `wasm_worker_protocol::PROTOCOL_VERSION` follows for the
+    /// `Request`/`Response` plane.
+    ///
+    /// **These are two different planes and they version separately.**
+    /// `Request`/`Response` is main-thread → worker: the app asking the worker
+    /// to do something. `ControlMessage` is worker → broker: the worker asking
+    /// the main thread for a resource only the main thread can hold. A change
+    /// here does not bump `PROTOCOL_VERSION` and vice versa.
+    ///
+    /// Introduced at `1` because the plane had **no version at all** while
+    /// `Request`/`Response` carried one with a `Ready` handshake and failed
+    /// fast on mismatch. That was survivable only while the plane's shape was
+    /// frozen and proxy and host shipped together; it stops being survivable
+    /// the moment the plane grows a feature-dependent shape. Adding it before
+    /// widening the plane, rather than after, is the whole point —
+    /// `entity-browser-rust` asked for it on exactly that reasoning, since it
+    /// is their runtime that fails fast and their `tests/e2e_worker.rs` that
+    /// gains an assertion hook.
+    ///
+    /// **v2:** `WebRtcOpen` gains `ice_servers: Vec<WireIceServer>`. The
+    /// browser's `RTCConfiguration` is built by the broker, on the main
+    /// thread, but the values are provisioned into the *worker*
+    /// (`InitParams.webrtc`, `PROTOCOL_VERSION` v11). Carrying them on the
+    /// message that mints the `RTCPeerConnection` — rather than configuring
+    /// the broker separately — is what makes worker/main **skew**
+    /// structurally impossible: there is one source of truth and it travels
+    /// with the request that consumes it. The alternative (a
+    /// `MessagePortBroker::with_ice_servers` constructor) would require the
+    /// app to pass the same values to two places and be right twice, which
+    /// is precisely the skew `entity-browser-rust` ruled against when they
+    /// ruled `ice_servers` in-payload.
+    ///
+    /// Bumped rather than absorbed under `#[serde(default)]`: a v1 broker
+    /// silently ignoring `ice_servers` would gather host candidates only and
+    /// fail by finding no path, not by erroring — the failure mode that has
+    /// no symptom until S5 rung 2 and then looks like a NAT problem.
+    pub const CONTROL_PROTOCOL_VERSION: u32 = 2;
 
     /// Wire format on the control port. CBOR-encoded as a Uint8Array
     /// alongside any transferred MessagePort in MessageEvent.ports().
@@ -1284,6 +1406,19 @@ mod message_port {
     #[derive(serde::Serialize, serde::Deserialize, Debug)]
     #[serde(tag = "op")]
     pub enum ControlMessage {
+        /// Worker → broker, first message on a freshly-attached control port.
+        ///
+        /// Posted eagerly from `ControlPortClient::new` rather than awaited:
+        /// `MessagePort` queues messages posted before the far end calls
+        /// `start()`, so the ordering holds without making port setup async.
+        Hello { control_protocol_version: u32 },
+        /// Broker → worker: the versions agree, the port is in service.
+        HelloAck { control_protocol_version: u32 },
+        /// Broker → worker: the versions do not agree. The broker **stops
+        /// serving this port** and the worker fails subsequent `open_channel`
+        /// calls immediately, rather than letting a shape-mismatched
+        /// `OpenChannel` be parsed into something plausible.
+        ControlVersionMismatch { expected: u32, got: u32 },
         /// Connector → broker: "give me a port to peer_id, I'm
         /// from_peer." `from_peer` lets the broker source-route
         /// ChannelDenied responses back without needing a per-peer
@@ -1304,11 +1439,204 @@ mod message_port {
         /// receiving `ControlPortClient` can dispatch it to the right
         /// `MessagePortListener`.
         IncomingChannel { from_peer: String, to_peer: String },
+
+        // -------------------------------------------------------------
+        // §6.5 WebRTC negotiation (S3b)
+        // -------------------------------------------------------------
+        //
+        // The traffic is worker → main, which is why it lives here and not
+        // on `Request`/`Response`. A WebRTC connection is never requested by
+        // the main thread: the §10 dispatcher inside the worker's peer
+        // resolves a target, escalates to the §10.3 `establish_live` seam,
+        // and that drives negotiation — because the carrier and the signing
+        // identity both live in the worker. The main thread is the passive
+        // owner of a resource the worker cannot reach: `RTCPeerConnection`
+        // is `[Exposed=Window]` on every engine.
+        //
+        // These are one-for-one with `entity_signaling::webrtc::WebRtcIo`,
+        // so the worker-side impl is a thin proxy — the same relationship
+        // `MessagePortConnector` has to `OpenChannel`.
+        //
+        // **`negotiation_id` is not `request_id`.** `request_id` correlates
+        // one call with one reply; `negotiation_id` names the
+        // `RTCPeerConnection` across the many calls of a single negotiation.
+        // The routed proposal conflated them, which would have made a
+        // second concurrent negotiation on the same port indistinguishable
+        // from a late reply to the first.
+        /// Worker → broker: mint an `RTCPeerConnection` for this pairing.
+        WebRtcOpen {
+            request_id: u64,
+            negotiation_id: u64,
+            /// Explicit, never inferred — the v6 Subscribe lesson: "defaults
+            /// to primary" must not be silent.
+            peer_id: String,
+            /// Source-routing, symmetric with `OpenChannel.from_peer`.
+            from_peer: String,
+            #[serde(with = "serde_bytes")]
+            session_id: Vec<u8>,
+            /// ICE servers for the `RTCConfiguration` the broker is about to
+            /// mint. **Empty is legal and means host-candidates-only** — a
+            /// LAN-only deployment — never "use a default". A built-in public
+            /// STUN default would enroll a third party on the operator's
+            /// behalf, silently; keeping the emptiness on the wire is what
+            /// makes that a stated deployment fact rather than an inferred
+            /// one. Control-plane v2.
+            #[serde(default)]
+            ice_servers: Vec<WireIceServer>,
+        },
+        /// Worker → broker: `createOffer` + `setLocalDescription`.
+        WebRtcCreateOffer {
+            request_id: u64,
+            negotiation_id: u64,
+        },
+        /// Worker → broker: apply a remote offer, then answer it.
+        WebRtcCreateAnswer {
+            request_id: u64,
+            negotiation_id: u64,
+            #[serde(with = "serde_bytes")]
+            remote_sdp: Vec<u8>,
+            #[serde(with = "serde_bytes")]
+            remote_sdp_digest: Vec<u8>,
+        },
+        /// Worker → broker: apply the remote answer to an offer we made.
+        WebRtcAcceptAnswer {
+            request_id: u64,
+            negotiation_id: u64,
+            #[serde(with = "serde_bytes")]
+            remote_sdp: Vec<u8>,
+            #[serde(with = "serde_bytes")]
+            remote_sdp_digest: Vec<u8>,
+        },
+        /// Worker → broker: hand one counterpart candidate to the ICE agent.
+        WebRtcAddCandidate {
+            request_id: u64,
+            negotiation_id: u64,
+            candidate: String,
+            sdp_mid: String,
+            sdp_mline_index: u64,
+            /// Absent, never null or "" — `addIceCandidate` reads an empty
+            /// string as a real ufrag (§6.5 / §2.8).
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            username_fragment: Option<String>,
+        },
+        /// Worker → broker: take everything gathered since the last call.
+        WebRtcDrainCandidates {
+            request_id: u64,
+            negotiation_id: u64,
+        },
+        /// Worker → broker: resolve once the data channel opens.
+        WebRtcAwaitOpen {
+            request_id: u64,
+            negotiation_id: u64,
+            timeout_ms: u64,
+        },
+        /// Worker → broker: tear down. Fire-and-forget — there is no useful
+        /// reply and a dropped negotiation must not leak an
+        /// `RTCPeerConnection` waiting for one.
+        WebRtcClose { negotiation_id: u64 },
+
+        /// Broker → worker: the **finalized** local description, i.e.
+        /// `localDescription.sdp` *after* `setLocalDescription` — the SDP
+        /// carrying the DTLS `a=fingerprint` this peer will actually
+        /// present, never the raw `createOffer()` output (arch, §6.5
+        /// build-time guidance).
+        WebRtcLocalSdpReady {
+            request_id: u64,
+            #[serde(with = "serde_bytes")]
+            sdp: Vec<u8>,
+            #[serde(with = "serde_bytes")]
+            sdp_digest: Vec<u8>,
+        },
+        /// Broker → worker: a call with no payload succeeded.
+        WebRtcAck { request_id: u64 },
+        /// Broker → worker: locally-gathered candidates since the last drain.
+        WebRtcCandidates {
+            request_id: u64,
+            candidates: Vec<WireLocalCandidate>,
+        },
+        /// Broker → worker: the data channel is open. The `MessagePort`
+        /// arrives via `MessageEvent::ports()` — **one** port, not the
+        /// two-peer split `OpenChannel` performs. The broker keeps the far
+        /// end itself and pumps `RTCDataChannel` ⇄ that port, because the
+        /// WebRTC counterpart is not a registered peer.
+        WebRtcChannelGranted { request_id: u64 },
+        /// Broker → worker: this call failed.
+        WebRtcFailed { request_id: u64, reason: String },
+    }
+
+    /// One locally-gathered ICE candidate on the control plane.
+    ///
+    /// Mirrors `entity_signaling::webrtc::LocalCandidate`; kept separate so
+    /// `core/peer`'s transport module does not depend on the signaling
+    /// extension (the crate DAG forbids that edge).
+    #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq)]
+    pub struct WireLocalCandidate {
+        pub candidate: String,
+        pub sdp_mid: String,
+        pub sdp_mline_index: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub username_fragment: Option<String>,
+    }
+
+    /// One ICE server for the browser's own ICE agent.
+    ///
+    /// The browser analogue of the native reflector/relay pool — and *only* an
+    /// analogue, never a substitute. `srflx.rs` reaches our reflector over an
+    /// entity connection and calls `observe-address`; a browser's ICE agent
+    /// accepts `stun:` / `turns:` URLs and speaks RFC 5389, so it cannot be
+    /// pointed at an entity node. Relaying our reflector's answer in here would
+    /// be worse than omitting it: that observation is the mapping of the
+    /// WebSocket/TCP socket, a different port from the UDP the agent uses, so
+    /// it would describe a hole that never opens.
+    ///
+    /// Kept structurally parallel to (not shared with)
+    /// `entity_wasm_worker_protocol::WireIceServer`: the worker-protocol crate
+    /// is a deliberately decoupled serializable shadow, and `core/peer` must
+    /// not depend on it. Same reason `WireLocalCandidate` mirrors
+    /// `entity_signaling::webrtc::LocalCandidate` rather than reusing it.
+    #[derive(serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq, Default)]
+    pub struct WireIceServer {
+        /// `stun:` / `turn:` / `turns:` URLs for one logical server.
+        pub urls: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub username: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub credential: Option<String>,
     }
 
     /// In-flight outbound `OpenChannel` requests keyed by request id; each
     /// resolves with the granted `MessagePort` (or the responder's error).
     type PendingChannels = Rc<RefCell<HashMap<u64, oneshot::Sender<Result<MessagePort, String>>>>>;
+
+    /// What the broker sent back for one WebRTC call.
+    ///
+    /// A single reply type rather than one pending-map per call shape: the
+    /// correlation is by `request_id`, and a caller that awaited an SDP but
+    /// received candidates has a bug worth surfacing as a mismatch rather
+    /// than routing into a different map where it would silently never
+    /// resolve.
+    #[derive(Debug)]
+    pub enum WebRtcReply {
+        LocalSdp { sdp: Vec<u8>, sdp_digest: Vec<u8> },
+        Ack,
+        Candidates(Vec<WireLocalCandidate>),
+        Channel(MessagePort),
+        Failed(String),
+    }
+
+    /// In-flight WebRTC calls keyed by request id.
+    type PendingWebRtc = Rc<RefCell<HashMap<u64, oneshot::Sender<WebRtcReply>>>>;
+
+    /// Hand a reply to whoever is awaiting `request_id`.
+    ///
+    /// A reply for an unknown id is dropped, not logged as an error: it is
+    /// the normal shape of a late answer to a call whose awaiter already
+    /// timed out and removed its entry.
+    fn resolve_webrtc(pending: &PendingWebRtc, request_id: u64, reply: WebRtcReply) {
+        if let Some(tx) = pending.borrow_mut().remove(&request_id) {
+            let _ = tx.send(reply);
+        }
+    }
 
     /// Per-Worker control-port handler shared by the connector and
     /// listener. Multiplexes outbound OpenChannel requests via a
@@ -1324,6 +1652,19 @@ mod message_port {
         /// each `IncomingChannel` and routes the resulting Connection
         /// to the matching listener's accept queue.
         listeners: Rc<RefCell<HashMap<String, mpsc::UnboundedSender<Connection>>>>,
+        /// Set when the broker answers our `Hello` with
+        /// `ControlVersionMismatch`. Once set, `open_channel` refuses
+        /// immediately instead of posting an `OpenChannel` the far end has
+        /// already said it cannot parse.
+        control_skew: Rc<RefCell<Option<String>>>,
+        /// In-flight §6.5 negotiation calls. Shares the port and its single
+        /// onmessage handler with the channel plane — one handler per port is
+        /// the same invariant the broker holds, for the same reason
+        /// (`MessagePort.onmessage` is a single-valued slot).
+        webrtc_pending: PendingWebRtc,
+        /// Allocator for `negotiation_id`. Separate from `next_request_id`:
+        /// one negotiation spans many requests.
+        next_negotiation_id: RefCell<u64>,
         _on_message: SendWrapper<Closure<dyn FnMut(MessageEvent)>>,
     }
 
@@ -1333,8 +1674,14 @@ mod message_port {
             let listeners: Rc<RefCell<HashMap<String, mpsc::UnboundedSender<Connection>>>> =
                 Rc::new(RefCell::new(HashMap::new()));
 
+            let control_skew: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+
+            let webrtc_pending: PendingWebRtc = Rc::new(RefCell::new(HashMap::new()));
+
             let pending_for_closure = pending.clone();
             let listeners_for_closure = listeners.clone();
+            let skew_for_closure = control_skew.clone();
+            let webrtc_for_closure = webrtc_pending.clone();
             let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
                 let data = event.data();
                 let bytes = match data.dyn_into::<Uint8Array>() {
@@ -1384,21 +1731,198 @@ mod message_port {
                             }
                         }
                     }
-                    // Connectors don't receive OpenChannel — only the broker does.
-                    ControlMessage::OpenChannel { .. } => {}
+                    ControlMessage::ControlVersionMismatch { expected, got } => {
+                        let why = format!(
+                            "control-plane version skew: broker speaks {expected}, this worker \
+                             speaks {got} — proxy and host must ship together"
+                        );
+                        web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(&why));
+                        *skew_for_closure.borrow_mut() = Some(why.clone());
+                        // Fail every in-flight request too: they were posted
+                        // before the answer arrived and will never be served.
+                        for (_, tx) in pending_for_closure.borrow_mut().drain() {
+                            let _ = tx.send(Err(why.clone()));
+                        }
+                    }
+                    // The versions agree; nothing to do but keep serving.
+                    ControlMessage::HelloAck { .. } => {}
+
+                    ControlMessage::WebRtcLocalSdpReady {
+                        request_id,
+                        sdp,
+                        sdp_digest,
+                    } => {
+                        resolve_webrtc(
+                            &webrtc_for_closure,
+                            request_id,
+                            WebRtcReply::LocalSdp { sdp, sdp_digest },
+                        );
+                    }
+                    ControlMessage::WebRtcAck { request_id } => {
+                        resolve_webrtc(&webrtc_for_closure, request_id, WebRtcReply::Ack);
+                    }
+                    ControlMessage::WebRtcCandidates {
+                        request_id,
+                        candidates,
+                    } => {
+                        resolve_webrtc(
+                            &webrtc_for_closure,
+                            request_id,
+                            WebRtcReply::Candidates(candidates),
+                        );
+                    }
+                    ControlMessage::WebRtcChannelGranted { request_id } => {
+                        // ONE transferred port, not the two-peer split:
+                        // the broker keeps the far end and pumps the
+                        // RTCDataChannel against it.
+                        match event.ports().get(0).dyn_into::<MessagePort>() {
+                            Ok(p) => resolve_webrtc(
+                                &webrtc_for_closure,
+                                request_id,
+                                WebRtcReply::Channel(p),
+                            ),
+                            Err(_) => resolve_webrtc(
+                                &webrtc_for_closure,
+                                request_id,
+                                WebRtcReply::Failed(
+                                    "WebRtcChannelGranted with no transferred port".into(),
+                                ),
+                            ),
+                        }
+                    }
+                    ControlMessage::WebRtcFailed { request_id, reason } => {
+                        resolve_webrtc(
+                            &webrtc_for_closure,
+                            request_id,
+                            WebRtcReply::Failed(reason),
+                        );
+                    }
+
+                    // Broker-bound messages. A worker never receives these;
+                    // if one shows up the port is miswired, and dropping it
+                    // is what the channel plane already does.
+                    ControlMessage::OpenChannel { .. }
+                    | ControlMessage::Hello { .. }
+                    | ControlMessage::WebRtcOpen { .. }
+                    | ControlMessage::WebRtcCreateOffer { .. }
+                    | ControlMessage::WebRtcCreateAnswer { .. }
+                    | ControlMessage::WebRtcAcceptAnswer { .. }
+                    | ControlMessage::WebRtcAddCandidate { .. }
+                    | ControlMessage::WebRtcDrainCandidates { .. }
+                    | ControlMessage::WebRtcAwaitOpen { .. }
+                    | ControlMessage::WebRtcClose { .. } => {}
                 }
             });
 
             port.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
             port.start();
 
+            // Announce our version before anything else can be requested.
+            // Fire-and-forget: `MessagePort` queues this if the broker has not
+            // called `start()` yet, so no async setup is needed to keep the
+            // ordering. A failure to post is reported rather than swallowed —
+            // it means the port is already dead.
+            let mut buf = Vec::new();
+            if ciborium::into_writer(
+                &ControlMessage::Hello {
+                    control_protocol_version: CONTROL_PROTOCOL_VERSION,
+                },
+                &mut buf,
+            )
+            .is_ok()
+            {
+                let arr = Uint8Array::new_with_length(buf.len() as u32);
+                arr.copy_from(&buf);
+                if port.post_message(&arr).is_err() {
+                    web_sys::console::error_1(&wasm_bindgen::JsValue::from_str(
+                        "ControlPortClient: failed to post Hello on the control port",
+                    ));
+                }
+            }
+
             Rc::new(Self {
                 port: SendWrapper(port),
                 next_request_id: RefCell::new(1),
                 pending,
                 listeners,
+                control_skew,
+                webrtc_pending,
+                next_negotiation_id: RefCell::new(1),
                 _on_message: SendWrapper(on_message),
             })
+        }
+
+        /// Allocate a `negotiation_id` naming one `RTCPeerConnection` for the
+        /// life of a negotiation.
+        pub fn next_negotiation_id(&self) -> u64 {
+            let mut id = self.next_negotiation_id.borrow_mut();
+            let v = *id;
+            *id = id.wrapping_add(1);
+            v
+        }
+
+        /// Post a WebRTC control message and await the broker's reply.
+        ///
+        /// The caller supplies the `request_id` it baked into `msg` — the two
+        /// must agree or the reply lands in a map entry nobody is awaiting,
+        /// so `webrtc_call` owns the allocation and hands it to a builder
+        /// closure rather than trusting call sites to keep them in step.
+        pub async fn webrtc_call(
+            &self,
+            build: impl FnOnce(u64) -> ControlMessage,
+        ) -> Result<WebRtcReply, String> {
+            if let Some(why) = self.control_skew.borrow().as_ref() {
+                return Err(why.clone());
+            }
+            let request_id = {
+                let mut id = self.next_request_id.borrow_mut();
+                let v = *id;
+                *id = id.wrapping_add(1);
+                v
+            };
+            let (tx, rx) = oneshot::channel();
+            self.webrtc_pending.borrow_mut().insert(request_id, tx);
+
+            if let Err(e) = self.post(&build(request_id), None) {
+                self.webrtc_pending.borrow_mut().remove(&request_id);
+                return Err(format!("post failed: {e:?}"));
+            }
+            match rx.await {
+                Ok(WebRtcReply::Failed(reason)) => Err(reason),
+                Ok(reply) => Ok(reply),
+                // The sender was dropped without a reply — the pending entry
+                // was cleared out from under us (port death or version skew).
+                Err(_) => Err("control port closed before the reply arrived".to_string()),
+            }
+        }
+
+        /// Fire-and-forget on the control port — teardown only. Everything
+        /// that expects an answer goes through [`Self::webrtc_call`].
+        pub fn webrtc_post(&self, msg: &ControlMessage) {
+            let _ = self.post(msg, None);
+        }
+
+        /// CBOR-encode and post one control message, optionally transferring
+        /// a port alongside it.
+        fn post(
+            &self,
+            msg: &ControlMessage,
+            transfer: Option<&MessagePort>,
+        ) -> Result<(), wasm_bindgen::JsValue> {
+            let mut buf = Vec::new();
+            ciborium::into_writer(msg, &mut buf).map_err(|e| {
+                wasm_bindgen::JsValue::from_str(&format!("CBOR encode failed: {e}"))
+            })?;
+            let arr = Uint8Array::new_with_length(buf.len() as u32);
+            arr.copy_from(&buf);
+            match transfer {
+                Some(p) => {
+                    let list = js_sys::Array::new();
+                    list.push(p);
+                    self.port.0.post_message_with_transferable(&arr, &list)
+                }
+                None => self.port.0.post_message(&arr),
+            }
         }
 
         /// Register a listener's inbound-connection sink under the
@@ -1443,6 +1967,13 @@ mod message_port {
             from_peer: &str,
             peer_id: &str,
         ) -> Result<MessagePort, TransportError> {
+            // A known version skew is terminal for this port: posting an
+            // `OpenChannel` the broker has already refused to parse would
+            // burn the 30s timeout to reach the same answer, with a far worse
+            // error message at the end of it.
+            if let Some(why) = self.control_skew.borrow().as_ref() {
+                return Err(TransportError::ConnectError(why.clone()));
+            }
             let request_id = {
                 let mut id = self.next_request_id.borrow_mut();
                 let v = *id;
@@ -1616,6 +2147,90 @@ mod message_port {
 
 #[cfg(target_arch = "wasm32")]
 pub use message_port::{
-    connection_from_port, ControlMessage, ControlPortClient, MessagePortConnector,
-    MessagePortListener,
+    connection_from_port, connection_from_port_typed, ControlMessage, ControlPortClient,
+    MessagePortConnector, MessagePortListener, WebRtcReply, WireIceServer, WireLocalCandidate,
+    CONTROL_PROTOCOL_VERSION,
 };
+
+#[cfg(test)]
+mod sdp_digest_tests {
+    use super::*;
+
+    /// The SDP a real negotiation carries: CRLF-terminated, with the DTLS
+    /// fingerprint line the whole §6.5 discharge hangs on.
+    const SDP: &[u8] =
+        b"v=0\r\no=- 1 1 IN IP4 0.0.0.0\r\ns=-\r\na=fingerprint:sha-256 AB:CD:EF\r\n";
+
+    #[test]
+    fn a_faithful_crossing_is_accepted() {
+        let d = sdp_digest(SDP);
+        assert_eq!(
+            verified_sdp_from_bytes(SDP, &d).unwrap(),
+            String::from_utf8(SDP.to_vec()).unwrap()
+        );
+    }
+
+    #[test]
+    fn crlf_normalized_to_lf_is_refused() {
+        // The exact "helpful" transformation a `String` on the crossing invites
+        // and a type-checker never objects to. It changes no field a human
+        // reads, and it changes every byte a signature covers.
+        let original = sdp_digest(SDP);
+        let normalized: Vec<u8> = SDP
+            .iter()
+            .copied()
+            .filter(|b| *b != b'\r')
+            .collect::<Vec<u8>>();
+        let err = verified_sdp_from_bytes(&normalized, &original)
+            .expect_err("CRLF normalization must not pass the digest check");
+        assert!(err.contains("sdp_digest mismatch"), "{err}");
+    }
+
+    #[test]
+    fn a_trailing_whitespace_trim_is_refused() {
+        let original = sdp_digest(SDP);
+        let trimmed = SDP
+            .strip_suffix(b"\r\n")
+            .expect("fixture ends with CRLF")
+            .to_vec();
+        assert!(verified_sdp_from_bytes(&trimmed, &original).is_err());
+    }
+
+    #[test]
+    fn a_substituted_fingerprint_is_refused() {
+        // The attack the digest is downstream of: swap the fingerprint and the
+        // receiver binds a DTLS certificate the signer never presented.
+        let original = sdp_digest(SDP);
+        let swapped = String::from_utf8(SDP.to_vec())
+            .unwrap()
+            .replace("AB:CD:EF", "00:11:22")
+            .into_bytes();
+        assert_eq!(swapped.len(), SDP.len(), "same length, different bytes");
+        assert!(verified_sdp_from_bytes(&swapped, &original).is_err());
+    }
+
+    #[test]
+    fn non_utf8_is_refused_even_when_the_digest_matches() {
+        // Belt and braces: a corrupted crossing that also recomputed the
+        // digest still must not produce a `String` by lossy conversion.
+        let bad = vec![0xffu8, 0xfe, 0xfd];
+        let d = sdp_digest(&bad);
+        let err = verified_sdp_from_bytes(&bad, &d).expect_err("non-UTF-8 must be refused");
+        assert!(err.contains("not valid UTF-8"), "{err}");
+    }
+
+    #[test]
+    fn the_digest_is_raw_sha256_not_an_entity_content_hash() {
+        // Pinned against a hand-computed SHA-256 so a future refactor cannot
+        // quietly swap in `Hash::compute`, which ECF-wraps {type, data} and
+        // would hash a completely different input while still "having a
+        // digest".
+        use sha2::Digest;
+        let expected = sha2::Sha256::digest(SDP).to_vec();
+        assert_eq!(sdp_digest(SDP), expected);
+        assert_eq!(sdp_digest(SDP).len(), 32);
+        // And it is NOT the entity content hash of the same bytes.
+        let as_entity = entity_hash::Hash::compute("system/signaling/webrtc/offer", SDP);
+        assert_ne!(sdp_digest(SDP), as_entity.to_bytes());
+    }
+}

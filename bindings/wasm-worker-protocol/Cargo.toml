@@ -41,3 +41,11 @@ conversions = [
     "dep:entity-store",
     "dep:thiserror",
 ]
+
+# The crate is `#![cfg(target_arch = "wasm32")]`, so on native it compiles to
+# nothing and native `cargo test` has no tests to run — `make test` genuinely
+# does not execute these. They are `wasm_bindgen_test`s (pure serde, no browser
+# API needed, so the node runner suffices) and are run by a consumer that has a
+# wasm test runner. Same posture as `core/store/tests/idb_browser.rs`.
+[target.'cfg(target_arch = "wasm32")'.dev-dependencies]
+wasm-bindgen-test = "0.3"

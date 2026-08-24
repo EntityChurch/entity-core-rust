@@ -2092,10 +2092,31 @@ pub fn is_remote_uri(uri: &str, local_peer_id: &str) -> bool {
 
 /// Extract the peer_id from a URI that targets a remote peer.
 pub fn extract_peer_id_from_uri(uri: &str) -> Option<String> {
-    // Try entity:// format first
+    // Try entity:// format first.
+    //
+    // `is_peer_id` is applied here for the same reason the qualified-path
+    // branch below applies it: this function names the peer a dispatch will be
+    // ROUTED to, and every consumer downstream treats the result as a
+    // canonical 46-char base58 peer-id. It previously returned
+    // `parsed.peer_id` unchecked, so `entity://<anything>/path` yielded an
+    // authority the path branch would have rejected — asymmetric validation
+    // between two branches of one function.
+    //
+    // That gap had a real victim. An `entity://ecfv1-sha256:<hex>/...` URI —
+    // addressing a peer by its identity-entity hash rather than its peer-id —
+    // flowed unvalidated into `get_or_connect`, missed transport resolution
+    // (nothing is keyed by that string), escalated to the §10.3 seam, and
+    // reached `pair_key`/`glare_role` as one half of a MIXED-ENCODING pair.
+    // Both of those hash their inputs byte-exact, so the two peers derived
+    // different rendezvous buckets AND both resolved to `Impolite` — every
+    // peer-id sorts below every `ecfv1-…` string — so both offered and
+    // neither ever found the other. `included_count=0`, forever, with every
+    // visible step reporting success. Found by `entity-browser-rust`'s
+    // two-browser rig; pinned natively by
+    // `entity_signaling::webrtc`'s mixed-encoding tests.
     if uri.starts_with("entity://") {
         if let Ok(parsed) = entity_entity::EntityUri::parse(uri) {
-            if !parsed.peer_id.is_empty() {
+            if EntityUri::is_peer_id(&parsed.peer_id) {
                 return Some(parsed.peer_id);
             }
         }

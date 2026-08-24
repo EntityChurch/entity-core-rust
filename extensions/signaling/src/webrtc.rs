@@ -15,13 +15,13 @@
 //!
 //! # The schema version is pinned, and something pins to it
 //!
-//! [`SCHEMA_VERSION`] is the identifier a `system/peer/transport/webrtc` profile
+//! [`crate::webrtc::SCHEMA_VERSION`] is the identifier a `system/peer/transport/webrtc` profile
 //! carries in `negotiation.signaling_schema` (`EXTENSION-NETWORK.md` §6.5.2d).
 //! The two must agree or a peer advertises a dialect it does not speak.
 //!
 //! # Two deliberate non-collapses, both easy to get wrong
 //!
-//! - **[`IceCandidate`] is NOT [`crate::coordination::Candidate`]** — and the
+//! - **[`crate::webrtc::IceCandidate`] is NOT [`crate::coordination::Candidate`]** — and the
 //!   names differ here to keep anyone from "unifying" them. §6.5 draws the same
 //!   line §6.7 draws for reflection: a `system/network/candidate` is
 //!   entity-core's own reachability fact, gathered from `observe-address`; an
@@ -518,7 +518,7 @@ pub fn verify_claimed_signer(
 /// (both offered) is *fatal* to the `RTCPeerConnection` state machine. Native's
 /// both-fire symmetry does not survive it, so §6.5 pins W3C perfect negotiation
 /// keyed to the byte-wise ascending peer-id sort the rendezvous key derivation
-/// **already uses** ([`crate::key::pair`]) — not a new convention.
+/// **already uses** ([`crate::key::pair_key`]) — not a new convention.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlareRole {
     /// The lower-sorting peer-id (`lo`). Its offer **wins** a glare; it ignores
@@ -745,7 +745,7 @@ impl From<crate::punch::PunchError> for WebRtcError {
 /// the natural default and why the S5 gate uses it.
 pub struct WebRtcParty {
     /// The rendezvous key both peers derived — `pair` mode, so
-    /// [`crate::key::pair`] over the two ids.
+    /// [`crate::key::pair_key`] over the two ids.
     pub key: RendezvousKey,
     pub self_id: String,
     /// The counterpart, known out of band. This is what makes `pair` work.
@@ -875,6 +875,31 @@ pub async fn negotiate<C: Carrier, I: WebRtcIo>(
 
         // Trickle both ways every tick — candidates flow as they are gathered
         // rather than blocking the offer (§6.5 / RFC 8838).
+        //
+        // **Not before the session is settled.** Candidates correlate on
+        // `session_id` (`candidates_for` matches it exactly), and until this
+        // peer has either offered or adopted the offerer's session, `session`
+        // is a provisional id **no counterpart will ever query**. Draining into
+        // it is worse than waiting: `drain_local_candidates` is destructive, so
+        // a candidate posted under the provisional session is not merely
+        // mistagged, it is gone — never re-offered under the real one.
+        //
+        // The answerer is the exposed side: it holds its own `party.session_id`
+        // until it finds the offer, so anything gathered in that window is
+        // lost. Browsers happen to gather only after `setLocalDescription` —
+        // which for an answerer is inside `create_answer`, i.e. after adoption
+        // — so this is latent against a browser and immediate against any
+        // substrate that gathers earlier. Reproduced natively by
+        // `entity_peer::carrier::rendezvous_over_a_real_node` (the offerer saw
+        // zero remote candidates while the answerer saw its counterpart's).
+        //
+        // Holding them costs nothing: undrained candidates stay queued in the
+        // substrate and go out on the next tick under the settled session.
+        if !offered && !answered {
+            io.sleep_ms(party.poll_interval_ms).await;
+            continue;
+        }
+
         for local in io.drain_local_candidates().await {
             let c = IceCandidate {
                 session_id: session.clone(),
@@ -941,6 +966,93 @@ impl ToBlob for Answer {
 impl ToBlob for IceCandidate {
     fn to_entity(&self) -> Result<Entity, SignalingError> {
         IceCandidate::to_entity(self)
+    }
+}
+
+#[cfg(test)]
+mod mixed_encoding {
+    //! Both halves of a `pair` rendezvous MUST be the same kind of string.
+    //!
+    //! `pair_key` and `glare_role` both consume their ids **byte-exact** — that
+    //! is deliberate and documented (no case-folding, no normalization). The
+    //! consequence is that they are only correct when both ids are drawn from
+    //! the same namespace, and nothing in either function can detect that they
+    //! are not.
+    //!
+    //! `entity-browser-rust` hit this live: a peer addressed by its
+    //! identity-entity hash (`ecfv1-sha256:<hex>`) rather than its 46-char
+    //! base58 peer-id produced a §6.5 negotiation where **both** sides offered
+    //! and **neither** shared a bucket — `included_count=0` with every visible
+    //! step reporting success. These tests pin the mechanism so the failure can
+    //! never be silent again, and so a future normalization change has
+    //! something to break.
+    use super::*;
+    use crate::key::pair_key;
+
+    fn pid_and_hash(seed: u8) -> (String, String) {
+        let kp = entity_crypto::Keypair::from_seed([seed; 32]);
+        (
+            kp.peer_id().to_string(),
+            kp.peer_identity_hash().to_string(),
+        )
+    }
+
+    /// The property the whole `pair` mode rests on: exactly one side offers,
+    /// and both sides land in the same bucket.
+    #[test]
+    fn same_encoding_is_antisymmetric_and_agrees_on_a_bucket() {
+        let (a, _) = pid_and_hash(1);
+        let (b, _) = pid_and_hash(2);
+
+        let a_suppresses = pair_should_suppress_offer(&a, &b).unwrap();
+        let b_suppresses = pair_should_suppress_offer(&b, &a).unwrap();
+        assert_ne!(
+            a_suppresses, b_suppresses,
+            "exactly one side of a pair may offer"
+        );
+        assert_eq!(
+            pair_key(&a, &b),
+            pair_key(&b, &a),
+            "pair_key is order-independent, so both sides derive one bucket"
+        );
+    }
+
+    /// The bug, reproduced. Each peer knows itself by peer-id and its
+    /// counterpart by identity hash — so neither the glare rule nor the bucket
+    /// survives.
+    #[test]
+    fn mixed_encoding_makes_both_peers_offer_into_different_buckets() {
+        let (a_pid, a_hash) = pid_and_hash(1);
+        let (b_pid, b_hash) = pid_and_hash(2);
+
+        // Neither suppresses: every base58 peer-id sorts below every
+        // `ecfv1-…` string, so BOTH sides resolve to Impolite.
+        assert!(!pair_should_suppress_offer(&a_pid, &b_hash).unwrap());
+        assert!(!pair_should_suppress_offer(&b_pid, &a_hash).unwrap());
+
+        // And they are not even talking about the same rendezvous.
+        assert_ne!(
+            pair_key(&a_pid, &b_hash),
+            pair_key(&b_pid, &a_hash),
+            "mixed encodings derive different buckets — the collect that \
+             returns included_count=0"
+        );
+    }
+
+    /// Why it is specifically the *mixing* that breaks it: hashes on both
+    /// sides would rendezvous fine. The rule needs one namespace, not a
+    /// particular one — which is why this cannot be fixed inside `glare_role`
+    /// and has to be fixed by whoever chooses the addressing form.
+    #[test]
+    fn either_encoding_works_as_long_as_both_sides_agree() {
+        let (_, a_hash) = pid_and_hash(1);
+        let (_, b_hash) = pid_and_hash(2);
+
+        assert_ne!(
+            pair_should_suppress_offer(&a_hash, &b_hash).unwrap(),
+            pair_should_suppress_offer(&b_hash, &a_hash).unwrap()
+        );
+        assert_eq!(pair_key(&a_hash, &b_hash), pair_key(&b_hash, &a_hash));
     }
 }
 

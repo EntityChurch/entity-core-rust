@@ -147,3 +147,215 @@ impl Carrier for PeerCarrier {
             .messages)
     }
 }
+
+/// §6.5 rendezvous over a **real carrier and a real node** — the segment no
+/// other test covers.
+///
+/// `entity_signaling`'s own negotiation tests drive `negotiate` against a stub
+/// carrier and a shared in-memory bucket, so they prove the choreography and
+/// nothing about the wire. The browser leg proves the wire and cannot run
+/// outside a browser. Between them sits the piece that actually broke for
+/// `entity-browser-rust`: two peers deriving a `pair` key from real peer-ids,
+/// posting and collecting through a real signaling node over real TCP.
+///
+/// **No browser is required to test that**, which is the point — `WebRtcIo` is
+/// the only thing stubbed here. If the rendezvous layer is sound, this passes
+/// and their red is worker/browser-side; if it is not, this reproduces it
+/// natively in a second and a half instead of a container rig.
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod rendezvous_over_a_real_node {
+    use super::*;
+    use crate::{server, transport, PeerBuilder};
+    use entity_capability::GrantEntry;
+    use entity_crypto::Keypair;
+    use entity_signaling::key::pair_key;
+    use entity_signaling::webrtc::{
+        negotiate, IceCandidate, LocalCandidate, SessionId, VerificationPolicy, WebRtcIo,
+        WebRtcParty,
+    };
+    use std::sync::Mutex;
+
+    fn signaling_seed() -> Vec<(String, Vec<GrantEntry>)> {
+        vec![(
+            "default".to_string(),
+            entity_signaling::signaling_seed_grants(),
+        )]
+    }
+
+    async fn start_node(seed: u8) -> (String, u16, tokio::task::JoinHandle<()>) {
+        let keypair = entity_crypto::IdentityKeypair::Ed25519(Keypair::from_seed([seed; 32]));
+        let peer_id = keypair.peer_id().to_string();
+        let core = Arc::new(entity_signaling::SignalingCore::new(format!(
+            "node:{}",
+            seed
+        )));
+        let handler = Arc::new(entity_signaling::SignalingHandler::new(core, &peer_id));
+
+        let peer = PeerBuilder::new()
+            .identity_keypair(keypair)
+            .listen_addr("127.0.0.1:0")
+            .with_seed_policy(signaling_seed())
+            .handler(handler)
+            .build()
+            .expect("node builds");
+        let listener = peer.listen().await.expect("node listens");
+        let port = listener.socket_addr().port();
+        let shared = peer.shared();
+        peer.start_engines(&shared);
+        let handle = tokio::spawn(async move {
+            let _ = server::run(listener, shared).await;
+        });
+        (peer_id, port, handle)
+    }
+
+    fn carrier_for(node_id: &str, node_port: u16, seed: u8) -> (PeerCarrier, String) {
+        let keypair = entity_crypto::IdentityKeypair::Ed25519(Keypair::from_seed([seed; 32]));
+        let self_id = keypair.peer_id().to_string();
+        let carrier = PeerCarrier::new(
+            node_id.to_string(),
+            format!("127.0.0.1:{}", node_port),
+            keypair,
+            Arc::new(transport::TcpConnector),
+            entity_hash::HASH_ALGORITHM_SHA256,
+        );
+        (carrier, self_id)
+    }
+
+    /// Enough of a browser to exercise the choreography: SDP is an opaque
+    /// string to §6.5, so a labelled placeholder is as faithful as a real one.
+    /// `wait_open` never succeeds — this test is about the rendezvous, and a
+    /// channel that opened would prove nothing extra about it.
+    struct StubIo {
+        label: &'static str,
+        candidates: Mutex<Vec<LocalCandidate>>,
+        remote_seen: Mutex<Vec<IceCandidate>>,
+    }
+
+    impl StubIo {
+        fn new(label: &'static str) -> Self {
+            Self {
+                label,
+                candidates: Mutex::new(vec![LocalCandidate {
+                    candidate: format!("candidate:1 1 udp 1 127.0.0.1 900 typ host {label}"),
+                    sdp_mid: "0".into(),
+                    sdp_mline_index: 0,
+                    username_fragment: None,
+                }]),
+                remote_seen: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WebRtcIo for StubIo {
+        type Channel = ();
+
+        async fn create_offer(&self) -> Result<String, String> {
+            Ok(format!(
+                "v=0\r\no=- {} 1 IN IP4 0.0.0.0\r\ns=-\r\n",
+                self.label
+            ))
+        }
+        async fn create_answer(&self, _remote: &str) -> Result<String, String> {
+            Ok(format!(
+                "v=0\r\no=- {}-answer 1 IN IP4 0.0.0.0\r\ns=-\r\n",
+                self.label
+            ))
+        }
+        async fn accept_answer(&self, _remote: &str) -> Result<(), String> {
+            Ok(())
+        }
+        async fn drain_local_candidates(&self) -> Vec<LocalCandidate> {
+            std::mem::take(&mut *self.candidates.lock().unwrap())
+        }
+        async fn add_remote_candidate(&self, c: &IceCandidate) -> Result<(), String> {
+            self.remote_seen.lock().unwrap().push(c.clone());
+            Ok(())
+        }
+        async fn wait_open(&self, timeout_ms: u64) -> Result<(), String> {
+            tokio::time::sleep(std::time::Duration::from_millis(timeout_ms.min(20))).await;
+            Err("stub channel never opens".into())
+        }
+        async fn sleep_ms(&self, ms: u64) {
+            tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+        }
+        fn now_ms(&self) -> u64 {
+            web_time::SystemTime::now()
+                .duration_since(web_time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        }
+    }
+
+    fn party(key: RendezvousKey, me: &str, them: &str, io_deadline: u64) -> WebRtcParty {
+        WebRtcParty {
+            key,
+            self_id: me.to_string(),
+            peer_id: them.to_string(),
+            session_id: SessionId::generate(),
+            poll_interval_ms: 25,
+            deadline_ms: io_deadline,
+            trust: VerificationPolicy::AllowUnverifiedPreContainer,
+        }
+    }
+
+    /// The claim under test: two peers that address each other by canonical
+    /// peer-id land in **one** bucket at a real node, and each sees the
+    /// other's deposit.
+    ///
+    /// Asserted on what crosses the node rather than on a channel, because
+    /// `wait_open` is stubbed: A must accept B's answer (or B must answer A's
+    /// offer), which is only reachable if the collect that carried it was
+    /// non-empty. `included_count=0` on both sides — the reported symptom —
+    /// fails this test.
+    #[tokio::test]
+    async fn two_peers_share_one_bucket_and_see_each_other() {
+        let (node_id, node_port, node_handle) = start_node(0x61).await;
+        let (a_carrier, a_id) = carrier_for(&node_id, node_port, 0x62);
+        let (b_carrier, b_id) = carrier_for(&node_id, node_port, 0x63);
+        assert_ne!(a_id, b_id);
+
+        // Exactly what `BrowserWebRtcEstablisher` does: each side derives the
+        // key from (its own id, its target's id).
+        let a_key = pair_key(&a_id, &b_id);
+        let b_key = pair_key(&b_id, &a_id);
+        assert_eq!(
+            a_key, b_key,
+            "pair_key sorts its arguments, so both sides derive one bucket"
+        );
+
+        // Exactly one may offer.
+        let a_suppress =
+            entity_signaling::webrtc::pair_should_suppress_offer(&a_id, &b_id).unwrap();
+        let b_suppress =
+            entity_signaling::webrtc::pair_should_suppress_offer(&b_id, &a_id).unwrap();
+        assert_ne!(a_suppress, b_suppress);
+
+        let a_io = StubIo::new("A");
+        let b_io = StubIo::new("B");
+
+        let a_party = party(a_key, &a_id, &b_id, 4_000);
+        let b_party = party(b_key, &b_id, &a_id, 4_000);
+        let (a_res, b_res) = tokio::join!(
+            negotiate(&a_party, &a_carrier, &a_io),
+            negotiate(&b_party, &b_carrier, &b_io),
+        );
+
+        // Both time out: the stub channel never opens. That is expected and is
+        // NOT what this test measures.
+        assert!(a_res.is_err() && b_res.is_err(), "stub channel never opens");
+
+        // What it measures: the rendezvous carried. Each side fed the other's
+        // trickled candidate, which it can only have obtained from a collect
+        // that returned the counterpart's deposit.
+        let a_saw = a_io.remote_seen.lock().unwrap().len();
+        let b_saw = b_io.remote_seen.lock().unwrap().len();
+        assert!(
+            a_saw > 0 && b_saw > 0,
+            "each peer must see the other's deposit through the node — \
+             A saw {a_saw}, B saw {b_saw} (both zero is the reported rung-1 symptom)"
+        );
+
+        node_handle.abort();
+    }
+}

@@ -145,6 +145,10 @@ thiserror = "2"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
+# `Vec<u8>` fields that must encode as a CBOR bstr rather than an array of
+# integers — the SDP payloads on the worker↔broker control plane, where the
+# §6.5 invariant is about BYTES (see `ControlMessage`).
+serde_bytes = "0.11"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

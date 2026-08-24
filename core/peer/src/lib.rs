@@ -8,10 +8,15 @@ pub mod connection_state;
 pub use entity_durability as durability;
 #[cfg(all(feature = "local-files", not(target_arch = "wasm32")))]
 pub use entity_local_files as local_files;
-#[cfg(feature = "network")]
 /// The §7.3.1 coordination half — offer/collect at a signaling node. Shared by
 /// every punch substrate, so it is **not** gated on `wasm32`: the browser leg's
 /// WebRTC exchange (`EXTENSION-SIGNALING.md` §6.5) rides the same carrier.
+///
+/// `signaling` only. It previously also carried `#[cfg(feature = "network")]`,
+/// which nothing in the module justifies — its imports are `entity_signaling`,
+/// `remote`, and `transport`, with no `entity_network` among them. The stray
+/// gate made `--features signaling` alone fail to build, because
+/// `punch_establisher` is `signaling`-gated and imports this module.
 #[cfg(feature = "signaling")]
 pub mod carrier;
 #[cfg(all(feature = "http-live", not(target_arch = "wasm32")))]
@@ -22,6 +27,13 @@ pub mod ingest;
 pub mod keepalive;
 pub mod live_establish;
 pub mod liveness;
+/// EXTENSION-NETWORK rung 3's imperative `PeerLink` seam. Gated on `network`
+/// because it imports `entity_network` (an optional dep behind that feature)
+/// and calls `runtime::sleep_ms` (gated the same way, and documented there as
+/// gated "with `network_link` on the same feature" — this declaration is where
+/// that pairing was missing). Its only consumer, the rung-3 injection in
+/// `run()`, has always been `#[cfg(feature = "network")]`.
+#[cfg(feature = "network")]
 pub mod network_link;
 pub mod peer_status;
 pub mod published_root;
@@ -49,6 +61,11 @@ pub mod session_entity;
 pub mod srflx;
 pub mod transport;
 pub mod transport_profile;
+/// The worker half of the §6.5 negotiation. wasm32-only and `signaling`-gated:
+/// `RTCPeerConnection` is `[Exposed=Window]`, so the seam exists only where
+/// there is a main thread to proxy to.
+#[cfg(all(target_arch = "wasm32", feature = "signaling"))]
+pub mod worker_webrtc;
 
 pub use ingest::{ingest_envelope_signatures, IngestError};
 
@@ -60,10 +77,15 @@ use entity_crypto::{IdentityKeypair, Keypair, PeerId};
 use entity_handler::NoopAttestationStore;
 use entity_handler::{AttestationStore, Handler, HandlerRegistry};
 use entity_hash::Hash;
+/// Only the clock engine registers a context field, so the import carries the
+/// same gate as its single use site — otherwise a build without `clock` warns,
+/// which is fatal under the `-D warnings` lint gate.
+#[cfg(feature = "clock")]
+use entity_store::ContextFieldRegistration;
 use entity_store::{
-    CascadeHalt, ContentStore, ContentStoreEvent, ContextFieldRegistration, ExecutionContext,
-    LocationIndex, MemoryContentStore, MemoryLocationIndex, NotifyingContentStore,
-    NotifyingLocationIndex, SyncTreeHook, TreeChangeEvent,
+    CascadeHalt, ContentStore, ContentStoreEvent, ExecutionContext, LocationIndex,
+    MemoryContentStore, MemoryLocationIndex, NotifyingContentStore, NotifyingLocationIndex,
+    SyncTreeHook, TreeChangeEvent,
 };
 use entity_tree::TreeHandler;
 use thiserror::Error;

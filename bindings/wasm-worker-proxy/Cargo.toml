@@ -25,4 +25,21 @@ web-sys = { version = "0.3", features = [
     "MessageChannel",
     "DedicatedWorkerGlobalScope",
     "ErrorEvent",
+    # §6.5 WebRTC negotiation. Main-thread only — `RTCPeerConnection` is
+    # `[Exposed=Window]` in the W3C IDL on every engine, which is why the
+    # broker drives it on the worker's behalf rather than the worker owning it.
+    "RtcPeerConnection",
+    "RtcConfiguration",
+    "RtcSessionDescription",
+    "RtcSessionDescriptionInit",
+    "RtcSdpType",
+    "RtcDataChannel",
+    "RtcDataChannelInit",
+    "RtcDataChannelEvent",
+    "RtcDataChannelState",
+    "RtcDataChannelType",
+    "RtcIceCandidate",
+    "RtcIceCandidateInit",
+    "RtcPeerConnectionIceEvent",
+    "Event",
 ] }

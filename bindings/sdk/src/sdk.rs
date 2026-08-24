@@ -1092,6 +1092,12 @@ pub struct PeerContextBuilder {
     /// way to install custom grant policy — they're stuck on the
     /// static fallback.
     grant_resolver: Option<entity_peer::GrantResolver>,
+    /// When set via [`PeerContextBuilder::with_live_establish`], the build
+    /// path installs it on the underlying `Peer` via `set_live_establish`
+    /// (EXTENSION-NETWORK §10.3). Without it the §10 ladder is unchanged —
+    /// §10.3 is additive — so this is opt-in per deployment, never a
+    /// default posture.
+    live_establish: Option<Arc<dyn entity_peer::live_establish::LiveEstablish>>,
 }
 
 impl Default for PeerContextBuilder {
@@ -1118,7 +1124,36 @@ impl PeerContextBuilder {
             binding_hooks: Vec::new(),
             inspect_registry: None,
             grant_resolver: None,
+            live_establish: None,
         }
+    }
+
+    /// Install the EXTENSION-NETWORK §10.3 live-establishment seam.
+    ///
+    /// §10.3 is where a dispatch that found no live transport escalates to
+    /// traversal. What fills the slot is substrate-specific and deliberately
+    /// not decided here: natively a §7 TCP punch
+    /// (`entity_peer::punch_establisher`), in a browser the §6.5 WebRTC
+    /// negotiation (`entity_peer::worker_webrtc::BrowserWebRtcEstablisher`) —
+    /// same slot, same obligations, different substrate.
+    ///
+    /// **Opt-in, and it has to be.** With nothing installed the §10 ladder is
+    /// exactly what it was — §10.3's additive property. Installing an
+    /// establisher gives the peer a dependency on a signaling node, which is
+    /// not something a deployment should acquire by default; it is why the
+    /// worker host gates this on a per-peer `webrtc_enabled` rather than on
+    /// "config is present" (`PROTOCOL_VERSION` v11).
+    ///
+    /// Landing before `shared()` is load-bearing for the same reason
+    /// `with_grant_resolver` is: each `PeerShared` clone captures the seam at
+    /// clone time, so a seam installed afterwards would be invisible to every
+    /// snapshot already taken.
+    pub fn with_live_establish(
+        mut self,
+        seam: Arc<dyn entity_peer::live_establish::LiveEstablish>,
+    ) -> Self {
+        self.live_establish = Some(seam);
+        self
     }
 
     /// Install a connect-handler grant resolver
@@ -1430,6 +1465,12 @@ impl PeerContextBuilder {
         if let Some(resolver) = self.grant_resolver {
             peer.set_grant_resolver(resolver);
         }
+        // Same ordering constraint, same reason: `PeerShared` captures the
+        // §10.3 seam at clone time, so a seam installed after the first
+        // `shared()` snapshot would never be consulted by it.
+        if let Some(seam) = self.live_establish {
+            peer.set_live_establish(seam);
+        }
         let shared = peer.shared();
 
         let (owner_self_cap, owner_capability_hash) = mint_owner_self_cap(
@@ -1541,6 +1582,12 @@ impl PeerContextBuilder {
         // (`core/peer/src/lib.rs:260`), so resolver must land first.
         if let Some(resolver) = self.grant_resolver {
             peer.set_grant_resolver(resolver);
+        }
+        // Same ordering constraint, same reason: `PeerShared` captures the
+        // §10.3 seam at clone time, so a seam installed after the first
+        // `shared()` snapshot would never be consulted by it.
+        if let Some(seam) = self.live_establish {
+            peer.set_live_establish(seam);
         }
 
         // Create shared state ONCE — never call peer.shared() again.
@@ -2479,6 +2526,9 @@ pub struct EntitySDKBuilder {
     /// `PeerContextBuilder::with_grant_resolver` at build time. Per
     /// Godot ask D2.
     grant_resolver: Option<entity_peer::GrantResolver>,
+    /// EXTENSION-NETWORK §10.3 live-establishment seam for the default peer.
+    /// Forwarded to `PeerContextBuilder::with_live_establish` at build time.
+    live_establish: Option<Arc<dyn entity_peer::live_establish::LiveEstablish>>,
 }
 
 impl Default for EntitySDKBuilder {
@@ -2503,7 +2553,20 @@ impl EntitySDKBuilder {
             binding_hooks: Vec::new(),
             inspect_routing: false,
             grant_resolver: None,
+            live_establish: None,
         }
+    }
+
+    /// Install the EXTENSION-NETWORK §10.3 live-establishment seam on the
+    /// default peer. Forwarded to
+    /// [`PeerContextBuilder::with_live_establish`] at build time — see that
+    /// method for why it is opt-in and why it must land before `shared()`.
+    pub fn with_live_establish(
+        mut self,
+        seam: Arc<dyn entity_peer::live_establish::LiveEstablish>,
+    ) -> Self {
+        self.live_establish = Some(seam);
+        self
     }
 
     /// Enable inspect-sink routing for the default peer. Forwarded to
@@ -2693,6 +2756,9 @@ impl EntitySDKBuilder {
             // Forward the already-Arc-ed resolver into the lower
             // builder. The closure adapter just calls through.
             b = b.with_grant_resolver(move |pid, hash| resolver(pid, hash));
+        }
+        if let Some(seam) = self.live_establish {
+            b = b.with_live_establish(seam);
         }
         Ok(b)
     }

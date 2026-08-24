@@ -117,6 +117,41 @@ fmt: toolchain
 # Tier-1 check = the green gate (lint + test).
 check: lint test
 
+# ----------------------------------------------------------------------------
+# Per-feature gating sweep — the thing `test` and `clippy` structurally cannot
+# see
+# ----------------------------------------------------------------------------
+# `cargo test`/`cargo clippy` over the workspace get CARGO'S FEATURE UNIFICATION:
+# every feature any member enables is enabled for everyone. That is the right
+# behaviour for the suite and it makes the suite BLIND to a mis-gated module —
+# a `pub mod x;` missing the `#[cfg(feature = ...)]` its imports require builds
+# fine, because something else in the workspace turned the feature on.
+#
+# A downstream consumer depending on `entity-peer` with `default-features =
+# false` gets no such help, and that is exactly how it was found: `entity-peer`
+# would not compile natively without `network` (network_link.rs), nor with
+# `signaling` alone (a stray `network` gate on `carrier`), while `make test` sat
+# at 1911·0F throughout. Reported by `entity-browser-rust`, whose build is that
+# consumer.
+#
+# One feature at a time is the highest-signal check for this bug class: it
+# isolates each gate against its own imports. Not in `check` — it is ~25 clippy
+# runs — but run it when touching module gating, optional deps, or a `cfg`.
+PEER_FEATURES := inbox network continuation subscription clock revision query history \
+                 compute handlers conformance capability-handler attestation quorum \
+                 identity role registry discovery relay signaling type-system content \
+                 local-files websocket http-live
+features: toolchain
+	$(call RUN_TOOLCHAIN,set -e; \
+	  echo "--- no-default-features ---"; \
+	  cargo clippy -p entity-peer --no-default-features -- -D warnings; \
+	  for f in $(PEER_FEATURES); do \
+	    echo "--- $$f ---"; \
+	    cargo clippy -p entity-peer --no-default-features --features $$f -- -D warnings; \
+	  done; \
+	  echo "--- all-features ---"; \
+	  cargo clippy -p entity-peer --all-features -- -D warnings)
+
 # Tier-1 clean = remove the build artifacts (the runtime + toolchain images).
 clean:
 	-podman rmi $(IMAGE) $(IMAGE)-toolchain
