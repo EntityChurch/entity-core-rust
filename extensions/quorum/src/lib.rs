@@ -7,7 +7,7 @@
 //! resolver registry (`concrete` built-in; consumers register others
 //! such as `identity-resolved`).
 //!
-//! Spec: `../entity-core-architecture/docs/architecture/v7.0-core-revision/core-protocol-domain/specs/extensions/EXTENSION-QUORUM.md`
+//! Spec: `entity-system-architecture` `specs/extensions/EXTENSION-QUORUM.md`
 
 pub mod cache;
 pub mod data;

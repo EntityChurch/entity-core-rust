@@ -1,0 +1,729 @@
+
+# entity-core-rust
+
+Read **AGENTS-STANDARD.md** first. This file adds entity-core-rust specifics.
+
+## Overview
+
+Rust implementation of Entity Core Protocol v7.9 — a clean rewrite replacing
+`entity-core-rs`. This repo **implements** the spec; it does not design protocol.
+Three deployment roles from one codebase: data toolkit, embedded peer, standalone
+server. The crate DAG and design rationale live in `docs/ARCHITECTURE.md`; WASM
+compatibility and the worker stack live in `docs/ARCHITECTURE-WASM-AND-TRANSPORT.md`
+— this file does not repeat them.
+
+## Committing & pushing — standing authorization
+
+**Commit and push finished work without asking.** When a change is complete and the
+gate is green (`make test` / `make clippy` / `make fmt`, plus `make wasm` when it
+applies), `git commit -s` it and `git push origin <branch>` — do not stop to ask
+whether to commit or push, and do not end a turn leaving finished work uncommitted.
+Sibling repos pin our commits; an uncommitted tree is an unciteable one.
+
+The golden rules still bind: **never force-push**, never rewrite shared history, and
+never push to the `codeberg` mirror (append-only, ADR-0014) — `origin` is the push
+target. Ask only when a push would be non-fast-forward, or when the work is genuinely
+unfinished.
+
+## How we work here — tier **CORE**
+
+This repo runs the entity-OS methodology at the **Core** tier — the framework is
+`METHODOLOGY.md` (injected, identical everywhere; read it once). Conformance gates the wire
+here. It does **not** catch process drift, stale build-state claims, unaccounted accumulation,
+or a discipline quietly eaten by a competing legitimate pressure. Those need the ratchet.
+
+What binds today:
+
+- **Universal disciplines D1–D12** (`METHODOLOGY.md` §4) — apply as written; nothing to re-derive.
+- **The review questions** (§6) — run on every diff.
+- **The Audit Doctrine A0–A12** (§7.2) — open it for *"Y is broken"* or *"something feels
+  wrong,"* including when the thing that feels wrong is our own process. **A1 is the prime:
+  trace a value before you theorize.** The Foundation Audit Doctrine (§7.3) when opening a new
+  surface to design against.
+- **The ratchet** — every audit ends by syncing what it taught into this file, same session.
+  **If it didn't land here, it didn't land.**
+- **The promotion ladder** (§3) — bit us once → an anti-pattern entry; a second time in a
+  different shape → a ratified discipline. Candidates are applied, not yet claimed to generalize.
+  **A discipline with no enforcement point is theater** — name the grep, the lint rule, or the
+  gate test.
+
+**Owed:** a standing `DISCIPLINE-*` doc assembling this repo's own rules with an anti-pattern
+catalog, each entry grounded by a source commit. The near-term native candidates are the ones
+this stack actually forces — ownership/`Drop` accounting across the extension boundary, and the
+cargo-feature-gating hazard where a `#[cfg(feature)]`-gated handler reads as an absent substrate
+surface and tempts a reinvention (the `local-files` reinvention is the worked instance of that
+class ecosystem-wide).
+
+## Setup / environment
+
+- **Cargo workspace.** Build via `make` over podman (host needs only `make` + podman);
+  see `Makefile` for the verb set — `make test` / `make clippy` / `make fmt` / `make wasm`.
+- **Edition / MSRV:** edition 2021; toolchain pinned to **1.94.1** via `rust-toolchain.toml`
+  (ships `clippy`, `rustfmt`, and the `wasm32-unknown-unknown` target).
+- Cross-compile target for browser builds: `wasm32-unknown-unknown`.
+- Idioms: `tokio` (async, base `features = ["sync"]`), `ciborium` (CBOR),
+  `thiserror` (per-crate typed errors), `async-trait`. Godot binding: `gdext 0.4`;
+  FFI: `cdylib` + `cbindgen`.
+
+## Build & test
+
+```bash
+make test                      # full suite (cargo build + cargo test all)
+make clippy                    # lint
+make fmt                       # format
+cargo test -p entity-core      # single crate (use -p <crate> for any other)
+make wasm                      # wasm32 CI build (see below)
+make features                  # 27-configuration cfg matrix — see below
+```
+
+**Run `make features` whenever a change adds or moves a guard, and always when it
+touches `core/peer`.** `make test` and `make clippy` both run the *default* feature
+set, so neither sees a symbol that only exists under some `#[cfg(feature = …)]`.
+That gap is not theoretical: the §5.2 sub-dispatch denial (`90e60c0`) built its 403
+body with `make_error_response_entity`, which was `#[cfg(feature = "compute")]` —
+so with `compute` off the security guard did not merely lose its message, it
+**failed to compile**, and had that helper been infallible the guard would have
+compiled away silently. Green `test` + green `clippy`, defect intact. This is the
+cfg-gating hazard already named below, from the other direction: not a gated symbol
+misread as an absent surface, but a gated symbol quietly removing a guard that
+depends on it. **A security invariant of the dispatch core must not be reachable
+only through an extension's feature gate** — say so at the `fn` when you un-gate one.
+
+If the podman build fails with `could not parse/generate dep info … Permission
+denied (os error 13)`, that is an SELinux MCS relabel race against the shared
+`~/.cache/cargo-target-entity-core-rust` volume (`:Z` on a concurrently-used
+mount), not a code error. Re-run; it is not a signal about the diff.
+
+WASM CI build excludes `websocket` (tokio-tungstenite doesn't compile for wasm32):
+
+```bash
+cargo build --target wasm32-unknown-unknown -p entity-peer --no-default-features \
+  --features "inbox,continuation,subscription,clock,revision,query,history,compute,handlers,identity,role,registry,discovery,type-system,content,signaling,network"
+```
+
+Add `-p entity-wasm-worker-host -p entity-wasm-worker-proxy -p entity-wasm-worker-protocol`
+when touching the worker crates. `attestation`/`quorum` are transitive via `identity`
+(list only when testing without identity). `local-files` MAY be enabled on wasm32 but is
+conventionally left out for clarity. Check WASM only for changes to async/await, time,
+networking, or spawn.
+
+`signaling` and `network` joined the lane at S1. Both extension crates are socket-free,
+so what the wasm build carries is the **carrier half** (rendezvous-key derivation, the
+§6.1 coordination messages, candidate selection). The TCP wiring in `core/peer` —
+`punch_establisher`, `srflx`, `reuseport` — stays `not(target_arch = "wasm32")`; a
+browser gets its traversal from a WebRTC `LiveEstablish` impl at the §10.3 seam, which
+is already `#[async_trait(?Send)]` on wasm32 for exactly that reason. Don't "fix" those
+gates by making the TCP path compile on wasm32.
+
+## Code style
+
+- **Spec-first, minimal-diff.** Every decision traces to a spec section; read the passage
+  before coding. No opportunistic refactors; closeout-tier tasks ship ~the proposed LOC.
+- Errors: `thiserror` enums per crate, no string errors. Wire: **CBOR only** (no JSON).
+  Concurrency: `tokio` + `Arc<RwLock<>>`.
+- **WASM handler impls** use cfg-gated `async_trait`; use `web_time` not `std::time`. See
+  `docs/ARCHITECTURE-WASM-AND-TRANSPORT.md` for the exact pattern and the worker-boundary rules.
+- **Hot paths:** `SyncTreeHook`/`on_tree_change` engines MUST cache their decoded config in
+  `RwLock<...>` and refresh only on events under their own config subtree — never
+  `location_index.list()` + `content_store.get()` + decode per put (that was a 100×+
+  regression). Canary: `core/peer/src/lib.rs::perf_treeput_1100` (`--release`).
+- **A MUST-write owes a named collector, swept BEFORE the write.** A spec'd write with no
+  reaper is a leak by construction (CONTINUATION v1.23 §3.4 A.1 — ~1,440 marker nodes/day
+  against one dead peer). When adding the reaper: sweep at the top of the bind path, never
+  after it — an entry whose *origination* timestamp already predates the window would
+  otherwise be removed by the very call that wrote it, which reads from outside as the write
+  silently failing. Wire it at **every** binder you actually run, not just the one that owns
+  the sweep code (here: the continuation handler *and* the dispatcher's `rejected` markers,
+  which are caller-driven and unbounded). Reference: `extensions/continuation/src/marker_collect.rs`;
+  the ordering is held by `test_distinct_timestamps_yield_distinct_paths` /
+  `test_path_safety_sanitization` / `test_mirror_pointer_in_body`, which fail if the sweep
+  moves after the bind.
+- **A hypothetical you check MUST carry the shape you will write.** *(Ratified: bit us
+  twice, in opposite directions.)* When a decision is made by probing a synthetic value
+  through the real validator — `is_attenuated(&child, parent)`, an RL2 hypothetical, any
+  "would this pass?" construction — build the probe with **every** field the persisted
+  value will actually carry, and compute the derived ones *before* the probe, not after.
+  A probe that differs from the write is a check against a value that never exists:
+  - **Too permissive** → passes at issue, rejected at use. ROLE v1.7 §5.3 names this
+    verbatim ("RL2 OK at issue, chain-invalid at use") — `build_hypothetical_token` +
+    `effective_expires_at`, `extensions/role/src/handler.rs`.
+  - **Too strict** → nothing issues at all, and the 403 looks like a scope defect. §6.2
+    `request` built its probe `expires_at: None` while `is_attenuated` enforces §5.6's
+    "child expiry ≤ parent's" — so **every** request from a caller whose cap expires was
+    403, and the arch proposal that measured us read the symptom backwards. Fix: clamp
+    first, probe with the clamped value (`clamp_mint_expiry` → `child`).
+  **Enforcement:** the probe's assertion belongs in a test that fixes the derived field on
+  the *parent* — `request_mint_cannot_outlive_the_caller_capability` fails (403, not a
+  wrong expiry) if the probe and the mint drift apart again. Grep for `is_attenuated(&`
+  and any `hypothetical`/`probe`/`would_` construction when touching a mint path.
+- **One representation carrying two meanings is the bug — split it so the distinction
+  cannot be a mistake.** *(Ratified: bit us twice, in two representations.)* The first was a
+  type (`7c21d04`, below). The second was a **field name**: `since` meant an *exclusive
+  watermark walking newer* on `fetch` and an *inclusive cursor walking older* on `log`, so
+  the same argument returned **disjoint** sets from the two operations with no error
+  anywhere — and in our tree the collision was literally one function, `decode_log_params`,
+  serving both handlers, with the SDK's `build_log_params` serving both encoders. **When two
+  operations share a decoder, they share a vocabulary; check they mean the same thing by
+  it.** The fix is never to pick one reading: §4.4.2 removed the collision (`log` takes
+  `start_at`, `fetch` keeps `since`) and we split both the decoder and the builder, because
+  a shared code path is what lets the two meanings drift back together (`59e6f55`).
+- **A closed grammar needs a writer that refuses, not just a matcher that omits — and
+  where nothing *can* be refused, say so at the `fn`.** *(Ratified: bit us twice, and the
+  second time the correct answer was the opposite one.)* §2.4 pinned the exclude matcher to four forms; the
+  matcher is only half the rule. A peer that drops `**` from its matcher and a peer that
+  rejects `**` at config write are **indistinguishable until a config carries one** — and
+  then they silently disagree about trie membership, which decides the version root, which
+  is the version's identity. §4.4.17 V6 is the load-bearing half, and it belongs **before**
+  any check that interprets the value: our required-exclude coverage test would otherwise
+  have read `system/**` as coverage and stored a pattern we refuse to evaluate. Same shape
+  for any pinned vocabulary — validate at the boundary that persists it, and put the
+  refusal ahead of the interpretation.
+  The second bite inverted it. REGISTRY §4's `name_format_dispatch` grammar is *also*
+  closed — `*` only, every other byte literal — and reaching for the same V6 shape would
+  have been wrong: **no pattern is invalid there**, because every non-`*` byte is a literal,
+  so §4 says outright that a registry MUST NOT reject a pattern for containing `?`, `[`, or
+  `\`. Two closed grammars, opposite write-time dispositions, and the difference is whether
+  the grammar *can* be violated. So the rule has two halves: refuse at the writer when the
+  grammar admits a violation, and **state the absence of a refusal at the matcher when it
+  does not** — otherwise the next reader ports V6 across and starts 400-ing legal configs
+  (`9f02618`, `dispatch_match`).
+- **An `Option<T>` whose `None` must mean opposite things is the wrong type — name the
+  third state.** *(Ratified with the rule above; this is the first of the two shapes,
+  `7c21d04`.)* §5.2's resource dimension needed a
+  ceiling for in-process sub-dispatch. Modelled as `Option<CapabilityToken>`, `None` had to
+  mean **deny** for a handler holding no grant and **allow** for the peer's own SDK/engine
+  entry points, which present no capability because they are the root authority. Both are
+  correct readings of "absent," and either default is a shipped bug: deny breaks every
+  `Peer::execute_with_options`, allow reinstates the escalation for exactly the grantless
+  caller. `DispatchCeiling::{PeerRoot, Handler(Option<_>)}` makes the distinction
+  unrepresentable-as-a-mistake and forces every call site to state which it is. **Reach for
+  the enum the moment you catch yourself writing "`None` here means…" twice with different
+  answers** — the compiler then finds the call sites for you, which is how the sweep stayed
+  honest across 14 of them.
+- **Prove an absence by construction, not by grep, before you report it.** *(Ratified: bit
+  us twice, and the second time the region was the build graph, not the file.)* The
+  `substitute` category skipped against our peer and core-go's report read that as *"a 1-skip
+  coverage artifact, not a defect."* Checking rather than adopting the reading: enumerate
+  **every `Cargo.toml` in the tree** and ask who depends on `entity-storage-substitute-http` —
+  the workspace root and the crate itself, nothing else. `core/peer` has a `dep:` feature for
+  every other extension and none for this one. So `system/substitute/http` is built, tested,
+  and **unreachable from any peer binary** — a real gap, not an artifact, and the shape our
+  own charter already names (a surface present in the tree and absent from the substrate).
+  **The bounded region is whatever makes the enumeration exhaustive**: a function body when
+  the question is "does this path check X" (below), the dependency graph when it is "can
+  anything reach this handler." Pick the boundary that closes, then enumerate over it —
+  `59e6f55`.
+  Arch routed §4a as a read-and-report and explicitly made no absence claim. Answering it
+  with `grep check_permission core/peer/` would have been worthless — the call could sit in
+  any helper. What settled it was a **brace-balanced extraction of the whole function** and a
+  count of every authorization symbol inside it (`check_permission`, `check_resource_scope`,
+  `check_grant_covers`, `matches_scope`, `STATUS_FORBIDDEN`: all zero across 628 lines). That
+  turned "we did not verify" into "the path runs no check of any dimension," which is a
+  stronger and *different* finding than the one asked about — go at least reaches its L1
+  check. The standard's "prove a negative before you claim it" has a method: **bound the
+  region syntactically, then enumerate over the bounded region.**
+- **A fix that rewrites its own test's expectation has destroyed the evidence that it is a
+  fix — the mutation still goes red, and it goes red against the new belief.** *(Candidate:
+  bit us once, `aaa591e` → `cf570b2`, caught by the cross-impl gate in the same session.)*
+  Cohort item R-4 said `is_revoked` scans where the spec mandates an O(1) index. Implemented
+  as written; the fixture that filed a revocation the old way was updated to the new way in
+  the same commit; `entity-registry` went 77 green and the mutation *did* bite. All of it
+  was worthless: go's `registry.v6` writes a revocation at the own-hash path via `tree-put`
+  and requires exclusion, so the index-only reader was **non-conformant**, and the armed gate
+  scored 1586/**1F** where the same gate had scored 1587/0F an hour earlier. **A mutation
+  proves a test is coupled to the code; it cannot prove the test asserts the right thing** —
+  and a test edited in the same commit as the behaviour is not an independent witness of
+  anything. **Enforcement:** when a change alters *what a test asserts* rather than whether it
+  passes, the in-tree suite is downgraded from evidence to a smoke check — run the cross-impl
+  instrument (`scripts/validate-complete.sh <impl>` in core-go, not a bare `validate-peer`)
+  **before** reporting the item closed, and say which fixtures you rewrote. The bare run is
+  not the instrument: it prints posture noise for every impl and says so itself.
+  **Applied as written, 2026-08-20 (`6c889df`), and it stays a candidate** — by the outcome
+  the rule predicts, not by a second bite. REGISTRY v1.19's §4.1b classifier inverted two rows
+  of our own in-tree table (`alice` broad→narrow, `*.lab` narrow→broad), so the rewritten table
+  could not witness itself. What settled it was **mutating on the wire**: revert the classifier,
+  **rebuild the peer**, score it — `registry` 17/18·1F. Two things the run added. First, the
+  mutation is evidence only if the harness rebuilds from the dirty tree; check the build line
+  (`peer-manager` prints `working tree dirty at <sha>`) or you have mutated a binary nobody
+  re-made. Second, and cheaper than it looks: `peer-manager start --type rust` +
+  `validate-peer -category <one>` is a ~2-minute loop, so *"the cross-impl instrument is too
+  slow to mutate against"* is not true for a single category and should not be offered as a
+  reason. `validate-complete.sh` is the **gate**; the single-category start/stop is the
+  **probe**, and it is what turns a PASS into a measurement.
+- **A ledger's description of an item is not evidence about its severity — a "one-line
+  hygiene fix" can be a scored cross-impl FAIL.** *(Candidate: bit us once, `6c889df`.)*
+  Cohort item R-17 rode the board as *"rust's one-liner"* (a `type_ref` reading `core/entity`
+  where REGISTRY §4.3's own table names the precise token). Landing it and then reverting it on
+  the wire scored `type_system` **431/438 · 1F** — it had been a live scored failure against us
+  the whole time, because the sibling that fixed it first makes its descriptor the one every
+  seat is compared to. **A cohort item touching a *published contract* — a type descriptor, an
+  advertised handler interface, a status code — is measured by a check somewhere; find the
+  check before you accept the ledger's adjective.** Enforcement: `grep -rn <symbol>
+  cmd/internal/validate/` in core-go for the item's surface, and if a check names it, report
+  the item's state as that check's verdict rather than as the ledger's wording.
+- **An unobservable branch is not shipped, even when it is "obviously" faster.** *(Same
+  session, same entry's other half.)* Fixing R-4 by consulting the index *first* and falling
+  back to the scan looked strictly better. Mutation: delete the fast path — **no test failed**,
+  because `by-target/{hex}` sits *inside* the scanned prefix, so the keyed lookup can only find
+  what the scan finds. A branch that reads as covered and cannot fail is worse than its
+  absence: it is an unmeasured claim in the shape of an optimization. Ship the scan, pin the
+  containment that makes the fast path pointless (`revocation_by_target_is_inside_the_scanned_prefix`),
+  and let it fail loudly if the two paths ever diverge.
+- **A byte-exactness claim tested with a value your own codec authored proves nothing — the
+  fixture must carry a field the codec cannot emit.** *(Candidate: bit us once, caught by the
+  mutation before landing, §4.3 `set-resolver-config`.)* "Stores the submitted bytes verbatim"
+  and "re-encodes the decoded struct" are **the same address** for any value the codec models
+  completely, because `to_entity(from_entity(x)) == x` is exactly what the round-trip test one
+  file up already asserts. So a `assert_eq!(got.content_hash, submitted.content_hash)` over a
+  config built by `ResolverConfigData::to_entity` is green under both implementations, and the
+  mutation *"replace the verbatim store with `config.to_entity()`"* survived it. What separates
+  them is a **forward-compat key** — `schema_version_2027` here, the shape §4.2 exists to permit
+  — which the decoder ignores, the encoder cannot produce, and a re-encoding peer silently drops.
+  Same shape as the ratified probe rule and pointed the other way: there, the probe must carry
+  every field the *write* will; here, the fixture must carry a field the *codec* will not.
+  **Enforcement:** any test whose name or assertion says *byte-exact* / *as written* / *verbatim*
+  owes one unmodelled key, and the mutation to prove it (`set_resolver_config_stores_the_
+  submitted_bytes_and_get_returns_them`, whose modelled rows pass the re-encode mutation and
+  whose last row is the one that fails).
+  **Broadened 2026-08-20, and the second shape is a DECISION rather than a storage path** —
+  *"byte-identical" in a spec MUST is a comparison whose answer is a security verdict, and the
+  same decode-then-re-encode loss becomes a fail-open instead of a hash mismatch.* §4.3's
+  pin-delta is that shape: the predicate decides whether a write needs pin authority, so a
+  decoded compare that drops a §4.2 forward-compat key reads a changed pin list as *"no
+  change"* and rewrites the registry's most privileged row under `registry-configure` alone.
+  We read the word literally and compared raw field bytes; **core-go's typed-struct decode did
+  not, and that is where it bit** (go `f44ed4d`, mutation-verified). Arch adopted the reading
+  into R-27 §5 rather than ruling it, because *"the operation name and the byte rule are the
+  two halves of one check."* **Provenance stated exactly: this did not bite us a second time —
+  we found it in a sibling.** So the rule is broadened on evidence but stays a **candidate**
+  at this seat, per the ladder. **Enforcement, the new half:** when a spec MUST turns on
+  *byte-identical* — or you are comparing two encodings of the "same" value to reach an
+  authz / dedup / change verdict — extract the **raw field bytes**
+  (`entity_wire::cbor_map_field_raw`) from both sides; never compare decoded structs.
+  Grep for `from_entity(` on a value that feeds a comparison rather than a read. Teeth:
+  `a_pin_field_this_codec_does_not_model_still_counts_as_a_pin_change`, which is the one row
+  of that suite the decoded-compare mutation fails.
+  **And the corollary the same packet taught: a green in-tree suite cannot see this class at
+  all.** Our own codec never emits the unmodelled key, so only a hand-built forward-compat
+  fixture — or a sibling's peer — can bite. That is the same *"cross-impl FAIL is the true
+  signal"* shape as the invariant-pointer path, and it is why the fixture rule above is written
+  as *the codec cannot emit it* rather than *the codec does not use it*.
+  **Broadened again 2026-08-21, and the third shape is the cheapest to write and the hardest to
+  see: a test whose EXPECTED value is computed by the code under test.** NETWORK §6.5.3's
+  hex-strictness item routed as *"`BuildContentURL` must render `hex(h.Bytes())`, not
+  `hex(h.EffectiveDigest())`"*. Our builder was already right — but the test guarding it was
+  `assert_eq!(content_url(base, &h), format!("{base}/content/{}", h.to_hex()))`, which compares
+  the builder against **the very function the builder calls**, so any mutation of the shared
+  helper moves both sides together and the assertion cannot fail. Measured, not assumed:
+  mutating `Hash::to_hex` to the digest-only form — *the precise shape core-go shipped* — leaves
+  `url_construction_matches_http_live_routes` **green** and reddens only the new property test.
+  A round-trip is not a claim about bytes; it is a claim that the encoder and decoder agree,
+  which is exactly the thing that is true under both implementations. **Enforcement:** a test
+  whose expected value invokes a helper the implementation also invokes is a tautology — assert
+  the **property** instead (here: the hex begins with the format-code byte and its length is
+  `2 + 2*digest_len(format)`, exercised at **two** formats so a hardcoded 66 fails the SHA-384
+  row), and **run the mutation on the shared helper, not on the caller** — mutating the caller
+  alone makes a tautological test look like it bites. Teeth:
+  `content_url_hex_is_the_full_wire_form_at_every_format_width` (`published_root.rs`) and
+  `content_url_hex_width_follows_the_format_byte_at_every_layout` (`storage-substitute-http`).
+  **Provenance stated exactly: no defect escaped here — what the mutation caught was the test
+  being theater**, so this stays a **candidate** rather than promoting the entry.
+  **The sweep that same rule's boundary demanded, and what it found.** SPECIFICATION-FORMAT
+  §8.4.5 states its own enforcement point — *"grep a draft for `33`, `66`, `49`, `98`,
+  `hex33`, 'fixed-length'; every hit is either a worked instance labelled as one, or a
+  defect"* — and the boundary is **every site that pins a hash width**, not just the routed
+  http-poll routes. Run over our tree it surfaced two genuine ones the routing did not name,
+  both invisible while one algorithm ships: `revision::is_prefix_config_path` gated on
+  `rest.len() != 66 + "/config".len()` while its **own writer** emits format-relative
+  `Hash::to_hex`, and `store::opfs`'s replay framed the head hash at a fixed 33 while
+  `encode_entity_record` writes variable-length `Hash::to_bytes`. **Both are a write-shape /
+  read-shape asymmetry inside a single file** — the inverse of the by-target index bite below,
+  and closer to home, because there is no sibling to blame and no cross-impl check that would
+  ever see it. When a routed item is about a hash's *encoding*, run §8.4.5's grep before
+  reporting it closed.
+- **An operation added to a `Handler` has two registration sites, and the second one is in
+  another crate.** `impl Handler::operations()` makes it answerable; `bootstrap_handler(...)` in
+  `core/peer/src/lib.rs` writes the **advertised** `system/handler/{pattern}` interface entity
+  that publishes the contract (§4.4 advertised-handler discipline). A peer that answers an
+  operation it does not advertise is inconsistent with its own published interface, and the
+  in-tree handler tests cannot see it — they construct the handler directly and never read the
+  interface entity. Grep `bootstrap_handler(` when adding an op; it is one line and it is the
+  only place the peer says out loud what it serves.
+- **A vector's discriminator can be defeated by something the vector does not control —
+  check the row actually distinguishes before reporting it green.** *(Ratified: bit us
+  twice in one packet, in two different repos' vectors.)* A conformance row asserts an
+  outcome; whether reaching that outcome *required* the behaviour under test is a separate
+  question, and it is the one that decides whether a PASS is evidence.
+  - **`MERGE-SPEC-TIE-1`** says write the two configs *"in both orders"*. Our
+    `LocationIndex` is `BTreeMap`-backed, and within one config prefix path order **is**
+    `{name}` order — so re-inserting in the other order changes nothing about what is
+    enumerated, and a keep-whichever-came-first peer passes **both** rows. §4.4.18's own
+    argument is that `list_entities` **ordering** is unspecified: insertion order is not a
+    proxy for enumeration order. The row only went red against rank-only comparison once it
+    ran through a deliberately reverse-enumerating store double (`0e325ba`).
+  - **`HIST-CONFIG-SPECIFICITY-1`** says write at *"a path both match"* using
+    `a/b/c/d` and `a/*/c/*/e`. **No such path exists** — under §5.4 the second is an
+    *exact* pattern whose interior `*`s are literal bytes. The pair separates the scorer and
+    cannot drive the selection, so the two claims need two tests (`ea27715`).
+  - And from the other side of the wire: core-go's `registry.v15_dispatch_grammar` drives
+    the **grammar** through the **filter**, so against our filter reading every row returns
+    `resolved` and its three `resolved` rows pass **trivially, for the wrong reason**.
+  **Enforcement:** for any row whose property is "X does not depend on Y", vary **Y** — not
+  a proxy for Y — and run the mutation. If the row cannot be made to fail, it is not
+  measuring anything; write the unreachability down (see
+  `merge_spec_key_3_pattern_order_is_unreachable_by_construction`) rather than leave a
+  branch that reads as covered.
+  **Third axis, and the cheapest to miss: the process ENVIRONMENT can be the thing the row does
+  not control** *(B-1, `bd44465`)*. The obvious test for the 0600 key fix —
+  `assert mode == 0o600` after a mint — is a claim about the **umask**, not about the code:
+  measured under `umask 0077` it **passes against the unfixed `fs::write`** (3F at 0022, 1F at
+  0077). The row that holds at every umask is the **re-mint over an existing 0644 file**, because
+  `write` preserves a mode it did not create. When an assertion reads a value the OS, the clock, the
+  locale or the filesystem also gets a vote on, run the mutation under **two** settings of it — one
+  run cannot tell "the code is right" from "the environment was kind."
+- **N impls agreeing is evidence only if each one measured the stated condition — check that the
+  harness transmits the vector's preconditions before you read agreement as convergence.**
+  *(Candidate: bit us once, 2026-08-22, caught before the report went out.)* The 362-vector
+  cross-bless would not lock; the single vector was `cv9a` (`map` contains `depth_exceeded`), and the
+  harness's own §4 classifier read *"one-differs → core-go's bug"* from rust + py + the frozen
+  emission's disagreement. **The attribution was backwards.** The control that settled it was driving
+  **go's own peer** over the wire and cross-blessing it against go's *in-process* emission: go
+  disagreed with **itself**, and the three "agreeing" peers all matched go-over-the-wire. Mechanism,
+  proven by construction at both ends rather than inferred from the vote: the driver encodes exactly
+  one budget key (`{"budget": Operations}`), **`Depth` is never transmitted**, and §5.2 has no request
+  field for evaluation depth at any seat — so every wire emission ran the vector at
+  `PEER_DEFAULT_MAX_DEPTH` (1024) instead of its declared 24, and its 60-level element never tripped.
+  Three emissions from one harness that drops the same precondition are **cohort-consistent by
+  construction**, which is exactly the case the standard's *"cohort-consistent, not independent
+  convergence"* warns about — here wearing the shape of a majority verdict against the one emission
+  that was right. **Enforcement:** for any vector whose outcome turns on a declared precondition
+  (budget, depth, clock, capability constraint), enumerate that precondition against the fields the
+  driver actually **encodes** before citing a lock or filing a divergence; when a cross-bless does not
+  lock, **run the sibling against itself over both routes** — it is one extra emission and it
+  distinguishes "their evaluator" from "the transport" in a single comparison. Corollary, and it is
+  about our own back-catalogue: `worked/recurse/tail-sum` pins `Depth: 16` and has locked in every
+  wire bless we ever reported, but its recursion is *tail* and 5 levels deep, so it passes at 16 and
+  at 1024 alike — **every "N/N LOCKED" we have published over route B was silent about the depth
+  axis.** Not wrong; narrower than it read, and a report should say which.
+- **A failing cross-impl check is a hypothesis about which peer is wrong, not a verdict —
+  and the pressure to converge runs toward whoever wrote the check.** *(Candidate: bit us
+  once, `479de51`, caught before landing.)* `registry.v15_dispatch_grammar` failed against
+  us. The matcher it names was correct; the failure was §4.1 step 2's **filter** semantics,
+  where the paragraph has two clauses that contradict each other and the two seats each
+  implement one. Converging looked like closing a divergence and would have adopted a
+  reading that contradicts a plain normative sentence — *"backends with [an entry] are
+  consulted ONLY when the pattern matches"* — on the surface §4.1 calls the primary privacy
+  mechanism. **Before changing code to turn a sibling's check green, name which sentence
+  each behaviour follows from.** If both readings have text, it is a spec question and it is
+  routed, not settled by whoever shipped the check first — the same call arch upheld for
+  core-go one field over. Two further things the near-miss taught: state the argument
+  **against** your own reading in the routing (ours makes §4.1's catch-all MUST evadable by
+  omitting a row, which is the strongest case for theirs), and **pin both sides in tests**,
+  so whichever way it is ruled exactly one test flips and neither reading is accidental.
+  **Vindicated, 2026-08-19 (`898e55b`)** — and by the outcome the rule predicts rather than
+  by a second bite, so it stays a candidate. Arch ruled both routed registry items and
+  **neither seat's reading survived either one**: the §4.1 filter is now a pure function of
+  the name (our row 1 lost on the argument we filed against ourselves; go's no-match fallback
+  lost too) and `name_constraints` is §4's one matcher (go's and py's filing, our divergent
+  side). Converging on the sibling would have shipped a reading the spec later withdrew, in
+  both directions. Two additions the landing earned: when the ruling arrives, **run the
+  mutation on the pins** — reinstate each withdrawn branch and confirm exactly one test goes
+  red, because "one flips" is a claim about the tests, not about the ruling (three runs here,
+  one failing test each). And **ask for a ruling, not for a winner**: both seats asked "which
+  of us?" and the answer was a third reading, because the defect was that one paragraph
+  answered the question twice — a routing that offers only two options invites ratifying half
+  of a sentence that should not have been written.
+- **A green category is not evidence about a surface the category does not check.**
+  *(Candidate: `479de51`.)* `revision 103/103`, `history 34/34` and `type 27/30` were green
+  in the same run that carried this packet's REVISION §4.4.18, HISTORY §6.2 and TYPE §4.6
+  work — and `validate-peer` has **no** check for merge specificity, `HIST-CONFIG-SPECIFICITY-1`,
+  or `type_pattern`. Enumerate the checks by name before citing a category total as
+  cross-impl verification of what you changed (`grep -rn <vector-id> cmd/internal/validate/`);
+  `registry_issuer` **did** carry `set_issuer_policy_max_ttl_ceiling`,
+  `register_ttl_clamped_to_max` and `renew_ttl_clamped_to_max`, so the TTL half is
+  wire-verified and the other three surfaces are in-tree only. Report the difference.
+  **The same holds *inside* a check, and that half is newly earned (`898e55b`).** A
+  multi-row check short-circuits at the first failing row, so a FAIL is evidence about **one**
+  row and silence about the rest — including rows measuring the *same* defect. go's
+  `name_constraints_grammar` reported us FAIL at row 1 (`?` read as a wildcard) and their
+  report says outright that rows 2 and 4 "were not reached"; both were **also** wrong here,
+  and row 4 was wrong in a way their rationale does not describe — the row exists because a
+  shell-glob fails it by *erroring* (go 500ed), while our POSIX matcher failed it by
+  answering, refusing the literal name its own policy names. **Fix the defect the rows
+  describe, not the row that turned red**, and when the failing row is fixed, re-run for the
+  rest rather than reading one green line as the whole check.
+- **A routing's work item is a delta against the *sibling's* tree — recompute it against yours
+  before you scope it, and say so in the reply.** *(Candidate: bit us once, 2026-08-21, caught
+  before writing a line of code.)* core-go routed COMPUTE v3.26 as *"add the carve-out at the
+  array-element boundary in materialize"* — a one-function change, with go's own diff as the
+  worked reference. **We had nothing to carve out of.** `range` / `group-by` / `concat` /
+  `assoc` did not exist here at all: the item was v3.24 (four primitives + five spec-pinned args
+  types) **plus** v3.25's four corner rulings **plus** v3.26, three versions in one line of a
+  ledger. A routing is written from the seat that landed it, so its scope is *their* delta;
+  yours is whatever your tree is missing, and the two are only the same when both seats were
+  level to begin with. **Enforcement — it is one grep and it is exhaustive, not a sample:**
+  before scoping a routed item, enumerate the symbols it names in the **closed table that
+  dispatches them** (here `dispatch_builtin` / `dispatch_builtin_alias` / `builtin_input_type` in
+  `extensions/compute/src/builtins.rs` — the match arms *are* the inventory, so an absent arm is
+  proof, not a partial grep). If the thing being amended is not there, the item is the whole
+  chain: build it, and **report the scope difference in the reply** rather than closing the
+  routed item as written — a seat that silently absorbs three versions into a one-line item
+  leaves the ledger claiming a parity that nobody measured. Corollary for the reply: name the
+  versions you actually landed, not the version the routing was titled with.
+- **A ruling that changes a PUBLISHED DESCRIPTOR cannot be landed seat-by-seat — the first
+  seat to land it goes red, and that is the check working, not a defect.** *(Candidate: bit us
+  once, 2026-08-21, caught on the wire and backed out the same session.)* C-11 Corner 2 (D3)
+  narrows `system/compute/concat-args.collections` from `array_of system/hash` to a scalar. We
+  implemented it from the routing's §4 worklist; `cargo test`, `clippy` and `make features` were
+  all green, and `validate-peer -category type_system` scored **1F** on
+  `type_system_compute_concat_args_match`. The check compares our *published* descriptor against
+  **the sibling's local type table** (`allLocalTypes` → `compareTypeDefsOutcome`), so a descriptor
+  edit is a divergence the moment one seat makes it and until the last seat does. Two things this
+  earns, and the second is the one that generalises:
+  - **The grep that says "not scored" has to match the check's *construction*, not its name.**
+    `grep -rn concat-args cmd/internal/validate/` returned nothing and we read that as "no check
+    names this surface" — but the check name is **generated** (`"type_" + sanitizeName(def.Name) +
+    "_match"`), so no literal ever appears. For a per-item check, grep the **loop that declares
+    it**, not the item. This is the same "published contract is measured somewhere" entry as R-17
+    above, failing from the other direction: there the ledger's adjective was wrong, here our own
+    absence-proof was.
+  - **DRAFT is a status, and it binds.** The proposal carrying D3 is `Status: DRAFT` targeting
+    v3.27, and the standard says implement the **landed** spec, not an in-flight proposal — arch's
+    own packet said *"do not implement from this packet's prose"* two sections after the worklist
+    that asked for it. When a routing's worklist and its "what arch still owes" table disagree,
+    the **spec's landed text wins** and the disagreement is the thing to report. Ship the
+    behaviour a ruling calls existing non-conformance (Corner 1 was explicitly ungated: the
+    asymmetry violates the *landed* §2.4); hold the ones that edit a declaration until the fold,
+    and say so at the code with the measurement attached.
+- **A cross-impl vector suite is a fixture set — re-bless at every new SHA, because "we blessed
+  at N" says nothing about N+3.** *(Candidate, same session.)* We reported `352/352 LOCKED` and
+  routed it as the evidence for C-6. go then seeded CV-7a/b/c (→355) and CV-8a/b/c (→358), and
+  bisect at our own `145cd1c` measured **3 two-way**, not 0: `cv7c` (a real, un-caught defect —
+  `concat` answered `type_mismatch` where an error *sub-collection* must short-circuit), `cv8a`,
+  and `sweep/0281` — **a vector nobody named in any routing**, which the same fix closed. The
+  defect was live under a green PASS for the same reason go's was: *the two readings agree
+  everywhere the fixtures live.* **Enforcement:** a corpus SHA in a report is a claim with an
+  expiry date. Before citing a LOCK as evidence, re-generate and re-bless at the sibling's current
+  freeze; and when a bless comes back dirty, **bisect before attributing** — `git stash` →
+  `peer-manager start` → emit → cross-bless is ~4 minutes and it is the difference between "this
+  is pre-existing" and "I measured that this is pre-existing." Both of ours turned out to be
+  pre-existing; the run is what makes that sentence worth anything.
+- **A carve-out on a value rule must key on the value's CODE, never on its in-flight variant —
+  and name the criterion, not the category.** *(Candidate, same session, decided as lead.)* C-11
+  Corner 1 makes `map`'s output element a contained position. go carved out the three
+  *evaluation-limit* codes (`budget_exhausted` / `depth_exceeded` / `cascade_limit`) so they
+  propagate. The carve-out is right for the wrong-sized reason: what makes containment incoherent
+  is a resource **shared across the elements** — `budget.operations` is one counter pinned at 0 by
+  `saturating_sub`, so containing it fills the array at a split point decided by cost accounting
+  and then reports **success** for an aborted evaluation. `depth_exceeded` does not share that
+  property (`budget.depth` is restored on unwind), so it is element-wise and contains, exactly like
+  `div(x, 0)`. **Named divergence from go, routed, and deliberately kept out of the frozen corpus
+  at both seats.** The half that is not a judgement call: the predicate MUST read the `code`, because
+  keying on `ComputeValue::Error(_)` vs the SA-1 entity form would reinstate the precise §2.4
+  provenance-dependence the ruling exists to remove — with the consequence, stated rather than
+  hidden, that an *authored* `compute/error{code: budget_exhausted}` also aborts a `map`. Teeth:
+  `the_map_carve_out_is_shared_resource_not_limit_code`, whose two halves fail under go's wider set
+  and under no carve-out at all.
+- **A recovery test that only exercises the seed does not reach the loop.** *(Same session; the
+  mutation caught it, review did not.)* `fold`'s accumulator is bound, not consumed, so a closure
+  that ignores it recovers — and there are **two** branches that must not short-circuit: the
+  `initial`, and each `fn` result threaded into the next invocation. Our first test set only
+  `initial` to an error and the closure never produced one, so restoring the per-iteration
+  `if acc.is_error() { return acc }` left it **green**. The discriminator has to make the *loop*
+  produce the error: `fold(λ(acc, x). div(1, x), 0, [0, 1])` → `1`, where iteration 1 mints the
+  error and iteration 2 ignores it. **Run the mutation per branch, not per behaviour** — "the
+  feature is tested" and "this branch is tested" are different claims, and only the second one is
+  what a mutation measures.
+- **A declared exclusion whose ground is "nothing installs it" is a gap wearing an exemption —
+  register the surface and let the wire tell you what it was hiding.** *(Candidate: bit us once,
+  2026-08-22.)* `CONFORMANCE-EXCLUSIONS.md`'s substitute entry rested on two grounds: Ruling 4
+  (`claimed_source_peer_id` is dispatcher context, not a wire field — a property of the *protocol*,
+  cohort-convergent, a real exclusion) and *"nothing installs the surface"* — exhaustively true, and
+  **not an exclusion ground at all**. The second one is the shape our own charter already names, a
+  surface present in the tree and absent from the substrate, and writing it into the exclusions doc
+  is how it survived: `substitute 0P/**1S**` read as *declared* rather than as *undone*, and a skip
+  counts as a failure. It was the sole reason this seat's release gate exited 1 while go's exited 0.
+  **Wiring it (one `builder.handler(...)` line) turned an unmeasured surface into `5P/3F`
+  immediately, and a fourth defect surfaced while fixing those three.** All four had been shipping,
+  invisible, behind a fully green in-tree suite:
+  - §2.3's `entry` travelled as a **`bstr`** where go (`Entry entity.Entity`) and py (a dict) both
+    carry the entity as a **value**, so every cross-impl call died at the first field. Our encoder
+    and our decoder agreed with each other — the same-side round-trip pitfall already stated at the
+    top of this section, realized as completely as it can be, because no cross-impl caller existed
+    to disagree.
+  - The §7 plaintext refusal answered **400** where it is a **403** (an authorization decision about
+    the scheme, not a malformed request).
+  - §2.2's *"`content_url_prefix` is REQUIRED, no derivation default"* was implemented as a
+    derivation — and then, after the absent case was fixed, **still failed on the empty-string
+    case**, because go's `TransportEndpoint` carries no `omitempty` and "unset" arrives as
+    `Some("")`. *"Absent and empty are the same fact"* is already a rule here for optional arrays;
+    it binds a REQUIRED string too, from the other direction — both mean "the publisher committed
+    to nothing", and refusing only `None` let the empty string fall through to the scheme gate and
+    report the **wrong defect**, which is what kept the check red through a fix that looked complete
+    in-tree.
+  **Enforcement, two greps.** (a) Any entry in `CONFORMANCE-EXCLUSIONS.md` whose *"not drivable"*
+  paragraph cites our own build rather than the protocol is a work item, not an exemption — re-read
+  them at each release. (b) For every `impl Handler` in `extensions/`, grep the peer binary for its
+  constructor; a handler no `cmd/` crate depends on is unreachable, and the dependency graph is the
+  region that makes that enumeration exhaustive (`grep -rn <crate-name> --include=Cargo.toml .`).
+  **And the corollary about citations:** our decoder cited *"D-14, §6.4 — workbench-go review"* by
+  name and implemented it faithfully; the spec later pinned the opposite and said outright that an
+  impl doing what D-14 asked *"is non-conformant."* **A code comment citing a proposal or a review
+  item is a claim with an expiry date, and the comment will never tell you it expired** — when a
+  ruling lands on a surface, grep the tree for the superseded item's identifier, not just for the
+  behaviour.
+- **SDK '`static` futures:** any `pub async fn(&self, ...)` on borrowed accessors
+  (`IdentityOps`/`ComputeOps`/…) plumbed through a `BoxFuture<'static>` consumer trait must
+  instead return `impl Future + Send + 'static` (drop `Send` on wasm32): capture Arcs/owned
+  state up front, run in `async move`. `PeerContext` is not `Clone`. Retrofitting is a large
+  refactor — reach for this shape from the start.
+
+## Project structure
+
+The strict crate DAG (a crate may import only crates above it; never introduce cycles)
+is documented in `docs/ARCHITECTURE.md`. Two invariants that govern where changes may
+land: only four extension-to-extension substrate edges are permitted (`quorum→attestation`,
+`role→attestation`, `identity→attestation+quorum`, `relay→route`) — no others; and entity
+storage (bootstrap, handler emit, tree put) goes through the single `emit()` path, never a
+direct `store.put()`. Other key facts:
+
+- `entity-core` is the facade crate re-exporting `core/*` as namespaced modules.
+- `bindings/wasm-worker-*` crates are **wasm32-only** (`#![cfg(target_arch = "wasm32")]`).
+- Naming: the L3 frontend team is **"Dom"**, not "EGUI".
+
+## Boundaries — do NOT modify
+
+- **No protocol design.** No new primitives, wire messages, or handler operations not in the
+  spec; no pluggable validator registries / new hook types / new context fields to paper over
+  a gap. Log ambiguities to `docs/SPEC-AMBIGUITIES.md` (exact passage + ambiguity + interim
+  choice) and route upstream — don't invent a mechanism.
+- `../entity-core-rs/` (old Rust impl) — **reference only**; do not replicate its patterns.
+  `../entity-core-go/` and `../entity-core-py/` — interop context only; do not copy structure.
+- **wasm-worker-\* crates must not affect native bindings.** Godot/FFI/CLI stay unaffected by
+  worker changes (the crates are wasm32-only at lib root).
+- **Private keys** belong only in the per-peer keystore (PEM on disk / OPFS / app config) or
+  in a live in-memory `Keypair`. Never into bundles/exports/"portable" structs, capability or
+  delegation chains, wire messages, logs, or anything `Serialize`/`Debug`-derived. When
+  porting a Go field, confirm the Rust shape actually needs it (Bundle v1 shipped a vestigial
+  `keypair_pem` — Go's ceremony-rerun shape needed it, Rust's entity-shape didn't).
+
+## Protocol / interop invariants agents get wrong
+
+Cross-impl wire fidelity. Same-side round-trip tests pass with the **wrong** shape too
+(encoder + decoder agree); only a cross-impl validator catches these. Run
+`validate-peer -category <touched>` on any wire-shape change.
+
+- **Byte fidelity:** entity `data` must be preserved as-is — never decode+re-encode.
+- **ECF is deterministic:** sorted keys, minimal integers, definite lengths (RFC 8949 §4.2).
+- **Hash input is only `{type, data}`** — never the `content_hash` itself.
+- **A routed pointer is a starting point, not the boundary — derive the boundary from the
+  normative sentence, then sweep it.** *(Ratified: bit us twice in two shapes, same day.)*
+  A routing note names the site somebody **measured** or the line they **read**; the spec
+  names the sites that **bind**. Those are not the same list, and stopping at the pointer
+  closes the routing item with the defect still in the tree, behind a green gate. Before
+  implementing any ruling, write down the boundary in the spec's own terms — then find every
+  place in *our* code that falls inside it. The two that earned this:
+  - **Sibling *sites*.** §2.4's code-only `compute/error` rule names the §7.2 `result_path`
+    write and the SA-9 `store` crossing in one sentence. Arch routed only `store`;
+    `result_path` was broken identically (minted form handled, SA-1 value form passed
+    through verbatim). `materialize_error_value` now serves both — `d149915`.
+  - **Sibling *arms*.** ROUTING-2026-08-16-i routed `apply.rs:187`, the builtin intercept.
+    That same function had a second arm — the unrecognized-bare-name fall-through — which
+    reached external dispatch with `capability`/`resource` still attached, where they *would*
+    be honored. §2.1 keys on the **path**, not on the name resolving, so both arms bind —
+    `747b41a`.
+  - **Sibling *directions*.** A rule about what may appear on the wire binds the **encoder,
+    the decoder, and every construction that feeds them** — and the lenient direction is the
+    fail-open one. CAP-6 ("an unrepresentable temporal term MUST be absent, never wrapped or
+    saturated") was routed as a mint-side clamp; the same field was also encoded through
+    `x as i64` (negative above `i64::MAX` — and ROLE §5.3's `saturating_add` produces exactly
+    that input) and decoded through `try_from(...).ok()`, which read a value **go refuses**
+    as *absent*, i.e. as a cap that never expires. Fixing only the mint leaves us honoring
+    the tokens the cohort's unfixed peers already emitted — `entity_ecf::uinteger` +
+    `decode_temporal_field`.
+  - **Sibling *derivations*.** A rule about how a value is *derived* binds every site that
+    derives it, and the sites are found by the argument, not by the grep. §5.2's
+    `target_peer = extract_peer(execute.data.uri, local)` was routed as one conformance FAIL
+    at `connection.rs`; compute's `compute/apply` F2 dual-check computed the same argument
+    the same wrong way, from an *expression-supplied* path, and it is the ceiling that check
+    exists to enforce. Of 15 `check_permission` callers, 13 build a local-qualified pattern
+    themselves and are correct — the two that take a caller-influenced path are the two that
+    bind. Sweep by *"where does this argument come from"*, not by the callee's name —
+    `80d9f67`.
+  - **Sibling *producers*.** A rule about what a value may be binds every site that
+    *mints* the artifact carrying it, and the routing names the ones somebody exercised.
+    §6a.9.1's ttl cascade and ceiling were routed as `register-request` + `renew-request`;
+    `approve-request` is a **third** producer of peer-issued bindings, minting from a body
+    queued days earlier, and it had neither. A manual-mode registry could therefore sign
+    above a ceiling the operator had already lowered. Found by asking *"who else calls
+    `issue_binding`"* rather than by following the two op names in the packet — the boundary
+    is the mint path, not the routed operations (`c06a6ab`).
+  - **Sibling *halves of one index*.** When a lookup changes shape, the **write** that feeds
+    it is inside the boundary. §6a.6's by-target revocation index was routed as a read-side
+    scan-vs-lookup finding; the fetch path already *read* by-target remotely but **cached
+    under the own-hash key**, because the local side scanned. Landing only the lookup would
+    have made every fetched revocation invisible — a silent fail-**open** on the check that
+    excludes a compromised binding, strictly worse than the scan it "fixed". A read-shape
+    change with no corresponding write-shape audit is half a change — `a23bb27`.
+    **And the inverse, from the same index one packet later: a routed pointer can name the
+    wrong *layer*, so check that the sentence cited governs the site cited.** Ledger item R-4
+    quoted §6a.6 (*"an O(1) index lookup, not a scan"*) at `resolver::is_revoked`. §6a.6's
+    argument is a **`registry`** and it is called from **§6a.4**, the peer-issued algorithm —
+    the reader `a23bb27` already converted. The site R-4 named implements **§3.1**, a different
+    sentence that constrains no storage path, and conformance drives it as a scan. Implementing
+    the citation made a green peer red. **A section number in a routing is a claim about which
+    rule binds your code, not a fact** — read the sentence, check its arguments and its caller,
+    and answer with the measurement when they do not line up (here: core-go scans at the same
+    layer, so the divergence the item describes does not exist between the seats) — `cf570b2`.
+  - **Sibling *fields named by one sentence*.** §4.4.17 V6 says *"every `exclude` /
+    `exclude_types` pattern"* and §2.4 gives both the same matcher. The routing, and every
+    example anyone quotes, is about `exclude` — so `exclude_types` sat there as an **exact
+    string compare**, silently ignoring every patterned entry a peer had stored, and it is
+    the field where the four forms are *most* visible (`app/*`, `*-draft`). Same packet, same
+    shape one layer out: the SDK built `fetch`'s params through the **log** builder, so a
+    rename to `log`'s field would have left `fetch` emitting a type that no longer declares
+    it. When a rule's sentence names two fields, grep for the second one — it is the one with
+    no example — `59e6f55`.
+  Also check every **form** the value arrives in: a kind-based predicate (`is_error`) makes
+  the enum variant and the entity variant one fact, so a site fixed for one is not fixed.
+  And when a swept site turns out to be **fine**, prove it and say so at the code rather than
+  "fixing" it silently — three `n as u64` casts read as truncations and are not, because
+  `ciborium::value::Integer` is bounded to CBOR's integer range. An unproven negative in a
+  sweep is how a no-op change gets reported as a fix.
+  **Enforcement:** each swept site owes a test that is verified to fail against the prior
+  behaviour — run the mutation, don't assume the assertion bites. For a wire-shape change,
+  the cross-impl half is `validate-peer -category <touched>` against a live peer, and check
+  the **check's own message**, not the summary line: go's CAP-6 strong probe is conditional,
+  so a skipped probe and a passed one both read as `PASS` in the table.
+- **Where our ordering deliberately departs from §4.1 pseudocode, say so at the code and
+  name the filed issue.** Q23's rejection is structural — before args, `resource` or
+  `capability` are resolved — while the pseudocode places it *after* resource evaluation
+  (which would return the resource's error instead of `invalid_expression`). Go, rust and py
+  all reject early; the ordering is filed as go spec-issue `2026-08-16-d`. §8.3 says
+  implementations follow the pseudocode, so an undocumented departure reads as a bug and
+  invites a "fix" that would diverge us from the other two seats to match text under
+  correction. Gate the ordering with a test that can tell the two apart —
+  `test_builtin_apply_rejects_capability_or_resource` uses unresolvable hashes, so early
+  rejection yields `invalid_expression` and late would yield `not_found`.
+- **`system/hash` is always a 33-byte CBOR bstr** (`algorithm || digest`, 0x00 + 32-byte
+  digest) — as a single field, array element, or map key. NOT a flat `{format_code, digest}`
+  record and NOT a CBOR map. (§4.5 bstr-extension overrides §2.8's named-type→record rule.)
+- **Typed-struct fields are bare CBOR maps**, not entity wrappers. Only fields typed
+  `core/entity` (`result`, `params`) get the `{type, data, content_hash}` wrapper; fields
+  typed as a specific struct (`deliver_to`, `bounds`, `durability`/`durability_request`) are
+  bare maps. Reference: `core/peer/src/durability.rs::to_cbor` (encoder),
+  `connection.rs::extract_deliver_to` (parser).
+- **Optional fields SHOULD be absent** (key not present), not null (null is valid). For an
+  optional *array*, absent and empty are the same fact, so **absent is the encoding** — emit
+  no key rather than `[]`, decode absent to an empty collection, and model it as a plain
+  `Vec` (an `Option<Vec>` invents a third state the wire cannot carry). Reference:
+  `advertisement_to_entity` / `advertisement_from_params` (`extensions/signaling/src/data.rs`),
+  gated by `a_node_serving_no_reflection_omits_the_key_entirely` and the Go-pinned vector
+  `go_encoded_advertise_result_decodes_here_byte_for_byte`.
+- **Signature signer field = `system/hash`** (content hash of the identity entity), not a
+  `peer_id` string.
+- **Capability `delegation_caveats` = flat struct**, not an array of objects.
+- **Worker peer-scoping:** every peer-targeted `Request` variant MUST carry an explicit
+  `peer_id: String` — never let "defaults to primary" be silent (see the v6 Subscribe fix).
+  New fields on existing variants use `#[serde(default)]`; bump `PROTOCOL_VERSION` on any
+  wire-shape change.

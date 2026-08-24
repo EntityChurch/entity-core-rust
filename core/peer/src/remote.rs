@@ -450,7 +450,8 @@ impl RemoteEndpoint for InboundReentryEndpoint {
     /// startup window, not the permanent gap it was. `self.capability` remains
     /// the cap we MINTED FOR the remote (grantee = the counterpart) and is NOT a
     /// valid originating cap; only the `held_grant` cap (granter = the remote,
-    /// grantee = us) is. See `docs/PROPOSAL-SYMMETRIC-REENTRY-MUTUAL-MINTING.md`.
+    /// grantee = us) is. Normative text:
+    /// `PROPOSAL-SYMMETRIC-REENTRY-MUTUAL-MINTING` in `entity-system-architecture`.
     ///
     /// The §7a.2a reentry flow is unaffected: it passes the caller-minted cap
     /// explicitly as `dispatch_cap`, which takes precedence over this.

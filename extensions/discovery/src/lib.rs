@@ -18,7 +18,7 @@
 //! DNS-SD wire constants pinned below are the cross-impl-divergence point that
 //! gating closes.
 //!
-//! Spec: `../entity-core-architecture/docs/architecture/v7.0-core-revision/core-protocol-domain/specs/extensions/network-peer-extensions/EXTENSION-DISCOVERY.md`
+//! Spec: `entity-system-architecture` `specs/extensions/EXTENSION-DISCOVERY.md`
 
 pub mod backend;
 pub mod data;

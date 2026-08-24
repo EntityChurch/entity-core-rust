@@ -196,8 +196,9 @@ pub fn parse_execute_response(envelope: &Envelope) -> Result<ParsedResponse, Pro
                 // gap that stranded Go's 202 ack in the reader. Tolerate it
                 // (Postel / MUST-ignore spirit): map a null result to the same
                 // `primitive/null` entity we emit, keeping `result: Entity`.
-                // See docs/validation/reports/
-                // 2026-07-19-go-rust-response-null-result.md.
+                // Root-caused in the 2026-07-19 go↔rust null-result validation
+                // run (internal dev history; the tolerance above is the whole
+                // of what it concluded).
                 result_entity = Some(match v {
                     ciborium::Value::Null => null_result_entity(),
                     _ => decode_entity_from_value(v)?,

@@ -17,7 +17,7 @@
 //! meta-resolver consults the local local-name store for `local-name` chain entries
 //! and skips-with-warning any backend kind it does not implement (§4.2).
 //!
-//! Spec: `../entity-core-architecture/docs/architecture/v7.0-core-revision/core-protocol-domain/specs/extensions/network-peer-extensions/EXTENSION-REGISTRY.md`
+//! Spec: `entity-system-architecture` `specs/extensions/EXTENSION-REGISTRY.md`
 
 pub mod data;
 pub mod local_name;

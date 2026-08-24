@@ -1,7 +1,8 @@
 //! SQLite-backed restart-equivalence integration tests.
 //!
-//! These tests exercise the contract from
-//! `docs/architecture/v7.0-core-revision/proposals/PROPOSAL-RESTART-EQUIVALENCE.md`:
+//! These tests exercise the restart-equivalence contract (normative anchor:
+//! SYSTEM-COMPOSITION §6.7; patterns in `entity-system-architecture`
+//! `guides/GUIDE-RESTART-AND-PERSISTENCE.md`):
 //! "a peer with durable storage that stops and restarts MUST produce
 //! externally observable behavior equivalent to a continuously-running
 //! peer holding the same durable state."

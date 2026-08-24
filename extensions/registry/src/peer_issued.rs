@@ -12,13 +12,12 @@
 //! locally (shipped or pre-fetched), stored under the *registry's* namespace
 //! `/{registry}/system/registry/binding/…`. The live remote-read seam (fetch
 //! the registry peer's tree on a cache miss) is a `core/peer`/SDK concern that
-//! populates this store; it is not part of the extension (see
-//! `docs/archive/SPEC-PROBLEMS-PEER-ISSUED-REGISTRY.md`).
+//! populates this store; it is not part of the extension.
 //!
 //! The only registry-specific substance is step 3 of [`resolve_one`]:
 //! signature-verify the binding against the **pinned** registry key
-//! (`pinned_key_of(registry)` — materialized per spec-problems doc **P1**:
-//! the signer's identity entity must derive to the configured registry peer-id).
+//! (`pinned_key_of(registry)`), where the pin is materialized as: the signer's
+//! identity entity must derive to the configured registry peer-id.
 
 use std::sync::Arc;
 

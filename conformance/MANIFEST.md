@@ -6,8 +6,8 @@ the architecture repo. The Rust `wire-conformance` harness loads
 
 The `.cbor` is the build-fixture output produced by Go's
 `cmd/internal/wire-conformance build-fixture` against the `.diag` source
-at the arch-repo canonical path:
-`entity-core-architecture/.../core-protocol-domain/specs/test-vectors/ecf-conformance/conformance-vectors-v{N}.diag`.
+at its canonical path in the spec repo:
+`entity-core-protocol` `specs/test-vectors/ecf-conformance/conformance-vectors-v{N}.diag`.
 
 Per the ECF conformance cross-team assignment §2.2, this
 impl does NOT regenerate `.cbor` from `.diag` — that would defeat the

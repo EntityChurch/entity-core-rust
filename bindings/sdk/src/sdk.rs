@@ -11,10 +11,12 @@
 //!
 //! Peers are defined by configuration, not type labels. A peer's
 //! identity comes from its handlers, capability grants, tree contents,
-//! and Ed25519 keypair. See GUIDE-PEER-CONCERNS-AND-NAMESPACES.md
-//! for the concern matrix and archetype patterns.
+//! and Ed25519 keypair. See `entity-system-architecture`
+//! `guides/GUIDE-PEER-CONCERNS-AND-NAMESPACES.md` for the concern matrix and
+//! archetype patterns.
 //!
-//! See `docs/architecture/specs/ENTITY-SDK-API.md` for the full design.
+//! This crate **is** the canonical SDK surface — there is no separate design
+//! doc upstream of it; the rustdoc on the items below is the API reference.
 
 // SDK modules define public API surface for external consumers. Many
 // items are intentionally unused by this binary but remain part of the

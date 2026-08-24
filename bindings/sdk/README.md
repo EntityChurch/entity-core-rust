@@ -116,5 +116,6 @@ wrappers may need recompilation but not redesign.
 
 ## Origin
 
-Lifted from `egui-entity-core-rust/src/{sdk,register_handler,subscription,peer_manager}.rs`
-per `godot-entity-core-rust/docs/PROPOSAL-SDK-EXTRACTION.md`.
+Lifted from `src/{sdk,register_handler,subscription,peer_manager}.rs` in the app that is
+now `entity-browser-rust` (then named `egui-entity-core-rust`), per
+`godot-entity-core-rust` `docs/legacy/PROPOSAL-SDK-EXTRACTION.md`.

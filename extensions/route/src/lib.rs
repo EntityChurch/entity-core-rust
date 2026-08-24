@@ -28,7 +28,7 @@
 //! pluggable in-process resolver would earn its place. v1 ships the stored table
 //! only (LAN/VPN/gateway need nothing more).
 //!
-//! Spec: `../entity-core-architecture/docs/architecture/v7.0-core-revision/core-protocol-domain/specs/extensions/network-peer-extensions/EXTENSION-ROUTE.md`
+//! Spec: `entity-system-architecture` `specs/extensions/EXTENSION-ROUTE.md`
 
 use entity_ecf::{integer, text, to_ecf, Value};
 use entity_entity::Entity;

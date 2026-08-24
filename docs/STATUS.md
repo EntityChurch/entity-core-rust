@@ -2,6 +2,13 @@
 
 _Updated: 2026-08-22 · public: v0.8.0 (master)_
 
+> **A note on the citations below.** Entries name the handoff, routing note or
+> validation report that produced them — files under `docs/status/` and
+> `docs/validation/reports/`. Those are **internal dev history and are not part of
+> the public source mirror**, so in a published checkout those paths will not
+> resolve. They are kept as provenance for the cohort, not as links. Every claim
+> an entry makes is stated in the entry itself; nothing here requires opening one.
+
 ## Where it is
 
 entity-core-rust is the Rust reference implementation of the Entity Core

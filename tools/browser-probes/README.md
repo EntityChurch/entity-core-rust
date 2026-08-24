@@ -22,8 +22,9 @@ Substitute `rtc-datachannel-transfer.html` (and `PROBE2`) for the second probe.
 | `rtc-worker-scope.html` | Is `RTCPeerConnection` constructible in a dedicated Worker? |
 | `rtc-datachannel-transfer.html` | Can a live `RTCDataChannel` be transferred into a Worker? |
 
-Results and what they mean for the WebRTC transport (S3):
-`docs/validation/reports/2026-08-02-rtcpeerconnection-worker-scope.md`.
+Results and what they mean for the WebRTC transport (S3) are summarised in the engine-coverage
+table below. (The full 2026-08-02 measurement report is internal dev history and is not part of
+the published tree.)
 
 **These are engine-specific by nature.** A result is only claimed for the engine and version it
 was measured on — record both. Firefox and Chromium can and do differ here.
@@ -44,10 +45,15 @@ The browser leg targets browsers on Android / Linux / Windows / macOS, which is 
 **WebKitGTK result:** `RTCPeerConnection` is **undefined** — absent from the build, not disabled. Secure
 context, all WebRTC settings accepted, full GStreamer `webrtcbin` + `libnice` stack installed, and both
 RTC-related `WebKitFeature` toggles enabled; still undefined. `MessagePort` **is** available, so the brokered
-`MessageChannel` path works there — it is the WebRTC substrate itself that is missing. Full write-up and the
-four eliminated false-negative explanations:
-`docs/validation/reports/2026-08-03-webkitgtk-webrtc-absent.md`. This is a claim about **that build**, not about
-WebKitGTK generally and emphatically not about Apple's WebKit.
+`MessageChannel` path works there — it is the WebRTC substrate itself that is missing. Four false-negative
+explanations were eliminated before the result was recorded: a secure-context refusal (the probe is served over
+`http://127.0.0.1`, not `file://`), a missing settings knob (`enable-webrtc` / `enable-media-stream` /
+`enable-mock-capture-devices` were all set and all accepted), a missing GStreamer backend (rebuilt with
+`gstreamer1.0-plugins-{base,good,bad}`, `gstreamer1.0-nice`, `libnice10` — no change), and a disabled
+experimental feature (the `WebKitFeature` list carries no `PeerConnection` master toggle at all). Peripheral
+tuning knobs surviving while the constructor is absent is the signature of the feature being compiled out.
+(The full 2026-08-03 write-up is internal dev history and is not part of the published tree.) This is a claim about
+**that build**, not about WebKitGTK generally and emphatically not about Apple's WebKit.
 
 **WebKitGTK is in scope, deliberately** (`entity-browser-rust`, 2026-08-03). It is not a hypothetical
 port: `make tauri-run` is that repo's live desktop path. Their `AGENTS.md` records the exact failure

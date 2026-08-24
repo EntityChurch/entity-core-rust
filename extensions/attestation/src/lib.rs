@@ -6,7 +6,7 @@
 //! (EXTENSION-QUORUM, EXTENSION-IDENTITY, future) layer kind-discriminated
 //! semantics on top.
 //!
-//! Spec: `../entity-core-architecture/docs/architecture/v7.0-core-revision/core-protocol-domain/specs/extensions/EXTENSION-ATTESTATION.md`
+//! Spec: `entity-system-architecture` `specs/extensions/EXTENSION-ATTESTATION.md`
 
 pub mod data;
 pub mod handler;

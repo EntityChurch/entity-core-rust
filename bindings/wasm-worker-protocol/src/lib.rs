@@ -69,9 +69,9 @@ pub mod conversions;
 /// per the v6 lesson. v10 proxies fail fast via the `PROTOCOL_VERSION`
 /// handshake.
 ///
-/// Ruled with `entity-browser-rust`
-/// (`docs/status/ROUTING-2026-08-03-provisioning-payload-for-codesign-to-browser-rust.md`
-/// → their provisioning ruling): Init-time only, no
+/// Ruled with `entity-browser-rust` (2026-08-03 provisioning co-design; the
+/// routing note is internal dev history, the ruling is stated in full here):
+/// Init-time only, no
 /// `Request::ProvisionWebRtc` — `live_establish` is installed at peer
 /// **build**, and enabling WebRTC on an already-built peer would mean
 /// mutating §10.3 policy while a dispatch could be consulting it. If a

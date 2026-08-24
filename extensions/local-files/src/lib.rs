@@ -1,6 +1,6 @@
 //! DOMAIN-LOCAL-FILES v1.2 — `local/files` handler over EXTENSION-CONTENT v3.5.
 //!
-//! Spec: `../entity-core-architecture/.../core-protocol-domain/specs/domains/DOMAIN-LOCAL-FILES.md`.
+//! Spec: `entity-system-architecture` `specs/domains/DOMAIN-LOCAL-FILES.md`.
 //!
 //! Maps a host filesystem subtree into the entity tree. File bytes are
 //! chunked via FastCDC + persisted through the CONTENT v3.5 substrate

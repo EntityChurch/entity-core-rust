@@ -7,7 +7,7 @@ It is one of three independent reference implementations (alongside the
 Go oracle and the Python reference) and is the upstream the entity-browser and
 Godot apps depend on. See `docs/ARCHITECTURE.md` for the crate DAG and
 design decisions, and `docs/CLI.md` for the command-line tools. The
-normative protocol spec lives in the `entity-core-architecture` repo.
+normative protocol spec lives in the `entity-system-architecture` repo.
 
 ---
 
@@ -54,7 +54,7 @@ required to build:
 ```
 entity-systems/
 ├── entity-core-rust/             ← this repo
-├── entity-core-architecture/     ← protocol spec (recommended for contributors)
+├── entity-system-architecture/   ← protocol spec (recommended for contributors)
 ├── entity-core-go/               ← reference implementation (interop testing)
 └── entity-core-rs/               ← old implementation (reference only)
 ```

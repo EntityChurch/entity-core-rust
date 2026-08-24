@@ -6,7 +6,7 @@
 //! Assignments derive capability tokens from the role definition;
 //! exclusions deny a peer all role-derived access within a context.
 //!
-//! Spec: `../entity-core-architecture/docs/architecture/v7.0-core-revision/core-protocol-domain/specs/extensions/EXTENSION-ROLE.md`
+//! Spec: `entity-system-architecture` `specs/extensions/EXTENSION-ROLE.md`
 //!
 //! Open spec questions surfaced during implementation are tracked in
 //! `docs/SPEC-AMBIGUITIES-ROLE.md`.

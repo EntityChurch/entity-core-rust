@@ -5,8 +5,8 @@
 //!
 //! Backed by `entity_sdk::PeerContext` so capability-aware methods (generation,
 //! L1 dispatch, subscribe) are available alongside the existing L0 store ops.
-//! See `godot-entity-core-rust/docs/CONTEXT-SDK-AVAILABLE.md` for the SDK
-//! consumption pattern.
+//! See `godot-entity-core-rust` `docs/legacy/CONTEXT-SDK-AVAILABLE.md` for the
+//! SDK consumption pattern.
 //!
 //! The event bridge spawns a tokio task that reads `TreeChangeEvent`s and
 //! forwards them via `std::sync::mpsc` to be emitted as Godot signals in

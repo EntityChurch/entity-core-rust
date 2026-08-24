@@ -6,9 +6,7 @@
 //! interactive sibling (`EXTENSION-ENCRYPTED-SESSION`, §20) is deferred
 //! post-release and is NOT built here.
 //!
-//! Spec: `../entity-core-architecture/docs/architecture/v7.0-core-revision/
-//! core-protocol-domain/specs/extensions/network-peer-extensions/
-//! EXTENSION-ENCRYPTION.md`.
+//! Spec: `entity-system-architecture` `specs/extensions/EXTENSION-ENCRYPTION.md`.
 //!
 //! # Architecture
 //!

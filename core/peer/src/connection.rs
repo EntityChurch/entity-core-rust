@@ -309,7 +309,9 @@ pub async fn handle_connection(
         // giving this acceptor authority to originate back over this same §6.5
         // channel. Self-verifying (the enclosed cap's granter must be the peer we
         // authenticated); the narrow connection grant never has to authorize it.
-        // See docs/PROPOSAL-SYMMETRIC-REENTRY-MUTUAL-MINTING.md.
+        // Normative text: `PROPOSAL-SYMMETRIC-REENTRY-MUTUAL-MINTING` in
+        // `entity-system-architecture`. (Our in-tree copy of that name is the
+        // implementation record — dev history, not part of the source mirror.)
         if envelope.root.entity_type == entity_types::TYPE_EXECUTE {
             if let Ok(fields) = entity_protocol::decode_execute_fields(&envelope.root.data) {
                 if fields.operation == "reentry-grant" {
@@ -400,7 +402,8 @@ pub(crate) fn build_hello_response_envelope(
 /// authority back over this connection. Best-effort — a malformed or
 /// mis-granted frame is logged and dropped, leaving us without originating
 /// authority (the pre-mutual-minting state), never breaking the connection.
-/// See docs/PROPOSAL-SYMMETRIC-REENTRY-MUTUAL-MINTING.md.
+/// Normative text: `PROPOSAL-SYMMETRIC-REENTRY-MUTUAL-MINTING` in
+/// `entity-system-architecture`.
 fn accept_reentry_grant(
     envelope: &Envelope,
     remote_peer_id: &str,

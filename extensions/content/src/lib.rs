@@ -1,7 +1,7 @@
 //! EXTENSION-CONTENT v3.5 — content blobs, chunks, descriptors, chunkers
 //! and the optional `system/content` handler.
 //!
-//! Spec: `entity-core-architecture/.../specs/extensions/standard-peer-extensions/EXTENSION-CONTENT.md` v3.5.
+//! Spec: `entity-system-architecture` `specs/extensions/EXTENSION-CONTENT.md` v3.5.
 //!
 //! Surfaces this crate exposes:
 //!

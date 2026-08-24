@@ -8,9 +8,9 @@ description = "Cross-frontend verb dispatcher for the entity-core shell — cons
 
 [dependencies]
 # Streaming primitive — VerbOutput::Lines / Dispatch carry
-# `tokio::sync::mpsc::Receiver`. Picked per
-# `egui-entity-core-rust/docs/plans/SHELL-EXTRACTION-PHASE-1-NOTES.md`
-# §3.2 and Godot's compatibility note (drains cleanly from `_process`).
+# `tokio::sync::mpsc::Receiver`. Picked during the shell extraction because it
+# is the one channel both embeddings can consume: the frontend polls it from
+# its render loop, and Godot drains it cleanly from `_process`.
 tokio = { version = "1", default-features = false, features = ["sync"] }
 
 # Entity-body formatting for the `cat` verb. Lifted from egui's

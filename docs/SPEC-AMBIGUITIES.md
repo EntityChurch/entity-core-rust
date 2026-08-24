@@ -4,6 +4,13 @@ Questions and under-specified areas encountered during implementation that
 should go back to the architecture team. Each entry names the spec, the
 passage, what is unclear, and the interim implementation choice (if any).
 
+> **A note on the citations below.** Entries cite the routing notes, handoffs and
+> validation reports that carried a question upstream or brought a ruling back —
+> files under `docs/status/` and `docs/validation/reports/`, plus a few in sibling
+> repos. Those are **internal dev history and are not part of the public source
+> mirror**, so in a published checkout those paths will not resolve. They are
+> provenance, not links; each entry states its own ruling and interim choice.
+
 ---
 
 ## CAPABILITY §5.5 / SUBSCRIPTION §4.2 — `entity://` deliver_uri vs capability-scope canonicalization

@@ -2,10 +2,10 @@
 //!
 //! One role, one punch, one JSON line on stdout, exit 0 iff the punch was
 //! *verified*. It speaks the CLI/JSON/exit contract agreed with `entity-core-go`
-//! (`ROUTING-2026-08-01-g1-and-contracts-to-go.md` §3.1/§3.2, accepted without
-//! counters in Go's `ROUTING-2026-08-01-g1-contracts-answered-to-rust.md`), so
-//! either half can be swapped for Go's `cmd/signaling-punch` and the harness does
-//! not change.
+//! on 2026-08-01 (their routing note accepted §3.1/§3.2 without counters; both
+//! notes are internal dev history — the contract itself is the flags, the JSON
+//! line and the exit code documented below), so either half can be swapped for
+//! Go's `cmd/signaling-punch` and the harness does not change.
 //!
 //! ```text
 //!   signaling-punch --node 127.0.0.1:4050 --role responder --mode tag --input chess \

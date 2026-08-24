@@ -89,7 +89,7 @@
 //! the §1.1 pins being made in advance, and by three independently-written
 //! clients hitting this server from outside.
 //!
-//! Spec: `../entity-system-architecture/docs/proposals/PROPOSAL-CONNECTION-NODE.md`
+//! Spec: `entity-system-architecture` `docs/proposals/implemented/extensions/PROPOSAL-CONNECTION-NODE.md`
 
 pub mod coordination;
 pub mod core;

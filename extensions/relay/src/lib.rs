@@ -27,7 +27,7 @@
 //! the Rust dispatch layer (the inner rides as an `Entity` whose `data` the
 //! wire codec preserves byte-for-byte).
 //!
-//! Spec: `../entity-core-architecture/docs/architecture/v7.0-core-revision/core-protocol-domain/specs/extensions/network-peer-extensions/EXTENSION-RELAY.md`
+//! Spec: `entity-system-architecture` `specs/extensions/EXTENSION-RELAY.md`
 
 pub mod data;
 pub mod forwarder;
