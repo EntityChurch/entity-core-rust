@@ -60,7 +60,11 @@ impl IdentityHandler {
                 if let Some(path) = &bound_path {
                     self.location_index.remove(path);
                 }
-                return Ok(error(STATUS_BAD_REQUEST, "compromise_recovery_rejected", reason));
+                return Ok(error(
+                    STATUS_BAD_REQUEST,
+                    "compromise_recovery_rejected",
+                    reason,
+                ));
             }
         }
         if let Err(e) = identity_verify_cert(&attestation_hash, &att, &actx) {
@@ -82,9 +86,7 @@ impl IdentityHandler {
                 if read_function(&att) == Some("controller") {
                     let handler_id = "maybe_issue_local_controller_cap";
                     if let Some(grants) = self.read_peer_config_controller_grants() {
-                        if let Err(e) =
-                            self.issue_peer_to_controller_cap(&att.attested, &grants)
-                        {
+                        if let Err(e) = self.issue_peer_to_controller_cap(&att.attested, &grants) {
                             self.emit_controller_event(
                                 "failure_observation",
                                 handler_id,
@@ -103,7 +105,11 @@ impl IdentityHandler {
                     .properties
                     .iter()
                     .find_map(|(k, v)| {
-                        if k.as_text() == Some("target_cert") { v.as_bytes() } else { None }
+                        if k.as_text() == Some("target_cert") {
+                            v.as_bytes()
+                        } else {
+                            None
+                        }
                     })
                     .and_then(|b| Hash::from_bytes(b).ok());
                 match target_hash {
@@ -150,15 +156,15 @@ impl IdentityHandler {
         let old_handle = att
             .properties
             .iter()
-            .find_map(|(k, v)| if k.as_text() == Some("old_handle") { v.as_bytes() } else { None })
+            .find_map(|(k, v)| {
+                if k.as_text() == Some("old_handle") {
+                    v.as_bytes()
+                } else {
+                    None
+                }
+            })
             .and_then(|b| Hash::from_bytes(b).ok());
-        let old_handle = match old_handle {
-            Some(h) => h,
-            // No old_handle in properties → treat as non-handle-bearing
-            // (sub-controller / agent recovery). Pass through to standard
-            // identity_verify_cert.
-            None => return None,
-        };
+        let old_handle = old_handle?;
         let cache_path = self.qualify(&path_contact_quorum_publish(&old_handle));
         let cached_hash = match self.location_index.get(&cache_path) {
             Some(h) => h,
@@ -174,7 +180,13 @@ impl IdentityHandler {
         let cached_signers: Vec<Hash> = cached_publish
             .properties
             .iter()
-            .find_map(|(k, v)| if k.as_text() == Some("signers") { v.as_array() } else { None })
+            .find_map(|(k, v)| {
+                if k.as_text() == Some("signers") {
+                    v.as_array()
+                } else {
+                    None
+                }
+            })
             .map(|arr| {
                 arr.iter()
                     .filter_map(|v| v.as_bytes().and_then(|b| Hash::from_bytes(b).ok()))
@@ -184,7 +196,13 @@ impl IdentityHandler {
         let cached_threshold: u64 = cached_publish
             .properties
             .iter()
-            .find_map(|(k, v)| if k.as_text() == Some("threshold") { v.as_integer() } else { None })
+            .find_map(|(k, v)| {
+                if k.as_text() == Some("threshold") {
+                    v.as_integer()
+                } else {
+                    None
+                }
+            })
             .and_then(|i| {
                 let n: i128 = i.into();
                 if n < 0 {
@@ -258,15 +276,17 @@ impl IdentityHandler {
     /// concurrent publishers are valid, this path is one of the sites that
     /// the receiver-local CAS/convergent-mirroring primitive (Go track) will
     /// need to anchor.
-    fn seed_contact_quorum_publish_cache(
-        &self,
-        att: &AttestationData,
-        att_hash: Hash,
-    ) {
+    fn seed_contact_quorum_publish_cache(&self, att: &AttestationData, att_hash: Hash) {
         let handle = att
             .properties
             .iter()
-            .find_map(|(k, v)| if k.as_text() == Some("published_handle") { v.as_bytes() } else { None })
+            .find_map(|(k, v)| {
+                if k.as_text() == Some("published_handle") {
+                    v.as_bytes()
+                } else {
+                    None
+                }
+            })
             .and_then(|b| Hash::from_bytes(b).ok());
         if let Some(h) = handle {
             let path = self.qualify(&path_contact_quorum_publish(&h));

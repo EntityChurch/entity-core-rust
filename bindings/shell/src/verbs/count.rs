@@ -21,11 +21,7 @@ use crate::runtime::BoxFuture;
 /// Verb-op (§8.1). Issue a count for entities of `type_filter` (empty
 /// string = no filter), streaming the result as a Dispatched chunk
 /// followed by Complete or Failed.
-pub fn count_op<S>(
-    binding: &dyn PeerBinding,
-    type_filter: &str,
-    spawn: S,
-) -> VerbOutput
+pub fn count_op<S>(binding: &dyn PeerBinding, type_filter: &str, spawn: S) -> VerbOutput
 where
     S: FnOnce(BoxFuture<'static, ()>),
 {
@@ -72,15 +68,27 @@ mod tests {
     }
 
     impl PeerBinding for StubBinding {
-        fn peer_id(&self) -> &str { "alice" }
-        fn primary_peer_id(&self) -> String { "alice".into() }
-        fn peer_ids(&self) -> Vec<String> { vec!["alice".into()] }
-        fn connected_peers(&self) -> Vec<String> { Vec::new() }
-        fn peer_label(&self, _pid: &str) -> Option<String> { None }
+        fn peer_id(&self) -> &str {
+            "alice"
+        }
+        fn primary_peer_id(&self) -> String {
+            "alice".into()
+        }
+        fn peer_ids(&self) -> Vec<String> {
+            vec!["alice".into()]
+        }
+        fn connected_peers(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn peer_label(&self, _pid: &str) -> Option<String> {
+            None
+        }
         fn tree_listing(&self, _pid: &str, _prefix: &str) -> Vec<TreeListingEntry> {
             Vec::new()
         }
-        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> { None }
+        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> {
+            None
+        }
         fn count(
             &self,
             _pid: &str,

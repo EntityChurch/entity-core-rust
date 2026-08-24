@@ -52,8 +52,14 @@ impl AttestationData {
 
     pub fn to_entity(&self) -> Result<Entity, AttestationError> {
         let mut fields: Vec<(Value, Value)> = Vec::new();
-        fields.push((text("attested"), Value::Bytes(self.attested.to_bytes().to_vec())));
-        fields.push((text("attesting"), Value::Bytes(self.attesting.to_bytes().to_vec())));
+        fields.push((
+            text("attested"),
+            Value::Bytes(self.attested.to_bytes().to_vec()),
+        ));
+        fields.push((
+            text("attesting"),
+            Value::Bytes(self.attesting.to_bytes().to_vec()),
+        ));
         if let Some(v) = self.expires_at {
             fields.push((text("expires_at"), entity_ecf::integer(v as i64)));
         }
@@ -94,8 +100,13 @@ pub(crate) fn get_field<'a>(
     map: &'a [(ciborium::Value, ciborium::Value)],
     key: &str,
 ) -> Option<&'a ciborium::Value> {
-    map.iter()
-        .find_map(|(k, v)| if k.as_text() == Some(key) { Some(v) } else { None })
+    map.iter().find_map(|(k, v)| {
+        if k.as_text() == Some(key) {
+            Some(v)
+        } else {
+            None
+        }
+    })
 }
 
 pub(crate) fn field_hash(

@@ -87,7 +87,9 @@ impl ModeStore {
         now_ms: i64,
     ) -> PollPage {
         let guard = self.inner.lock().expect("relay store mutex");
-        let after = since.unwrap_or(0).saturating_add(if since.is_some() { 1 } else { 0 });
+        let after = since
+            .unwrap_or(0)
+            .saturating_add(if since.is_some() { 1 } else { 0 });
         // `since` is the last-seen seq → start strictly after it. `None` → seq 0.
         let start = if since.is_some() { after } else { 0 };
 

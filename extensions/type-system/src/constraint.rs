@@ -75,21 +75,17 @@ impl StandardConstraintHandler {
         match req.constraint_type.as_str() {
             TYPE_CONSTRAINT_MIN => eval_min(&req.value, &req.constraint_data),
             TYPE_CONSTRAINT_MAX => eval_max(&req.value, &req.constraint_data),
-            TYPE_CONSTRAINT_MIN_LENGTH => {
-                eval_min_length(&req.value, &req.constraint_data)
-            }
-            TYPE_CONSTRAINT_MAX_LENGTH => {
-                eval_max_length(&req.value, &req.constraint_data)
-            }
+            TYPE_CONSTRAINT_MIN_LENGTH => eval_min_length(&req.value, &req.constraint_data),
+            TYPE_CONSTRAINT_MAX_LENGTH => eval_max_length(&req.value, &req.constraint_data),
             TYPE_CONSTRAINT_MIN_COUNT => eval_min_count(&req.value, &req.constraint_data),
             TYPE_CONSTRAINT_MAX_COUNT => eval_max_count(&req.value, &req.constraint_data),
             TYPE_CONSTRAINT_PATTERN => eval_pattern(&req.value, &req.constraint_data),
             TYPE_CONSTRAINT_ONE_OF => eval_one_of(&req.value, &req.constraint_data, false),
-            TYPE_CONSTRAINT_NOT_ONE_OF => {
-                eval_one_of(&req.value, &req.constraint_data, true)
-            }
+            TYPE_CONSTRAINT_NOT_ONE_OF => eval_one_of(&req.value, &req.constraint_data, true),
             TYPE_CONSTRAINT_FORMAT => eval_format(&req.value, &req.constraint_data),
-            TYPE_CONSTRAINT_TYPE_PATTERN => self.eval_type_pattern(&req.value, &req.constraint_data),
+            TYPE_CONSTRAINT_TYPE_PATTERN => {
+                self.eval_type_pattern(&req.value, &req.constraint_data)
+            }
             other => ValidateResult::invalid(format!("unknown constraint type: {}", other)),
         }
     }
@@ -160,7 +156,10 @@ impl Handler for StandardConstraintHandler {
                 STATUS_BAD_REQUEST,
                 error_entity(
                     "unknown_operation",
-                    &format!("system/type/constraint/* expects validate, got {}", ctx.operation),
+                    &format!(
+                        "system/type/constraint/* expects validate, got {}",
+                        ctx.operation
+                    ),
                 ),
             ));
         }
@@ -214,8 +213,8 @@ pub struct ValidateRequest {
 
 impl ValidateRequest {
     pub fn from_entity(entity: &Entity) -> Result<Self, String> {
-        let value: Value = ciborium::from_reader(entity.data.as_slice())
-            .map_err(|e| format!("decode: {}", e))?;
+        let value: Value =
+            ciborium::from_reader(entity.data.as_slice()).map_err(|e| format!("decode: {}", e))?;
         let mut field_value: Option<Value> = None;
         let mut constraint_type: Option<String> = None;
         let mut constraint_data: Option<Value> = None;
@@ -262,10 +261,7 @@ impl ValidateResult {
         }
     }
     pub fn to_entity(&self) -> Result<Entity, String> {
-        let mut entries = vec![(
-            entity_ecf::text("valid"),
-            entity_ecf::bool_val(self.valid),
-        )];
+        let mut entries = vec![(entity_ecf::text("valid"), entity_ecf::bool_val(self.valid))];
         if let Some(ref r) = self.reason {
             entries.push((entity_ecf::text("reason"), entity_ecf::text(r)));
         }
@@ -396,9 +392,7 @@ fn eval_pattern(value: &Value, data: &Value) -> ValidateResult {
     let anchored = format!("^(?:{})$", pattern);
     let re = match regex::Regex::new(&anchored) {
         Ok(r) => r,
-        Err(_) => {
-            return ValidateResult::invalid(format!("invalid RE2 pattern: {}", pattern))
-        }
+        Err(_) => return ValidateResult::invalid(format!("invalid RE2 pattern: {}", pattern)),
     };
     if re.is_match(s) {
         ValidateResult::valid()
@@ -468,9 +462,7 @@ fn value_as_f64(v: Option<&Value>) -> Option<f64> {
 
 fn value_as_u64(v: Option<&Value>) -> Option<u64> {
     match v? {
-        Value::Integer(i) => {
-            u64::try_from(*i).ok()
-        }
+        Value::Integer(i) => u64::try_from(*i).ok(),
         _ => None,
     }
 }
@@ -512,11 +504,7 @@ mod tests {
     use super::*;
     use ciborium::value::Integer;
 
-    fn make_request(
-        constraint_type: &str,
-        value: Value,
-        constraint_data: Value,
-    ) -> Entity {
+    fn make_request(constraint_type: &str, value: Value, constraint_data: Value) -> Entity {
         let data = entity_ecf::to_ecf(&Value::Map(vec![
             (entity_ecf::text("value"), value),
             (

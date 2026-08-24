@@ -128,8 +128,7 @@ pub fn decode_entity(data: &[u8]) -> Result<Entity, WireError> {
             "content_hash" => {
                 let (bytes, _) = decode_cbor_bytes(data, value_start)?;
                 content_hash = Some(
-                    Hash::from_bytes(bytes)
-                        .map_err(|e| WireError::CborDecode(e.to_string()))?,
+                    Hash::from_bytes(bytes).map_err(|e| WireError::CborDecode(e.to_string()))?,
                 );
             }
             _ => {} // unknown keys are tolerated
@@ -139,10 +138,9 @@ pub fn decode_entity(data: &[u8]) -> Result<Entity, WireError> {
 
     let entity_type =
         entity_type.ok_or_else(|| WireError::CborDecode("missing 'type' field".into()))?;
-    let data =
-        entity_data.ok_or_else(|| WireError::CborDecode("missing 'data' field".into()))?;
-    let content_hash = content_hash
-        .ok_or_else(|| WireError::CborDecode("missing 'content_hash' field".into()))?;
+    let data = entity_data.ok_or_else(|| WireError::CborDecode("missing 'data' field".into()))?;
+    let content_hash =
+        content_hash.ok_or_else(|| WireError::CborDecode("missing 'content_hash' field".into()))?;
 
     Ok(Entity {
         entity_type,
@@ -265,8 +263,7 @@ pub fn decode_envelope(data: &[u8]) -> Result<Envelope, WireError> {
                 root = Some(decode_entity(&data[value_start..value_end])?);
             }
             "included" => {
-                let (inc_major, inc_count, inc_head) =
-                    parse_cbor_head(data, value_start)?;
+                let (inc_major, inc_count, inc_head) = parse_cbor_head(data, value_start)?;
                 if inc_major != 5 {
                     return Err(WireError::CborDecode(format!(
                         "envelope.included must be a CBOR map, got major={inc_major}"
@@ -334,7 +331,9 @@ pub fn cbor_map_field_raw<'a>(data: &'a [u8], key: &str) -> Option<&'a [u8]> {
 /// Errors on indefinite-length or reserved argument bytes (ECF requires definite).
 fn parse_cbor_head(data: &[u8], offset: usize) -> Result<(u8, u64, usize), WireError> {
     if offset >= data.len() {
-        return Err(WireError::CborDecode("unexpected EOF parsing CBOR head".into()));
+        return Err(WireError::CborDecode(
+            "unexpected EOF parsing CBOR head".into(),
+        ));
     }
     let first = data[offset];
     let major = first >> 5;
@@ -349,7 +348,9 @@ fn parse_cbor_head(data: &[u8], offset: usize) -> Result<(u8, u64, usize), WireE
         }
         25 => {
             if offset + 3 > data.len() {
-                return Err(WireError::CborDecode("EOF reading CBOR u16 argument".into()));
+                return Err(WireError::CborDecode(
+                    "EOF reading CBOR u16 argument".into(),
+                ));
             }
             let mut b = [0u8; 2];
             b.copy_from_slice(&data[offset + 1..offset + 3]);
@@ -357,7 +358,9 @@ fn parse_cbor_head(data: &[u8], offset: usize) -> Result<(u8, u64, usize), WireE
         }
         26 => {
             if offset + 5 > data.len() {
-                return Err(WireError::CborDecode("EOF reading CBOR u32 argument".into()));
+                return Err(WireError::CborDecode(
+                    "EOF reading CBOR u32 argument".into(),
+                ));
             }
             let mut b = [0u8; 4];
             b.copy_from_slice(&data[offset + 1..offset + 5]);
@@ -365,7 +368,9 @@ fn parse_cbor_head(data: &[u8], offset: usize) -> Result<(u8, u64, usize), WireE
         }
         27 => {
             if offset + 9 > data.len() {
-                return Err(WireError::CborDecode("EOF reading CBOR u64 argument".into()));
+                return Err(WireError::CborDecode(
+                    "EOF reading CBOR u64 argument".into(),
+                ));
             }
             let mut b = [0u8; 8];
             b.copy_from_slice(&data[offset + 1..offset + 9]);
@@ -389,11 +394,13 @@ fn cbor_item_end(data: &[u8], offset: usize) -> Result<usize, WireError> {
         0 | 1 => Ok(after_head), // uint / negative integer — head only
         2 | 3 => {
             // bytes / text — head + N bytes payload
-            let end = after_head.checked_add(value as usize).ok_or_else(|| {
-                WireError::CborDecode("CBOR string/bytes length overflow".into())
-            })?;
+            let end = after_head
+                .checked_add(value as usize)
+                .ok_or_else(|| WireError::CborDecode("CBOR string/bytes length overflow".into()))?;
             if end > data.len() {
-                return Err(WireError::CborDecode("CBOR string/bytes runs past end".into()));
+                return Err(WireError::CborDecode(
+                    "CBOR string/bytes runs past end".into(),
+                ));
             }
             Ok(end)
         }
@@ -423,7 +430,9 @@ fn cbor_item_end(data: &[u8], offset: usize) -> Result<usize, WireError> {
             // (ai 25 → +2 bytes, ai 26 → +4, ai 27 → +8, ai 0..=23 → 0).
             Ok(after_head)
         }
-        _ => Err(WireError::CborDecode(format!("unknown CBOR major type {major}"))),
+        _ => Err(WireError::CborDecode(format!(
+            "unknown CBOR major type {major}"
+        ))),
     }
 }
 
@@ -436,9 +445,9 @@ fn decode_cbor_text(data: &[u8], offset: usize) -> Result<(&str, usize), WireErr
         )));
     }
     let start = offset + head_size;
-    let end = start.checked_add(len as usize).ok_or_else(|| {
-        WireError::CborDecode("CBOR text length overflow".into())
-    })?;
+    let end = start
+        .checked_add(len as usize)
+        .ok_or_else(|| WireError::CborDecode("CBOR text length overflow".into()))?;
     if end > data.len() {
         return Err(WireError::CborDecode("CBOR text runs past end".into()));
     }
@@ -456,9 +465,9 @@ fn decode_cbor_bytes(data: &[u8], offset: usize) -> Result<(&[u8], usize), WireE
         )));
     }
     let start = offset + head_size;
-    let end = start.checked_add(len as usize).ok_or_else(|| {
-        WireError::CborDecode("CBOR bytes length overflow".into())
-    })?;
+    let end = start
+        .checked_add(len as usize)
+        .ok_or_else(|| WireError::CborDecode("CBOR bytes length overflow".into()))?;
     if end > data.len() {
         return Err(WireError::CborDecode("CBOR bytes runs past end".into()));
     }
@@ -636,7 +645,10 @@ mod tests {
         // cross-peer mirror recipe: include_payload + deref_included).
         let root = make_entity("test/root", "r");
         let payload_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-            (entity_ecf::text("created_at"), entity_ecf::integer(1_700_000_000)),
+            (
+                entity_ecf::text("created_at"),
+                entity_ecf::integer(1_700_000_000),
+            ),
             (entity_ecf::text("ratio"), entity_ecf::Value::Float(1.5)),
         ]));
         let payload = Entity::new("test/cap", payload_data).unwrap();
@@ -676,10 +688,7 @@ mod tests {
         let encoded = encode_envelope(&envelope);
         let decoded = decode_envelope(&encoded).unwrap();
         assert!(decoded.included.contains_key(&extra_hash));
-        assert_eq!(
-            decoded.included[&extra_hash].entity_type,
-            "test/extra"
-        );
+        assert_eq!(decoded.included[&extra_hash].entity_type, "test/extra");
     }
 
     #[test]
@@ -695,15 +704,18 @@ mod tests {
         // Build response data with inline entity in result field
         let mut data = Vec::new();
         data.push(0xA3); // map(3)
-        // "result" (7 encoded bytes) < "status" (7) lex, then "request_id" (11)
-        // text(6) "result"
+                         // "result" (7 encoded bytes) < "status" (7) lex, then "request_id" (11)
+                         // text(6) "result"
         data.extend_from_slice(&[0x66, b'r', b'e', b's', b'u', b'l', b't']);
         data.extend_from_slice(&result_encoded);
         // text(6) "status"
         data.extend_from_slice(&[0x66, b's', b't', b'a', b't', b'u', b's']);
-        data.push(0x18); data.push(200); // uint 200
-        // text(10) "request_id"
-        data.extend_from_slice(&[0x6A, b'r', b'e', b'q', b'u', b'e', b's', b't', b'_', b'i', b'd']);
+        data.push(0x18);
+        data.push(200); // uint 200
+                        // text(10) "request_id"
+        data.extend_from_slice(&[
+            0x6A, b'r', b'e', b'q', b'u', b'e', b's', b't', b'_', b'i', b'd',
+        ]);
         data.extend_from_slice(&[0x65, b'r', b'e', b'q', b'-', b'1']); // text(5) "req-1"
 
         let resp_entity = Entity::new("system/protocol/execute_response", data).unwrap();
@@ -726,15 +738,16 @@ mod tests {
                             if dk.as_text() == Some("result") {
                                 assert!(
                                     dv.as_map().is_some(),
-                                    "result must be an inline entity map, got: {:?}", dv
+                                    "result must be an inline entity map, got: {:?}",
+                                    dv
                                 );
                                 assert!(
                                     dv.as_bytes().is_none(),
                                     "result must NOT be a byte string (hash reference)"
                                 );
                                 let ent_map = dv.as_map().unwrap();
-                                let keys: Vec<_> = ent_map.iter()
-                                    .filter_map(|(k, _)| k.as_text()).collect();
+                                let keys: Vec<_> =
+                                    ent_map.iter().filter_map(|(k, _)| k.as_text()).collect();
                                 assert!(keys.contains(&"type"));
                                 assert!(keys.contains(&"data"));
                                 assert!(keys.contains(&"content_hash"));

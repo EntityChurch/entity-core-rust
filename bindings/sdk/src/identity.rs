@@ -211,9 +211,8 @@ impl<'a> IdentityOps<'a> {
         signers: Vec<Hash>,
         threshold: u64,
         name: Option<String>,
-    ) -> impl std::future::Future<Output = Result<IdentityCreateQuorumResult, SdkError>>
-    + Send
-    + 'static {
+    ) -> impl std::future::Future<Output = Result<IdentityCreateQuorumResult, SdkError>> + Send + 'static
+    {
         let (params, path) = match build_identity_create_quorum_request(&signers, threshold, name) {
             Ok(pair) => pair,
             Err(e) => return future_ready(Err(e)),
@@ -269,8 +268,8 @@ impl<'a> IdentityOps<'a> {
         &self,
         att: NewAttestation,
     ) -> impl std::future::Future<Output = Result<IdentityCreateAttestationResult, SdkError>>
-    + Send
-    + 'static {
+           + Send
+           + 'static {
         let (params, path) = match build_identity_create_attestation_request(&att) {
             Ok(pair) => pair,
             Err(e) => return future_ready(Err(e)),
@@ -317,13 +316,12 @@ impl<'a> IdentityOps<'a> {
         &self,
         new_att: NewAttestation,
     ) -> impl std::future::Future<Output = Result<IdentitySupersedeAttestationResult, SdkError>>
-    + Send
-    + 'static {
-        let (params, path) =
-            match build_identity_supersede_attestation_request(&new_att) {
-                Ok(pair) => pair,
-                Err(e) => return future_ready(Err(e)),
-            };
+           + Send
+           + 'static {
+        let (params, path) = match build_identity_supersede_attestation_request(&new_att) {
+            Ok(pair) => pair,
+            Err(e) => return future_ready(Err(e)),
+        };
         let opts = match path {
             Some(p) => path_resource_opts(p),
             None => ExecuteOptions::default(),
@@ -332,7 +330,11 @@ impl<'a> IdentityOps<'a> {
             .ctx
             .execute("system/identity", "supersede_attestation", params, opts);
         future_boxed(async move {
-            decode_or_err(fut.await?, "supersede_attestation", decode_supersede_att_result)
+            decode_or_err(
+                fut.await?,
+                "supersede_attestation",
+                decode_supersede_att_result,
+            )
         })
     }
 
@@ -342,11 +344,10 @@ impl<'a> IdentityOps<'a> {
         new_att: NewAttestation,
     ) -> impl std::future::Future<Output = Result<IdentitySupersedeAttestationResult, SdkError>> + 'static
     {
-        let (params, path) =
-            match build_identity_supersede_attestation_request(&new_att) {
-                Ok(pair) => pair,
-                Err(e) => return future_ready(Err(e)),
-            };
+        let (params, path) = match build_identity_supersede_attestation_request(&new_att) {
+            Ok(pair) => pair,
+            Err(e) => return future_ready(Err(e)),
+        };
         let opts = match path {
             Some(p) => path_resource_opts(p),
             None => ExecuteOptions::default(),
@@ -355,7 +356,11 @@ impl<'a> IdentityOps<'a> {
             .ctx
             .execute("system/identity", "supersede_attestation", params, opts);
         future_boxed(async move {
-            decode_or_err(fut.await?, "supersede_attestation", decode_supersede_att_result)
+            decode_or_err(
+                fut.await?,
+                "supersede_attestation",
+                decode_supersede_att_result,
+            )
         })
     }
 
@@ -372,8 +377,8 @@ impl<'a> IdentityOps<'a> {
         target_hash: Hash,
         reason: impl Into<String>,
     ) -> impl std::future::Future<Output = Result<IdentityRevokeAttestationResult, SdkError>>
-    + Send
-    + 'static {
+           + Send
+           + 'static {
         let params = build_identity_revoke_attestation_request(target_hash, &reason.into());
         let fut = self.ctx.execute(
             "system/identity",
@@ -425,8 +430,8 @@ impl<'a> IdentityOps<'a> {
         new_mode: PublishMode,
         contact_id: Option<Hash>,
     ) -> impl std::future::Future<Output = Result<IdentityPublishAttestationResult, SdkError>>
-    + Send
-    + 'static {
+           + Send
+           + 'static {
         let params =
             build_identity_publish_attestation_request(attestation_hash, new_mode, contact_id);
         let path = canonical_publish_path(attestation_hash, new_mode, contact_id);
@@ -765,9 +770,7 @@ fn decode_hash_field(
     )))
 }
 
-fn decode_create_att_result(
-    entity: &Entity,
-) -> Result<IdentityCreateAttestationResult, SdkError> {
+fn decode_create_att_result(entity: &Entity) -> Result<IdentityCreateAttestationResult, SdkError> {
     let val: ciborium::Value = ciborium::de::from_reader(entity.data.as_slice())
         .map_err(|e| SdkError::HandlerError(format!("decode create-attestation-result: {}", e)))?;
     let map = val
@@ -808,8 +811,9 @@ fn decode_create_att_result(
 fn decode_supersede_att_result(
     entity: &Entity,
 ) -> Result<IdentitySupersedeAttestationResult, SdkError> {
-    let val: ciborium::Value = ciborium::de::from_reader(entity.data.as_slice())
-        .map_err(|e| SdkError::HandlerError(format!("decode supersede-attestation-result: {}", e)))?;
+    let val: ciborium::Value = ciborium::de::from_reader(entity.data.as_slice()).map_err(|e| {
+        SdkError::HandlerError(format!("decode supersede-attestation-result: {}", e))
+    })?;
     let map = val
         .as_map()
         .ok_or_else(|| SdkError::HandlerError("supersede-attestation-result not a map".into()))?;
@@ -856,8 +860,9 @@ fn decode_publish_att_result(
         }
     }
     Ok(IdentityPublishAttestationResult {
-        attestation_hash: attestation_hash
-            .ok_or_else(|| SdkError::HandlerError("publish-result missing attestation_hash".into()))?,
+        attestation_hash: attestation_hash.ok_or_else(|| {
+            SdkError::HandlerError("publish-result missing attestation_hash".into())
+        })?,
         new_path: new_path
             .ok_or_else(|| SdkError::HandlerError("publish-result missing new_path".into()))?,
     })
@@ -892,7 +897,10 @@ pub(crate) fn future_boxed<
 }
 
 #[cfg(target_arch = "wasm32")]
-pub(crate) fn future_boxed<T: 'static, F: std::future::Future<Output = Result<T, SdkError>> + 'static>(
+pub(crate) fn future_boxed<
+    T: 'static,
+    F: std::future::Future<Output = Result<T, SdkError>> + 'static,
+>(
     f: F,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, SdkError>> + 'static>> {
     Box::pin(f)
@@ -951,8 +959,9 @@ mod tests {
             .revoke_attestation(target, "test revocation")
             .await;
         match r {
-            Err(SdkError::NotFound { status: 404, code, .. })
-                if code.as_deref() == Some("target_not_found") => {}
+            Err(SdkError::NotFound {
+                status: 404, code, ..
+            }) if code.as_deref() == Some("target_not_found") => {}
             other => panic!(
                 "expected 404 target_not_found for synthetic hash, got {:?}",
                 other
@@ -977,10 +986,7 @@ mod tests {
         let att = NewAttestation {
             attesting: me,
             attested: me,
-            properties: vec![(
-                entity_ecf::text("kind"),
-                entity_ecf::text("identity-cert"),
-            )],
+            properties: vec![(entity_ecf::text("kind"), entity_ecf::text("identity-cert"))],
             supersedes: None,
             not_before: None,
             expires_at: None,
@@ -1020,8 +1026,9 @@ mod tests {
         };
         let r = ctx.identity().supersede_attestation(att).await;
         match r {
-            Err(SdkError::NotFound { status: 404, code, .. })
-                if code.as_deref() == Some("previous_not_found") => {}
+            Err(SdkError::NotFound {
+                status: 404, code, ..
+            }) if code.as_deref() == Some("previous_not_found") => {}
             Ok(ok) => panic!("unexpected success: {:?}", ok.attestation_hash),
             Err(other) => panic!("unexpected error variant: {:?}", other),
         }
@@ -1042,8 +1049,9 @@ mod tests {
             .publish_attestation(bogus, PublishMode::Public, None)
             .await;
         match r {
-            Err(SdkError::NotFound { status: 404, code, .. })
-                if code.as_deref() == Some("cert_not_found") => {}
+            Err(SdkError::NotFound {
+                status: 404, code, ..
+            }) if code.as_deref() == Some("cert_not_found") => {}
             Ok(ok) => panic!(
                 "unexpected success: hash={:?} new_path={}",
                 ok.attestation_hash, ok.new_path

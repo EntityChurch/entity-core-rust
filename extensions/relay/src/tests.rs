@@ -74,12 +74,19 @@ fn decode(data: &[u8]) -> Vec<(Value, Value)> {
 }
 
 fn field<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
-    map.iter()
-        .find_map(|(k, v)| if k.as_text() == Some(key) { Some(v) } else { None })
+    map.iter().find_map(|(k, v)| {
+        if k.as_text() == Some(key) {
+            Some(v)
+        } else {
+            None
+        }
+    })
 }
 
 fn result_code(r: &HandlerResult) -> Option<String> {
-    field(&decode(&r.result.data), "code").and_then(|v| v.as_text()).map(|s| s.to_string())
+    field(&decode(&r.result.data), "code")
+        .and_then(|v| v.as_text())
+        .map(|s| s.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +135,12 @@ fn forward_request_round_trip() {
         route: Some(vec![]),
         ..fr.clone()
     };
-    assert_eq!(ForwardRequest::from_entity(&fr4.to_entity().unwrap()).unwrap().route, None);
+    assert_eq!(
+        ForwardRequest::from_entity(&fr4.to_entity().unwrap())
+            .unwrap()
+            .route,
+        None
+    );
 }
 
 #[test]
@@ -198,7 +210,12 @@ fn peer_id_fields_are_text_not_hash() {
 // Mode S — :put / :poll
 // ---------------------------------------------------------------------------
 
-fn put_ctx(keypair: &IdentityKeypair, namespace: &str, expires_at: Option<i64>, inner: &Entity) -> HandlerContext {
+fn put_ctx(
+    keypair: &IdentityKeypair,
+    namespace: &str,
+    expires_at: Option<i64>,
+    inner: &Entity,
+) -> HandlerContext {
     let identity = keypair.peer_entity().unwrap();
     let author = identity.content_hash;
     let peer_id = keypair.peer_id().as_str().to_string();
@@ -209,7 +226,13 @@ fn put_ctx(keypair: &IdentityKeypair, namespace: &str, expires_at: Option<i64>, 
         envelope_inner: inner.content_hash,
     };
     // §2.2: put_by is checked against the authenticated *session* peer.
-    ctx_session("put", se.to_entity().unwrap(), Some(author), vec![identity, inner.clone()], Some(&peer_id))
+    ctx_session(
+        "put",
+        se.to_entity().unwrap(),
+        Some(author),
+        vec![identity, inner.clone()],
+        Some(&peer_id),
+    )
 }
 
 #[tokio::test]
@@ -219,7 +242,10 @@ async fn put_then_poll_returns_entry() {
     let kp = IdentityKeypair::from(Keypair::generate());
     let inner = inner_envelope(1);
 
-    let put = r.handle(&put_ctx(&kp, "alice-ns", None, &inner)).await.unwrap();
+    let put = r
+        .handle(&put_ctx(&kp, "alice-ns", None, &inner))
+        .await
+        .unwrap();
     assert_eq!(put.status, 200, "{:?}", result_code(&put));
     let put_map = decode(&put.result.data);
     let entry_hash = match field(&put_map, "entry_hash") {
@@ -227,7 +253,10 @@ async fn put_then_poll_returns_entry() {
         _ => panic!("missing entry_hash"),
     };
     // The opaque inner envelope was stored verbatim and is fetchable by hash.
-    assert!(cs.get(&inner.content_hash).is_some(), "inner envelope must be stored");
+    assert!(
+        cs.get(&inner.content_hash).is_some(),
+        "inner envelope must be stored"
+    );
     // Relay receive-side fetch-surface ruling: the inner is ALSO
     // tree-bound under the namespace subtree so the receiver fetches it via
     // `tree:get` (not `system/content`). path→hash to the same content-store blob.
@@ -239,11 +268,21 @@ async fn put_then_poll_returns_entry() {
     );
 
     // Poll from start.
-    let pr = PollRequest { namespace: "alice-ns".into(), since: None, limit: None };
-    let poll = r.handle(&ctx("poll", pr.to_entity().unwrap(), None, vec![])).await.unwrap();
+    let pr = PollRequest {
+        namespace: "alice-ns".into(),
+        since: None,
+        limit: None,
+    };
+    let poll = r
+        .handle(&ctx("poll", pr.to_entity().unwrap(), None, vec![]))
+        .await
+        .unwrap();
     assert_eq!(poll.status, 200);
     let pmap = decode(&poll.result.data);
-    let entries = field(&pmap, "entries").and_then(|v| v.as_array()).cloned().unwrap();
+    let entries = field(&pmap, "entries")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap();
     assert_eq!(entries.len(), 1);
     match &entries[0] {
         Value::Bytes(b) => assert_eq!(Hash::from_bytes(b).unwrap(), entry_hash),
@@ -256,11 +295,24 @@ async fn put_then_poll_returns_entry() {
 async fn empty_namespace_returns_empty_not_404() {
     let (cs, li) = stores();
     let r = relay(&cs, &li);
-    let pr = PollRequest { namespace: "never-written".into(), since: None, limit: None };
-    let poll = r.handle(&ctx("poll", pr.to_entity().unwrap(), None, vec![])).await.unwrap();
+    let pr = PollRequest {
+        namespace: "never-written".into(),
+        since: None,
+        limit: None,
+    };
+    let poll = r
+        .handle(&ctx("poll", pr.to_entity().unwrap(), None, vec![]))
+        .await
+        .unwrap();
     assert_eq!(poll.status, 200); // NOT namespace_not_found/404 (§4.2)
     let pmap = decode(&poll.result.data);
-    assert_eq!(field(&pmap, "entries").and_then(|v| v.as_array()).unwrap().len(), 0);
+    assert_eq!(
+        field(&pmap, "entries")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .len(),
+        0
+    );
     assert_eq!(field(&pmap, "has_more"), Some(&Value::Bool(false)));
 }
 
@@ -270,21 +322,53 @@ async fn poll_cursor_advances() {
     let r = relay(&cs, &li);
     let kp = IdentityKeypair::from(Keypair::generate());
     for i in 0..3u8 {
-        let put = r.handle(&put_ctx(&kp, "ns", None, &inner_envelope(i))).await.unwrap();
+        let put = r
+            .handle(&put_ctx(&kp, "ns", None, &inner_envelope(i)))
+            .await
+            .unwrap();
         assert_eq!(put.status, 200, "{:?}", result_code(&put));
     }
     // Page size 2 → first page 2 entries + has_more, second page 1 + done.
-    let p1 = PollRequest { namespace: "ns".into(), since: None, limit: Some(2) };
-    let r1 = r.handle(&ctx("poll", p1.to_entity().unwrap(), None, vec![])).await.unwrap();
+    let p1 = PollRequest {
+        namespace: "ns".into(),
+        since: None,
+        limit: Some(2),
+    };
+    let r1 = r
+        .handle(&ctx("poll", p1.to_entity().unwrap(), None, vec![]))
+        .await
+        .unwrap();
     let m1 = decode(&r1.result.data);
-    assert_eq!(field(&m1, "entries").and_then(|v| v.as_array()).unwrap().len(), 2);
+    assert_eq!(
+        field(&m1, "entries")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .len(),
+        2
+    );
     assert_eq!(field(&m1, "has_more"), Some(&Value::Bool(true)));
-    let cursor = field(&m1, "cursor").and_then(|v| v.as_bytes()).unwrap().to_vec();
+    let cursor = field(&m1, "cursor")
+        .and_then(|v| v.as_bytes())
+        .unwrap()
+        .to_vec();
 
-    let p2 = PollRequest { namespace: "ns".into(), since: Some(cursor), limit: Some(2) };
-    let r2 = r.handle(&ctx("poll", p2.to_entity().unwrap(), None, vec![])).await.unwrap();
+    let p2 = PollRequest {
+        namespace: "ns".into(),
+        since: Some(cursor),
+        limit: Some(2),
+    };
+    let r2 = r
+        .handle(&ctx("poll", p2.to_entity().unwrap(), None, vec![]))
+        .await
+        .unwrap();
     let m2 = decode(&r2.result.data);
-    assert_eq!(field(&m2, "entries").and_then(|v| v.as_array()).unwrap().len(), 1);
+    assert_eq!(
+        field(&m2, "entries")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .len(),
+        1
+    );
     assert_eq!(field(&m2, "has_more"), Some(&Value::Bool(false)));
 }
 
@@ -322,7 +406,10 @@ async fn expired_on_arrival_rejected_400() {
     let kp = IdentityKeypair::from(Keypair::generate());
     let inner = inner_envelope(3);
     // expires_at in the distant past.
-    let res = r.handle(&put_ctx(&kp, "ns", Some(1), &inner)).await.unwrap();
+    let res = r
+        .handle(&put_ctx(&kp, "ns", Some(1), &inner))
+        .await
+        .unwrap();
     assert_eq!(res.status, 400);
     assert_eq!(result_code(&res).as_deref(), Some(CODE_EXPIRED_ON_ARRIVAL));
 }
@@ -333,7 +420,10 @@ async fn namespace_invalid_rejected() {
     let r = relay(&cs, &li);
     let kp = IdentityKeypair::from(Keypair::generate());
     let inner = inner_envelope(4);
-    let res = r.handle(&put_ctx(&kp, "bad/../escape", None, &inner)).await.unwrap();
+    let res = r
+        .handle(&put_ctx(&kp, "bad/../escape", None, &inner))
+        .await
+        .unwrap();
     assert_eq!(res.status, 400);
     assert_eq!(result_code(&res).as_deref(), Some(CODE_NAMESPACE_INVALID));
 }
@@ -343,7 +433,12 @@ async fn namespace_invalid_rejected() {
 // ---------------------------------------------------------------------------
 
 fn forward_ctx(req: &ForwardRequest, inner: &Entity) -> HandlerContext {
-    ctx("forward", req.to_entity().unwrap(), None, vec![inner.clone()])
+    ctx(
+        "forward",
+        req.to_entity().unwrap(),
+        None,
+        vec![inner.clone()],
+    )
 }
 
 #[tokio::test]
@@ -396,15 +491,31 @@ async fn forward_unreachable_falls_back_to_mode_s() {
     let res = r.handle(&forward_ctx(&req, &inner)).await.unwrap();
     assert_eq!(res.status, 200, "{:?}", result_code(&res));
     let m = decode(&res.result.data);
-    assert_eq!(field(&m, "status").and_then(|v| v.as_text()), Some(FORWARD_STATUS_QUEUED_FALLBACK));
+    assert_eq!(
+        field(&m, "status").and_then(|v| v.as_text()),
+        Some(FORWARD_STATUS_QUEUED_FALLBACK)
+    );
     // §6.2.1: stored at namespace = destination peer_id; the destination polls
     // its own peer-id namespace on reconnect and retrieves the entry.
     assert_eq!(field(&m, "stored_at").and_then(|v| v.as_text()), Some(dest));
 
-    let pr = PollRequest { namespace: dest.into(), since: None, limit: None };
-    let poll = r.handle(&ctx("poll", pr.to_entity().unwrap(), None, vec![])).await.unwrap();
+    let pr = PollRequest {
+        namespace: dest.into(),
+        since: None,
+        limit: None,
+    };
+    let poll = r
+        .handle(&ctx("poll", pr.to_entity().unwrap(), None, vec![]))
+        .await
+        .unwrap();
     let pm = decode(&poll.result.data);
-    assert_eq!(field(&pm, "entries").and_then(|v| v.as_array()).unwrap().len(), 1);
+    assert_eq!(
+        field(&pm, "entries")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .len(),
+        1
+    );
     // The opaque inner envelope rode the fallback store and is fetchable.
     assert!(cs.get(&inner.content_hash).is_some());
 }
@@ -462,7 +573,10 @@ async fn forward_recorded_with(
     let rec = Arc::new(RecordingForwarder::default());
     let r = relay(cs, li).with_forwarder(rec.clone());
     let inner = inner_envelope(req.envelope_inner.digest()[0]);
-    let req = ForwardRequest { envelope_inner: inner.content_hash, ..req };
+    let req = ForwardRequest {
+        envelope_inner: inner.content_hash,
+        ..req
+    };
     let res = r.handle(&forward_ctx(&req, &inner)).await.unwrap();
     let last = rec.last.lock().unwrap().clone();
     (res, last)
@@ -470,7 +584,11 @@ async fn forward_recorded_with(
 
 /// Tree-bind a `system/route` entity under this relay's route subtree, the way
 /// a `route-configure`-capped `tree:put` would (EXTENSION-ROUTE §2).
-fn install_route(cs: &Arc<dyn ContentStore>, li: &Arc<dyn LocationIndex>, rd: entity_route::RouteData) {
+fn install_route(
+    cs: &Arc<dyn ContentStore>,
+    li: &Arc<dyn LocationIndex>,
+    rd: entity_route::RouteData,
+) {
     let e = rd.to_entity().unwrap();
     let h = cs.put(e.clone()).unwrap();
     let path = format!("/{}/{}", PEER, entity_route::route_path(&h));
@@ -495,7 +613,10 @@ async fn source_route_next_hop_mismatch_rejected_pre_dispatch() {
     let (res, recorded) = forward_recorded(req).await;
     assert_eq!(res.status, 400);
     assert_eq!(result_code(&res).as_deref(), Some(CODE_INVALID_REQUEST));
-    assert!(recorded.is_none(), "invariant must reject before any forward");
+    assert!(
+        recorded.is_none(),
+        "invariant must reject before any forward"
+    );
 }
 
 // A matching next_hop == route[0] is accepted (advisory, not an error).
@@ -646,7 +767,11 @@ async fn source_route_takes_precedence_over_table() {
     };
     let (res, recorded) = forward_recorded_with(&cs, &li, req).await;
     assert_eq!(res.status, 200);
-    assert_eq!(recorded.unwrap().next_hop, HOP_B, "source route must win over table");
+    assert_eq!(
+        recorded.unwrap().next_hop,
+        HOP_B,
+        "source route must win over table"
+    );
 }
 
 // --- ROUTE table: non-matching table → no_route/502 (no fallback before a
@@ -686,8 +811,16 @@ async fn route_table_no_match_is_no_route() {
 fn inbox_relay_round_trip() {
     let d = InboxRelayData {
         relays: vec![
-            InboxRelayEntry { relay: "z6MkR1".into(), namespace: "z6MkDest".into(), priority: 10 },
-            InboxRelayEntry { relay: "z6MkR2".into(), namespace: "z6MkDest".into(), priority: 50 },
+            InboxRelayEntry {
+                relay: "z6MkR1".into(),
+                namespace: "z6MkDest".into(),
+                priority: 10,
+            },
+            InboxRelayEntry {
+                relay: "z6MkR2".into(),
+                namespace: "z6MkDest".into(),
+                priority: 50,
+            },
         ],
         expires_at: Some(1730999999999),
     };
@@ -731,12 +864,31 @@ async fn fallback_honors_declared_inbox_relay_namespace() {
     let res = r.handle(&forward_ctx(&req, &inner)).await.unwrap();
     assert_eq!(res.status, 200);
     let m = decode(&res.result.data);
-    assert_eq!(field(&m, "status").and_then(|v| v.as_text()), Some(FORWARD_STATUS_QUEUED_FALLBACK));
-    assert_eq!(field(&m, "stored_at").and_then(|v| v.as_text()), Some("custom-inbox"));
+    assert_eq!(
+        field(&m, "status").and_then(|v| v.as_text()),
+        Some(FORWARD_STATUS_QUEUED_FALLBACK)
+    );
+    assert_eq!(
+        field(&m, "stored_at").and_then(|v| v.as_text()),
+        Some("custom-inbox")
+    );
     // Pollable at the declared namespace.
-    let pr = PollRequest { namespace: "custom-inbox".into(), since: None, limit: None };
-    let poll = r.handle(&ctx("poll", pr.to_entity().unwrap(), None, vec![])).await.unwrap();
-    assert_eq!(field(&decode(&poll.result.data), "entries").and_then(|v| v.as_array()).unwrap().len(), 1);
+    let pr = PollRequest {
+        namespace: "custom-inbox".into(),
+        since: None,
+        limit: None,
+    };
+    let poll = r
+        .handle(&ctx("poll", pr.to_entity().unwrap(), None, vec![]))
+        .await
+        .unwrap();
+    assert_eq!(
+        field(&decode(&poll.result.data), "entries")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -779,7 +931,10 @@ fn publish_inbox_relay_decl(
     let decl_entity = decl.to_entity().unwrap();
     let decl_hash = decl_entity.content_hash;
     cs.put(decl_entity).unwrap();
-    li.set(&format!("/{}/{}", PEER, inbox_relay_path(dest_pid)), decl_hash);
+    li.set(
+        &format!("/{}/{}", PEER, inbox_relay_path(dest_pid)),
+        decl_hash,
+    );
 
     let signer_identity = signer_kp.peer_entity().unwrap();
     cs.put(signer_identity.clone()).unwrap();
@@ -793,7 +948,10 @@ fn publish_inbox_relay_decl(
     .unwrap();
     let sig_hash = sig.content_hash;
     cs.put(sig).unwrap();
-    li.set(&entity_hash::invariant_signature_path(PEER, &decl_hash), sig_hash);
+    li.set(
+        &entity_hash::invariant_signature_path(PEER, &decl_hash),
+        sig_hash,
+    );
 }
 
 #[tokio::test]
@@ -866,7 +1024,11 @@ const FIX_DEST: &str = "2KCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC";
 /// Digest-only hex (32 bytes, no leading format byte) — the form Go pins as
 /// `ecf-sha256:<hex>`.
 fn digest_hex(e: &Entity) -> String {
-    e.content_hash.digest().iter().map(|b| format!("{:02x}", b)).collect()
+    e.content_hash
+        .digest()
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect()
 }
 
 #[test]
@@ -882,7 +1044,10 @@ fn fixture_f1_forward_request_full() {
     .unwrap();
     // §3.1 omitempty: the absent `route` keeps this byte-identical to v1.0, so
     // the digest is unchanged — the cross-impl byte-equality pin still holds.
-    assert_eq!(digest_hex(&e), "a5f7048f6c5f44ba64c5a3373ded97d77c2600f62236e7e48be3d1cc42a24476");
+    assert_eq!(
+        digest_hex(&e),
+        "a5f7048f6c5f44ba64c5a3373ded97d77c2600f62236e7e48be3d1cc42a24476"
+    );
 }
 
 #[test]
@@ -896,7 +1061,10 @@ fn fixture_f2_forward_request_no_next_hop() {
     }
     .to_entity()
     .unwrap();
-    assert_eq!(digest_hex(&e), "73acd98db5781cbe28ad777628a72696cf9494e0135647888cfc98f918b1d42b");
+    assert_eq!(
+        digest_hex(&e),
+        "73acd98db5781cbe28ad777628a72696cf9494e0135647888cfc98f918b1d42b"
+    );
 }
 
 #[test]
@@ -909,7 +1077,10 @@ fn fixture_s1_store_entry_full() {
     }
     .to_entity()
     .unwrap();
-    assert_eq!(digest_hex(&e), "7170ad83b98218b6e976b1612573ad2f22bd3a6cc07be05aeb954a8cbeadb893");
+    assert_eq!(
+        digest_hex(&e),
+        "7170ad83b98218b6e976b1612573ad2f22bd3a6cc07be05aeb954a8cbeadb893"
+    );
 }
 
 #[test]
@@ -922,7 +1093,10 @@ fn fixture_s2_store_entry_no_expiry() {
     }
     .to_entity()
     .unwrap();
-    assert_eq!(digest_hex(&e), "e6b39ba557d16e0434ca8a9f99c4dd3a18b1c5ce5811a7da08e8802cfbefd660");
+    assert_eq!(
+        digest_hex(&e),
+        "e6b39ba557d16e0434ca8a9f99c4dd3a18b1c5ce5811a7da08e8802cfbefd660"
+    );
 }
 
 #[test]
@@ -936,7 +1110,10 @@ fn fixture_a2_advertise_mode_s_only() {
     }
     .to_entity()
     .unwrap();
-    assert_eq!(digest_hex(&e), "ad08fae1f18d664eeaa00cc81980fef729ed9208f10027d281b45f81b2f361cb");
+    assert_eq!(
+        digest_hex(&e),
+        "ad08fae1f18d664eeaa00cc81980fef729ed9208f10027d281b45f81b2f361cb"
+    );
 }
 
 #[test]
@@ -948,7 +1125,10 @@ fn fixture_r1_forward_result_forwarded() {
     }
     .to_entity()
     .unwrap();
-    assert_eq!(digest_hex(&e), "301ad8fa052934d2f89dfdadf55c1a935dde76a1961bda294e66007a91c41cac");
+    assert_eq!(
+        digest_hex(&e),
+        "301ad8fa052934d2f89dfdadf55c1a935dde76a1961bda294e66007a91c41cac"
+    );
 }
 
 #[test]
@@ -960,29 +1140,49 @@ fn fixture_r2_forward_result_queued_fallback() {
     }
     .to_entity()
     .unwrap();
-    assert_eq!(digest_hex(&e), "beb909b6fd44a8f18f8922e69b514b63951f553b9e9faf1004ebd929047e801c");
+    assert_eq!(
+        digest_hex(&e),
+        "beb909b6fd44a8f18f8922e69b514b63951f553b9e9faf1004ebd929047e801c"
+    );
 }
 
 #[test]
 fn fixture_r4_poll_request_fresh() {
-    let e = PollRequest { namespace: FIX_DEST.into(), since: None, limit: None }
-        .to_entity()
-        .unwrap();
-    assert_eq!(digest_hex(&e), "02e3b67a804e7f8fe8ced4db9ae3b50f141635e53632e2e9decfcfd57188e2d3");
+    let e = PollRequest {
+        namespace: FIX_DEST.into(),
+        since: None,
+        limit: None,
+    }
+    .to_entity()
+    .unwrap();
+    assert_eq!(
+        digest_hex(&e),
+        "02e3b67a804e7f8fe8ced4db9ae3b50f141635e53632e2e9decfcfd57188e2d3"
+    );
 }
 
 #[test]
 fn fixture_r6_poll_result_empty() {
     let e = PollResult::new(vec![], 0, false).to_entity().unwrap();
-    assert_eq!(digest_hex(&e), "31945acad42877af8832ceba4a2521b24dd1615606a128ed8185d55ad9cabec8");
+    assert_eq!(
+        digest_hex(&e),
+        "31945acad42877af8832ceba4a2521b24dd1615606a128ed8185d55ad9cabec8"
+    );
 }
 
 #[test]
 fn fixture_r7_poll_result_with_entries() {
-    let e = PollResult::new(vec![lit_hash(0xA1), lit_hash(0xA2), lit_hash(0xA3)], 3, true)
-        .to_entity()
-        .unwrap();
-    assert_eq!(digest_hex(&e), "00ef28d4599590dcae25c30f81fce96102aa05fdcbfae88dbb09e2429f3d3485");
+    let e = PollResult::new(
+        vec![lit_hash(0xA1), lit_hash(0xA2), lit_hash(0xA3)],
+        3,
+        true,
+    )
+    .to_entity()
+    .unwrap();
+    assert_eq!(
+        digest_hex(&e),
+        "00ef28d4599590dcae25c30f81fce96102aa05fdcbfae88dbb09e2429f3d3485"
+    );
 }
 
 #[test]
@@ -997,21 +1197,35 @@ fn fixture_i1_inbox_relay_single() {
     }
     .to_entity()
     .unwrap();
-    assert_eq!(digest_hex(&e), "8d2039cbea7ab65ff59fa6ad5055e062c357d3314f8ccfd2ab31c03ef31629b0");
+    assert_eq!(
+        digest_hex(&e),
+        "8d2039cbea7ab65ff59fa6ad5055e062c357d3314f8ccfd2ab31c03ef31629b0"
+    );
 }
 
 #[test]
 fn fixture_i2_inbox_relay_primary_backup() {
     let e = InboxRelayData {
         relays: vec![
-            InboxRelayEntry { relay: FIX_RELAY.into(), namespace: FIX_DEST.into(), priority: 10 },
-            InboxRelayEntry { relay: FIX_SENDER.into(), namespace: FIX_DEST.into(), priority: 50 },
+            InboxRelayEntry {
+                relay: FIX_RELAY.into(),
+                namespace: FIX_DEST.into(),
+                priority: 10,
+            },
+            InboxRelayEntry {
+                relay: FIX_SENDER.into(),
+                namespace: FIX_DEST.into(),
+                priority: 50,
+            },
         ],
         expires_at: None,
     }
     .to_entity()
     .unwrap();
-    assert_eq!(digest_hex(&e), "9e00962b4b7023e21431cd9d04e00e75fb7b785c602558494a15346e98a336cc");
+    assert_eq!(
+        digest_hex(&e),
+        "9e00962b4b7023e21431cd9d04e00e75fb7b785c602558494a15346e98a336cc"
+    );
 }
 
 #[test]

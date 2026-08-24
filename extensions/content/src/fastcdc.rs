@@ -152,7 +152,7 @@ mod tests {
         let p = CdcParams::from_target(1024 * 1024).unwrap();
         assert_eq!(p.min_size, 256 * 1024); // 256 KiB
         assert_eq!(p.max_size, 2 * 1024 * 1024); // 2 MiB
-        // bits = 20 → mask_s = (1 << 22) - 1, mask_l = (1 << 18) - 1
+                                                 // bits = 20 → mask_s = (1 << 22) - 1, mask_l = (1 << 18) - 1
         assert_eq!(p.mask_s, 0x003F_FFFF);
         assert_eq!(p.mask_l, 0x0003_FFFF);
     }

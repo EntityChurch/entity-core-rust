@@ -50,10 +50,7 @@ pub fn verify_content(store: &Arc<dyn ContentStore>, blob_hash: &Hash) -> Result
         actual = actual.saturating_add(payload_len as u64);
     }
     if actual != declared {
-        return Err(VerifyError::SizeMismatch {
-            declared,
-            actual,
-        });
+        return Err(VerifyError::SizeMismatch { declared, actual });
     }
     Ok(())
 }
@@ -67,10 +64,7 @@ pub fn verify_content(store: &Arc<dyn ContentStore>, blob_hash: &Hash) -> Result
 /// this function at `extensions/content/src/lib.rs`. Pure local helper
 /// over a complete closure (no protocol surface; cap discipline is
 /// guarded by [`crate::ensure_closure`]).
-pub fn reassemble(
-    store: &Arc<dyn ContentStore>,
-    blob_hash: &Hash,
-) -> Result<Vec<u8>, VerifyError> {
+pub fn reassemble(store: &Arc<dyn ContentStore>, blob_hash: &Hash) -> Result<Vec<u8>, VerifyError> {
     let (total_size, chunk_hashes) = decode_blob(store, blob_hash)?;
     let mut out: Vec<u8> = Vec::with_capacity(total_size as usize);
     for ch in &chunk_hashes {
@@ -145,7 +139,9 @@ fn decode_blob(
     store: &Arc<dyn ContentStore>,
     blob_hash: &Hash,
 ) -> Result<(u64, Vec<Hash>), VerifyError> {
-    let blob = store.get(blob_hash).ok_or(VerifyError::BlobMissing(*blob_hash))?;
+    let blob = store
+        .get(blob_hash)
+        .ok_or(VerifyError::BlobMissing(*blob_hash))?;
     if blob.entity_type != TYPE_CONTENT_BLOB {
         return Err(VerifyError::NotABlob);
     }
@@ -176,8 +172,8 @@ fn decode_hash_record(value: &Value) -> Result<Hash, VerifyError> {
 }
 
 fn chunk_payload_len(chunk: &Entity) -> Result<usize, String> {
-    let v: Value = ciborium::from_reader(chunk.data.as_slice())
-        .map_err(|e| format!("cbor: {}", e))?;
+    let v: Value =
+        ciborium::from_reader(chunk.data.as_slice()).map_err(|e| format!("cbor: {}", e))?;
     Ok(v.get("payload")
         .and_then(|v| v.as_bytes().cloned())
         .map(|b| b.len())
@@ -185,8 +181,8 @@ fn chunk_payload_len(chunk: &Entity) -> Result<usize, String> {
 }
 
 fn chunk_payload_bytes(chunk: &Entity) -> Result<Vec<u8>, String> {
-    let v: Value = ciborium::from_reader(chunk.data.as_slice())
-        .map_err(|e| format!("cbor: {}", e))?;
+    let v: Value =
+        ciborium::from_reader(chunk.data.as_slice()).map_err(|e| format!("cbor: {}", e))?;
     Ok(v.get("payload")
         .and_then(|v| v.as_bytes().cloned())
         .unwrap_or_default())
@@ -225,7 +221,9 @@ mod tests {
         let mut rng_state: u64 = 0xC0FFEE;
         let mut raw = vec![0u8; 1 << 16];
         for b in &mut raw {
-            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *b = (rng_state >> 24) as u8;
         }
         let h = create_blob_fastcdc(&s, &raw, 4096).unwrap();

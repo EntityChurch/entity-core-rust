@@ -65,7 +65,14 @@ pub fn walk_expression_graph(
     root_path: Option<&str>,
 ) {
     let mut visited = HashSet::new();
-    walk_recursive(entity, visitor, content_store, included, &mut visited, root_path);
+    walk_recursive(
+        entity,
+        visitor,
+        content_store,
+        included,
+        &mut visited,
+        root_path,
+    );
 }
 
 fn walk_recursive(
@@ -133,11 +140,9 @@ fn walk_recursive(
                 // is a hash, emit it for install-time R1 chain-root audit.
                 // Dynamic values fall through and are checked at runtime.
                 if let Some(cap_ref_hash) = &capability_hash {
-                    if let Some(cap_lit) = resolve_static_literal_hash_value(
-                        cap_ref_hash,
-                        content_store,
-                        included,
-                    ) {
+                    if let Some(cap_lit) =
+                        resolve_static_literal_hash_value(cap_ref_hash, content_store, included)
+                    {
                         visitor.visit_static_literal_capability(&cap_lit);
                     }
                 }
@@ -155,7 +160,9 @@ fn walk_recursive(
                 {
                     if let Some(args) = data_hash_map(&data, "args") {
                         if let Some((_, path_hash)) = args.iter().find(|(k, _)| k == "path") {
-                            if let Some(path_entity) = resolve_hash(path_hash, content_store, included) {
+                            if let Some(path_entity) =
+                                resolve_hash(path_hash, content_store, included)
+                            {
                                 if path_entity.entity_type == TYPE_LITERAL {
                                     if let Some(lit_data) = decode_data(&path_entity) {
                                         if let Some(store_path) = data_str(&lit_data, "value") {
@@ -202,7 +209,14 @@ fn walk_hash_fields(
         Value::Bytes(b) => {
             if let Ok(hash) = Hash::from_bytes(b) {
                 if let Some(referenced) = resolve_hash(&hash, content_store, included) {
-                    walk_recursive(&referenced, visitor, content_store, included, visited, root_path);
+                    walk_recursive(
+                        &referenced,
+                        visitor,
+                        content_store,
+                        included,
+                        visited,
+                        root_path,
+                    );
                 }
             }
         }
@@ -220,7 +234,11 @@ fn walk_hash_fields(
     }
 }
 
-fn resolve_hash(hash: &Hash, content_store: &dyn ContentStore, included: &HashMap<Hash, Entity>) -> Option<Entity> {
+fn resolve_hash(
+    hash: &Hash,
+    content_store: &dyn ContentStore,
+    included: &HashMap<Hash, Entity>,
+) -> Option<Entity> {
     if let Some(e) = included.get(hash) {
         return Some(e.clone());
     }
@@ -328,7 +346,8 @@ impl ExpressionVisitor for DependencyCollector {
         _path: &str,
         _operation: &str,
         _resource: Option<entity_capability::ResourceTarget>,
-    ) {}
+    ) {
+    }
     fn visit_store_target(&mut self, _path: &str) {}
 }
 
@@ -415,9 +434,7 @@ pub fn audit_subgraph(
 pub fn deterministic_id(root_path: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(root_path.as_bytes());
-    data_encoding::BASE32_NOPAD
-        .encode(&digest)
-        .to_lowercase()
+    data_encoding::BASE32_NOPAD.encode(&digest).to_lowercase()
 }
 
 // ---------------------------------------------------------------------------
@@ -586,7 +603,9 @@ mod tests {
         let id2 = deterministic_id("app/cell/A1");
         assert_eq!(id1, id2);
         assert_eq!(id1.len(), 52);
-        assert!(id1.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        assert!(id1
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
 
         let id3 = deterministic_id("app/cell/B2");
         assert_ne!(id1, id3);

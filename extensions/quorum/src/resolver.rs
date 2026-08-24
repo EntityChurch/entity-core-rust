@@ -80,11 +80,8 @@ impl<'a> ResolverContext<'a> {
 /// side-effect-free. Resolvers MAY recursively invoke `current_signer_set`
 /// (via captured registry references), in which case they MUST propagate
 /// `ResolverContext.depth` and `visited` state.
-pub type ResolverFn = Arc<
-    dyn Fn(&Hash, &mut ResolverContext) -> Result<Hash, ResolverError>
-        + Send
-        + Sync,
->;
+pub type ResolverFn =
+    Arc<dyn Fn(&Hash, &mut ResolverContext) -> Result<Hash, ResolverError> + Send + Sync>;
 
 /// Process-wide resolver registry. Identity (and other consumers) call
 /// `register_resolver("identity-resolved", ...)` at install time.
@@ -105,11 +102,7 @@ impl ResolverRegistry {
     /// pointer-equal) is permitted as a no-op for hot-reload scenarios.
     /// No silent replacement; no stacking. Replacement requires explicit
     /// unregistration first (no `unregister_resolver` op in v2).
-    pub fn register(
-        &self,
-        mode_name: &str,
-        resolver: ResolverFn,
-    ) -> Result<(), RegisterError> {
+    pub fn register(&self, mode_name: &str, resolver: ResolverFn) -> Result<(), RegisterError> {
         let mut inner = self.inner.write().unwrap();
         if let Some(existing) = inner.get(mode_name) {
             if Arc::ptr_eq(existing, &resolver) {

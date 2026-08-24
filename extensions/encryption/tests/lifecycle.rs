@@ -7,7 +7,7 @@ use entity_encryption::{
 };
 
 fn pubkey_hash(seed: u8) -> entity_hash::Hash {
-    let pubkey = x25519_public(&vec![seed; 32]).unwrap();
+    let pubkey = x25519_public(&[seed; 32]).unwrap();
     EncryptionPubkeyData {
         enc_key_type: 0x01,
         public_key: pubkey.to_vec(),
@@ -30,7 +30,11 @@ fn enc_cert_lifecycle_1_tier_a() {
     // Publish A; rotate A→B.
     let mut view = TierAView {
         pubkeys: vec![a, b],
-        handoffs: vec![EncryptionHandoffData { previous_pubkey: a, next_pubkey: b, created: 100 }],
+        handoffs: vec![EncryptionHandoffData {
+            previous_pubkey: a,
+            next_pubkey: b,
+            created: 100,
+        }],
         revocations: vec![],
     };
 
@@ -54,7 +58,10 @@ fn enc_cert_lifecycle_1_tier_a() {
 
     // Sending directly to revoked B is likewise rejected.
     assert!(view.is_revoked(&b));
-    assert!(matches!(view.check_encryptable(&b).unwrap_err(), EncryptionError::KeyRevoked(_)));
+    assert!(matches!(
+        view.check_encryptable(&b).unwrap_err(),
+        EncryptionError::KeyRevoked(_)
+    ));
 }
 
 /// Multi-hop handoff chain resolves to the terminal pubkey (most-recent wins).
@@ -64,8 +71,16 @@ fn handoff_chain_walks_to_terminal() {
     let view = TierAView {
         pubkeys: vec![a, b, c],
         handoffs: vec![
-            EncryptionHandoffData { previous_pubkey: a, next_pubkey: b, created: 100 },
-            EncryptionHandoffData { previous_pubkey: b, next_pubkey: c, created: 200 },
+            EncryptionHandoffData {
+                previous_pubkey: a,
+                next_pubkey: b,
+                created: 100,
+            },
+            EncryptionHandoffData {
+                previous_pubkey: b,
+                next_pubkey: c,
+                created: 200,
+            },
         ],
         revocations: vec![],
     };
@@ -83,8 +98,16 @@ fn revoked_initial_refused_no_silent_redirect() {
     let (a, b) = (pubkey_hash(0x50), pubkey_hash(0x51));
     let view = TierAView {
         pubkeys: vec![a, b],
-        handoffs: vec![EncryptionHandoffData { previous_pubkey: a, next_pubkey: b, created: 100 }],
-        revocations: vec![EncryptionRevocationData { revokes: a, reason: None, created: 200 }],
+        handoffs: vec![EncryptionHandoffData {
+            previous_pubkey: a,
+            next_pubkey: b,
+            created: 100,
+        }],
+        revocations: vec![EncryptionRevocationData {
+            revokes: a,
+            reason: None,
+            created: 200,
+        }],
     };
 
     // The granular §10 primitive sees the successor…
@@ -111,7 +134,10 @@ fn key_backup_roundtrip() {
     )
     .unwrap();
 
-    assert_eq!(unwrap_private_key(b"my backup passphrase", &backup).unwrap(), private_key);
+    assert_eq!(
+        unwrap_private_key(b"my backup passphrase", &backup).unwrap(),
+        private_key
+    );
 
     let err = unwrap_private_key(b"wrong passphrase", &backup).unwrap_err();
     assert!(matches!(err, EncryptionError::AeadFailed(_)), "got {err:?}");

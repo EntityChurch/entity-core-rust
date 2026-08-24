@@ -56,7 +56,13 @@ pub fn create_blob_fixed(
         chunks.push(chunk_hash);
         offset = end;
     }
-    put_blob(store, raw.len() as u64, chunk_size as u64, CONTENT_CHUNKING_FIXED, &chunks)
+    put_blob(
+        store,
+        raw.len() as u64,
+        chunk_size as u64,
+        CONTENT_CHUNKING_FIXED,
+        &chunks,
+    )
 }
 
 /// FastCDC/NC2 chunker (§3.6). Derives params from `target_size` via
@@ -180,8 +186,8 @@ fn put_chunk(store: &Arc<dyn ContentStore>, payload: &[u8]) -> Result<Hash, Chun
         entity_ecf::text("payload"),
         ciborium::Value::Bytes(payload.to_vec()),
     )]));
-    let chunk = Entity::new(TYPE_CONTENT_CHUNK, data)
-        .map_err(|e| ChunkerError::Entity(e.to_string()))?;
+    let chunk =
+        Entity::new(TYPE_CONTENT_CHUNK, data).map_err(|e| ChunkerError::Entity(e.to_string()))?;
     Ok(store.put(chunk)?)
 }
 
@@ -195,20 +201,24 @@ fn put_blob(
     chunking: u64,
     chunks: &[Hash],
 ) -> Result<Hash, ChunkerError> {
-    let chunks_arr = ciborium::Value::Array(
-        chunks
-            .iter()
-            .map(|h| hash_to_bstr(h))
-            .collect::<Vec<_>>(),
-    );
+    let chunks_arr = ciborium::Value::Array(chunks.iter().map(hash_to_bstr).collect::<Vec<_>>());
     let data = entity_ecf::to_ecf(&ciborium::Value::Map(vec![
-        (entity_ecf::text("total_size"), ciborium::Value::Integer(total_size.into())),
-        (entity_ecf::text("chunk_size"), ciborium::Value::Integer(chunk_size.into())),
-        (entity_ecf::text("chunking"), ciborium::Value::Integer(chunking.into())),
+        (
+            entity_ecf::text("total_size"),
+            ciborium::Value::Integer(total_size.into()),
+        ),
+        (
+            entity_ecf::text("chunk_size"),
+            ciborium::Value::Integer(chunk_size.into()),
+        ),
+        (
+            entity_ecf::text("chunking"),
+            ciborium::Value::Integer(chunking.into()),
+        ),
         (entity_ecf::text("chunks"), chunks_arr),
     ]));
-    let blob = Entity::new(TYPE_CONTENT_BLOB, data)
-        .map_err(|e| ChunkerError::Entity(e.to_string()))?;
+    let blob =
+        Entity::new(TYPE_CONTENT_BLOB, data).map_err(|e| ChunkerError::Entity(e.to_string()))?;
     Ok(store.put(blob)?)
 }
 
@@ -264,7 +274,7 @@ mod tests {
         // Two identical 4 KiB blocks back-to-back — should dedupe to a
         // single chunk entity in the store.
         let raw: Vec<u8> = (0..2)
-            .flat_map(|_| std::iter::repeat(0xCD).take(4096))
+            .flat_map(|_| std::iter::repeat_n(0xCD, 4096))
             .collect();
         let before_len = s.len();
         create_blob_fixed(&s, &raw, 4096).unwrap();
@@ -302,7 +312,9 @@ mod tests {
         let mut rng: u64 = 0x1234_5678;
         let mut raw = vec![0u8; 1 << 18]; // 256 KiB
         for b in &mut raw {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *b = (rng >> 24) as u8;
         }
         let target = 4096;
@@ -338,7 +350,9 @@ mod tests {
         let mut raw = vec![0u8; 1 << 17]; // 128 KiB
         for b in &mut raw {
             // Tiny LCG — deterministic, good enough for a test fixture
-            rng_state = rng_state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng_state = rng_state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             *b = (rng_state >> 24) as u8;
         }
 

@@ -162,11 +162,7 @@ pub fn default_map() -> Value {
 
 /// Create a CBOR map from an iterator of (String, Value) pairs.
 pub fn map_from_iter(iter: impl IntoIterator<Item = (String, Value)>) -> Value {
-    Value::Map(
-        iter.into_iter()
-            .map(|(k, v)| (Value::Text(k), v))
-            .collect(),
-    )
+    Value::Map(iter.into_iter().map(|(k, v)| (Value::Text(k), v)).collect())
 }
 
 /// Insert a key-value pair into a CBOR map.

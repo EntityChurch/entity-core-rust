@@ -77,10 +77,7 @@ pub fn peer_create_op(
 ) -> VerbOutput {
     let label_disp = label.as_deref().unwrap_or("(unlabeled)").to_string();
     let mode_label = mode.label();
-    action_sink.submit(ShellRequest::CreatePeer {
-        mode,
-        label,
-    });
+    action_sink.submit(ShellRequest::CreatePeer { mode, label });
     VerbOutput::Info(vec![InfoRow::text(format!(
         "→ creating {} peer: {}",
         mode_label, label_disp
@@ -117,10 +114,7 @@ pub fn peer_rename_op(
 ) -> VerbOutput {
     let disp = label.as_deref().unwrap_or("(cleared)").to_string();
     let short = display::short_pid(&peer_id);
-    action_sink.submit(ShellRequest::RenamePeer {
-        peer_id,
-        label,
-    });
+    action_sink.submit(ShellRequest::RenamePeer { peer_id, label });
     VerbOutput::Info(vec![InfoRow::text(format!(
         "→ renaming peer {} → \"{}\"",
         short, disp
@@ -221,17 +215,27 @@ mod tests {
     }
 
     impl PeerBinding for StubBinding {
-        fn peer_id(&self) -> &str { &self.primary }
-        fn primary_peer_id(&self) -> String { self.primary.clone() }
-        fn peer_ids(&self) -> Vec<String> { self.peers.clone() }
-        fn connected_peers(&self) -> Vec<String> { self.remotes.clone() }
+        fn peer_id(&self) -> &str {
+            &self.primary
+        }
+        fn primary_peer_id(&self) -> String {
+            self.primary.clone()
+        }
+        fn peer_ids(&self) -> Vec<String> {
+            self.peers.clone()
+        }
+        fn connected_peers(&self) -> Vec<String> {
+            self.remotes.clone()
+        }
         fn peer_label(&self, pid: &str) -> Option<String> {
             self.labels.get(pid).cloned()
         }
         fn tree_listing(&self, _pid: &str, _prefix: &str) -> Vec<TreeListingEntry> {
             Vec::new()
         }
-        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> { None }
+        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> {
+            None
+        }
     }
 
     struct RecordingSink {
@@ -254,7 +258,9 @@ mod tests {
     }
 
     fn sink() -> RecordingSink {
-        RecordingSink { requests: RefCell::new(Vec::new()) }
+        RecordingSink {
+            requests: RefCell::new(Vec::new()),
+        }
     }
 
     #[test]

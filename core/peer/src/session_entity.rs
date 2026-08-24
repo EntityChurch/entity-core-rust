@@ -256,8 +256,7 @@ impl PeerSession {
         }
 
         let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(fields));
-        Entity::new(TYPE_PEER_SESSION, data)
-            .expect("entity construction for system/peer/session")
+        Entity::new(TYPE_PEER_SESSION, data).expect("entity construction for system/peer/session")
     }
 
     /// Decode a `system/peer/session` `Entity`.
@@ -276,8 +275,9 @@ impl PeerSession {
 
         let remote_peer_id = field_text(&map, "remote_peer_id")
             .ok_or(SessionEntityDecodeError::MissingField("remote_peer_id"))?;
-        let remote_identity_hash = field_hash(&map, "remote_identity_hash")?
-            .ok_or(SessionEntityDecodeError::MissingField("remote_identity_hash"))?;
+        let remote_identity_hash = field_hash(&map, "remote_identity_hash")?.ok_or(
+            SessionEntityDecodeError::MissingField("remote_identity_hash"),
+        )?;
         let remote_public_key = field_bytes(&map, "remote_public_key");
         let granted_at = field_uint(&map, "granted_at")
             .ok_or(SessionEntityDecodeError::MissingField("granted_at"))?;
@@ -415,12 +415,14 @@ fn field_hash(
     key: &'static str,
 ) -> Result<Option<Hash>, SessionEntityDecodeError> {
     match field_lookup(map, key) {
-        Some(ciborium::Value::Bytes(b)) => Hash::from_bytes(b)
-            .map(Some)
-            .map_err(|e| SessionEntityDecodeError::BadFieldShape {
-                field: key,
-                detail: e.to_string(),
-            }),
+        Some(ciborium::Value::Bytes(b)) => {
+            Hash::from_bytes(b)
+                .map(Some)
+                .map_err(|e| SessionEntityDecodeError::BadFieldShape {
+                    field: key,
+                    detail: e.to_string(),
+                })
+        }
         Some(_) => Err(SessionEntityDecodeError::BadFieldShape {
             field: key,
             detail: "expected 33-byte CBOR bstr".into(),
@@ -510,10 +512,7 @@ mod tests {
 
     #[test]
     fn r6_session_bidirectional_round_trips() {
-        let original = fixture_minted_only().with_held(
-            fixture_cap_ref(0xc3),
-            1_700_000_010_000,
-        );
+        let original = fixture_minted_only().with_held(fixture_cap_ref(0xc3), 1_700_000_010_000);
         assert!(original.held_capability.is_some());
         assert!(original.minted_capability.is_some());
         let entity = original.to_entity();
@@ -679,7 +678,10 @@ mod tests {
         let err = PeerSession::from_entity(&entity).unwrap_err();
         assert!(matches!(
             err,
-            SessionEntityDecodeError::BadFieldShape { field: "minted_capability", .. }
+            SessionEntityDecodeError::BadFieldShape {
+                field: "minted_capability",
+                ..
+            }
         ));
     }
 }

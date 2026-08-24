@@ -33,9 +33,7 @@ use crate::data::{
     MODE_RECOGNIZE_ON_ATTESTATION,
 };
 use crate::helpers::is_excluded;
-use crate::paths::{
-    path_role_definition, peer_segment_from_hash, PATH_INITIAL_GRANT_POLICY,
-};
+use crate::paths::{path_role_definition, peer_segment_from_hash, PATH_INITIAL_GRANT_POLICY};
 
 /// Spec-pinned identity-cert kind/function strings (EXTENSION-IDENTITY
 /// §3.3 / §4.2). Hardcoded here so the role crate doesn't take a dep on
@@ -51,9 +49,13 @@ pub const DEFAULT_MAX_CHAIN_DEPTH: usize = 32;
 /// Read `properties.function` from an attestation. Local helper so this
 /// module doesn't depend on `entity-identity`.
 fn read_function(att: &AttestationData) -> Option<&str> {
-    att.properties
-        .iter()
-        .find_map(|(k, v)| if k.as_text() == Some("function") { v.as_text() } else { None })
+    att.properties.iter().find_map(|(k, v)| {
+        if k.as_text() == Some("function") {
+            v.as_text()
+        } else {
+            None
+        }
+    })
 }
 
 /// Read `peer-config.trusts_quorum` from the local tree. Returns `None`
@@ -185,13 +187,7 @@ fn walk_to_trusted_controller(
             return true;
         }
         // Sub-controller: recurse via parent controller's peer hash.
-        if walk_to_trusted_controller(
-            ctx,
-            &ctrl.attesting,
-            trusted_quorum,
-            depth - 1,
-            as_of,
-        ) {
+        if walk_to_trusted_controller(ctx, &ctrl.attesting, trusted_quorum, depth - 1, as_of) {
             return true;
         }
     }
@@ -217,9 +213,7 @@ pub struct PolicyResolverDeps {
 pub fn build_policy_resolver(
     deps: PolicyResolverDeps,
 ) -> Arc<dyn Fn(&entity_crypto::PeerId, &Hash) -> Option<Vec<GrantEntry>> + Send + Sync> {
-    Arc::new(move |_peer_id, identity_hash| {
-        resolve_grants(&deps, identity_hash)
-    })
+    Arc::new(move |_peer_id, identity_hash| resolve_grants(&deps, identity_hash))
 }
 
 /// Pure dispatch entry point — separated for unit testing without

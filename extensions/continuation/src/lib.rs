@@ -68,12 +68,23 @@ const CODE_CAPABILITY_DENIED: &str = "capability_denied";
 /// accumulating markers under different keys. Pre-v1.14 Rust used
 /// `cascade_depth` (not stable across the impl's internal book-keeping);
 /// v1.14 absorption moves the field back to request_id.
+///
+/// The W6 attribution fields (PROPOSAL-CONTINUATION-LOST-ERROR-MARKER-MUST
+/// option (ii) security bound) carry the authority split onto the bind's
+/// `ExecutionContext`: `handler_grant` is the cap that AUTHORIZED the write
+/// (the marker rides component authority), `caller_capability` is the
+/// advancing EXECUTE's cap, NOTED for the audit trail. Recorded by any
+/// emit-pathway consumer that persists write attribution (history's W6
+/// rule); `None`s degrade to the pre-W6 unattributed bind.
 #[derive(Debug, Clone)]
 struct ChainErr {
     chain_id: String,
     #[allow(dead_code)]
     request_id: String,
     step_index: String,
+    author: Option<Hash>,
+    caller_capability: Option<Hash>,
+    handler_grant: Option<Hash>,
 }
 
 /// The continuation handler: system/continuation with advance, resume, abandon.
@@ -282,6 +293,9 @@ impl ContinuationHandler {
                 .unwrap_or_else(|| ctx.request_id.clone()),
             request_id: ctx.request_id.clone(),
             step_index: ctx.request_id.clone(),
+            author: ctx.author,
+            caller_capability: ctx.capability_hash,
+            handler_grant: ctx.handler_grant_hash,
         };
 
         let result = self
@@ -376,9 +390,9 @@ impl ContinuationHandler {
     }
 
     /// EXTENSION-CONTINUATION §3.4: bind an informational lost-error
-    /// marker. Two `reason` values:
-    /// - `"on_error_dispatch_failed"` (A.1, v1.10): an `on_error` dispatch
-    ///   itself failed.
+    /// marker (e.g. reason `"on_error_dispatch_failed"`, A.1 v1.10 — an
+    /// `on_error` dispatch itself failed).
+    ///
     /// Bind a `lost`-variant chain-error marker per EXTENSION-CONTINUATION
     /// v1.20 §3.10. Sender / originator side; chain dispatch was attempted
     /// but its outcome was not delivered back to the chain step.
@@ -449,7 +463,10 @@ impl ContinuationHandler {
                 entity_ecf::text("step_index"),
                 entity_ecf::text(&ce.step_index),
             ),
-            (entity_ecf::text("target_peer_id"), entity_ecf::text(&target_peer_id)),
+            (
+                entity_ecf::text("target_peer_id"),
+                entity_ecf::text(&target_peer_id),
+            ),
             (entity_ecf::text("target_uri"), entity_ecf::text(failed_uri)),
             (
                 entity_ecf::text("timestamp"),
@@ -489,7 +506,28 @@ impl ContinuationHandler {
         );
         match self.content_store.put(entity) {
             Ok(h) => {
-                self.location_index.set(&marker_path, h);
+                // W6 attribution (marker-proposal option (ii) security
+                // bound): the bind is authorized by the HANDLER's own
+                // grant (component authority — it cannot 403 under any
+                // chain cap), while the advancing EXECUTE's cap rides
+                // along as `caller_capability`, noted-not-authorizing.
+                // `set_with_context` carries the split on the emit
+                // pathway so attribution-persisting consumers (history's
+                // W6 rule) record it; the binding itself is byte-
+                // identical to a plain `set`.
+                let bind_ctx = entity_store::ExecutionContext {
+                    chain_id: Some(ce.chain_id.clone()),
+                    author: ce.author,
+                    caller_capability: ce.caller_capability,
+                    request_id: Some(ce.request_id.clone()),
+                    capability: ce.handler_grant,
+                    handler_grant: ce.handler_grant,
+                    handler_pattern: Some("system/continuation".to_string()),
+                    operation: Some("advance".to_string()),
+                    ..Default::default()
+                };
+                self.location_index
+                    .set_with_context(&marker_path, h, bind_ctx);
             }
             Err(e) => {
                 tracing::warn!(
@@ -501,6 +539,7 @@ impl ContinuationHandler {
         }
     }
 
+    #[allow(clippy::too_many_arguments)] // advance plumbing: every arg is a distinct §3.6 input
     async fn advance_forward(
         &self,
         execute_fn: &ExecuteFn,
@@ -527,8 +566,7 @@ impl ContinuationHandler {
             if let Some(on_error) = &cont.on_error {
                 let params_entity = Entity::new("primitive/any", result_bytes.to_vec())
                     .map_err(|e| HandlerError::Internal(e.to_string()))?;
-                let dispatch_cap =
-                    self.resolve_dispatch_capability(&cont.dispatch_capability);
+                let dispatch_cap = self.resolve_dispatch_capability(&cont.dispatch_capability);
                 let sink_resource = entity_capability::ResourceTarget {
                     targets: vec![on_error.uri.clone()],
                     exclude: Vec::new(),
@@ -622,8 +660,7 @@ impl ContinuationHandler {
             None => (None, None, None),
         };
         let dispatch_target = resolve_or_default(&post_value, &target_x, &cont.target);
-        let dispatch_operation =
-            resolve_or_default(&post_value, &operation_x, &cont.operation);
+        let dispatch_operation = resolve_or_default(&post_value, &operation_x, &cont.operation);
         let dispatch_resource =
             resolve_or_default_resource(&post_value, &resource_x, &cont.resource);
 
@@ -963,10 +1000,7 @@ impl ContinuationHandler {
             }
         } else {
             // Not all slots: update join with accumulated received
-            let updated = JoinData {
-                received,
-                ..join
-            };
+            let updated = JoinData { received, ..join };
             self.store_join(parent_path, &updated)?;
 
             // Return partial result
@@ -984,7 +1018,7 @@ impl ContinuationHandler {
             Ok(HandlerResult {
                 status: STATUS_OK,
                 result,
-            included: std::collections::HashMap::new(),
+                included: std::collections::HashMap::new(),
             })
         }
     }
@@ -1323,12 +1357,14 @@ impl ContinuationHandler {
             .ok_or_else(|| HandlerError::Internal("execute_fn not available".into()))?;
 
         // Read suspended entity at path
-        let hash = self.location_index.get(&path).ok_or_else(|| {
-            HandlerError::Internal("not found".into())
-        })?;
-        let entity = self.content_store.get(&hash).ok_or_else(|| {
-            HandlerError::Internal("entity not in store".into())
-        })?;
+        let hash = self
+            .location_index
+            .get(&path)
+            .ok_or_else(|| HandlerError::Internal("not found".into()))?;
+        let entity = self
+            .content_store
+            .get(&hash)
+            .ok_or_else(|| HandlerError::Internal("entity not in store".into()))?;
 
         if entity.entity_type != "system/continuation/suspended" {
             return Ok(error_result(
@@ -1392,7 +1428,11 @@ impl ContinuationHandler {
         let hash = match self.location_index.get(&path) {
             Some(h) => h,
             None => {
-                return Ok(error_result(STATUS_NOT_FOUND, "not_found", "nothing at path"));
+                return Ok(error_result(
+                    STATUS_NOT_FOUND,
+                    "not_found",
+                    "nothing at path",
+                ));
             }
         };
         let entity = match self.content_store.get(&hash) {
@@ -1427,7 +1467,7 @@ impl ContinuationHandler {
         Ok(HandlerResult {
             status: STATUS_OK,
             result,
-        included: std::collections::HashMap::new(),
+            included: std::collections::HashMap::new(),
         })
     }
 }
@@ -1814,12 +1854,18 @@ fn decode_resource_target(v: &ciborium::Value) -> Option<entity_capability::Reso
         match k.as_text() {
             Some("targets") => {
                 if let Some(arr) = v.as_array() {
-                    targets = arr.iter().filter_map(|e| e.as_text().map(|s| s.to_string())).collect();
+                    targets = arr
+                        .iter()
+                        .filter_map(|e| e.as_text().map(|s| s.to_string()))
+                        .collect();
                 }
             }
             Some("exclude") => {
                 if let Some(arr) = v.as_array() {
-                    exclude = arr.iter().filter_map(|e| e.as_text().map(|s| s.to_string())).collect();
+                    exclude = arr
+                        .iter()
+                        .filter_map(|e| e.as_text().map(|s| s.to_string()))
+                        .collect();
                 }
             }
             _ => {}
@@ -1861,13 +1907,9 @@ fn decode_transform(v: &ciborium::Value) -> Option<TransformData> {
                     transform_ops = arr.iter().filter_map(decode_transform_op).collect();
                 }
             }
-            Some("resource_extract") => {
-                resource_extract = v.as_text().map(|s| s.to_string())
-            }
+            Some("resource_extract") => resource_extract = v.as_text().map(|s| s.to_string()),
             Some("target_extract") => target_extract = v.as_text().map(|s| s.to_string()),
-            Some("operation_extract") => {
-                operation_extract = v.as_text().map(|s| s.to_string())
-            }
+            Some("operation_extract") => operation_extract = v.as_text().map(|s| s.to_string()),
             _ => {}
         }
     }
@@ -1964,7 +2006,10 @@ fn decode_deliver_to(v: &ciborium::Value) -> Option<DeliverySpec> {
 
 fn encode_continuation(cont: &ContinuationData) -> Vec<u8> {
     let mut fields = vec![
-        (entity_ecf::text("operation"), entity_ecf::text(&cont.operation)),
+        (
+            entity_ecf::text("operation"),
+            entity_ecf::text(&cont.operation),
+        ),
         (entity_ecf::text("target"), entity_ecf::text(&cont.target)),
     ];
 
@@ -1972,7 +2017,10 @@ fn encode_continuation(cont: &ContinuationData) -> Vec<u8> {
         fields.push((
             entity_ecf::text("deliver_to"),
             entity_ecf::Value::Map(vec![
-                (entity_ecf::text("operation"), entity_ecf::text(&dt.operation)),
+                (
+                    entity_ecf::text("operation"),
+                    entity_ecf::text(&dt.operation),
+                ),
                 (entity_ecf::text("uri"), entity_ecf::text(&dt.uri)),
             ]),
         ));
@@ -1989,7 +2037,10 @@ fn encode_continuation(cont: &ContinuationData) -> Vec<u8> {
         fields.push((
             entity_ecf::text("on_error"),
             entity_ecf::Value::Map(vec![
-                (entity_ecf::text("operation"), entity_ecf::text(&oe.operation)),
+                (
+                    entity_ecf::text("operation"),
+                    entity_ecf::text(&oe.operation),
+                ),
                 (entity_ecf::text("uri"), entity_ecf::text(&oe.uri)),
             ]),
         ));
@@ -2037,7 +2088,10 @@ fn encode_join(join: &JoinData) -> Vec<u8> {
         fields.push((
             entity_ecf::text("deliver_to"),
             entity_ecf::Value::Map(vec![
-                (entity_ecf::text("operation"), entity_ecf::text(&dt.operation)),
+                (
+                    entity_ecf::text("operation"),
+                    entity_ecf::text(&dt.operation),
+                ),
                 (entity_ecf::text("uri"), entity_ecf::text(&dt.uri)),
             ]),
         ));
@@ -2048,8 +2102,7 @@ fn encode_join(join: &JoinData) -> Vec<u8> {
             entity_ecf::Value::Bytes(cap.to_bytes().to_vec()),
         ));
     }
-    let expected_arr: Vec<entity_ecf::Value> =
-        join.expected.iter().map(entity_ecf::text).collect();
+    let expected_arr: Vec<entity_ecf::Value> = join.expected.iter().map(entity_ecf::text).collect();
     fields.push((
         entity_ecf::text("expected"),
         entity_ecf::Value::Array(expected_arr),
@@ -2059,12 +2112,18 @@ fn encode_join(join: &JoinData) -> Vec<u8> {
         fields.push((
             entity_ecf::text("on_error"),
             entity_ecf::Value::Map(vec![
-                (entity_ecf::text("operation"), entity_ecf::text(&oe.operation)),
+                (
+                    entity_ecf::text("operation"),
+                    entity_ecf::text(&oe.operation),
+                ),
                 (entity_ecf::text("uri"), entity_ecf::text(&oe.uri)),
             ]),
         ));
     }
-    fields.push((entity_ecf::text("operation"), entity_ecf::text(&join.operation)));
+    fields.push((
+        entity_ecf::text("operation"),
+        entity_ecf::text(&join.operation),
+    ));
     if let Some(ref p) = join.params {
         // `params` is `primitive/any` — splice inline per ENTITY-CBOR-ENCODING
         // §7.6.1. See note in encode_continuation.
@@ -2084,7 +2143,10 @@ fn encode_join(join: &JoinData) -> Vec<u8> {
             (entity_ecf::text(k), val)
         })
         .collect();
-    fields.push((entity_ecf::text("received"), entity_ecf::Value::Map(received_pairs)));
+    fields.push((
+        entity_ecf::text("received"),
+        entity_ecf::Value::Map(received_pairs),
+    ));
     if let Some(n) = join.remaining_executions {
         fields.push((
             entity_ecf::text("remaining_executions"),
@@ -2109,7 +2171,10 @@ fn encode_resource_target(rt: &entity_capability::ResourceTarget) -> entity_ecf:
         fields.push((entity_ecf::text("exclude"), entity_ecf::Value::Array(arr)));
     }
     let targets: Vec<entity_ecf::Value> = rt.targets.iter().map(entity_ecf::text).collect();
-    fields.push((entity_ecf::text("targets"), entity_ecf::Value::Array(targets)));
+    fields.push((
+        entity_ecf::text("targets"),
+        entity_ecf::Value::Array(targets),
+    ));
     entity_ecf::Value::Map(fields)
 }
 
@@ -2136,8 +2201,7 @@ fn encode_transform(t: &TransformData) -> entity_ecf::Value {
     }
     // G1 §2.2: ordered list — Array preserves op order through to_ecf.
     if !t.transform_ops.is_empty() {
-        let ops: Vec<entity_ecf::Value> =
-            t.transform_ops.iter().map(encode_transform_op).collect();
+        let ops: Vec<entity_ecf::Value> = t.transform_ops.iter().map(encode_transform_op).collect();
         fields.push((
             entity_ecf::text("transform_ops"),
             entity_ecf::Value::Array(ops),
@@ -2257,7 +2321,6 @@ fn apply_transform(
 // `read_result_code` (returns Option<String>) which the new v1.19 §3.10.5
 // `{reason}` = `result.data.code` single-rule flow uses directly.
 
-
 /// Best-effort dotted-path navigation: `None` if any segment is missing or
 /// the value is not a map at that point. Unlike [`navigate_path`], never
 /// errors — the §2.2 "transforms do not produce errors" contract.
@@ -2345,11 +2408,7 @@ fn apply_transform_op(
                     .iter()
                     .map(|f| get_str(&pairs, f).unwrap_or_default())
                     .collect();
-                set_field(
-                    &mut pairs,
-                    into,
-                    ciborium::Value::Text(parts.join(sep)),
-                );
+                set_field(&mut pairs, into, ciborium::Value::Text(parts.join(sep)));
             }
         }
         "replace_literal" => {
@@ -2364,9 +2423,7 @@ fn apply_transform_op(
             }
         }
         "split" => {
-            if let (Some(field), Some(sep), Some(into)) =
-                (&op.field, &op.sep, &op.into)
-            {
+            if let (Some(field), Some(sep), Some(into)) = (&op.field, &op.sep, &op.into) {
                 if let Some(s) = get_str(&pairs, field) {
                     let parts: Vec<ciborium::Value> = s
                         .split(sep.as_str())
@@ -2377,9 +2434,7 @@ fn apply_transform_op(
             }
         }
         "slice" => {
-            if let (Some(field), Some(range), Some(into)) =
-                (&op.field, &op.range, &op.into)
-            {
+            if let (Some(field), Some(range), Some(into)) = (&op.field, &op.range, &op.into) {
                 if let Some(s) = get_str(&pairs, field) {
                     let sliced = slice_by_range(&s, range);
                     set_field(&mut pairs, into, ciborium::Value::Text(sliced));
@@ -2429,7 +2484,9 @@ fn apply_transform_op(
                     // Plural: skip missing/non-map individually; still write
                     // the (possibly empty) concatenation.
                     for src in fs {
-                        let Some(v) = navigate_opt(&cur, src) else { continue };
+                        let Some(v) = navigate_opt(&cur, src) else {
+                            continue;
+                        };
                         let Some(m) = v.as_map() else { continue };
                         for (k, _) in m {
                             if let Some(s) = k.as_text() {
@@ -2461,30 +2518,28 @@ fn apply_transform_op(
         // assemble_params can splice it directly.
         "deref_included" => {
             if let Some(field) = &op.field {
-                if let Some(field_val) = pairs
+                if let Some(ciborium::Value::Bytes(bytes)) = pairs
                     .iter()
                     .find(|(k, _)| k.as_text() == Some(field.as_str()))
                     .map(|(_, v)| v.clone())
                 {
-                    if let ciborium::Value::Bytes(bytes) = field_val {
-                        if let Ok(h) = Hash::from_bytes(&bytes) {
-                            if let Some(entity) = included.get(&h) {
-                                let data_val: ciborium::Value =
-                                    ciborium::from_reader(entity.data.as_slice())
-                                        .unwrap_or(ciborium::Value::Bytes(entity.data.clone()));
-                                let inline = ciborium::Value::Map(vec![
-                                    (
-                                        ciborium::Value::Text("content_hash".to_string()),
-                                        ciborium::Value::Bytes(h.to_bytes().to_vec()),
-                                    ),
-                                    (ciborium::Value::Text("data".to_string()), data_val),
-                                    (
-                                        ciborium::Value::Text("type".to_string()),
-                                        ciborium::Value::Text(entity.entity_type.clone()),
-                                    ),
-                                ]);
-                                set_field(&mut pairs, field, inline);
-                            }
+                    if let Ok(h) = Hash::from_bytes(&bytes) {
+                        if let Some(entity) = included.get(&h) {
+                            let data_val: ciborium::Value =
+                                ciborium::from_reader(entity.data.as_slice())
+                                    .unwrap_or(ciborium::Value::Bytes(entity.data.clone()));
+                            let inline = ciborium::Value::Map(vec![
+                                (
+                                    ciborium::Value::Text("content_hash".to_string()),
+                                    ciborium::Value::Bytes(h.to_bytes().to_vec()),
+                                ),
+                                (ciborium::Value::Text("data".to_string()), data_val),
+                                (
+                                    ciborium::Value::Text("type".to_string()),
+                                    ciborium::Value::Text(entity.entity_type.clone()),
+                                ),
+                            ]);
+                            set_field(&mut pairs, field, inline);
                         }
                     }
                 }
@@ -2545,9 +2600,7 @@ enum TransformOpsError {
 
 /// Validate `transform_ops` at install (EXTENSION-CONTINUATION §8.1, G1 +
 /// v1.15 collect_keys mutual exclusivity). Returns the first failure.
-fn validate_transform_ops(
-    transform: &Option<TransformData>,
-) -> Result<(), TransformOpsError> {
+fn validate_transform_ops(transform: &Option<TransformData>) -> Result<(), TransformOpsError> {
     if let Some(t) = transform {
         for op in &t.transform_ops {
             if !KNOWN_TRANSFORM_OPS.contains(&op.op.as_str()) {
@@ -2555,13 +2608,9 @@ fn validate_transform_ops(
             }
             // v1.15 §2.2: collect_keys MUST NOT carry both `field` and
             // `fields`. The op IS recognized; the args are invalid.
-            if op.op == "collect_keys"
-                && op.field.is_some()
-                && op.fields.is_some()
-            {
+            if op.op == "collect_keys" && op.field.is_some() && op.fields.is_some() {
                 return Err(TransformOpsError::InvalidArgs(
-                    "collect_keys: field and fields are mutually exclusive"
-                        .to_string(),
+                    "collect_keys: field and fields are mutually exclusive".to_string(),
                 ));
             }
         }
@@ -2712,19 +2761,19 @@ fn assemble_params(
 
         // Params + result_field: inject
         (Some(params_bytes), Some(field)) => {
-            let mut params_val: ciborium::Value =
-                ciborium::from_reader(params_bytes.as_slice())
-                    .map_err(|e| HandlerError::InvalidParams(format!("decode params: {}", e)))?;
-            let result_val: ciborium::Value =
-                ciborium::from_reader(result_bytes)
-                    .map_err(|e| HandlerError::InvalidParams(format!("decode result: {}", e)))?;
+            let mut params_val: ciborium::Value = ciborium::from_reader(params_bytes.as_slice())
+                .map_err(|e| HandlerError::InvalidParams(format!("decode params: {}", e)))?;
+            let result_val: ciborium::Value = ciborium::from_reader(result_bytes)
+                .map_err(|e| HandlerError::InvalidParams(format!("decode result: {}", e)))?;
 
             if let ciborium::Value::Map(ref mut map) = params_val {
                 // Remove existing field if present, then add
                 map.retain(|(k, _)| k.as_text() != Some(field));
                 map.push((ciborium::Value::Text(field.clone()), result_val));
             } else {
-                return Err(HandlerError::InvalidParams("params not a map for injection".into()));
+                return Err(HandlerError::InvalidParams(
+                    "params not a map for injection".into(),
+                ));
             }
 
             let mut buf = Vec::new();
@@ -2750,12 +2799,10 @@ fn merge_resolution(
 ) -> Result<Vec<u8>, HandlerError> {
     match (params, resolution) {
         (Some(p), Some(r)) => {
-            let mut params_val: ciborium::Value =
-                ciborium::from_reader(p.as_slice())
-                    .map_err(|e| HandlerError::InvalidParams(format!("decode params: {}", e)))?;
-            let res_val: ciborium::Value =
-                ciborium::from_reader(r.as_slice())
-                    .map_err(|e| HandlerError::InvalidParams(format!("decode resolution: {}", e)))?;
+            let mut params_val: ciborium::Value = ciborium::from_reader(p.as_slice())
+                .map_err(|e| HandlerError::InvalidParams(format!("decode params: {}", e)))?;
+            let res_val: ciborium::Value = ciborium::from_reader(r.as_slice())
+                .map_err(|e| HandlerError::InvalidParams(format!("decode resolution: {}", e)))?;
 
             if let (ciborium::Value::Map(ref mut pm), ciborium::Value::Map(rm)) =
                 (&mut params_val, res_val)
@@ -2791,7 +2838,7 @@ fn advancement_result(advanced: bool) -> HandlerResult {
     HandlerResult {
         status: STATUS_OK,
         result,
-    included: std::collections::HashMap::new(),
+        included: std::collections::HashMap::new(),
     }
 }
 
@@ -2810,7 +2857,11 @@ fn error_result(status: u32, code: &str, message: &str) -> HandlerResult {
     // probes) defaulting to a generic `bad_request` and surfacing as a
     // false-negative finding (R-1, Go cross-impl validation).
     let result = Entity::new(entity_types::TYPE_ERROR, data).unwrap();
-    HandlerResult { status, result, included: std::collections::HashMap::new() }
+    HandlerResult {
+        status,
+        result,
+        included: std::collections::HashMap::new(),
+    }
 }
 
 #[cfg(test)]
@@ -2819,7 +2870,9 @@ mod tests {
     use entity_store::{MemoryContentStore, MemoryLocationIndex};
 
     fn test_peer_id() -> String {
-        entity_crypto::Keypair::from_seed([42u8; 32]).peer_id().to_string()
+        entity_crypto::Keypair::from_seed([42u8; 32])
+            .peer_id()
+            .to_string()
     }
 
     fn make_handler() -> ContinuationHandler {
@@ -2844,9 +2897,10 @@ mod tests {
     }
 
     fn make_execute() -> Entity {
-        let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-            (entity_ecf::text("request_id"), entity_ecf::text("r1")),
-        ]));
+        let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+            entity_ecf::text("request_id"),
+            entity_ecf::text("r1"),
+        )]));
         Entity::new(entity_types::TYPE_EXECUTE, data).unwrap()
     }
 
@@ -2948,7 +3002,10 @@ mod tests {
 
         let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
-        let abandoned = map.iter().find(|(k, _)| k.as_text() == Some("abandoned")).unwrap();
+        let abandoned = map
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("abandoned"))
+            .unwrap();
         assert_eq!(abandoned.1.as_bool(), Some(true));
 
         // Entity should be removed
@@ -2964,9 +3021,10 @@ mod tests {
 
     #[test]
     fn test_assemble_trigger() {
-        let params = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-            (entity_ecf::text("key"), entity_ecf::text("val")),
-        ]));
+        let params = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+            entity_ecf::text("key"),
+            entity_ecf::text("val"),
+        )]));
         let result = vec![1, 2, 3];
         let assembled = assemble_params(&Some(params.clone()), &None, &result).unwrap();
         assert_eq!(assembled, params);
@@ -2974,15 +3032,17 @@ mod tests {
 
     #[test]
     fn test_assemble_inject() {
-        let params = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-            (entity_ecf::text("x"), entity_ecf::text("y")),
-        ]));
+        let params = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+            entity_ecf::text("x"),
+            entity_ecf::text("y"),
+        )]));
         let result_bytes = {
             let mut buf = Vec::new();
             ciborium::into_writer(&ciborium::Value::Text("injected".into()), &mut buf).unwrap();
             buf
         };
-        let assembled = assemble_params(&Some(params), &Some("data".into()), &result_bytes).unwrap();
+        let assembled =
+            assemble_params(&Some(params), &Some("data".into()), &result_bytes).unwrap();
         let val: ciborium::Value = ciborium::from_reader(assembled.as_slice()).unwrap();
         let map = val.as_map().unwrap();
         assert_eq!(map.len(), 2); // x + data
@@ -3073,7 +3133,11 @@ mod tests {
         let out = decode(&apply_transform(&input, &Some(t), &HashMap::new()).unwrap());
         let m = out.as_map().unwrap();
         assert_eq!(
-            m.iter().find(|(k, _)| k.as_text() == Some("x")).unwrap().1.as_text(),
+            m.iter()
+                .find(|(k, _)| k.as_text() == Some("x"))
+                .unwrap()
+                .1
+                .as_text(),
             Some("v")
         );
     }
@@ -3099,7 +3163,10 @@ mod tests {
         let bad = vec![0xff, 0xff, 0xff];
         let mut t2 = td();
         t2.extract = Some("a".into());
-        assert_eq!(apply_transform(&bad, &Some(t2), &HashMap::new()).unwrap(), bad);
+        assert_eq!(
+            apply_transform(&bad, &Some(t2), &HashMap::new()).unwrap(),
+            bad
+        );
     }
 
     #[test]
@@ -3122,29 +3189,65 @@ mod tests {
         };
 
         // strip_prefix
-        let o = TransformOp { field: Some("p".into()), prefix: Some("/peer/system/tree".into()), ..op("strip_prefix") };
+        let o = TransformOp {
+            field: Some("p".into()),
+            prefix: Some("/peer/system/tree".into()),
+            ..op("strip_prefix")
+        };
         assert_eq!(get(&run(o), "p").unwrap().as_text(), Some("/notes/x"));
         // prepend / append
-        let o = TransformOp { field: Some("a".into()), literal: Some("X-".into()), ..op("prepend") };
+        let o = TransformOp {
+            field: Some("a".into()),
+            literal: Some("X-".into()),
+            ..op("prepend")
+        };
         assert_eq!(get(&run(o), "a").unwrap().as_text(), Some("X-foo"));
-        let o = TransformOp { field: Some("a".into()), literal: Some("-Y".into()), ..op("append") };
+        let o = TransformOp {
+            field: Some("a".into()),
+            literal: Some("-Y".into()),
+            ..op("append")
+        };
         assert_eq!(get(&run(o), "a").unwrap().as_text(), Some("foo-Y"));
         // join
-        let o = TransformOp { fields: Some(vec!["a".into(), "b".into()]), sep: Some("/".into()), into: Some("c".into()), ..op("join") };
+        let o = TransformOp {
+            fields: Some(vec!["a".into(), "b".into()]),
+            sep: Some("/".into()),
+            into: Some("c".into()),
+            ..op("join")
+        };
         assert_eq!(get(&run(o), "c").unwrap().as_text(), Some("foo/bar"));
         // replace_literal
-        let o = TransformOp { field: Some("a".into()), from: Some("o".into()), to: Some("0".into()), ..op("replace_literal") };
+        let o = TransformOp {
+            field: Some("a".into()),
+            from: Some("o".into()),
+            to: Some("0".into()),
+            ..op("replace_literal")
+        };
         assert_eq!(get(&run(o), "a").unwrap().as_text(), Some("f00"));
         // split
-        let o = TransformOp { field: Some("p".into()), sep: Some("/".into()), into: Some("parts".into()), ..op("split") };
+        let o = TransformOp {
+            field: Some("p".into()),
+            sep: Some("/".into()),
+            into: Some("parts".into()),
+            ..op("split")
+        };
         let parts = get(&run(o), "parts").unwrap();
         assert_eq!(parts.as_array().unwrap().len(), 6); // leading "" + 5 segs
-        // slice (chars 1..5 of "foo" → clamp)
-        let o = TransformOp { field: Some("a".into()), range: Some("1:2".into()), into: Some("s".into()), ..op("slice") };
+                                                        // slice (chars 1..5 of "foo" → clamp)
+        let o = TransformOp {
+            field: Some("a".into()),
+            range: Some("1:2".into()),
+            into: Some("s".into()),
+            ..op("slice")
+        };
         assert_eq!(get(&run(o), "s").unwrap().as_text(), Some("o"));
 
         // Totality: missing field ⇒ no-op (value unchanged, no panic).
-        let o = TransformOp { field: Some("absent".into()), prefix: Some("z".into()), ..op("strip_prefix") };
+        let o = TransformOp {
+            field: Some("absent".into()),
+            prefix: Some("z".into()),
+            ..op("strip_prefix")
+        };
         assert_eq!(get(&run(o), "a").unwrap().as_text(), Some("foo"));
         // Totality: non-map value ⇒ returned unchanged.
         let nm = apply_transform_op(txt("scalar"), &op("prepend"), &HashMap::new());
@@ -3167,7 +3270,13 @@ mod tests {
         }];
         let out = decode(&apply_transform(&input, &Some(t), &HashMap::new()).unwrap());
         assert_eq!(
-            out.as_map().unwrap().iter().find(|(k, _)| k.as_text() == Some("path")).unwrap().1.as_text(),
+            out.as_map()
+                .unwrap()
+                .iter()
+                .find(|(k, _)| k.as_text() == Some("path"))
+                .unwrap()
+                .1
+                .as_text(),
             Some("/c")
         );
     }
@@ -3213,7 +3322,10 @@ mod tests {
             .find(|(k, _)| k.as_text() == Some("content_hash"))
             .map(|(_, v)| v.clone())
             .unwrap();
-        assert_eq!(inline_hash.as_bytes().unwrap().as_slice(), h.to_bytes().as_slice());
+        assert_eq!(
+            inline_hash.as_bytes().unwrap().as_slice(),
+            h.to_bytes().as_slice()
+        );
     }
 
     #[test]
@@ -3251,7 +3363,11 @@ mod tests {
         for (input, op) in cases {
             let original = input.clone();
             let out = apply_transform_op(input, &op, &inc);
-            assert_eq!(out, original, "deref_included must be a no-op for {:?}", op.field);
+            assert_eq!(
+                out, original,
+                "deref_included must be a no-op for {:?}",
+                op.field
+            );
         }
 
         // 4. valid hash, but absent from included → no-op (value unchanged).
@@ -3283,8 +3399,7 @@ mod tests {
         let author = Hash::compute("test", b"deref-miss-author");
         let cap = make_cap_entity_for_install(author, author, None);
         let cap_hash = cap.content_hash;
-        let install_included: HashMap<Hash, Entity> =
-            [(cap_hash, cap.clone())].into();
+        let install_included: HashMap<Hash, Entity> = [(cap_hash, cap.clone())].into();
 
         // Build install params with a result_transform that derefs `ref`.
         let path = format!(
@@ -3361,8 +3476,7 @@ mod tests {
         let author = Hash::compute("test", b"deref-miss-field-author");
         let cap = make_cap_entity_for_install(author, author, None);
         let cap_hash = cap.content_hash;
-        let install_included: HashMap<Hash, Entity> =
-            [(cap_hash, cap.clone())].into();
+        let install_included: HashMap<Hash, Entity> = [(cap_hash, cap.clone())].into();
 
         let path = format!(
             "/{}/system/continuation/suspended/deref-miss-field",
@@ -3406,10 +3520,8 @@ mod tests {
         });
 
         // Result is a map but doesn't have `ref` at all.
-        let result_inner = entity_ecf::Value::Map(vec![(
-            entity_ecf::text("other"),
-            entity_ecf::text("data"),
-        )]);
+        let result_inner =
+            entity_ecf::Value::Map(vec![(entity_ecf::text("other"), entity_ecf::text("data"))]);
         let mut buf = Vec::new();
         ciborium::into_writer(&result_inner, &mut buf).unwrap();
         let adv_params = make_params(entity_ecf::Value::Map(vec![(
@@ -3432,8 +3544,7 @@ mod tests {
         let author = Hash::compute("test", b"deref-miss-map-author");
         let cap = make_cap_entity_for_install(author, author, None);
         let cap_hash = cap.content_hash;
-        let install_included: HashMap<Hash, Entity> =
-            [(cap_hash, cap.clone())].into();
+        let install_included: HashMap<Hash, Entity> = [(cap_hash, cap.clone())].into();
 
         let path = format!(
             "/{}/system/continuation/suspended/deref-miss-map",
@@ -3511,8 +3622,7 @@ mod tests {
         let author = Hash::compute("test", b"validator-recipe-author");
         let cap = make_cap_entity_for_install(author, author, None);
         let cap_hash = cap.content_hash;
-        let install_included: HashMap<Hash, Entity> =
-            [(cap_hash, cap.clone())].into();
+        let install_included: HashMap<Hash, Entity> = [(cap_hash, cap.clone())].into();
 
         let path = format!(
             "/{}/system/continuation/suspended/validator-recipe",
@@ -3859,7 +3969,9 @@ mod tests {
         assert_eq!(r.targets, vec!["/a".to_string(), "/b".to_string()]);
         // None path / miss ⇒ default.
         assert_eq!(
-            resolve_or_default_resource(&v, &None, &dflt).unwrap().targets,
+            resolve_or_default_resource(&v, &None, &dflt)
+                .unwrap()
+                .targets,
             vec!["/static".to_string()]
         );
         assert_eq!(
@@ -3891,8 +4003,7 @@ mod tests {
         // Install a forward continuation through the real install op so the
         // cap + chain land in the content store (matches production path).
         let path = format!("/{}/system/continuation/suspended/v110", test_peer_id());
-        let install_params =
-            make_install_params("app/target", "process", cap_hash, None, None);
+        let install_params = make_install_params("app/target", "process", cap_hash, None, None);
         let install_ctx = make_install_ctx(author, &path, install_params, included);
         assert_eq!(h.handle(&install_ctx).await.unwrap().status, STATUS_OK);
 
@@ -3954,7 +4065,10 @@ mod tests {
         assert_eq!(result.status, STATUS_OK);
         let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
-        let advanced = map.iter().find(|(k, _)| k.as_text() == Some("advanced")).unwrap();
+        let advanced = map
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("advanced"))
+            .unwrap();
         assert_eq!(advanced.1.as_bool(), Some(true));
     }
 
@@ -3963,11 +4077,7 @@ mod tests {
     // (PROPOSAL-COHERENT-CAPABILITY-AUTHORITY, EXTENSION-CONTINUATION §3.2)
     // -------------------------------------------------------------------
 
-    fn make_cap_entity_for_install(
-        granter: Hash,
-        grantee: Hash,
-        parent: Option<Hash>,
-    ) -> Entity {
+    fn make_cap_entity_for_install(granter: Hash, grantee: Hash, parent: Option<Hash>) -> Entity {
         let mut fields = vec![
             (entity_ecf::text("created_at"), entity_ecf::integer(0)),
             (
@@ -4021,7 +4131,11 @@ mod tests {
         } else {
             entity_types::TYPE_CONTINUATION
         };
-        Entity::new(entity_type, entity_ecf::to_ecf(&entity_ecf::Value::Map(fields))).unwrap()
+        Entity::new(
+            entity_type,
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(fields)),
+        )
+        .unwrap()
     }
 
     fn make_install_ctx(
@@ -4069,7 +4183,10 @@ mod tests {
         let ctx = make_install_ctx(author, &path, params, included);
 
         let result = h.handle(&ctx).await.unwrap();
-        assert_eq!(result.status, STATUS_OK, "install should succeed for self-issued cap");
+        assert_eq!(
+            result.status, STATUS_OK,
+            "install should succeed for self-issued cap"
+        );
 
         // Verify entity persisted at path with correct type.
         let stored_hash = h.location_index.get(&path).expect("path bound");
@@ -4165,7 +4282,10 @@ mod tests {
         assert_eq!(result.status, STATUS_OK);
 
         let stored_hash = h.location_index.get(&path).expect("join path bound");
-        let stored = h.content_store.get(&stored_hash).expect("join entity stored");
+        let stored = h
+            .content_store
+            .get(&stored_hash)
+            .expect("join entity stored");
         assert_eq!(stored.entity_type, entity_types::TYPE_CONTINUATION_JOIN);
     }
 
@@ -4241,11 +4361,8 @@ mod tests {
         let root = make_cap_entity_for_install(a, b, None);
         let child = make_cap_entity_for_install(b, c, Some(root.content_hash));
         let cap_hash = child.content_hash;
-        let included: HashMap<Hash, Entity> = [
-            (root.content_hash, root.clone()),
-            (cap_hash, child.clone()),
-        ]
-        .into();
+        let included: HashMap<Hash, Entity> =
+            [(root.content_hash, root.clone()), (cap_hash, child.clone())].into();
 
         let path = format!("/{}/system/continuation/suspended/c1", test_peer_id());
         let params = make_install_params("app/handler", "process", cap_hash, None, None);
@@ -4255,10 +4372,14 @@ mod tests {
         assert_eq!(result.status, STATUS_OK);
 
         // Phase: verify cap chain was persisted to content store (root + child).
-        assert!(h.content_store.get(&root.content_hash).is_some(),
-            "root cap should be persisted");
-        assert!(h.content_store.get(&cap_hash).is_some(),
-            "leaf cap should be persisted");
+        assert!(
+            h.content_store.get(&root.content_hash).is_some(),
+            "root cap should be persisted"
+        );
+        assert!(
+            h.content_store.get(&cap_hash).is_some(),
+            "leaf cap should be persisted"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -4290,10 +4411,7 @@ mod tests {
             fields.push((entity_ecf::text("result_field"), entity_ecf::text(rf)));
         }
         if result_merge {
-            fields.push((
-                entity_ecf::text("result_merge"),
-                entity_ecf::bool_val(true),
-            ));
+            fields.push((entity_ecf::text("result_merge"), entity_ecf::bool_val(true)));
         }
         Entity::new(
             entity_types::TYPE_CONTINUATION,
@@ -4328,13 +4446,15 @@ mod tests {
         let ctx = make_install_ctx(author, &path, params, included);
 
         let result = h.handle(&ctx).await.unwrap();
-        assert_eq!(result.status, STATUS_OK, "result_merge alone should install");
+        assert_eq!(
+            result.status, STATUS_OK,
+            "result_merge alone should install"
+        );
 
         // Round-trip: stored continuation should carry result_merge=true.
         let stored_hash = h.location_index.get(&path).expect("path bound");
         let stored = h.content_store.get(&stored_hash).expect("entity stored");
-        let val: ciborium::Value =
-            ciborium::from_reader(stored.data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(stored.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
         let rm = map
             .iter()
@@ -4373,8 +4493,7 @@ mod tests {
         let result = h.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_BAD_REQUEST);
 
-        let val: ciborium::Value =
-            ciborium::from_reader(result.result.data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let code = val
             .as_map()
             .unwrap()
@@ -4396,18 +4515,25 @@ mod tests {
             (entity_ecf::text("collide"), entity_ecf::text("static")),
         ]));
         let result = cbor(ciborium::Value::Map(vec![
-            (ciborium::Value::Text("collide".into()), ciborium::Value::Text("dynamic".into())),
-            (ciborium::Value::Text("added".into()), ciborium::Value::Text("from_result".into())),
+            (
+                ciborium::Value::Text("collide".into()),
+                ciborium::Value::Text("dynamic".into()),
+            ),
+            (
+                ciborium::Value::Text("added".into()),
+                ciborium::Value::Text("from_result".into()),
+            ),
         ]));
-        let (assembled, degraded) =
-            assemble_params_merge(&Some(static_params), &result).unwrap();
+        let (assembled, degraded) = assemble_params_merge(&Some(static_params), &result).unwrap();
         assert!(!degraded);
         let v = decode(&assembled);
         let map = v.as_map().unwrap();
         // 3 keys: scaffold + collide + added (collide overwritten, not duplicated).
         assert_eq!(map.len(), 3, "merged map must dedup overlapping keys");
         let get = |k: &str| -> Option<&ciborium::Value> {
-            map.iter().find(|(mk, _)| mk.as_text() == Some(k)).map(|(_, mv)| mv)
+            map.iter()
+                .find(|(mk, _)| mk.as_text() == Some(k))
+                .map(|(_, mv)| mv)
         };
         assert_eq!(get("scaffold").and_then(|x| x.as_text()), Some("S"));
         assert_eq!(get("collide").and_then(|x| x.as_text()), Some("dynamic"));
@@ -4418,12 +4544,12 @@ mod tests {
     fn test_v116_assemble_params_merge_non_map_value_degrades() {
         // v1.16 §3.4: non-map post-transform value degrades to static-only
         // params and signals the merge_value_not_map marker.
-        let static_params = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-            (entity_ecf::text("scaffold"), entity_ecf::text("S")),
-        ]));
+        let static_params = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+            entity_ecf::text("scaffold"),
+            entity_ecf::text("S"),
+        )]));
         let result = cbor(ciborium::Value::Text("not-a-map".into()));
-        let (assembled, degraded) =
-            assemble_params_merge(&Some(static_params), &result).unwrap();
+        let (assembled, degraded) = assemble_params_merge(&Some(static_params), &result).unwrap();
         assert!(degraded, "non-map value MUST flag degradation");
         let v = decode(&assembled);
         let map = v.as_map().unwrap();
@@ -4461,6 +4587,9 @@ mod tests {
             chain_id: "chain-xyz".to_string(),
             request_id: "req-1".to_string(),
             step_index: "req-1".to_string(),
+            author: None,
+            caller_capability: None,
+            handler_grant: None,
         }
     }
 
@@ -4583,7 +4712,11 @@ mod tests {
             test_peer_id(),
         );
         let entries = h.location_index.list(&prefix);
-        assert_eq!(entries.len(), 1, "non-path-safe reason routed to unspecified_error");
+        assert_eq!(
+            entries.len(),
+            1,
+            "non-path-safe reason routed to unspecified_error"
+        );
         // Body still carries the raw `code` field.
         let marker = h.content_store.get(&entries[0].hash).unwrap();
         let v: ciborium::Value = ciborium::from_reader(marker.data.as_slice()).unwrap();
@@ -4639,22 +4772,311 @@ mod tests {
         );
     }
 
+    /// PROPOSAL-CONTINUATION-LOST-ERROR-MARKER-MUST §4 vector 1 — the F2
+    /// bind-under-denial vector (Go reference shape:
+    /// `TestF2_BindUnderDenial_MarkerRidesHandlerAuthority`).
+    ///
+    /// A chain whose `dispatch_capability` covers `system/inbox/*` ONLY
+    /// (the F11 misconfiguration, reproduced) suffers an `on_error`
+    /// dispatch failure. The lost marker MUST land anyway — bound at the
+    /// observing peer's own tree under the continuation handler's OWN
+    /// authority, never the chain's propagated cap — keyed by the
+    /// original request ID (F1 ratification), with no reactive dispatch.
+    ///
+    /// Rust's mechanism: `write_lost_error_marker` is a direct
+    /// component-authority write through the handler's own store handles
+    /// — no capability check exists at the bind site, so the bind cannot
+    /// 403 under any chain cap (same class as the §3.10.7 receiver-side
+    /// `rejected` marker in Go, which the proposal cites as precedent).
+    /// The bind never crosses a peer boundary.
+    #[tokio::test]
+    async fn f2_bind_under_denial_marker_rides_handler_authority() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let h = make_handler();
+        let author = Hash::compute("test", b"f2-author");
+
+        // The chain's cap: a real scoped grant covering system/inbox/*
+        // only — the marker namespace is explicitly outside it.
+        let scope = |paths: Vec<&str>| {
+            entity_ecf::Value::Map(vec![(
+                entity_ecf::text("include"),
+                entity_ecf::Value::Array(paths.into_iter().map(entity_ecf::text).collect()),
+            )])
+        };
+        let grant = entity_ecf::Value::Map(vec![
+            (
+                entity_ecf::text("handlers"),
+                scope(vec!["system/continuation"]),
+            ),
+            (entity_ecf::text("operations"), scope(vec!["*"])),
+            (entity_ecf::text("resources"), scope(vec!["system/inbox/*"])),
+        ]);
+        let cap_fields = vec![
+            (entity_ecf::text("created_at"), entity_ecf::integer(0)),
+            (
+                entity_ecf::text("grantee"),
+                entity_ecf::Value::Bytes(author.to_bytes().to_vec()),
+            ),
+            (
+                entity_ecf::text("granter"),
+                entity_ecf::Value::Bytes(author.to_bytes().to_vec()),
+            ),
+            (
+                entity_ecf::text("grants"),
+                entity_ecf::Value::Array(vec![grant]),
+            ),
+        ];
+        let cap = Entity::new(
+            entity_types::TYPE_CAP_TOKEN,
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(cap_fields)),
+        )
+        .unwrap();
+        let cap_hash = cap.content_hash;
+        h.content_store.put(cap.clone()).unwrap();
+        let included: HashMap<Hash, Entity> = [(cap_hash, cap)].into();
+
+        // Install a chain with an on_error compensation target.
+        let path = format!("/{}/system/continuation/suspended/f2-cb", test_peer_id());
+        let install_params_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+            (
+                entity_ecf::text("dispatch_capability"),
+                entity_ecf::Value::Bytes(cap_hash.to_bytes().to_vec()),
+            ),
+            (
+                entity_ecf::text("on_error"),
+                entity_ecf::Value::Map(vec![
+                    (entity_ecf::text("operation"), entity_ecf::text("put")),
+                    (
+                        entity_ecf::text("uri"),
+                        entity_ecf::text("system/tree/error-log"),
+                    ),
+                ]),
+            ),
+            (entity_ecf::text("operation"), entity_ecf::text("put")),
+            (entity_ecf::text("target"), entity_ecf::text("system/tree")),
+        ]));
+        let install_params =
+            Entity::new(entity_types::TYPE_CONTINUATION, install_params_data).unwrap();
+        let install_ctx = make_install_ctx(author, &path, install_params, included);
+        assert_eq!(h.handle(&install_ctx).await.unwrap().status, STATUS_OK);
+
+        // on_error dispatch fails — and count dispatches for the §4
+        // non-reactivity assertion.
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let dispatches_in_mock = dispatches.clone();
+        let mock: ExecuteFn = Arc::new(move |_uri, _op, _params, _opts| {
+            dispatches_in_mock.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Err(HandlerError::Internal(
+                    "simulated on_error delivery failure".into(),
+                ))
+            })
+        });
+
+        // Advance with an error result (status 500) → on_error path.
+        let adv_params = make_params(entity_ecf::Value::Map(vec![
+            (
+                entity_ecf::text("result"),
+                entity_ecf::Value::Bytes(entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+                    entity_ecf::text("code"),
+                    entity_ecf::text("boom"),
+                )]))),
+            ),
+            (
+                entity_ecf::text("status"),
+                entity_ecf::Value::Integer(500u32.into()),
+            ),
+        ]));
+        let mut adv_ctx = make_install_ctx(author, &path, adv_params, HashMap::new());
+        adv_ctx.operation = "advance".to_string();
+        adv_ctx.request_id = "req-f2".to_string();
+        adv_ctx.execute_fn = Some(mock);
+        adv_ctx.bounds = Some(entity_handler::Bounds {
+            chain_id: Some("chain-f2".to_string()),
+            ..Default::default()
+        });
+
+        let resp = h.handle(&adv_ctx).await.unwrap();
+        assert_eq!(
+            resp.status, STATUS_OK,
+            "marker path must stay best-effort/non-blocking (200)"
+        );
+
+        // 1. The marker LANDED despite the cap not covering the
+        //    namespace, keyed by the original request ID (F1).
+        let prefix = format!(
+            "/{}/system/runtime/chain-errors/lost/chain-f2/req-f2/on_error_dispatch_failed/",
+            test_peer_id(),
+        );
+        let entries = h.location_index.list(&prefix);
+        assert_eq!(
+            entries.len(),
+            1,
+            "bind-under-denial: expected exactly 1 marker under {} — MUST-bind must be satisfiable under handler authority",
+            prefix
+        );
+        let marker = h
+            .content_store
+            .get(&entries[0].hash)
+            .expect("marker in store");
+        assert_eq!(marker.entity_type, "system/runtime/chain-error-lost");
+        let v: ciborium::Value = ciborium::from_reader(marker.data.as_slice()).unwrap();
+        let map = v.as_map().unwrap();
+        let text_field = |key: &str| -> Option<&str> {
+            map.iter()
+                .find(|(k, _)| k.as_text() == Some(key))
+                .and_then(|(_, val)| val.as_text())
+        };
+        assert_eq!(
+            text_field("chain_id"),
+            Some("chain-f2"),
+            "marker chain coordinate"
+        );
+        assert_eq!(
+            text_field("step_index"),
+            Some("req-f2"),
+            "F1 RequestID ratification: step key is the original request ID"
+        );
+
+        // 2. Non-reactivity (§4): the marker bind triggered nothing —
+        //    the only dispatch was the failed on_error delivery itself.
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            1,
+            "marker MUST NOT trigger reactive behavior"
+        );
+    }
+
+    /// W6 attribution on the marker bind (marker-proposal option (ii)
+    /// security bound — the audit-trail half Go/Py already record). The
+    /// bind's emit-pathway `ExecutionContext` MUST carry the authority
+    /// split: `capability`/`handler_grant` = the continuation handler's
+    /// own grant (what AUTHORIZED the write), `caller_capability` = the
+    /// advancing chain's cap (NOTED, never authorizing). Observed here
+    /// via a capture hook on the notifying index — the same surface
+    /// history's W6 rule persists from.
+    #[tokio::test]
+    async fn w6_marker_bind_carries_attribution_split() {
+        struct Capture {
+            seen: std::sync::Mutex<Vec<(String, entity_store::ExecutionContext)>>,
+        }
+        impl entity_store::SyncTreeHook for Capture {
+            fn on_tree_change(
+                &self,
+                event: &entity_store::TreeChangeEvent,
+                _ctx: &mut entity_store::ExecutionContext,
+            ) -> Result<(), entity_store::CascadeHalt> {
+                if let Some(c) = &event.context {
+                    self.seen
+                        .lock()
+                        .unwrap()
+                        .push((event.path.clone(), c.clone()));
+                }
+                Ok(())
+            }
+            fn name(&self) -> &str {
+                "test/w6-capture"
+            }
+            fn handler_pattern(&self) -> &str {
+                "test"
+            }
+        }
+
+        let capture = Arc::new(Capture {
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let notifying = Arc::new(entity_store::NotifyingLocationIndex::new(
+            Arc::new(MemoryLocationIndex::new()),
+            Arc::new(|_evt| {}),
+        ));
+        notifying.register_hook(capture.clone());
+        let h = ContinuationHandler::new(
+            Arc::new(MemoryContentStore::new()),
+            notifying,
+            test_peer_id(),
+        );
+
+        let handler_grant = Hash::compute("test", b"w6-handler-grant");
+        let chain_cap = Hash::compute("test", b"w6-chain-cap");
+        let author = Hash::compute("test", b"w6-author");
+        let ce = ChainErr {
+            chain_id: "chain-w6".to_string(),
+            request_id: "req-w6".to_string(),
+            step_index: "req-w6".to_string(),
+            author: Some(author),
+            caller_capability: Some(chain_cap),
+            handler_grant: Some(handler_grant),
+        };
+        h.write_lost_error_marker(
+            &ce,
+            "system/inbox/w6-target",
+            502,
+            "connection_failed",
+            7u64,
+            None,
+        );
+
+        let seen = capture.seen.lock().unwrap();
+        let (path, bind_ctx) = seen
+            .iter()
+            .find(|(p, _)| p.contains("/system/runtime/chain-errors/lost/chain-w6/req-w6/"))
+            .expect("marker bind fired the emit pathway with a context");
+        assert!(path.contains("/connection_failed/"), "reason segment");
+        assert_eq!(
+            bind_ctx.capability,
+            Some(handler_grant),
+            "W6: the AUTHORIZING cap is the handler's own grant"
+        );
+        assert_eq!(
+            bind_ctx.handler_grant,
+            Some(handler_grant),
+            "W6: handler_grant attribution present"
+        );
+        assert_eq!(
+            bind_ctx.caller_capability,
+            Some(chain_cap),
+            "W6: the chain's cap is NOTED as caller_capability"
+        );
+        assert_eq!(bind_ctx.author, Some(author));
+        assert_eq!(bind_ctx.chain_id.as_deref(), Some("chain-w6"));
+        assert_eq!(
+            bind_ctx.handler_pattern.as_deref(),
+            Some("system/continuation")
+        );
+    }
+
     // -----------------------------------------------------------------
     // helpers / category classification
     // -----------------------------------------------------------------
 
     #[test]
     fn test_classify_transport_failure() {
-        assert_eq!(classify_transport_failure("request foo timed out after 30s"), "recv_timeout");
-        assert_eq!(classify_transport_failure("reader task terminated"), "connection_broken");
-        assert_eq!(classify_transport_failure("decode failed"), "protocol_error");
+        assert_eq!(
+            classify_transport_failure("request foo timed out after 30s"),
+            "recv_timeout"
+        );
+        assert_eq!(
+            classify_transport_failure("reader task terminated"),
+            "connection_broken"
+        );
+        assert_eq!(
+            classify_transport_failure("decode failed"),
+            "protocol_error"
+        );
         // Unknown shape falls back to protocol_error per V7 §6.12.
-        assert_eq!(classify_transport_failure("something else"), "protocol_error");
+        assert_eq!(
+            classify_transport_failure("something else"),
+            "protocol_error"
+        );
     }
 
     #[test]
     fn test_sanitize_reason_segment() {
-        assert_eq!(sanitize_reason_segment("capability_denied"), "capability_denied");
+        assert_eq!(
+            sanitize_reason_segment("capability_denied"),
+            "capability_denied"
+        );
         assert_eq!(sanitize_reason_segment("not_found"), "not_found");
         assert_eq!(sanitize_reason_segment("has/slash"), "unspecified_error");
         assert_eq!(sanitize_reason_segment("has space"), "unspecified_error");

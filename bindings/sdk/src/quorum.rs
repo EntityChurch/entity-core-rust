@@ -389,7 +389,10 @@ fn quorum_body_fields(
     // ECF order: metadata, name, signer_resolution, signers, threshold.
     let mut fields: Vec<(ciborium::Value, ciborium::Value)> = Vec::new();
     if let Some(m) = metadata {
-        fields.push((entity_ecf::text("metadata"), ciborium::Value::Map(m.clone())));
+        fields.push((
+            entity_ecf::text("metadata"),
+            ciborium::Value::Map(m.clone()),
+        ));
     }
     if let Some(n) = name {
         fields.push((entity_ecf::text("name"), entity_ecf::text(n)));
@@ -468,10 +471,7 @@ fn build_publish_request(
         ));
     }
     if let Some(props) = properties {
-        fields.push((
-            entity_ecf::text("properties"),
-            ciborium::Value::Map(props),
-        ));
+        fields.push((entity_ecf::text("properties"), ciborium::Value::Map(props)));
     }
     fields.push((
         entity_ecf::text("quorum_id"),
@@ -496,11 +496,7 @@ fn build_publish_request(
         entity_ecf::text("threshold"),
         entity_ecf::integer(threshold as i64),
     ));
-    fields.sort_by(|a, b| {
-        a.0.as_text()
-            .unwrap_or("")
-            .cmp(b.0.as_text().unwrap_or(""))
-    });
+    fields.sort_by(|a, b| a.0.as_text().unwrap_or("").cmp(b.0.as_text().unwrap_or("")));
     let data = entity_ecf::to_ecf(&ciborium::Value::Map(fields));
     Entity::new(TYPE_QUORUM_PUBLISH_REQ, data)
         .expect("publish-request entity construction is infallible")
@@ -599,7 +595,10 @@ fn future_ready<T: 'static>(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn future_boxed<T: Send + 'static, F: std::future::Future<Output = Result<T, SdkError>> + Send + 'static>(
+fn future_boxed<
+    T: Send + 'static,
+    F: std::future::Future<Output = Result<T, SdkError>> + Send + 'static,
+>(
     f: F,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<T, SdkError>> + Send + 'static>> {
     Box::pin(f)
@@ -670,8 +669,9 @@ mod tests {
         };
         let result = ctx.quorum().create(q).await;
         match result {
-            Err(SdkError::BadRequest { status: 400, code, .. })
-                if code.as_deref() == Some("invalid_threshold") => {}
+            Err(SdkError::BadRequest {
+                status: 400, code, ..
+            }) if code.as_deref() == Some("invalid_threshold") => {}
             other => panic!("expected 400 invalid_threshold, got {:?}", other),
         }
     }

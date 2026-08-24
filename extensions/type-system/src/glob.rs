@@ -79,7 +79,10 @@ mod tests {
 
     #[test]
     fn single_star_segment_scoped() {
-        assert!(glob_match("system/capability/*", "system/capability/grant-entry"));
+        assert!(glob_match(
+            "system/capability/*",
+            "system/capability/grant-entry"
+        ));
         assert!(!glob_match(
             "system/capability/*",
             "system/capability/path-scope/foo"

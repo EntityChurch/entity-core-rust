@@ -134,11 +134,11 @@ pub type ExecuteFn = Arc<
 #[cfg(target_arch = "wasm32")]
 pub type ExecuteFn = Arc<
     dyn Fn(
-            String,
-            String,
-            Entity,
-            ExecuteOptions,
-        ) -> Pin<Box<dyn Future<Output = Result<HandlerResult, HandlerError>>>>
+        String,
+        String,
+        Entity,
+        ExecuteOptions,
+    ) -> Pin<Box<dyn Future<Output = Result<HandlerResult, HandlerError>>>>,
 >;
 
 // ---------------------------------------------------------------------------
@@ -930,8 +930,7 @@ mod tests {
         reg.register(test_handler("system/tree"));
         let store = MemoryContentStore::new();
         let index = MemoryLocationIndex::new();
-        let result =
-            resolve_handler("system/tree/instances/backup", &store, &index, &reg).unwrap();
+        let result = resolve_handler("system/tree/instances/backup", &store, &index, &reg).unwrap();
         assert_eq!(result.pattern, "system/tree");
         assert_eq!(result.suffix, "/instances/backup");
     }
@@ -968,14 +967,16 @@ mod tests {
         let handler_data = entity_ecf::to_ecf(&entity_ecf::cbor_map! {
             "interface" => entity_ecf::text("system/handler/system/tree")
         });
-        let handler_entity =
-            Entity::new(entity_types::TYPE_HANDLER, handler_data).unwrap();
+        let handler_entity = Entity::new(entity_types::TYPE_HANDLER, handler_data).unwrap();
         let hash = store.put(handler_entity).unwrap();
         index.set("system/tree", hash);
 
         let result = resolve_handler("system/tree", &store, &index, &reg).unwrap();
         assert_eq!(result.pattern, "system/tree");
-        assert!(result.handler.is_some(), "compiled handler must take priority");
+        assert!(
+            result.handler.is_some(),
+            "compiled handler must take priority"
+        );
         assert!(result.manifest.is_some(), "tree manifest also recorded");
     }
 
@@ -995,21 +996,18 @@ mod tests {
             "expression_path" => entity_ecf::text("system/validate/entity-native/expr"),
             "interface" => entity_ecf::text("system/handler/system/validate/entity-native/multi")
         });
-        let handler_entity =
-            Entity::new(entity_types::TYPE_HANDLER, handler_data).unwrap();
+        let handler_entity = Entity::new(entity_types::TYPE_HANDLER, handler_data).unwrap();
         let hash = store.put(handler_entity).unwrap();
         index.set("system/validate/entity-native/multi", hash);
 
-        let result = resolve_handler(
-            "system/validate/entity-native/multi",
-            &store,
-            &index,
-            &reg,
-        )
-        .expect("tree-only handler must resolve per V7 §6.6");
+        let result = resolve_handler("system/validate/entity-native/multi", &store, &index, &reg)
+            .expect("tree-only handler must resolve per V7 §6.6");
         assert_eq!(result.pattern, "system/validate/entity-native/multi");
         assert!(result.handler.is_none(), "no compiled handler — tree-only");
-        assert!(result.manifest.is_some(), "manifest must be carried for entity-native dispatch");
+        assert!(
+            result.manifest.is_some(),
+            "manifest must be carried for entity-native dispatch"
+        );
     }
 
     #[test]
@@ -1024,14 +1022,16 @@ mod tests {
         let handler_data = entity_ecf::to_ecf(&entity_ecf::cbor_map! {
             "expression_path" => entity_ecf::text("some/expr/path")
         });
-        let handler_entity =
-            Entity::new(entity_types::TYPE_HANDLER, handler_data).unwrap();
+        let handler_entity = Entity::new(entity_types::TYPE_HANDLER, handler_data).unwrap();
         let hash = store.put(handler_entity).unwrap();
         index.set("system/tree", hash);
 
         let result = resolve_handler("system/tree", &store, &index, &reg).unwrap();
         assert!(result.handler.is_some(), "compiled wins at same prefix");
-        assert!(result.manifest.is_some(), "manifest still recorded for inspection");
+        assert!(
+            result.manifest.is_some(),
+            "manifest still recorded for inspection"
+        );
     }
 
     // --- Absolute path resolution tests ---

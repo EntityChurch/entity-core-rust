@@ -49,14 +49,14 @@ fn validate_request(entity_type: &str, entity_data: Value) -> Entity {
     let params = cbor_map! {
         "entity" => inline
     };
-    Entity::new(
-        "system/type/validate-request",
-        entity_ecf::to_ecf(&params),
-    )
-    .unwrap()
+    Entity::new("system/type/validate-request", entity_ecf::to_ecf(&params)).unwrap()
 }
 
-fn run_validate(handler: &TypeHandler, params: Entity, exec: entity_handler::ExecuteFn) -> HandlerResult {
+fn run_validate(
+    handler: &TypeHandler,
+    params: Entity,
+    exec: entity_handler::ExecuteFn,
+) -> HandlerResult {
     let ctx = HandlerContext::builder(params.clone(), params)
         .pattern(format!("/{}/system/type", PEER_ID))
         .operation("validate")
@@ -82,12 +82,18 @@ fn validate_pass_through_constraint() {
 
     // Type def: app/user with a `name` field carrying min_length=1
     // and max_length=10 constraints.
-    let min_len_constraint = build_constraint("system/type/constraint/min-length", cbor_map! {
-        "min_length" => integer(1)
-    });
-    let max_len_constraint = build_constraint("system/type/constraint/max-length", cbor_map! {
-        "max_length" => integer(10)
-    });
+    let min_len_constraint = build_constraint(
+        "system/type/constraint/min-length",
+        cbor_map! {
+            "min_length" => integer(1)
+        },
+    );
+    let max_len_constraint = build_constraint(
+        "system/type/constraint/max-length",
+        cbor_map! {
+            "max_length" => integer(10)
+        },
+    );
     let name_field = cbor_map! {
         "type_ref" => text("primitive/string"),
         "constraints" => entity_ecf::array(vec![min_len_constraint, max_len_constraint])
@@ -125,9 +131,12 @@ fn validate_reports_constraint_violation() {
     let cs = Arc::new(MemoryContentStore::new());
     let li = Arc::new(MemoryLocationIndex::new());
 
-    let max_len_constraint = build_constraint("system/type/constraint/max-length", cbor_map! {
-        "max_length" => integer(3)
-    });
+    let max_len_constraint = build_constraint(
+        "system/type/constraint/max-length",
+        cbor_map! {
+            "max_length" => integer(3)
+        },
+    );
     let name_field = cbor_map! {
         "type_ref" => text("primitive/string"),
         "constraints" => entity_ecf::array(vec![max_len_constraint])
@@ -254,9 +263,12 @@ fn validate_optional_field_absent_skips_constraints() {
     let cs = Arc::new(MemoryContentStore::new());
     let li = Arc::new(MemoryLocationIndex::new());
 
-    let min_constraint = build_constraint("system/type/constraint/min-length", cbor_map! {
-        "min_length" => integer(1)
-    });
+    let min_constraint = build_constraint(
+        "system/type/constraint/min-length",
+        cbor_map! {
+            "min_length" => integer(1)
+        },
+    );
     let name_field = cbor_map! {
         "type_ref" => text("primitive/string"),
         "optional" => entity_ecf::bool_val(true),
@@ -360,9 +372,12 @@ fn validate_narrowing_violation_on_child_type_def() {
     let li = Arc::new(MemoryLocationIndex::new());
 
     // Parent type with min=5 on `age`.
-    let parent_min = build_constraint("system/type/constraint/min", cbor_map! {
-        "min" => integer(5)
-    });
+    let parent_min = build_constraint(
+        "system/type/constraint/min",
+        cbor_map! {
+            "min" => integer(5)
+        },
+    );
     let parent_age_field = cbor_map! {
         "type_ref" => text("primitive/uint"),
         "constraints" => entity_ecf::array(vec![parent_min])
@@ -376,9 +391,12 @@ fn validate_narrowing_violation_on_child_type_def() {
     store_type_def(&cs, &li, "base/with-min", parent_def);
 
     // Child type that WIDENS min — should narrow but widens (min=0).
-    let child_min = build_constraint("system/type/constraint/min", cbor_map! {
-        "min" => integer(0)
-    });
+    let child_min = build_constraint(
+        "system/type/constraint/min",
+        cbor_map! {
+            "min" => integer(0)
+        },
+    );
     let child_age_field = cbor_map! {
         "type_ref" => text("primitive/uint"),
         "constraints" => entity_ecf::array(vec![child_min])

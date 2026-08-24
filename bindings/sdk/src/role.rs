@@ -208,7 +208,11 @@ impl<'a> RoleOps<'a> {
     ) -> impl std::future::Future<Output = Result<RoleAssignResult, SdkError>> + Send + 'static
     {
         let role_name = role_name.into();
-        let path = path_role_assignment(&context.into(), &peer_segment_from_hash(&peer_hash), &role_name);
+        let path = path_role_assignment(
+            &context.into(),
+            &peer_segment_from_hash(&peer_hash),
+            &role_name,
+        );
         let params = build_assign_request(&role_name);
         let opts = path_resource_opts(path);
         let fut = self.ctx.execute("system/role", "assign", params, opts);
@@ -223,7 +227,11 @@ impl<'a> RoleOps<'a> {
         role_name: impl Into<String>,
     ) -> impl std::future::Future<Output = Result<RoleAssignResult, SdkError>> + 'static {
         let role_name = role_name.into();
-        let path = path_role_assignment(&context.into(), &peer_segment_from_hash(&peer_hash), &role_name);
+        let path = path_role_assignment(
+            &context.into(),
+            &peer_segment_from_hash(&peer_hash),
+            &role_name,
+        );
         let params = build_assign_request(&role_name);
         let opts = path_resource_opts(path);
         let fut = self.ctx.execute("system/role", "assign", params, opts);
@@ -572,7 +580,10 @@ fn decode_or_err<T>(
     decode(&result.result)
 }
 
-fn read_map(entity: &Entity, ctx: &'static str) -> Result<Vec<(ciborium::Value, ciborium::Value)>, SdkError> {
+fn read_map(
+    entity: &Entity,
+    ctx: &'static str,
+) -> Result<Vec<(ciborium::Value, ciborium::Value)>, SdkError> {
     let val: ciborium::Value = ciborium::de::from_reader(entity.data.as_slice())
         .map_err(|e| SdkError::HandlerError(format!("decode {}: {}", ctx, e)))?;
     match val {
@@ -641,8 +652,9 @@ fn decode_assign_result(entity: &Entity) -> Result<RoleAssignResult, SdkError> {
         }
     }
     Ok(RoleAssignResult {
-        assignment_path: assignment_path
-            .ok_or_else(|| SdkError::HandlerError("assign-result missing assignment_path".into()))?,
+        assignment_path: assignment_path.ok_or_else(|| {
+            SdkError::HandlerError("assign-result missing assignment_path".into())
+        })?,
         derived_tokens,
     })
 }
@@ -659,8 +671,9 @@ fn decode_unassign_result(entity: &Entity) -> Result<RoleUnassignResult, SdkErro
         }
     }
     Ok(RoleUnassignResult {
-        assignment_path: assignment_path
-            .ok_or_else(|| SdkError::HandlerError("unassign-result missing assignment_path".into()))?,
+        assignment_path: assignment_path.ok_or_else(|| {
+            SdkError::HandlerError("unassign-result missing assignment_path".into())
+        })?,
         revoked_token_hashes,
     })
 }
@@ -677,8 +690,9 @@ fn decode_exclude_result(entity: &Entity) -> Result<RoleExcludeResult, SdkError>
         }
     }
     Ok(RoleExcludeResult {
-        exclusion_path: exclusion_path
-            .ok_or_else(|| SdkError::HandlerError("exclude-result missing exclusion_path".into()))?,
+        exclusion_path: exclusion_path.ok_or_else(|| {
+            SdkError::HandlerError("exclude-result missing exclusion_path".into())
+        })?,
         revoked_token_hashes,
     })
 }
@@ -692,8 +706,9 @@ fn decode_unexclude_result(entity: &Entity) -> Result<RoleUnexcludeResult, SdkEr
         }
     }
     Ok(RoleUnexcludeResult {
-        exclusion_path: exclusion_path
-            .ok_or_else(|| SdkError::HandlerError("unexclude-result missing exclusion_path".into()))?,
+        exclusion_path: exclusion_path.ok_or_else(|| {
+            SdkError::HandlerError("unexclude-result missing exclusion_path".into())
+        })?,
     })
 }
 
@@ -748,7 +763,9 @@ fn decode_delegate_result(entity: &Entity) -> Result<RoleDelegateResult, SdkErro
 // grants out of a response — but it's part of the GrantEntry codec
 // pair and exposing both keeps future-result-decoders ergonomic.)
 #[allow(dead_code)]
-fn _grant_codec_pair_is_part_of_the_public_capability_surface(v: &ciborium::Value) -> Option<GrantEntry> {
+fn _grant_codec_pair_is_part_of_the_public_capability_surface(
+    v: &ciborium::Value,
+) -> Option<GrantEntry> {
     decode_grant_entry(v).ok()
 }
 
@@ -878,7 +895,10 @@ mod tests {
     async fn exclude_then_unexclude_dispatches() {
         let ctx = make_ctx();
         let me = ctx.identity_hash();
-        ctx.role().exclude("group/delta", me).await.expect("exclude");
+        ctx.role()
+            .exclude("group/delta", me)
+            .await
+            .expect("exclude");
 
         let result = ctx
             .role()

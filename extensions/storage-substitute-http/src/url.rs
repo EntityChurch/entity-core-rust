@@ -118,8 +118,9 @@ impl EndpointConfig {
     fn decode_data_map(map: &[(Value, Value)]) -> Result<EndpointConfig, EndpointDecodeError> {
         let content_layout_str = field_text(map, "content_layout")
             .ok_or(EndpointDecodeError::MissingField("content_layout"))?;
-        let content_layout = ContentLayout::parse(&content_layout_str)
-            .ok_or(EndpointDecodeError::UnknownContentLayout(content_layout_str))?;
+        let content_layout = ContentLayout::parse(&content_layout_str).ok_or(
+            EndpointDecodeError::UnknownContentLayout(content_layout_str),
+        )?;
         let tree_url_prefix = field_text(map, "tree_url_prefix");
         let tree_leaf_suffix = field_text(map, "tree_leaf_suffix").unwrap_or_else(default_suffix);
 
@@ -152,13 +153,12 @@ impl EndpointConfig {
                 ),
             });
         }
-        let value: Value =
-            ciborium::from_reader(entity.data.as_slice()).map_err(|e| {
-                EndpointDecodeError::BadFieldShape {
-                    field: "<data>",
-                    detail: format!("cbor decode: {}", e),
-                }
-            })?;
+        let value: Value = ciborium::from_reader(entity.data.as_slice()).map_err(|e| {
+            EndpointDecodeError::BadFieldShape {
+                field: "<data>",
+                detail: format!("cbor decode: {}", e),
+            }
+        })?;
         let map = match value {
             Value::Map(m) => m,
             _ => return Err(EndpointDecodeError::NotAMap),
@@ -225,12 +225,7 @@ pub fn build_content_url(config: &EndpointConfig, hash: &Hash) -> Result<String,
     let url = match config.content_layout {
         ContentLayout::Flat => format!("{}/{}", trim(&config.content_url_prefix), hex),
         ContentLayout::Sharded2Flat => {
-            format!(
-                "{}/{}/{}",
-                trim(&config.content_url_prefix),
-                &hex[..2],
-                hex
-            )
+            format!("{}/{}/{}", trim(&config.content_url_prefix), &hex[..2], hex)
         }
         ContentLayout::Sharded2_4 => {
             format!(
@@ -423,10 +418,7 @@ mod tests {
             ),
         ]);
         let cfg = EndpointConfig::decode_endpoint_field(Some(&cbor)).unwrap();
-        assert_eq!(
-            cfg.content_url_prefix,
-            "https://my-domain.example/content"
-        );
+        assert_eq!(cfg.content_url_prefix, "https://my-domain.example/content");
     }
 
     #[test]
@@ -467,10 +459,7 @@ mod tests {
             ),
         ]);
         let cfg = EndpointConfig::decode_endpoint_field(Some(&cbor)).unwrap();
-        assert_eq!(
-            cfg.content_url_prefix,
-            "https://shared.example.com/content"
-        );
+        assert_eq!(cfg.content_url_prefix, "https://shared.example.com/content");
     }
 
     #[test]

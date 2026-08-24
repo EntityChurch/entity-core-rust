@@ -3373,3 +3373,46 @@ AAD hex + pubkey-hash derivation are firm regardless.
 > self/peer/group ciphertexts byte-equal to Go + Python (3-way §16.5 lock). R6
 > key-separation (`separation.rs`), §10/§11 sender resolution, and §8.5 group
 > lifecycle primitives also landed. No spec gap remains here.
+
+---
+
+## NETWORK §5.1 — keepalive ping authorization: no grant covers `system/protocol/connect`
+
+**Spec:** EXTENSION-NETWORK §5.1–§5.4 (keepalive is an EXECUTE on
+`system/protocol/connect`, operation `ping`; §12.1 makes the exchange MUST) ⨯
+ENTITY-CORE-PROTOCOL-V7 §4.4 (default connection grants) ⨯ NETWORK §3.2
+(network-handler capability model).
+
+**Passage.** §5.1: `EXECUTE system/protocol/connect operation: "ping"` with
+`system/network/ping` params, answered by `system/network/pong`. The ping
+rides the ordinary post-handshake EXECUTE path, so it reaches the receiver's
+handler-scope authorization check like any other dispatch.
+
+**Ambiguity.** Nothing grants it. The §4.4 default connection grants cover
+`system/tree` (get on types/handlers) + `system/capability` (request) only;
+NETWORK §3.2's grant-entry covers `system/network` (and its `internal_scope`
+names connect's `hello`/`authenticate` — not `ping`). A spec-literal
+implementation therefore 403s (`capability_denied`) every conformant
+keepalive ping, making the §12.1 MUST unsatisfiable under default grants.
+`hello`/`authenticate` don't hit this because they run pre-Established,
+before the capability layer exists.
+
+**Interim choice.** Treat `ping` as the **third protocol-level connect
+operation**: the receiving dispatch answers it after signature/capability
+*verification* but exempt from the handler-scope *grant* check (seam:
+`dispatch_request` in `core/peer/src/connection.rs`, just before the
+`handler_authorized` check). Not widening the §4.4 default grant set — that
+is shared cross-impl capability surface. Needs an architecture ruling:
+(a) ping is protocol-level (this choice — then the connect manifest ops list
+and §3.1 `internal_scope` should say so), or (b) §4.4/§3.2 grow an explicit
+connect/ping grant. Related observation for the same ruling: whether the
+bootstrap connect-handler manifest advertises `ping` in its `operations`
+(Rust currently advertises `["authenticate", "hello"]`, unchanged).
+
+**Related §5.4 reading routed with it.** "if result is timeout or result is
+error: missed += 1" — Rust counts only transport error/deadline as a miss;
+an EXECUTE_RESPONSE with a non-200 status counts as *liveness* (the peer
+demonstrably answered a frame; also keeps the floor from killing live
+connections to impls that haven't built §5 yet, e.g. rung-1-only cohort
+members during the convergence build). If the cohort converges on "4xx is a
+miss," that's a one-line change in `keepalive.rs::ping`.

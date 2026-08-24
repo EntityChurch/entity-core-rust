@@ -21,8 +21,11 @@ pub(crate) fn error(status: u32, code: &str, message: &str) -> HandlerResult {
 
 /// Build a `system/protocol/status` result entity from CBOR map fields.
 pub(crate) fn status_result(fields: Vec<(Value, Value)>) -> HandlerResult {
-    let result = Entity::new(entity_types::TYPE_PROTOCOL_STATUS, to_ecf(&Value::Map(fields)))
-        .expect("status entity");
+    let result = Entity::new(
+        entity_types::TYPE_PROTOCOL_STATUS,
+        to_ecf(&Value::Map(fields)),
+    )
+    .expect("status entity");
     HandlerResult {
         status: entity_handler::STATUS_OK,
         result,

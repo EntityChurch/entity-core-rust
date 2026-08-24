@@ -148,7 +148,10 @@ pub(crate) fn write_lost_error_marker(
             entity_ecf::text("target_peer_id"),
             entity_ecf::text(&target_peer_id),
         ),
-        (entity_ecf::text("target_uri"), entity_ecf::text(deliver_uri)),
+        (
+            entity_ecf::text("target_uri"),
+            entity_ecf::text(deliver_uri),
+        ),
         (
             entity_ecf::text("timestamp"),
             entity_ecf::integer(timestamp_ms as i64),
@@ -225,7 +228,10 @@ mod tests {
 
     #[test]
     fn classify_transport_failure_maps_known_strings() {
-        assert_eq!(classify_transport_failure("request timed out"), "recv_timeout");
+        assert_eq!(
+            classify_transport_failure("request timed out"),
+            "recv_timeout"
+        );
         assert_eq!(
             classify_transport_failure("connection reset by peer"),
             "connection_broken"
@@ -234,6 +240,9 @@ mod tests {
             classify_transport_failure("decode error: malformed CBOR"),
             "protocol_error"
         );
-        assert_eq!(classify_transport_failure("totally unknown"), "protocol_error");
+        assert_eq!(
+            classify_transport_failure("totally unknown"),
+            "protocol_error"
+        );
     }
 }

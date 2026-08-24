@@ -212,8 +212,8 @@ impl EntityPeerManager {
         }
 
         let alias = dict_get_string(&config, "alias").unwrap_or_default();
-        let storage_kind = dict_get_string(&config, "storage_kind")
-            .unwrap_or_else(|| "memory".to_string());
+        let storage_kind =
+            dict_get_string(&config, "storage_kind").unwrap_or_else(|| "memory".to_string());
         let storage_path = dict_get_string(&config, "storage_path").unwrap_or_default();
         let listen_address = dict_get_string(&config, "listen_address").unwrap_or_default();
         let extensions_field = dict_get_string(&config, "extensions").unwrap_or_default();
@@ -275,7 +275,10 @@ impl EntityPeerManager {
 
         // Listen address (always set; empty string means EntityPeer
         // skips the listener — see peer_node.rs listen() error path).
-        peer_gd.set("listen_address", &GString::from(listen_address.as_str()).to_variant());
+        peer_gd.set(
+            "listen_address",
+            &GString::from(listen_address.as_str()).to_variant(),
+        );
         // Pass debug_grants through to the EntityPeer so build_*_context
         // bakes it into PeerConfig.debug_open_grants.
         peer_gd.set("debug_grants", &debug_grants.to_variant());
@@ -321,7 +324,10 @@ impl EntityPeerManager {
             "sqlite" => {
                 peer_gd.set("peer_name", &GString::from(alias.as_str()).to_variant());
                 if !storage_path.is_empty() {
-                    peer_gd.set("data_dir", &GString::from(storage_path.as_str()).to_variant());
+                    peer_gd.set(
+                        "data_dir",
+                        &GString::from(storage_path.as_str()).to_variant(),
+                    );
                 }
                 self.base_mut().add_child(&peer_gd);
                 peer_gd.bind_mut().build_boot_context()
@@ -355,7 +361,11 @@ impl EntityPeerManager {
         // addresses from config). The SDK takes ownership of `ctx` and
         // hands back an Arc<PeerContext> we can share with EntityPeer.
         let metadata = PeerMetadata {
-            label: if alias.is_empty() { None } else { Some(alias.clone()) },
+            label: if alias.is_empty() {
+                None
+            } else {
+                Some(alias.clone())
+            },
             persisted: storage_kind == "sqlite",
             listen_addresses: if listen_address.is_empty() {
                 Vec::new()
@@ -501,10 +511,7 @@ impl EntityPeerManager {
             return out;
         };
         let label_str: String = meta.label.clone().unwrap_or_default();
-        out.set(
-            GString::from("label"),
-            GString::from(label_str.as_str()),
-        );
+        out.set(GString::from("label"), GString::from(label_str.as_str()));
         out.set(GString::from("persisted"), meta.persisted);
         let mut addrs = PackedStringArray::new();
         for a in &meta.listen_addresses {

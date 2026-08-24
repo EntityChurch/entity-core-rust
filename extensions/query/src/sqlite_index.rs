@@ -107,8 +107,11 @@ impl QueryIndexStore for SqliteQueryIndexes {
 
     fn remove_entries_for_path(&self, path: &str) {
         let conn = self.conn.lock().unwrap();
-        conn.execute("DELETE FROM query_type_index WHERE path = ?1", params![path])
-            .expect("sqlite query type index delete failed");
+        conn.execute(
+            "DELETE FROM query_type_index WHERE path = ?1",
+            params![path],
+        )
+        .expect("sqlite query type index delete failed");
         conn.execute(
             "DELETE FROM query_reverse_hash WHERE source_path = ?1",
             params![path],
@@ -167,9 +170,7 @@ impl QueryIndexStore for SqliteQueryIndexes {
 
         // Exact match
         let mut stmt = conn
-            .prepare(
-                "SELECT path, hash FROM query_type_index WHERE entity_type = ?1 ORDER BY path",
-            )
+            .prepare("SELECT path, hash FROM query_type_index WHERE entity_type = ?1 ORDER BY path")
             .expect("sqlite query type index select exact failed");
         stmt.query_map(params![type_filter], |row| {
             let path: String = row.get(0)?;
@@ -262,9 +263,18 @@ mod tests {
     #[test]
     fn test_type_index_add_query() {
         let idx = test_indexes();
-        let e1 = make_entity("app/user", entity_ecf::cbor_map! { "name" => entity_ecf::text("alice") });
-        let e2 = make_entity("app/user", entity_ecf::cbor_map! { "name" => entity_ecf::text("bob") });
-        let e3 = make_entity("app/order", entity_ecf::cbor_map! { "id" => entity_ecf::text("o1") });
+        let e1 = make_entity(
+            "app/user",
+            entity_ecf::cbor_map! { "name" => entity_ecf::text("alice") },
+        );
+        let e2 = make_entity(
+            "app/user",
+            entity_ecf::cbor_map! { "name" => entity_ecf::text("bob") },
+        );
+        let e3 = make_entity(
+            "app/order",
+            entity_ecf::cbor_map! { "id" => entity_ecf::text("o1") },
+        );
 
         idx.add_entries_for_entity("users/alice", &e1);
         idx.add_entries_for_entity("users/bob", &e2);
@@ -280,7 +290,10 @@ mod tests {
     #[test]
     fn test_type_index_remove() {
         let idx = test_indexes();
-        let entity = make_entity("app/user", entity_ecf::cbor_map! { "name" => entity_ecf::text("alice") });
+        let entity = make_entity(
+            "app/user",
+            entity_ecf::cbor_map! { "name" => entity_ecf::text("alice") },
+        );
         idx.add_entries_for_entity("users/alice", &entity);
         assert_eq!(idx.query_type_index("app/user").len(), 1);
 
@@ -327,8 +340,14 @@ mod tests {
     #[test]
     fn test_update_entity_at_path() {
         let idx = test_indexes();
-        let e1 = make_entity("app/user", entity_ecf::cbor_map! { "name" => entity_ecf::text("alice") });
-        let e2 = make_entity("app/order", entity_ecf::cbor_map! { "id" => entity_ecf::text("o1") });
+        let e1 = make_entity(
+            "app/user",
+            entity_ecf::cbor_map! { "name" => entity_ecf::text("alice") },
+        );
+        let e2 = make_entity(
+            "app/order",
+            entity_ecf::cbor_map! { "id" => entity_ecf::text("o1") },
+        );
 
         idx.add_entries_for_entity("path/x", &e1);
         assert_eq!(idx.query_type_index("app/user").len(), 1);
@@ -343,7 +362,10 @@ mod tests {
     #[test]
     fn test_clear() {
         let idx = test_indexes();
-        let entity = make_entity("app/user", entity_ecf::cbor_map! { "name" => entity_ecf::text("a") });
+        let entity = make_entity(
+            "app/user",
+            entity_ecf::cbor_map! { "name" => entity_ecf::text("a") },
+        );
         idx.add_entries_for_entity("users/a", &entity);
         assert_eq!(idx.query_type_index("*").len(), 1);
 
@@ -361,7 +383,10 @@ mod tests {
         {
             let store = SqliteStore::open(&db_path).unwrap();
             let idx = SqliteQueryIndexes::new(store.connection()).unwrap();
-            let entity = make_entity("app/user", entity_ecf::cbor_map! { "name" => entity_ecf::text("alice") });
+            let entity = make_entity(
+                "app/user",
+                entity_ecf::cbor_map! { "name" => entity_ecf::text("alice") },
+            );
             idx.add_entries_for_entity("users/alice", &entity);
         }
 

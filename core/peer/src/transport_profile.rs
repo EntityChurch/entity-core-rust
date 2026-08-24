@@ -52,18 +52,14 @@ pub const OP_SUBSCRIBE_RESERVED: &str = "SUBSCRIBE";
 
 /// All non-reserved values, in spec-declared order. Useful for
 /// validation passes that reject unknown strings.
-pub const SUPPORTED_OPS_VALID: &[&str] = &[
-    OP_EXECUTE,
-    OP_TREE_GET,
-    OP_CONTENT_GET,
-    OP_MANIFEST_GET,
-];
+pub const SUPPORTED_OPS_VALID: &[&str] =
+    &[OP_EXECUTE, OP_TREE_GET, OP_CONTENT_GET, OP_MANIFEST_GET];
 
 /// Returns `true` if `op` is a currently-valid `supported_ops` value
 /// (i.e., one of the four non-reserved strings). `SUBSCRIBE` returns
 /// `false` — reserved values are not valid as a published op.
 pub fn is_valid_supported_op(op: &str) -> bool {
-    SUPPORTED_OPS_VALID.iter().any(|v| *v == op)
+    SUPPORTED_OPS_VALID.contains(&op)
 }
 
 // ===========================================================================
@@ -174,6 +170,7 @@ pub struct TcpProfileData {
     /// - profile-id `"primary"` ⇒ `0` (preserves the existing
     ///   primary-first convention byte-for-byte).
     /// - any other profile-id ⇒ `100` (the spec default).
+    ///
     /// Explicit `priority` is always authoritative — set it, name
     /// the profile-id freely. Emitted `omitempty`.
     pub priority: Option<u32>,
@@ -268,12 +265,8 @@ impl TcpProfileData {
     /// and by interop tests / sync code that mirrors a discovered
     /// peer's profile into the local tree.
     pub fn to_entity(&self) -> entity_entity::Entity {
-        let supported_ops_arr = entity_ecf::Value::Array(
-            self.supported_ops
-                .iter()
-                .map(|s| entity_ecf::text(s))
-                .collect(),
-        );
+        let supported_ops_arr =
+            entity_ecf::Value::Array(self.supported_ops.iter().map(entity_ecf::text).collect());
         let endpoint_map = entity_ecf::Value::Map(vec![(
             entity_ecf::text("url"),
             entity_ecf::text(&self.endpoint_url),
@@ -328,9 +321,7 @@ impl TcpProfileData {
     /// the entity-type suffix (`tcp` here) is invalid and MUST be
     /// rejected fail-closed. Returns
     /// [`TcpProfileDecodeError::TransportTypeMismatch`] for that case.
-    pub fn from_entity(
-        entity: &entity_entity::Entity,
-    ) -> Result<Self, TcpProfileDecodeError> {
+    pub fn from_entity(entity: &entity_entity::Entity) -> Result<Self, TcpProfileDecodeError> {
         if entity.entity_type != TYPE_PEER_TRANSPORT_TCP {
             return Err(TcpProfileDecodeError::UnexpectedType(
                 entity.entity_type.clone(),
@@ -342,8 +333,8 @@ impl TcpProfileData {
             ciborium::Value::Map(m) => m,
             _ => return Err(TcpProfileDecodeError::NotAMap),
         };
-        let peer_id = field_text(&map, "peer_id")
-            .ok_or(TcpProfileDecodeError::MissingField("peer_id"))?;
+        let peer_id =
+            field_text(&map, "peer_id").ok_or(TcpProfileDecodeError::MissingField("peer_id"))?;
         let transport_type = field_text(&map, "transport_type")
             .ok_or(TcpProfileDecodeError::MissingField("transport_type"))?;
         // D5 — MUST match entity-type suffix; fail closed.
@@ -354,12 +345,12 @@ impl TcpProfileData {
             });
         }
         let endpoint_url = match field_lookup(&map, "endpoint") {
-            Some(ciborium::Value::Map(m)) => field_text(m, "url").ok_or(
-                TcpProfileDecodeError::BadFieldShape {
+            Some(ciborium::Value::Map(m)) => {
+                field_text(m, "url").ok_or(TcpProfileDecodeError::BadFieldShape {
                     field: "endpoint.url",
                     detail: "missing or non-text url field".into(),
-                },
-            )?,
+                })?
+            }
             Some(_) => {
                 return Err(TcpProfileDecodeError::BadFieldShape {
                     field: "endpoint",
@@ -396,8 +387,8 @@ impl TcpProfileData {
             }
             None => return Err(TcpProfileDecodeError::MissingField("nonce_required")),
         };
-        let cap_flow = field_text(&map, "cap_flow")
-            .ok_or(TcpProfileDecodeError::MissingField("cap_flow"))?;
+        let cap_flow =
+            field_text(&map, "cap_flow").ok_or(TcpProfileDecodeError::MissingField("cap_flow"))?;
         // Q6 (ratified §8.9): `advertised_at` is OPTIONAL. Absent ⇒
         // None. Present-but-wrong-type ⇒ also None — the field is
         // advisory (D-3) so a malformed advisory is harmless, and
@@ -532,12 +523,8 @@ impl HttpProfileData {
 
     /// Encode to a `system/peer/transport/http` `Entity`.
     pub fn to_entity(&self) -> entity_entity::Entity {
-        let supported_ops_arr = entity_ecf::Value::Array(
-            self.supported_ops
-                .iter()
-                .map(|s| entity_ecf::text(s))
-                .collect(),
-        );
+        let supported_ops_arr =
+            entity_ecf::Value::Array(self.supported_ops.iter().map(entity_ecf::text).collect());
         let endpoint_map = entity_ecf::Value::Map(vec![(
             entity_ecf::text("url"),
             entity_ecf::text(&self.endpoint_url),
@@ -586,9 +573,7 @@ impl HttpProfileData {
 
     /// Decode a `system/peer/transport/http` `Entity`. D5: `transport_type`
     /// MUST equal `"http"` — mismatch is fail-closed.
-    pub fn from_entity(
-        entity: &entity_entity::Entity,
-    ) -> Result<Self, TcpProfileDecodeError> {
+    pub fn from_entity(entity: &entity_entity::Entity) -> Result<Self, TcpProfileDecodeError> {
         if entity.entity_type != TYPE_PEER_TRANSPORT_HTTP {
             return Err(TcpProfileDecodeError::UnexpectedType(
                 entity.entity_type.clone(),
@@ -600,8 +585,8 @@ impl HttpProfileData {
             ciborium::Value::Map(m) => m,
             _ => return Err(TcpProfileDecodeError::NotAMap),
         };
-        let peer_id = field_text(&map, "peer_id")
-            .ok_or(TcpProfileDecodeError::MissingField("peer_id"))?;
+        let peer_id =
+            field_text(&map, "peer_id").ok_or(TcpProfileDecodeError::MissingField("peer_id"))?;
         let transport_type = field_text(&map, "transport_type")
             .ok_or(TcpProfileDecodeError::MissingField("transport_type"))?;
         if transport_type != TRANSPORT_HTTP {
@@ -611,12 +596,12 @@ impl HttpProfileData {
             });
         }
         let endpoint_url = match field_lookup(&map, "endpoint") {
-            Some(ciborium::Value::Map(m)) => field_text(m, "url").ok_or(
-                TcpProfileDecodeError::BadFieldShape {
+            Some(ciborium::Value::Map(m)) => {
+                field_text(m, "url").ok_or(TcpProfileDecodeError::BadFieldShape {
                     field: "endpoint.url",
                     detail: "missing or non-text url field".into(),
-                },
-            )?,
+                })?
+            }
             Some(_) => {
                 return Err(TcpProfileDecodeError::BadFieldShape {
                     field: "endpoint",
@@ -653,8 +638,8 @@ impl HttpProfileData {
             }
             None => return Err(TcpProfileDecodeError::MissingField("nonce_required")),
         };
-        let cap_flow = field_text(&map, "cap_flow")
-            .ok_or(TcpProfileDecodeError::MissingField("cap_flow"))?;
+        let cap_flow =
+            field_text(&map, "cap_flow").ok_or(TcpProfileDecodeError::MissingField("cap_flow"))?;
         // Q6 ratified §8.9 — OPTIONAL; absent or wrong-type ⇒ None.
         // See TcpProfileData::from_entity for the full disposition.
         let advertised_at = match field_lookup(&map, "advertised_at") {
@@ -728,11 +713,8 @@ mod tests {
 
     #[test]
     fn tcp_profile_round_trip() {
-        let profile = TcpProfileData::for_local_listener(
-            "peer-A",
-            "tcp://127.0.0.1:4040",
-            1_700_000_000_000,
-        );
+        let profile =
+            TcpProfileData::for_local_listener("peer-A", "tcp://127.0.0.1:4040", 1_700_000_000_000);
         let entity = profile.to_entity();
         assert_eq!(entity.entity_type, TYPE_PEER_TRANSPORT_TCP);
         let decoded = TcpProfileData::from_entity(&entity).expect("decode");
@@ -749,8 +731,8 @@ mod tests {
         // A profile entity of a different transport type should NOT decode
         // as tcp — guards against mis-routing.
         let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![]));
-        let wrong = entity_entity::Entity::new("system/peer/transport/websocket", data)
-            .expect("entity ok");
+        let wrong =
+            entity_entity::Entity::new("system/peer/transport/websocket", data).expect("entity ok");
         match TcpProfileData::from_entity(&wrong) {
             Err(TcpProfileDecodeError::UnexpectedType(s)) => {
                 assert_eq!(s, "system/peer/transport/websocket");
@@ -765,10 +747,7 @@ mod tests {
         // A `system/peer/transport/tcp` entity claiming transport_type
         // "websocket" inside its data is invalid — fail closed.
         let bad_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-            (
-                entity_ecf::text("peer_id"),
-                entity_ecf::text("peer-A"),
-            ),
+            (entity_ecf::text("peer_id"), entity_ecf::text("peer-A")),
             (
                 entity_ecf::text("transport_type"),
                 entity_ecf::text("websocket"), // <-- mismatch
@@ -784,25 +763,19 @@ mod tests {
                 entity_ecf::text("supported_ops"),
                 entity_ecf::Value::Array(vec![entity_ecf::text("EXECUTE")]),
             ),
-            (
-                entity_ecf::text("freshness"),
-                entity_ecf::text("live"),
-            ),
+            (entity_ecf::text("freshness"), entity_ecf::text("live")),
             (
                 entity_ecf::text("nonce_required"),
                 entity_ecf::Value::Bool(true),
             ),
-            (
-                entity_ecf::text("cap_flow"),
-                entity_ecf::text("both"),
-            ),
+            (entity_ecf::text("cap_flow"), entity_ecf::text("both")),
             (
                 entity_ecf::text("advertised_at"),
                 entity_ecf::Value::Integer(0u64.into()),
             ),
         ]));
-        let entity = entity_entity::Entity::new(TYPE_PEER_TRANSPORT_TCP, bad_data)
-            .expect("entity ok");
+        let entity =
+            entity_entity::Entity::new(TYPE_PEER_TRANSPORT_TCP, bad_data).expect("entity ok");
         match TcpProfileData::from_entity(&entity) {
             Err(TcpProfileDecodeError::TransportTypeMismatch { expected, got }) => {
                 assert_eq!(expected, "tcp");
@@ -848,10 +821,7 @@ mod tests {
     fn http_profile_rejects_transport_type_mismatch() {
         // D5: data.transport_type MUST equal the entity-type suffix.
         let bad_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-            (
-                entity_ecf::text("peer_id"),
-                entity_ecf::text("peer-A"),
-            ),
+            (entity_ecf::text("peer_id"), entity_ecf::text("peer-A")),
             (
                 entity_ecf::text("transport_type"),
                 entity_ecf::text("tcp"), // <-- mismatch on http profile
@@ -878,8 +848,8 @@ mod tests {
                 entity_ecf::Value::Integer(0u64.into()),
             ),
         ]));
-        let entity = entity_entity::Entity::new(TYPE_PEER_TRANSPORT_HTTP, bad_data)
-            .expect("entity ok");
+        let entity =
+            entity_entity::Entity::new(TYPE_PEER_TRANSPORT_HTTP, bad_data).expect("entity ok");
         match HttpProfileData::from_entity(&entity) {
             Err(TcpProfileDecodeError::TransportTypeMismatch { expected, got }) => {
                 assert_eq!(expected, "http");
@@ -897,8 +867,7 @@ mod tests {
             entity_ecf::text("address"),
             entity_ecf::text("https://example.com/"),
         )]));
-        let flat =
-            entity_entity::Entity::new(TYPE_PEER_TRANSPORT_HTTP, data).expect("entity ok");
+        let flat = entity_entity::Entity::new(TYPE_PEER_TRANSPORT_HTTP, data).expect("entity ok");
         match HttpProfileData::from_entity(&flat) {
             Err(TcpProfileDecodeError::MissingField(_)) => {}
             other => panic!(
@@ -917,11 +886,13 @@ mod tests {
             entity_ecf::text("address"),
             entity_ecf::text("127.0.0.1:4040"),
         )]));
-        let flat = entity_entity::Entity::new(TYPE_PEER_TRANSPORT_TCP, data)
-            .expect("entity ok");
+        let flat = entity_entity::Entity::new(TYPE_PEER_TRANSPORT_TCP, data).expect("entity ok");
         match TcpProfileData::from_entity(&flat) {
             Err(TcpProfileDecodeError::MissingField(_)) => {}
-            other => panic!("expected MissingField on legacy flat shape, got {:?}", other),
+            other => panic!(
+                "expected MissingField on legacy flat shape, got {:?}",
+                other
+            ),
         }
     }
 
@@ -933,10 +904,7 @@ mod tests {
 
     #[test]
     fn q6_tcp_profile_omits_advertised_at_when_none() {
-        let profile = TcpProfileData::for_local_listener_no_clock(
-            "peer-X",
-            "tcp://127.0.0.1:5050",
-        );
+        let profile = TcpProfileData::for_local_listener_no_clock("peer-X", "tcp://127.0.0.1:5050");
         assert_eq!(profile.advertised_at, None);
         let entity = profile.to_entity();
         // Decode and confirm round-trips as None.
@@ -945,8 +913,7 @@ mod tests {
         assert_eq!(decoded.advertised_at, None);
         // CBOR-level proof: walk the entity's data map and assert
         // `advertised_at` is absent — not present-with-zero.
-        let val: ciborium::Value =
-            ciborium::from_reader(entity.data.as_slice()).expect("cbor");
+        let val: ciborium::Value = ciborium::from_reader(entity.data.as_slice()).expect("cbor");
         let map = match val {
             ciborium::Value::Map(m) => m,
             _ => panic!("data not a map"),
@@ -1031,16 +998,13 @@ mod tests {
 
     #[test]
     fn q6_http_profile_omits_advertised_at_when_none() {
-        let profile = HttpProfileData::for_local_listener_no_clock(
-            "peer-X",
-            "http://127.0.0.1:8080/entity",
-        );
+        let profile =
+            HttpProfileData::for_local_listener_no_clock("peer-X", "http://127.0.0.1:8080/entity");
         assert_eq!(profile.advertised_at, None);
         let entity = profile.to_entity();
         let decoded = HttpProfileData::from_entity(&entity).expect("decode");
         assert_eq!(decoded, profile);
-        let val: ciborium::Value =
-            ciborium::from_reader(entity.data.as_slice()).expect("cbor");
+        let val: ciborium::Value = ciborium::from_reader(entity.data.as_slice()).expect("cbor");
         let map = match val {
             ciborium::Value::Map(m) => m,
             _ => panic!("data not a map"),

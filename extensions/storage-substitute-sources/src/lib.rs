@@ -43,8 +43,8 @@ use async_trait::async_trait;
 use entity_capability::{CapabilityToken, ResourceTarget};
 use entity_content::miss_hook::{MissOutcome, MissResolver};
 use entity_entity::Entity;
-use entity_hash::Hash;
 use entity_handler::{ExecuteFn, ExecuteOptions};
+use entity_hash::Hash;
 use entity_store::{ContentStore, LocationIndex};
 
 mod data;
@@ -257,10 +257,8 @@ impl ChainConsultHook {
     /// single source peer. Exposed publicly for the §3-RES.7 informative
     /// meta path and for impl-side observability.
     pub fn candidates_for(&self, source_peer_id: &Hash) -> Vec<CandidateEntry> {
-        let qualified_prefix = format!(
-            "/{}/{}",
-            self.local_peer_id, PATH_PREFIX_SUBSTITUTE_SOURCES
-        );
+        let qualified_prefix =
+            format!("/{}/{}", self.local_peer_id, PATH_PREFIX_SUBSTITUTE_SOURCES);
         let now = now_epoch_ms();
         let mut candidates: Vec<CandidateEntry> = self
             .location_index
@@ -573,4 +571,3 @@ fn encode_value(v: &ciborium::Value) -> Result<Vec<u8>, ciborium::ser::Error<std
     ciborium::into_writer(v, &mut out)?;
     Ok(out)
 }
-

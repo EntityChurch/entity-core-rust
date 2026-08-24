@@ -8,12 +8,12 @@
 //! aead_key = HKDF-SHA-256(ikm=kek, salt=nonce, info="entity-core/self/"||key_id, L=32)
 //! ```
 
+use crate::aad;
 use crate::aead::{random_nonce, xchacha_decrypt, xchacha_encrypt, AEAD_KEY_SIZE, AEAD_NONCE_SIZE};
 use crate::kdf::{argon2id_key, hkdf_sha256, random_salt};
 use crate::registry::{self_mode_suite_allowed, AEAD_ID_XCHACHA20_POLY1305, KDF_ID_HKDF_SHA256};
 use crate::types::{EncryptionError, KdfParams, MODE_SELF};
 use crate::wrapper::EncryptedData;
-use crate::aad;
 
 /// §6.2 ASCII HKDF-info prefix — no separator, no NUL before `key_id` (F-GO-9).
 const SELF_INFO_PREFIX: &str = "entity-core/self/";
@@ -93,7 +93,13 @@ pub fn self_decrypt(passphrase: &[u8], ed: &EncryptedData) -> Result<Vec<u8>, En
     self_mode_suite_allowed(ed.aead_id, ed.kdf_id)?;
 
     let aead_key = derive_aead_key(passphrase, key_id, &ed.nonce, kdf_salt, params)?;
-    let aad = aad::self_aad(ed.aead_id, ed.kdf_id, &ed.nonce, kdf_salt, params.to_ecf_value());
+    let aad = aad::self_aad(
+        ed.aead_id,
+        ed.kdf_id,
+        &ed.nonce,
+        kdf_salt,
+        params.to_ecf_value(),
+    );
     xchacha_decrypt(&aead_key, &ed.nonce, &aad, &ed.ciphertext)
 }
 

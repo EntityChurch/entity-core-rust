@@ -10,7 +10,11 @@
 pub fn peer_id_of(path: &str) -> Option<String> {
     let rest = path.strip_prefix('/')?;
     let pid = rest.split('/').next()?;
-    if pid.is_empty() { None } else { Some(pid.to_string()) }
+    if pid.is_empty() {
+        None
+    } else {
+        Some(pid.to_string())
+    }
 }
 
 /// Resolve a verb-supplied path against the current working
@@ -62,7 +66,11 @@ pub fn normalize(path: &str) -> String {
     }
     let body = out.join("/");
     if body.is_empty() {
-        return if leading_slash { "/".into() } else { String::new() };
+        return if leading_slash {
+            "/".into()
+        } else {
+            String::new()
+        };
     }
     if leading_slash {
         format!("/{}", body)

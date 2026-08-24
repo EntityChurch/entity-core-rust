@@ -155,16 +155,23 @@ impl RootConfigData {
         Entity::new(TYPE_ROOT_CONFIG, data).map_err(|e| e.to_string())
     }
 
+    #[allow(clippy::field_reassign_with_default)] // decode idiom: default then fill per-key
     pub fn from_entity(e: &Entity) -> Result<Self, String> {
-        let v: Value = ciborium::from_reader(e.data.as_slice())
-            .map_err(|err| format!("cbor: {err}"))?;
+        let v: Value =
+            ciborium::from_reader(e.data.as_slice()).map_err(|err| format!("cbor: {err}"))?;
         let mut out = RootConfigData::default();
-        out.prefix = v.get("prefix").and_then(|x| x.as_text().map(String::from)).unwrap_or_default();
+        out.prefix = v
+            .get("prefix")
+            .and_then(|x| x.as_text().map(String::from))
+            .unwrap_or_default();
         out.filesystem_root = v
             .get("filesystem_root")
             .and_then(|x| x.as_text().map(String::from))
             .unwrap_or_default();
-        out.read_only = v.get("read_only").and_then(|x| x.as_bool()).unwrap_or(false);
+        out.read_only = v
+            .get("read_only")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
         out.exclude = string_array(v.get("exclude"));
         out.include = string_array(v.get("include"));
         out.publish_descriptors = v
@@ -210,17 +217,23 @@ pub struct WriteRequestData {
 }
 
 impl WriteRequestData {
+    #[allow(clippy::field_reassign_with_default)] // decode idiom: default then fill per-key
     pub fn from_params(e: &Entity) -> Result<Self, String> {
-        let v: Value = ciborium::from_reader(e.data.as_slice())
-            .map_err(|err| format!("cbor: {err}"))?;
+        let v: Value =
+            ciborium::from_reader(e.data.as_slice()).map_err(|err| format!("cbor: {err}"))?;
         let mut out = WriteRequestData::default();
         out.bytes = v.get("bytes").and_then(|x| x.as_bytes().cloned());
         out.content = match v.get("content") {
             Some(Value::Null) | None => None,
             Some(h) => Some(decode_hash_record(h)?),
         };
-        out.media_type = v.get("media_type").and_then(|x| x.as_text().map(String::from));
-        out.create_dirs = v.get("create_dirs").and_then(|x| x.as_bool()).unwrap_or(false);
+        out.media_type = v
+            .get("media_type")
+            .and_then(|x| x.as_text().map(String::from));
+        out.create_dirs = v
+            .get("create_dirs")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(false);
         Ok(out)
     }
 }
@@ -234,9 +247,10 @@ pub struct WatchRequestData {
 }
 
 impl WatchRequestData {
+    #[allow(clippy::field_reassign_with_default)] // decode idiom: default then fill per-key
     pub fn from_params(e: &Entity) -> Result<Self, String> {
-        let v: Value = ciborium::from_reader(e.data.as_slice())
-            .map_err(|err| format!("cbor: {err}"))?;
+        let v: Value =
+            ciborium::from_reader(e.data.as_slice()).map_err(|err| format!("cbor: {err}"))?;
         let mut out = WatchRequestData::default();
         out.root_name = v
             .get("root_name")
@@ -279,6 +293,10 @@ pub(crate) fn value_to_u64(v: &Value) -> Option<u64> {
 
 fn string_array(v: Option<&Value>) -> Vec<String> {
     v.and_then(|x| x.as_array().cloned())
-        .map(|arr| arr.iter().filter_map(|e| e.as_text().map(String::from)).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|e| e.as_text().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }

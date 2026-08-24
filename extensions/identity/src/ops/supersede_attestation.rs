@@ -103,9 +103,7 @@ impl IdentityHandler {
         // determinism); inherit from previous otherwise.
         let properties = match new_properties {
             Some(mut props) => {
-                props.sort_by(|a, b| {
-                    a.0.as_text().unwrap_or("").cmp(b.0.as_text().unwrap_or(""))
-                });
+                props.sort_by(|a, b| a.0.as_text().unwrap_or("").cmp(b.0.as_text().unwrap_or("")));
                 props
             }
             None => previous.properties.clone(),
@@ -118,7 +116,13 @@ impl IdentityHandler {
         // require kind invariance.
         let new_kind = properties
             .iter()
-            .find_map(|(k, v)| if k.as_text() == Some("kind") { v.as_text() } else { None })
+            .find_map(|(k, v)| {
+                if k.as_text() == Some("kind") {
+                    v.as_text()
+                } else {
+                    None
+                }
+            })
             .unwrap_or("");
         if prev_kind_str != new_kind {
             return Ok(error(
@@ -145,9 +149,20 @@ impl IdentityHandler {
         let contact_id = previous
             .properties
             .iter()
-            .find_map(|(k, v)| if k.as_text() == Some("contact_id") { v.as_bytes() } else { None })
+            .find_map(|(k, v)| {
+                if k.as_text() == Some("contact_id") {
+                    v.as_bytes()
+                } else {
+                    None
+                }
+            })
             .and_then(|b| Hash::from_bytes(b).ok());
-        let path = match self.compute_storage_path(&att, &prev_kind_str, mode_str.as_deref(), contact_id.as_ref())? {
+        let path = match self.compute_storage_path(
+            &att,
+            &prev_kind_str,
+            mode_str.as_deref(),
+            contact_id.as_ref(),
+        )? {
             Some(p) => p,
             None => {
                 return Ok(error(

@@ -11,7 +11,12 @@ use entity_type_system::TypeHandler;
 
 const PEER_ID: &str = "test-peer";
 
-fn store_type_def(cs: &Arc<MemoryContentStore>, li: &Arc<MemoryLocationIndex>, name: &str, def: Value) {
+fn store_type_def(
+    cs: &Arc<MemoryContentStore>,
+    li: &Arc<MemoryLocationIndex>,
+    name: &str,
+    def: Value,
+) {
     let entity = Entity::new("system/type", entity_ecf::to_ecf(&def)).unwrap();
     let hash = cs.put(entity).unwrap();
     li.set(&format!("/{}/system/type/{}", PEER_ID, name), hash);
@@ -86,7 +91,10 @@ fn compare_lists_only_a_only_b_and_shared() {
         .collect();
     assert!(only_a.contains(&"age".to_string()));
     assert!(only_b.contains(&"email".to_string()));
-    let shared = result.get("shared").and_then(|v| v.as_map().cloned()).unwrap();
+    let shared = result
+        .get("shared")
+        .and_then(|v| v.as_map().cloned())
+        .unwrap();
     assert!(shared.iter().any(|(k, _)| k.as_text() == Some("name")));
 }
 

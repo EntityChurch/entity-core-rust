@@ -114,19 +114,12 @@ impl HelloData {
                 entity_ecf::text("nonce"),
                 entity_ecf::Value::Bytes(self.nonce.clone()),
             ),
-            (
-                entity_ecf::text("peer_id"),
-                entity_ecf::text(&self.peer_id),
-            ),
+            (entity_ecf::text("peer_id"), entity_ecf::text(&self.peer_id)),
         ];
 
         if !self.protocols.is_empty() {
-            let arr: Vec<entity_ecf::Value> =
-                self.protocols.iter().map(entity_ecf::text).collect();
-            entries.push((
-                entity_ecf::text("protocols"),
-                entity_ecf::Value::Array(arr),
-            ));
+            let arr: Vec<entity_ecf::Value> = self.protocols.iter().map(entity_ecf::text).collect();
+            entries.push((entity_ecf::text("protocols"), entity_ecf::Value::Array(arr)));
         }
 
         // §4.5 negotiation fields. Emitted in canonical key order (ECF sorts
@@ -142,12 +135,8 @@ impl HelloData {
             ));
         }
         if !self.key_types.is_empty() {
-            let arr: Vec<entity_ecf::Value> =
-                self.key_types.iter().map(entity_ecf::text).collect();
-            entries.push((
-                entity_ecf::text("key_types"),
-                entity_ecf::Value::Array(arr),
-            ));
+            let arr: Vec<entity_ecf::Value> = self.key_types.iter().map(entity_ecf::text).collect();
+            entries.push((entity_ecf::text("key_types"), entity_ecf::Value::Array(arr)));
         }
 
         if let Some(ts) = self.timestamp {
@@ -237,10 +226,7 @@ pub fn default_advertised_key_types() -> Vec<String> {
 /// is the first entry in the **initiator's** preference order that the
 /// **responder** also supports, mapped to its format code. `None` when the
 /// intersection is empty (→ `incompatible_hash_format`).
-pub fn negotiate_active_format(
-    initiator_order: &[String],
-    responder_set: &[String],
-) -> Option<u8> {
+pub fn negotiate_active_format(initiator_order: &[String], responder_set: &[String]) -> Option<u8> {
     initiator_order
         .iter()
         .find(|f| responder_set.iter().any(|r| r == *f))
@@ -286,9 +272,7 @@ impl Connection {
             local_nonce: nonce,
             remote_nonce: None,
             remote_identity_hash: None,
-            local_hash_formats: default_advertised_hash_formats(
-                entity_hash::HASH_ALGORITHM_SHA256,
-            ),
+            local_hash_formats: default_advertised_hash_formats(entity_hash::HASH_ALGORITHM_SHA256),
             local_key_types: default_advertised_key_types(),
             local_key_type: KeyType::Ed25519.label().to_string(),
             active_hash_format: entity_hash::HASH_ALGORITHM_SHA256,
@@ -378,9 +362,7 @@ impl Connection {
             entity_crypto::CryptoError::UnsupportedKeyType(b) => {
                 ProtocolError::UnsupportedKeyType(b)
             }
-            other => {
-                ProtocolError::ConnectionError(format!("invalid remote peer_id: {}", other))
-            }
+            other => ProtocolError::ConnectionError(format!("invalid remote peer_id: {}", other)),
         })?;
 
         // §4.5 hash_formats negotiation (single active value). The active
@@ -734,8 +716,7 @@ pub fn build_authenticate_envelope(
         .map_err(|e| ProtocolError::Invalid(e.to_string()))?;
 
     // Wrap authenticate entity in an EXECUTE
-    let exec_entity =
-        build_connect_execute("connect-authenticate", "authenticate", &auth_entity)?;
+    let exec_entity = build_connect_execute("connect-authenticate", "authenticate", &auth_entity)?;
 
     // Envelope: root = EXECUTE, included = [auth_entity, identity, signature]
     let mut envelope = Envelope::new(exec_entity);

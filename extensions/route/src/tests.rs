@@ -72,7 +72,10 @@ fn metric_tiebreak() {
 #[test]
 fn exact_beats_default() {
     // Default route has the better metric (0); exact still wins (longest-match).
-    let routes = vec![forward(ROUTE_MATCH_DEFAULT, VIA1, 0), forward(DEST, VIA2, 100)];
+    let routes = vec![
+        forward(ROUTE_MATCH_DEFAULT, VIA1, 0),
+        forward(DEST, VIA2, 100),
+    ];
     assert_eq!(
         resolve(&routes, DEST, 1000),
         Some(RouteResolution::Forward(VIA2.into()))
@@ -106,7 +109,10 @@ fn no_route() {
 // --- ROUTE-DELIVER-1 — action=deliver → terminal at this relay. --------------
 #[test]
 fn deliver_action() {
-    assert_eq!(resolve(&[deliver(DEST)], DEST, 1000), Some(RouteResolution::Deliver));
+    assert_eq!(
+        resolve(&[deliver(DEST)], DEST, 1000),
+        Some(RouteResolution::Deliver)
+    );
     // Default-token deliver also resolves terminal.
     assert_eq!(
         resolve(&[deliver(ROUTE_MATCH_DEFAULT)], DEST, 1000),

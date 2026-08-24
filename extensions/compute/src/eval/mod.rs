@@ -165,10 +165,7 @@ impl<'a> EvalContext<'a> {
         self
     }
 
-    pub fn with_dispatch_execute(
-        mut self,
-        f: Option<DispatchExecuteFn<'a>>,
-    ) -> Self {
+    pub fn with_dispatch_execute(mut self, f: Option<DispatchExecuteFn<'a>>) -> Self {
         self.dispatch_execute = f;
         self
     }
@@ -280,21 +277,33 @@ fn evaluate_trampoline(
         }
 
         match evaluate_inner(&current_entity, &current_scope, budget, ctx) {
-            EvalResult::TailCall { entity: next, scope: next_scope, strip_result } => {
+            EvalResult::TailCall {
+                entity: next,
+                scope: next_scope,
+                strip_result,
+            } => {
                 if strip_result {
                     strip_pending = true;
                 }
                 if !is_compute_expression(&next) {
                     budget.depth += 1;
                     let result = ComputeValue::Entity(next);
-                    return if strip_pending { strip_cast_tag(result) } else { result };
+                    return if strip_pending {
+                        strip_cast_tag(result)
+                    } else {
+                        result
+                    };
                 }
                 current_entity = next;
                 current_scope = next_scope;
             }
             EvalResult::Value(value) => {
                 budget.depth += 1;
-                return if strip_pending { strip_cast_tag(value) } else { value };
+                return if strip_pending {
+                    strip_cast_tag(value)
+                } else {
+                    value
+                };
             }
         }
     }
@@ -380,9 +389,7 @@ pub(crate) fn compute_value_to_cbor(value: &ComputeValue) -> Value {
         ComputeValue::Primitive(v) => v.clone(),
         ComputeValue::Entity(e) => Value::Bytes(e.content_hash.to_bytes().to_vec()),
         ComputeValue::Closure(c) => Value::Bytes(c.to_entity().content_hash.to_bytes().to_vec()),
-        ComputeValue::Error(err) => {
-            Value::Bytes(err.to_entity().content_hash.to_bytes().to_vec())
-        }
+        ComputeValue::Error(err) => Value::Bytes(err.to_entity().content_hash.to_bytes().to_vec()),
         ComputeValue::Uint(u) => Value::Integer(ciborium::value::Integer::from(*u)),
     }
 }
@@ -396,7 +403,9 @@ pub(crate) fn canonical_sorted_pairs(pairs: &[(String, Hash)]) -> Vec<(String, H
     sorted.sort_by(|(a, _), (b, _)| {
         let a_len = ecf_key_encoded_len(a);
         let b_len = ecf_key_encoded_len(b);
-        a_len.cmp(&b_len).then_with(|| a.as_bytes().cmp(b.as_bytes()))
+        a_len
+            .cmp(&b_len)
+            .then_with(|| a.as_bytes().cmp(b.as_bytes()))
     });
     sorted
 }

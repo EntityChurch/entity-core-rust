@@ -140,11 +140,7 @@ impl Harness {
                 entity_ecf::integer(new_threshold as i64),
             ),
         ];
-        props.sort_by(|a, b| {
-            a.0.as_text()
-                .unwrap_or("")
-                .cmp(b.0.as_text().unwrap_or(""))
-        });
+        props.sort_by(|a, b| a.0.as_text().unwrap_or("").cmp(b.0.as_text().unwrap_or("")));
         let att = AttestationData {
             attesting: quorum_id,
             attested: quorum_id,
@@ -205,19 +201,15 @@ fn r7_prime_load_quorum_tolerates_history_transition_path_collision() {
     // FIRST by load_quorum's scan.
     let transition_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
         (text("event"), text("created")),
-        (text("path"), text(&format!("/test/{}", path_quorum(&q_hash)))),
+        (
+            text("path"),
+            text(format!("/test/{}", path_quorum(&q_hash))),
+        ),
     ]));
-    let transition = Entity::new(
-        entity_types::TYPE_HISTORY_TRANSITION,
-        transition_data,
-    )
-    .unwrap();
+    let transition = Entity::new(entity_types::TYPE_HISTORY_TRANSITION, transition_data).unwrap();
     let transition_hash = transition.content_hash;
     h.content_store.put(transition).unwrap();
-    let history_head_path = format!(
-        "/test/system/history/head/test/{}",
-        path_quorum(&q_hash)
-    );
+    let history_head_path = format!("/test/system/history/head/test/{}", path_quorum(&q_hash));
     h.location_index.set(&history_head_path, transition_hash);
 
     // Sanity: the history-head path sorts BEFORE the quorum path.
@@ -324,11 +316,10 @@ fn tv_q2_identity_resolved_with_resolver_succeeds() {
     h.add_peer("resolved");
     let q_hash = h.add_quorum(&["a"], 1, Some("identity-resolved"));
     let resolved_hash = h.peer("resolved");
-    h.resolver_registry
-        .register(
-            "identity-resolved",
-            Arc::new(move |_input, _rctx| Ok(resolved_hash)),
-        );
+    let _ = h.resolver_registry.register(
+        "identity-resolved",
+        Arc::new(move |_input, _rctx| Ok(resolved_hash)),
+    );
     let set = current_signer_set(&q_hash, &h.ctx()).unwrap();
     assert_eq!(set.signers, vec![resolved_hash]);
 }
@@ -374,11 +365,10 @@ fn tv_q5_resolver_registered_after_initial_call_works() {
     assert!(current_signer_set(&q_hash, &h.ctx()).is_err());
     // Register late.
     let resolved_hash = h.peer("resolved");
-    h.resolver_registry
-        .register(
-            "identity-resolved",
-            Arc::new(move |_input, _rctx| Ok(resolved_hash)),
-        );
+    let _ = h.resolver_registry.register(
+        "identity-resolved",
+        Arc::new(move |_input, _rctx| Ok(resolved_hash)),
+    );
     // Spec §4.3: MUST NOT cache "not a quorum"/"resolver missing" status —
     // re-evaluates fresh. Our impl doesn't cache the failure either.
     let set = current_signer_set(&q_hash, &h.ctx()).unwrap();
@@ -441,7 +431,10 @@ fn tv_qf14_failed_validation_does_not_invalidate() {
     // bypassed validation). Cache stays populated.
     let _u = h.add_quorum_update(q_hash, &["a"], 1, None, &[]); // unsigned
     let still_cached = h.signer_set_cache.get(&q_hash);
-    assert!(still_cached.is_some(), "raw write must not invalidate cache");
+    assert!(
+        still_cached.is_some(),
+        "raw write must not invalidate cache"
+    );
 }
 
 #[test]
@@ -491,7 +484,12 @@ fn k_of_n_fails_below_threshold() {
 fn k_of_n_threshold_zero_is_trivially_true() {
     let h = Harness::new();
     let signers: Vec<Hash> = vec![];
-    assert!(verify_k_of_n_signatures(&Hash::zero(), &signers, 0, &h.ctx()));
+    assert!(verify_k_of_n_signatures(
+        &Hash::zero(),
+        &signers,
+        0,
+        &h.ctx()
+    ));
 }
 
 // ===========================================================================
@@ -559,11 +557,7 @@ fn add_quorum_update_at(
             entity_ecf::integer(new_threshold as i64),
         ),
     ];
-    props.sort_by(|a, b| {
-        a.0.as_text()
-            .unwrap_or("")
-            .cmp(b.0.as_text().unwrap_or(""))
-    });
+    props.sort_by(|a, b| a.0.as_text().unwrap_or("").cmp(b.0.as_text().unwrap_or("")));
     let att = AttestationData {
         attesting: quorum_id,
         attested: quorum_id,
@@ -666,21 +660,23 @@ fn tv_q_v_identity_2_resolver_max_depth_exceeded() {
     h.add_peer("a");
     let q_hash = h.add_quorum(&["a"], 1, Some("recursive-mode"));
     // Resolver that recursively enters MAX_RESOLVER_DEPTH+1 times.
-    h.resolver_registry.register(
-        "recursive-mode",
-        Arc::new(|input, rctx| {
-            // Synthesize fresh hashes by hashing repeatedly so each enter()
-            // sees a distinct ref and never trips the cycle path.
-            let mut next = *input;
-            loop {
-                let mut bytes = next.to_bytes().to_vec();
-                bytes.push(0xAA);
-                let entity = entity_entity::Entity::new("test/recurse", bytes).unwrap();
-                next = entity.content_hash;
-                rctx.enter(next)?;
-            }
-        }),
-    ).unwrap();
+    h.resolver_registry
+        .register(
+            "recursive-mode",
+            Arc::new(|input, rctx| {
+                // Synthesize fresh hashes by hashing repeatedly so each enter()
+                // sees a distinct ref and never trips the cycle path.
+                let mut next = *input;
+                loop {
+                    let mut bytes = next.to_bytes().to_vec();
+                    bytes.push(0xAA);
+                    let entity = entity_entity::Entity::new("test/recurse", bytes).unwrap();
+                    next = entity.content_hash;
+                    rctx.enter(next)?;
+                }
+            }),
+        )
+        .unwrap();
     let err = current_signer_set(&q_hash, &h.ctx()).unwrap_err();
     assert!(
         matches!(err, crate::QuorumError::ResolverDepthExceeded { .. }),
@@ -695,15 +691,17 @@ fn tv_q_v_identity_2_resolver_cycle() {
     let mut h = Harness::new();
     h.add_peer("a");
     let q_hash = h.add_quorum(&["a"], 1, Some("cyclic-mode"));
-    h.resolver_registry.register(
-        "cyclic-mode",
-        Arc::new(|input, rctx| {
-            // Enter once, then re-enter with the same ref → cycle.
-            rctx.enter(*input)?;
-            rctx.enter(*input)?;
-            Ok(*input)
-        }),
-    ).unwrap();
+    h.resolver_registry
+        .register(
+            "cyclic-mode",
+            Arc::new(|input, rctx| {
+                // Enter once, then re-enter with the same ref → cycle.
+                rctx.enter(*input)?;
+                rctx.enter(*input)?;
+                Ok(*input)
+            }),
+        )
+        .unwrap();
     let err = current_signer_set(&q_hash, &h.ctx()).unwrap_err();
     assert!(
         matches!(err, crate::QuorumError::ResolverCycle { .. }),

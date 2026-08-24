@@ -135,8 +135,8 @@ pub fn build_error_response_with_marker(
     }
     let error_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(fields));
 
-    let error_entity = Entity::new(TYPE_ERROR, error_data)
-        .map_err(|e| ProtocolError::Invalid(e.to_string()))?;
+    let error_entity =
+        Entity::new(TYPE_ERROR, error_data).map_err(|e| ProtocolError::Invalid(e.to_string()))?;
 
     build_execute_response(request_id, status, error_entity)
 }
@@ -236,4 +236,3 @@ pub struct ParsedResponse {
     /// result back sees what an external caller would have seen.
     pub included: std::collections::HashMap<entity_hash::Hash, Entity>,
 }
-

@@ -54,10 +54,8 @@ impl RevisionEngine {
         location_index: Arc<dyn LocationIndex>,
         local_peer_id_str: String,
     ) -> Self {
-        let revision_path_prefix =
-            format!("/{}/system/revision/", &local_peer_id_str);
-        let root_path_prefix =
-            format!("/{}/system/tree/root/", &local_peer_id_str);
+        let revision_path_prefix = format!("/{}/system/revision/", &local_peer_id_str);
+        let root_path_prefix = format!("/{}/system/tree/root/", &local_peer_id_str);
         Self {
             content_store,
             location_index,
@@ -212,7 +210,8 @@ impl RevisionEngine {
         // cross-thread contention on this path is handled by the
         // NotifyingLocationIndex cascade discipline. A plain set() is
         // conformant under that serialization property.
-        let _cascade = self.location_index
+        let _cascade = self
+            .location_index
             .set_with_context(&head_path, entry_hash, ctx.clone());
 
         // Advance active-branch pointer when set (§6.1 algorithm step 4).
@@ -220,13 +219,10 @@ impl RevisionEngine {
         if let Some(ab_hash) = self.location_index.get(&ab_path) {
             if let Some(ab_entity) = self.content_store.get(&ab_hash) {
                 if let Some(name) = decode_active_branch_name(&ab_entity) {
-                    let branch_path = crate::rev_branch_path(
-                        &self.local_peer_id_str,
-                        &ph,
-                        &name,
-                    );
-                    let _cascade = self.location_index
-                        .set_with_context(&branch_path, entry_hash, ctx.clone());
+                    let branch_path = crate::rev_branch_path(&self.local_peer_id_str, &ph, &name);
+                    let _cascade =
+                        self.location_index
+                            .set_with_context(&branch_path, entry_hash, ctx.clone());
                 }
             }
         }
@@ -236,9 +232,11 @@ impl RevisionEngine {
 }
 
 impl SyncTreeHook for RevisionEngine {
-    fn on_tree_change(&self, event: &TreeChangeEvent, ctx: &mut ExecutionContext)
-        -> Result<(), entity_store::CascadeHalt>
-    {
+    fn on_tree_change(
+        &self,
+        event: &TreeChangeEvent,
+        ctx: &mut ExecutionContext,
+    ) -> Result<(), entity_store::CascadeHalt> {
         if event.path.starts_with(&self.revision_path_prefix) {
             // Writes under our own subtree don't trigger auto-version, but a
             // write to a `{revision_prefix}{66hex}/config` entry must
@@ -546,8 +544,7 @@ fn prefix_encompasses(canonical_prefix: &str, target: &str) -> bool {
     if canonical_prefix.is_empty() {
         return true;
     }
-    target == canonical_prefix
-        || target.starts_with(&format!("{}/", canonical_prefix))
+    target == canonical_prefix || target.starts_with(&format!("{}/", canonical_prefix))
 }
 
 /// Does the exclude list contain a pattern that covers `target` (canonical
@@ -568,13 +565,14 @@ fn exclude_list_covers(excludes: &[String], canonical_prefix: &str, target: &str
     };
 
     for raw in excludes {
-        let pat = raw.trim_matches('/').trim_end_matches("**").trim_end_matches('/');
+        let pat = raw
+            .trim_matches('/')
+            .trim_end_matches("**")
+            .trim_end_matches('/');
         if pat.is_empty() {
             return true;
         }
-        if target_relative == pat
-            || target_relative.starts_with(&format!("{}/", pat))
-        {
+        if target_relative == pat || target_relative.starts_with(&format!("{}/", pat)) {
             return true;
         }
     }
@@ -619,10 +617,8 @@ impl ConfigCoordinationHook {
         location_index: Arc<dyn LocationIndex>,
         local_peer_id: String,
     ) -> Self {
-        let revision_prefix =
-            format!("/{}/system/revision/", &local_peer_id);
-        let tracking_path_prefix =
-            format!("/{}/system/tree/tracking-config/", &local_peer_id);
+        let revision_prefix = format!("/{}/system/revision/", &local_peer_id);
+        let tracking_path_prefix = format!("/{}/system/tree/tracking-config/", &local_peer_id);
         Self {
             content_store,
             location_index,
@@ -649,12 +645,7 @@ impl ConfigCoordinationHook {
         build_tracking_config_entity(canonical, enabled)
     }
 
-    fn write_tracking_config(
-        &self,
-        canonical: &str,
-        enabled: bool,
-        ctx: &ExecutionContext,
-    ) {
+    fn write_tracking_config(&self, canonical: &str, enabled: bool, ctx: &ExecutionContext) {
         let Some(entity) = Self::build_tracking_config_entity(canonical, enabled) else {
             tracing::error!(canonical = %canonical, "failed to build tracking-config entity");
             return;
@@ -667,7 +658,8 @@ impl ConfigCoordinationHook {
             }
         };
         let path = self.tracking_path(canonical);
-        let _cascade = self.location_index
+        let _cascade = self
+            .location_index
             .set_with_context(&path, hash, ctx.clone());
         tracing::debug!(
             path = %path,
@@ -701,9 +693,11 @@ impl ConfigCoordinationHook {
 }
 
 impl SyncTreeHook for ConfigCoordinationHook {
-    fn on_tree_change(&self, event: &TreeChangeEvent, ctx: &mut ExecutionContext)
-        -> Result<(), entity_store::CascadeHalt>
-    {
+    fn on_tree_change(
+        &self,
+        event: &TreeChangeEvent,
+        ctx: &mut ExecutionContext,
+    ) -> Result<(), entity_store::CascadeHalt> {
         if !is_prefix_config_path(&event.path, &self.revision_prefix) {
             return Ok(());
         }
@@ -829,9 +823,7 @@ mod tests {
             ),
             (
                 entity_ecf::text("exclude"),
-                entity_ecf::Value::Array(
-                    cfg.exclude.iter().map(|s| entity_ecf::text(s)).collect(),
-                ),
+                entity_ecf::Value::Array(cfg.exclude.iter().map(entity_ecf::text).collect()),
             ),
             (
                 entity_ecf::text("merge_order"),
@@ -862,11 +854,7 @@ mod tests {
     fn coordination_creates_tracking_config_on_auto_version_enable() {
         let (store, li) = make_stores();
         let peer_id = test_peer_id();
-        let hook = ConfigCoordinationHook::new(
-            store.clone(),
-            li.clone(),
-            peer_id.clone(),
-        );
+        let hook = ConfigCoordinationHook::new(store.clone(), li.clone(), peer_id.clone());
 
         let cfg = base_config("project/", true);
         let cfg_entity = make_config_entity(&cfg);
@@ -882,7 +870,7 @@ mod tests {
             context: None,
         };
         let mut ctx = ExecutionContext::default();
-        hook.on_tree_change(&event, &mut ctx);
+        let _ = hook.on_tree_change(&event, &mut ctx);
 
         let tc_path = format!("/{}/system/tree/tracking-config/project", peer_id);
         let tc_hash = li.get(&tc_path).expect("tracking-config should be created");
@@ -896,11 +884,7 @@ mod tests {
     fn coordination_disables_tracking_config_on_auto_version_false() {
         let (store, li) = make_stores();
         let peer_id = test_peer_id();
-        let hook = ConfigCoordinationHook::new(
-            store.clone(),
-            li.clone(),
-            peer_id.clone(),
-        );
+        let hook = ConfigCoordinationHook::new(store.clone(), li.clone(), peer_id.clone());
 
         let cfg = base_config("project/", false);
         let cfg_hash = store.put(make_config_entity(&cfg)).unwrap();
@@ -913,7 +897,7 @@ mod tests {
             change_type: ChangeType::Created,
             context: None,
         };
-        hook.on_tree_change(&event, &mut ExecutionContext::default());
+        let _ = hook.on_tree_change(&event, &mut ExecutionContext::default());
 
         let tc_path = format!("/{}/system/tree/tracking-config/project", peer_id);
         let tc_hash = li.get(&tc_path).expect("tracking-config still created");
@@ -926,11 +910,7 @@ mod tests {
     fn coordination_disables_on_config_removal() {
         let (store, li) = make_stores();
         let peer_id = test_peer_id();
-        let hook = ConfigCoordinationHook::new(
-            store.clone(),
-            li.clone(),
-            peer_id.clone(),
-        );
+        let hook = ConfigCoordinationHook::new(store.clone(), li.clone(), peer_id.clone());
 
         let cfg = base_config("project/", true);
         let prev_hash = store.put(make_config_entity(&cfg)).unwrap();
@@ -944,7 +924,7 @@ mod tests {
             change_type: ChangeType::Deleted,
             context: None,
         };
-        hook.on_tree_change(&event, &mut ExecutionContext::default());
+        let _ = hook.on_tree_change(&event, &mut ExecutionContext::default());
 
         let tc_path = format!("/{}/system/tree/tracking-config/project", peer_id);
         let tc_hash = li.get(&tc_path).expect("tc written on removal");
@@ -957,11 +937,7 @@ mod tests {
     fn coordination_skips_invalid_configs() {
         let (store, li) = make_stores();
         let peer_id = test_peer_id();
-        let hook = ConfigCoordinationHook::new(
-            store.clone(),
-            li.clone(),
-            peer_id.clone(),
-        );
+        let hook = ConfigCoordinationHook::new(store.clone(), li.clone(), peer_id.clone());
 
         // Universal prefix with auto_version:true but no excludes → invalid.
         let cfg = base_config("/", true);
@@ -975,7 +951,7 @@ mod tests {
             change_type: ChangeType::Created,
             context: None,
         };
-        hook.on_tree_change(&event, &mut ExecutionContext::default());
+        let _ = hook.on_tree_change(&event, &mut ExecutionContext::default());
 
         // No tracking-config was written.
         let tc_path = format!("/{}/system/tree/tracking-config/root", peer_id);
@@ -986,11 +962,7 @@ mod tests {
     fn coordination_universal_prefix_uses_root_segment() {
         let (store, li) = make_stores();
         let peer_id = test_peer_id();
-        let hook = ConfigCoordinationHook::new(
-            store.clone(),
-            li.clone(),
-            peer_id.clone(),
-        );
+        let hook = ConfigCoordinationHook::new(store.clone(), li.clone(), peer_id.clone());
 
         let mut cfg = base_config("/", true);
         cfg.exclude = vec!["system/**".to_string()];
@@ -1004,7 +976,7 @@ mod tests {
             change_type: ChangeType::Created,
             context: None,
         };
-        hook.on_tree_change(&event, &mut ExecutionContext::default());
+        let _ = hook.on_tree_change(&event, &mut ExecutionContext::default());
 
         let tc_path = format!("/{}/system/tree/tracking-config/root", peer_id);
         let tc_hash = li.get(&tc_path).expect("universal tracking-config");
@@ -1018,11 +990,7 @@ mod tests {
     fn coordination_ignores_unrelated_paths() {
         let (store, li) = make_stores();
         let peer_id = test_peer_id();
-        let hook = ConfigCoordinationHook::new(
-            store.clone(),
-            li.clone(),
-            peer_id.clone(),
-        );
+        let hook = ConfigCoordinationHook::new(store.clone(), li.clone(), peer_id.clone());
 
         let event = TreeChangeEvent {
             path: format!("/{}/project/foo", peer_id),
@@ -1032,7 +1000,7 @@ mod tests {
             change_type: ChangeType::Created,
             context: None,
         };
-        hook.on_tree_change(&event, &mut ExecutionContext::default());
+        let _ = hook.on_tree_change(&event, &mut ExecutionContext::default());
 
         assert!(li.list("/").is_empty());
     }
@@ -1054,12 +1022,10 @@ mod tests {
             change_type: ChangeType::Created,
             context: None,
         };
-        engine.on_tree_change(&event, &mut ExecutionContext::default());
+        let _ = engine.on_tree_change(&event, &mut ExecutionContext::default());
 
         // No version created
-        assert!(li
-            .get(&crate::rev_head_path(&peer_id, &ph))
-            .is_none());
+        assert!(li.get(&crate::rev_head_path(&peer_id, &ph)).is_none());
     }
 
     fn base_config(prefix: &str, auto_version: bool) -> RevisionConfig {
@@ -1127,7 +1093,11 @@ mod tests {
     fn validate_rejects_universal_without_excludes() {
         let cfg = base_config("/", true);
         let err = validate_revision_config(&cfg).expect_err("should reject");
-        assert!(err.message.contains("system/revision"), "err was: {}", err.message);
+        assert!(
+            err.message.contains("system/revision"),
+            "err was: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -1140,7 +1110,10 @@ mod tests {
     #[test]
     fn validate_accepts_universal_with_full_enumeration() {
         let mut cfg = base_config("/", true);
-        cfg.exclude = REQUIRED_EXCLUDES.iter().map(|p| format!("{}/**", p)).collect();
+        cfg.exclude = REQUIRED_EXCLUDES
+            .iter()
+            .map(|p| format!("{}/**", p))
+            .collect();
         validate_revision_config(&cfg).expect("valid");
     }
 
@@ -1154,7 +1127,11 @@ mod tests {
             "system/tree/tracking-config/**".to_string(),
         ];
         let err = validate_revision_config(&cfg).expect_err("should reject");
-        assert!(err.message.contains("system/history"), "err was: {}", err.message);
+        assert!(
+            err.message.contains("system/history"),
+            "err was: {}",
+            err.message
+        );
     }
 
     #[test]
@@ -1162,7 +1139,11 @@ mod tests {
         // prefix /system/ encompasses system/revision, system/history, etc.
         let cfg = base_config("system/", true);
         let err = validate_revision_config(&cfg).expect_err("should reject");
-        assert!(err.code == "config/missing-required-exclude", "code was: {}", err.code);
+        assert!(
+            err.code == "config/missing-required-exclude",
+            "code was: {}",
+            err.code
+        );
     }
 
     #[test]
@@ -1203,12 +1184,10 @@ mod tests {
             change_type: ChangeType::Created,
             context: None,
         };
-        engine.on_tree_change(&event, &mut ExecutionContext::default());
+        let _ = engine.on_tree_change(&event, &mut ExecutionContext::default());
 
         // No config, no version created
-        assert!(li
-            .get(&crate::rev_head_path(&peer_id, &ph))
-            .is_none());
+        assert!(li.get(&crate::rev_head_path(&peer_id, &ph)).is_none());
     }
 
     /// Install a revision config in the tree at its hash-addressed path.
@@ -1223,10 +1202,7 @@ mod tests {
     ) {
         let cfg_hash = store.put(make_config_entity(cfg)).unwrap();
         let ph = test_ph(peer_id, &cfg.prefix);
-        li.set(
-            &crate::rev_config_path(peer_id, &ph),
-            cfg_hash,
-        );
+        li.set(&crate::rev_config_path(peer_id, &ph), cfg_hash);
     }
 
     /// Seed the tracked-root binding that the root tracker would normally
@@ -1275,7 +1251,7 @@ mod tests {
         seed_tracked_root(&li, &peer_id, "project", root);
 
         let evt = event_for(&peer_id, "project/file.txt", sample_hash(0x01));
-        engine.on_tree_change(&evt, &mut ExecutionContext::default());
+        let _ = engine.on_tree_change(&evt, &mut ExecutionContext::default());
 
         let ph = test_ph(&peer_id, "project/");
         let head_hash = li
@@ -1301,16 +1277,12 @@ mod tests {
 
         let ph = test_ph(&peer_id, "project/");
         let evt = event_for(&peer_id, "project/file.txt", sample_hash(0x01));
-        engine.on_tree_change(&evt, &mut ExecutionContext::default());
-        let first_head = li
-            .get(&crate::rev_head_path(&peer_id, &ph))
-            .unwrap();
+        let _ = engine.on_tree_change(&evt, &mut ExecutionContext::default());
+        let first_head = li.get(&crate::rev_head_path(&peer_id, &ph)).unwrap();
 
         // Same tracked root, another event — must dedup.
-        engine.on_tree_change(&evt, &mut ExecutionContext::default());
-        let second_head = li
-            .get(&crate::rev_head_path(&peer_id, &ph))
-            .unwrap();
+        let _ = engine.on_tree_change(&evt, &mut ExecutionContext::default());
+        let second_head = li.get(&crate::rev_head_path(&peer_id, &ph)).unwrap();
         assert_eq!(first_head, second_head);
     }
 
@@ -1326,16 +1298,12 @@ mod tests {
         let ph = test_ph(&peer_id, "project/");
         seed_tracked_root(&li, &peer_id, "project", sample_hash(0x01));
         let evt = event_for(&peer_id, "project/file.txt", sample_hash(0xaa));
-        engine.on_tree_change(&evt, &mut ExecutionContext::default());
-        let first_head = li
-            .get(&crate::rev_head_path(&peer_id, &ph))
-            .unwrap();
+        let _ = engine.on_tree_change(&evt, &mut ExecutionContext::default());
+        let first_head = li.get(&crate::rev_head_path(&peer_id, &ph)).unwrap();
 
         seed_tracked_root(&li, &peer_id, "project", sample_hash(0x02));
-        engine.on_tree_change(&evt, &mut ExecutionContext::default());
-        let second_head = li
-            .get(&crate::rev_head_path(&peer_id, &ph))
-            .unwrap();
+        let _ = engine.on_tree_change(&evt, &mut ExecutionContext::default());
+        let second_head = li.get(&crate::rev_head_path(&peer_id, &ph)).unwrap();
 
         assert_ne!(first_head, second_head);
         let entry = decode_revision_entry(&store.get(&second_head).unwrap()).unwrap();
@@ -1355,11 +1323,9 @@ mod tests {
         // No seed — tracking-config invariant violated.
         let ph = test_ph(&peer_id, "project/");
         let evt = event_for(&peer_id, "project/file.txt", sample_hash(0x01));
-        engine.on_tree_change(&evt, &mut ExecutionContext::default());
+        let _ = engine.on_tree_change(&evt, &mut ExecutionContext::default());
 
-        assert!(li
-            .get(&crate::rev_head_path(&peer_id, &ph))
-            .is_none());
+        assert!(li.get(&crate::rev_head_path(&peer_id, &ph)).is_none());
     }
 
     #[test]
@@ -1379,7 +1345,7 @@ mod tests {
             "system/revision/head/something",
             sample_hash(0xff),
         );
-        engine.on_tree_change(&evt, &mut ExecutionContext::default());
+        let _ = engine.on_tree_change(&evt, &mut ExecutionContext::default());
 
         // No head was advanced anywhere — own-path write is ignored.
         assert!(li.list("/").iter().all(|e| !e.path.ends_with("/head")));
@@ -1398,11 +1364,9 @@ mod tests {
 
         let ph = test_ph(&peer_id, "project/");
         let evt = event_for(&peer_id, "project/build/out.bin", sample_hash(0xbb));
-        engine.on_tree_change(&evt, &mut ExecutionContext::default());
+        let _ = engine.on_tree_change(&evt, &mut ExecutionContext::default());
 
-        assert!(li
-            .get(&crate::rev_head_path(&peer_id, &ph))
-            .is_none());
+        assert!(li.get(&crate::rev_head_path(&peer_id, &ph)).is_none());
     }
 
     /// End-to-end: install both hooks on a NotifyingLocationIndex, write a
@@ -1417,10 +1381,8 @@ mod tests {
         let peer_id = test_peer_id();
         let inner = Arc::new(MemoryLocationIndex::new());
         let store = Arc::new(MemoryContentStore::new());
-        let noop_broadcast: Arc<dyn Fn(TreeChangeEvent) + Send + Sync> =
-            Arc::new(|_| {});
-        let notifying =
-            Arc::new(NotifyingLocationIndex::new(inner.clone(), noop_broadcast));
+        let noop_broadcast: Arc<dyn Fn(TreeChangeEvent) + Send + Sync> = Arc::new(|_| {});
+        let notifying = Arc::new(NotifyingLocationIndex::new(inner.clone(), noop_broadcast));
 
         let coord = Arc::new(ConfigCoordinationHook::new(
             store.clone(),
@@ -1496,7 +1458,7 @@ mod tests {
         let ph_inner = test_ph(&peer_id, "project/src/");
 
         let evt = event_for(&peer_id, "project/src/file.rs", sample_hash(0x11));
-        engine.on_tree_change(&evt, &mut ExecutionContext::default());
+        let _ = engine.on_tree_change(&evt, &mut ExecutionContext::default());
 
         let outer = li
             .get(&crate::rev_head_path(&peer_id, &ph_outer))
@@ -1506,11 +1468,15 @@ mod tests {
             .expect("inner head");
         assert_ne!(outer, inner);
         assert_eq!(
-            decode_revision_entry(&store.get(&outer).unwrap()).unwrap().root,
+            decode_revision_entry(&store.get(&outer).unwrap())
+                .unwrap()
+                .root,
             sample_hash(0xaa)
         );
         assert_eq!(
-            decode_revision_entry(&store.get(&inner).unwrap()).unwrap().root,
+            decode_revision_entry(&store.get(&inner).unwrap())
+                .unwrap()
+                .root,
             sample_hash(0xbb)
         );
     }

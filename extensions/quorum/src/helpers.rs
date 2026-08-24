@@ -5,8 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use entity_attestation::{
-    find_attestations_targeting, find_live_head, AttestationCtx, AttestationData,
-    AttestationIndex,
+    find_attestations_targeting, find_live_head, AttestationCtx, AttestationData, AttestationIndex,
 };
 use entity_crypto::Keypair;
 use entity_entity::{find_signature_by_signer, Entity, TYPE_SIGNATURE};
@@ -83,10 +82,7 @@ pub fn is_quorum_id(hash: &Hash, ctx: &QuorumCtx) -> bool {
 ///
 /// Cache is keyed only on `quorum_id`; historical (`as_of`) lookups
 /// bypass the cache.
-pub fn current_signer_set(
-    quorum_id: &Hash,
-    ctx: &QuorumCtx,
-) -> Result<SignerSet, QuorumError> {
+pub fn current_signer_set(quorum_id: &Hash, ctx: &QuorumCtx) -> Result<SignerSet, QuorumError> {
     current_signer_set_as_of(quorum_id, None, ctx)
 }
 
@@ -110,11 +106,8 @@ pub fn current_signer_set_as_of(
     // Walk for the live (per as_of) head of the quorum-update chain.
     let (mut signers, mut threshold) = (quorum.signers.clone(), quorum.threshold);
     let actx = ctx.attestation_ctx();
-    let updates = find_attestations_targeting(
-        quorum_id,
-        |a| a.kind() == Some(KIND_QUORUM_UPDATE),
-        &actx,
-    );
+    let updates =
+        find_attestations_targeting(quorum_id, |a| a.kind() == Some(KIND_QUORUM_UPDATE), &actx);
     if !updates.is_empty() {
         let supersedes_set: HashSet<Hash> =
             updates.iter().filter_map(|(_, a)| a.supersedes).collect();
@@ -143,13 +136,14 @@ pub fn current_signer_set_as_of(
     // Resolution-mode dispatch (§5).
     let mode = quorum.resolution_mode();
     if mode != RESOLUTION_CONCRETE {
-        let resolver = ctx.resolver_registry.lookup(mode).ok_or_else(|| {
-            QuorumError::ResolverUnavailable {
-                quorum_id_hex: hex_segment(quorum_id),
-                mode_name: mode.to_string(),
-                available_modes: ctx.resolver_registry.available_modes(),
-            }
-        })?;
+        let resolver =
+            ctx.resolver_registry
+                .lookup(mode)
+                .ok_or_else(|| QuorumError::ResolverUnavailable {
+                    quorum_id_hex: hex_segment(quorum_id),
+                    mode_name: mode.to_string(),
+                    available_modes: ctx.resolver_registry.available_modes(),
+                })?;
         let mut visited: HashSet<Hash> = HashSet::new();
         let mut resolved = Vec::with_capacity(signers.len());
         for s in &signers {
@@ -221,14 +215,8 @@ fn find_quorum_update_head_at(
             return Some(current);
         }
         // Walk back via supersedes pointer.
-        let prev_hash = match current.supersedes {
-            Some(h) => h,
-            None => return None, // ran off the start; no entry valid at t
-        };
-        let prev = match actx.index.get(&prev_hash) {
-            Some(p) => p,
-            None => return None,
-        };
+        let prev_hash = current.supersedes?;
+        let prev = actx.index.get(&prev_hash)?;
         current = prev;
     }
 }
@@ -367,10 +355,7 @@ fn find_signature(target: &Hash, signer: &Hash, ctx: &QuorumCtx) -> Option<Signa
 }
 
 /// PR-2 (PROPOSAL-SYSTEM-PEER-RENAME): renamed from `resolve_peer_pubkey`.
-fn resolve_peer(
-    peer_hash: &Hash,
-    content_store: &Arc<dyn ContentStore>,
-) -> Option<[u8; 32]> {
+fn resolve_peer(peer_hash: &Hash, content_store: &Arc<dyn ContentStore>) -> Option<[u8; 32]> {
     let entity = content_store.get(peer_hash)?;
     if entity.entity_type != entity_crypto::TYPE_PEER {
         return None;

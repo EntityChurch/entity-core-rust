@@ -199,7 +199,8 @@ pub fn is_valid_namespace(ns: &str) -> bool {
     if ns.is_empty() || ns.starts_with('/') || ns.ends_with('/') {
         return false;
     }
-    ns.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+    ns.split('/')
+        .all(|seg| !seg.is_empty() && seg != "." && seg != "..")
 }
 
 // ---------------------------------------------------------------------------

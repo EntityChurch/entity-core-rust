@@ -94,11 +94,8 @@ mod tests {
         let content_store = Arc::new(MemoryContentStore::new());
         let base_index = Arc::new(MemoryLocationIndex::new());
         let indexes = Arc::new(QueryIndexes::new());
-        let indexing = IndexingLocationIndex::new(
-            base_index.clone(),
-            content_store.clone(),
-            indexes.clone(),
-        );
+        let indexing =
+            IndexingLocationIndex::new(base_index.clone(), content_store.clone(), indexes.clone());
 
         let entity = make_entity("app/user", "alice");
         let hash = content_store.put(entity).unwrap();
@@ -115,11 +112,8 @@ mod tests {
         let content_store = Arc::new(MemoryContentStore::new());
         let base_index = Arc::new(MemoryLocationIndex::new());
         let indexes = Arc::new(QueryIndexes::new());
-        let indexing = IndexingLocationIndex::new(
-            base_index.clone(),
-            content_store.clone(),
-            indexes.clone(),
-        );
+        let indexing =
+            IndexingLocationIndex::new(base_index.clone(), content_store.clone(), indexes.clone());
 
         let entity = make_entity("app/user", "alice");
         let hash = content_store.put(entity).unwrap();
@@ -135,11 +129,8 @@ mod tests {
         let content_store = Arc::new(MemoryContentStore::new());
         let base_index = Arc::new(MemoryLocationIndex::new());
         let indexes = Arc::new(QueryIndexes::new());
-        let indexing = IndexingLocationIndex::new(
-            base_index.clone(),
-            content_store.clone(),
-            indexes.clone(),
-        );
+        let indexing =
+            IndexingLocationIndex::new(base_index.clone(), content_store.clone(), indexes.clone());
 
         let e1 = make_entity("app/user", "alice");
         let h1 = content_store.put(e1).unwrap();
@@ -158,11 +149,8 @@ mod tests {
         let content_store = Arc::new(MemoryContentStore::new());
         let base_index = Arc::new(MemoryLocationIndex::new());
         let indexes = Arc::new(QueryIndexes::new());
-        let indexing = IndexingLocationIndex::new(
-            base_index.clone(),
-            content_store.clone(),
-            indexes.clone(),
-        );
+        let indexing =
+            IndexingLocationIndex::new(base_index.clone(), content_store.clone(), indexes.clone());
 
         let entity = make_entity("app/user", "alice");
         let hash = content_store.put(entity).unwrap();
@@ -177,11 +165,8 @@ mod tests {
         let content_store = Arc::new(MemoryContentStore::new());
         let base_index = Arc::new(MemoryLocationIndex::new());
         let indexes = Arc::new(QueryIndexes::new());
-        let indexing = IndexingLocationIndex::new(
-            base_index.clone(),
-            content_store.clone(),
-            indexes.clone(),
-        );
+        let indexing =
+            IndexingLocationIndex::new(base_index.clone(), content_store.clone(), indexes.clone());
 
         let entity = make_entity("app/user", "alice");
         let hash = content_store.put(entity).unwrap();

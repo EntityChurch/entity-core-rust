@@ -122,11 +122,7 @@ fn tap_op(peer_id: &str, action_sink: &dyn AppActionSink) -> VerbOutput {
 /// `/{peer_id}/system/continuation/{chain_id}` and chain-error markers
 /// at `/{peer_id}/system/runtime/chain-errors/{lost|rejected}/{chain_id}/...`.
 /// Returns a `Listing` with two sections: Continuations + Markers.
-pub fn chain_op(
-    binding: &dyn PeerBinding,
-    peer_id: &str,
-    chain_id: &str,
-) -> VerbOutput {
+pub fn chain_op(binding: &dyn PeerBinding, peer_id: &str, chain_id: &str) -> VerbOutput {
     let continuation_prefix = format!("/{peer_id}/system/continuation/");
     let chain_errors_prefix = format!("/{peer_id}/system/runtime/chain-errors/");
 
@@ -202,11 +198,7 @@ fn chain(
 /// Verb-op (§8.1). Enumerate every binding under `prefix` on
 /// `peer_id`. Pure path-enumerator primitive (v1.2 §2.2). Aliases
 /// already expanded at dispatcher tier.
-pub fn under_op(
-    binding: &dyn PeerBinding,
-    peer_id: &str,
-    prefix: &str,
-) -> VerbOutput {
+pub fn under_op(binding: &dyn PeerBinding, peer_id: &str, prefix: &str) -> VerbOutput {
     let entries = binding
         .tree_listing(peer_id, prefix)
         .into_iter()
@@ -271,7 +263,9 @@ pub fn errors_op(peer_id: &str, binding: &dyn PeerBinding) -> VerbOutput {
     use std::collections::BTreeMap;
     let mut by_chain: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for p in paths {
-        let chain_id = marker_chain_id(&p).map(String::from).unwrap_or_else(|| "?".into());
+        let chain_id = marker_chain_id(&p)
+            .map(String::from)
+            .unwrap_or_else(|| "?".into());
         let (kind, reason) = marker_kind_reason(&p);
         by_chain
             .entry(chain_id)
@@ -293,11 +287,7 @@ pub fn errors_op(peer_id: &str, binding: &dyn PeerBinding) -> VerbOutput {
 /// Verb-op (§8.1). Read the entity at `path` on `peer_id` and render
 /// path / type / hash / len header + CBOR-pretty-printed body.
 /// Entity-reader primitive (v1.2 §2.2).
-pub fn entity_op(
-    binding: &dyn PeerBinding,
-    peer_id: &str,
-    path: &str,
-) -> VerbOutput {
+pub fn entity_op(binding: &dyn PeerBinding, peer_id: &str, path: &str) -> VerbOutput {
     match binding.get_entity(peer_id, path) {
         Some(entity) => VerbOutput::Listing {
             sections: vec![ListingSection::with_header(
@@ -405,9 +395,8 @@ fn dump(
             }
         }
     }
-    let hash_hex = hash_hex.ok_or_else(|| {
-        ShellError::usage("inspect dump: missing <hash-hex> argument")
-    })?;
+    let hash_hex =
+        hash_hex.ok_or_else(|| ShellError::usage("inspect dump: missing <hash-hex> argument"))?;
     if hash_hex.is_empty() || !hash_hex.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err(ShellError::usage(format!(
             "inspect dump: hash must be a non-empty hex string (got '{hash_hex}')",
@@ -449,10 +438,7 @@ pub fn find_op(
     let truncated = total > limit;
     let mut entries: Vec<String> = all.into_iter().take(limit).collect();
     if truncated {
-        entries.push(format!(
-            "… {} more (raise with --limit N)",
-            total - limit
-        ));
+        entries.push(format!("… {} more (raise with --limit N)", total - limit));
     }
 
     VerbOutput::Listing {
@@ -471,11 +457,7 @@ pub fn find_op(
     }
 }
 
-fn find(
-    shell: &Shell,
-    args: &[&str],
-    binding: &dyn PeerBinding,
-) -> Result<VerbOutput, ShellError> {
+fn find(shell: &Shell, args: &[&str], binding: &dyn PeerBinding) -> Result<VerbOutput, ShellError> {
     let mut substring: Option<&str> = None;
     let mut limit: usize = FIND_DEFAULT_LIMIT;
     let mut i = 0;
@@ -506,9 +488,8 @@ fn find(
             }
         }
     }
-    let substring = substring.ok_or_else(|| {
-        ShellError::usage("inspect find: missing <substring> argument")
-    })?;
+    let substring =
+        substring.ok_or_else(|| ShellError::usage("inspect find: missing <substring> argument"))?;
     if substring.is_empty() {
         return Err(ShellError::usage(
             "inspect find: substring must be non-empty (refusing to match everything)",
@@ -641,11 +622,21 @@ mod tests {
     }
 
     impl PeerBinding for StubBinding {
-        fn peer_id(&self) -> &str { &self.bound }
-        fn primary_peer_id(&self) -> String { self.bound.clone() }
-        fn peer_ids(&self) -> Vec<String> { vec![self.bound.clone()] }
-        fn connected_peers(&self) -> Vec<String> { Vec::new() }
-        fn peer_label(&self, _pid: &str) -> Option<String> { None }
+        fn peer_id(&self) -> &str {
+            &self.bound
+        }
+        fn primary_peer_id(&self) -> String {
+            self.bound.clone()
+        }
+        fn peer_ids(&self) -> Vec<String> {
+            vec![self.bound.clone()]
+        }
+        fn connected_peers(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn peer_label(&self, _pid: &str) -> Option<String> {
+            None
+        }
         fn tree_listing(&self, _pid: &str, prefix: &str) -> Vec<TreeListingEntry> {
             self.bindings
                 .iter()
@@ -692,7 +683,8 @@ mod tests {
                     path: "/PEER1/system/runtime/chain-errors/lost/CHAIN_A/0/timeout/0xabc".into(),
                 },
                 TreeListingEntry {
-                    path: "/PEER1/system/runtime/chain-errors/rejected/CHAIN_A/1/cap_denied/0xdef".into(),
+                    path: "/PEER1/system/runtime/chain-errors/rejected/CHAIN_A/1/cap_denied/0xdef"
+                        .into(),
                 },
                 TreeListingEntry {
                     path: "/PEER1/system/runtime/chain-errors/lost/CHAIN_B/0/timeout/0x111".into(),
@@ -824,7 +816,10 @@ mod tests {
             .any(|r| r.contains("inspect chain")));
         // tap shortcut must be discoverable from help.
         assert!(
-            sections[0].entries.iter().any(|r| r.contains("inspect tap")),
+            sections[0]
+                .entries
+                .iter()
+                .any(|r| r.contains("inspect tap")),
             "help must list `inspect tap`"
         );
     }
@@ -897,9 +892,15 @@ mod tests {
         StubBinding {
             bound: "PEER1".into(),
             bindings: vec![
-                TreeListingEntry { path: "/PEER1/app/notes/one".into() },
-                TreeListingEntry { path: "/PEER1/app/notes/two".into() },
-                TreeListingEntry { path: "/PEER1/system/peers/PEER2".into() },
+                TreeListingEntry {
+                    path: "/PEER1/app/notes/one".into(),
+                },
+                TreeListingEntry {
+                    path: "/PEER1/app/notes/two".into(),
+                },
+                TreeListingEntry {
+                    path: "/PEER1/system/peers/PEER2".into(),
+                },
             ],
             entities: vec![
                 (
@@ -928,8 +929,15 @@ mod tests {
         };
         assert_eq!(sections.len(), 1);
         let section = &sections[0];
-        assert!(section.header.as_ref().unwrap().contains("entity /PEER1/app/notes/one"));
-        assert!(section.entries.iter().any(|r| r == "path:  /PEER1/app/notes/one"));
+        assert!(section
+            .header
+            .as_ref()
+            .unwrap()
+            .contains("entity /PEER1/app/notes/one"));
+        assert!(section
+            .entries
+            .iter()
+            .any(|r| r == "path:  /PEER1/app/notes/one"));
         assert!(section.entries.iter().any(|r| r == "type:  app/note"));
         assert!(section.entries.iter().any(|r| r == "hash:  aaaa1111bbbb"));
         assert!(section.entries.iter().any(|r| r.starts_with("len:")));
@@ -960,13 +968,25 @@ mod tests {
     #[test]
     fn inspect_dump_by_hash_renders_dump_shape_without_paths_section_by_default() {
         let binding = dump_fixture();
-        let output = dump_op(&binding, "PEER1", "aaaa1111bbbb", /*with_paths=*/ false);
+        let output = dump_op(
+            &binding,
+            "PEER1",
+            "aaaa1111bbbb",
+            /*with_paths=*/ false,
+        );
         let VerbOutput::Listing { sections } = output else {
             panic!("expected Listing");
         };
         assert_eq!(sections.len(), 1, "no --paths → one section");
-        assert!(sections[0].header.as_ref().unwrap().contains("dump aaaa1111bbbb"));
-        assert!(sections[0].entries.iter().any(|r| r == "hash:  aaaa1111bbbb"));
+        assert!(sections[0]
+            .header
+            .as_ref()
+            .unwrap()
+            .contains("dump aaaa1111bbbb"));
+        assert!(sections[0]
+            .entries
+            .iter()
+            .any(|r| r == "hash:  aaaa1111bbbb"));
     }
 
     #[test]
@@ -976,12 +996,23 @@ mod tests {
         let VerbOutput::Listing { sections } = output else {
             panic!("expected Listing");
         };
-        assert_eq!(sections.len(), 2, "with --paths → entity-dump + paths section");
+        assert_eq!(
+            sections.len(),
+            2,
+            "with --paths → entity-dump + paths section"
+        );
         let paths = &sections[1];
-        assert!(paths.header.as_ref().unwrap().contains("paths referencing this hash"));
+        assert!(paths
+            .header
+            .as_ref()
+            .unwrap()
+            .contains("paths referencing this hash"));
         assert!(paths.entries.iter().any(|p| p == "/PEER1/app/notes/one"));
         assert!(paths.entries.iter().any(|p| p == "/PEER1/app/notes/two"));
-        assert!(!paths.entries.iter().any(|p| p == "/PEER1/system/peers/PEER2"));
+        assert!(!paths
+            .entries
+            .iter()
+            .any(|p| p == "/PEER1/system/peers/PEER2"));
     }
 
     #[test]
@@ -1034,7 +1065,11 @@ mod tests {
             .last()
             .unwrap()
             .contains("more (raise with --limit"));
-        assert!(sections[0].header.as_ref().unwrap().contains("of 7 matches"));
+        assert!(sections[0]
+            .header
+            .as_ref()
+            .unwrap()
+            .contains("of 7 matches"));
     }
 
     #[test]
@@ -1080,9 +1115,8 @@ mod tests {
             marker_chain_id("/PEER1/system/runtime/chain-errors/lost/CX/0/r/0xabc"),
             Some("CX"),
         );
-        let (k, r) = marker_kind_reason(
-            "/PEER1/system/runtime/chain-errors/rejected/CX/1/cap_denied/0xdef",
-        );
+        let (k, r) =
+            marker_kind_reason("/PEER1/system/runtime/chain-errors/rejected/CX/1/cap_denied/0xdef");
         assert_eq!(k, "rejected");
         assert_eq!(r, "cap_denied");
     }

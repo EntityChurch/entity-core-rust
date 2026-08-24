@@ -296,11 +296,7 @@ impl RoleInitialGrantPolicyData {
         let identity_required = match get_field(&map, "identity_required") {
             None | Some(ciborium::Value::Null) => false,
             Some(ciborium::Value::Bool(b)) => *b,
-            Some(_) => {
-                return Err(RoleError::Decode(
-                    "identity_required must be bool".into(),
-                ))
-            }
+            Some(_) => return Err(RoleError::Decode("identity_required must be bool".into())),
         };
         Ok(Self {
             unknown_peer,
@@ -348,8 +344,13 @@ pub(crate) fn get_field<'a>(
     map: &'a [(ciborium::Value, ciborium::Value)],
     key: &str,
 ) -> Option<&'a ciborium::Value> {
-    map.iter()
-        .find_map(|(k, v)| if k.as_text() == Some(key) { Some(v) } else { None })
+    map.iter().find_map(|(k, v)| {
+        if k.as_text() == Some(key) {
+            Some(v)
+        } else {
+            None
+        }
+    })
 }
 
 pub(crate) fn field_text(
@@ -381,8 +382,8 @@ pub(crate) fn field_hash(
     map: &[(ciborium::Value, ciborium::Value)],
     key: &str,
 ) -> Result<Hash, RoleError> {
-    let v = get_field(map, key)
-        .ok_or_else(|| RoleError::Decode(format!("missing {} field", key)))?;
+    let v =
+        get_field(map, key).ok_or_else(|| RoleError::Decode(format!("missing {} field", key)))?;
     let bytes = v
         .as_bytes()
         .ok_or_else(|| RoleError::Decode(format!("{} must be byte string", key)))?;
@@ -393,8 +394,8 @@ pub(crate) fn field_u64(
     map: &[(ciborium::Value, ciborium::Value)],
     key: &str,
 ) -> Result<u64, RoleError> {
-    let v = get_field(map, key)
-        .ok_or_else(|| RoleError::Decode(format!("missing {} field", key)))?;
+    let v =
+        get_field(map, key).ok_or_else(|| RoleError::Decode(format!("missing {} field", key)))?;
     let i = v
         .as_integer()
         .ok_or_else(|| RoleError::Decode(format!("{} must be integer", key)))?;
@@ -428,8 +429,8 @@ fn decode_grant_array(
     map: &[(ciborium::Value, ciborium::Value)],
     key: &str,
 ) -> Result<Vec<GrantEntry>, RoleError> {
-    let v = get_field(map, key)
-        .ok_or_else(|| RoleError::Decode(format!("missing {} field", key)))?;
+    let v =
+        get_field(map, key).ok_or_else(|| RoleError::Decode(format!("missing {} field", key)))?;
     let arr = v
         .as_array()
         .ok_or_else(|| RoleError::Decode(format!("{} must be array", key)))?;
@@ -442,9 +443,7 @@ fn decode_grant_array(
 
 /// Decode an array of `system/capability/grant-entry` from a CBOR Value.
 /// Used by request decoders that receive grant arrays as op params.
-pub fn decode_grant_array_value(
-    value: &ciborium::Value,
-) -> Result<Vec<GrantEntry>, RoleError> {
+pub fn decode_grant_array_value(value: &ciborium::Value) -> Result<Vec<GrantEntry>, RoleError> {
     let arr = value
         .as_array()
         .ok_or_else(|| RoleError::Decode("grants must be array".into()))?;

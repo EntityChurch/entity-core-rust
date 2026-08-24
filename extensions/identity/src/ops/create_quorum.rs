@@ -1,9 +1,7 @@
 //! `system/identity:create_quorum` — creates a `system/quorum` entity at the
 //! caller-supplied canonical path, per EXTENSION-IDENTITY §6.
 
-use entity_handler::{
-    HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST,
-};
+use entity_handler::{HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST};
 use entity_quorum::{path_quorum, QuorumData};
 
 use crate::data::{decode_map, field_hash_array, field_map_opt, field_string_opt, field_u64};

@@ -3,16 +3,16 @@
 //! The handler manages subscription lifecycle. The engine (engine.rs)
 //! processes events and delivers notifications asynchronously.
 
-pub mod engine;
 pub(crate) mod chain_error;
+pub mod engine;
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use entity_entity::Entity;
 use entity_handler::{
-    Handler, HandlerContext, HandlerError, HandlerResult,
-    STATUS_BAD_REQUEST, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_OK, STATUS_REDIRECT,
+    Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST, STATUS_FORBIDDEN,
+    STATUS_NOT_FOUND, STATUS_OK, STATUS_REDIRECT,
 };
 use entity_hash::Hash;
 use entity_store::{ContentStore, LocationIndex};
@@ -381,7 +381,10 @@ impl SubscriptionHandler {
             .content_store
             .put(sub_entity)
             .map_err(|e| HandlerError::Internal(e.to_string()))?;
-        let sub_path = format!("/{}/system/subscription/{}", self.local_peer_id, subscription_id);
+        let sub_path = format!(
+            "/{}/system/subscription/{}",
+            self.local_peer_id, subscription_id
+        );
         self.location_index.set(&sub_path, hash);
 
         // Store delivery token entity
@@ -421,10 +424,7 @@ impl SubscriptionHandler {
                 entity_ecf::text("events"),
                 entity_ecf::Value::Array(events.iter().map(entity_ecf::text).collect()),
             ),
-            (
-                entity_ecf::text("pattern"),
-                entity_ecf::text(&pattern),
-            ),
+            (entity_ecf::text("pattern"), entity_ecf::text(&pattern)),
             (
                 entity_ecf::text("subscription_id"),
                 entity_ecf::text(&subscription_id),
@@ -462,7 +462,7 @@ impl SubscriptionHandler {
         Ok(HandlerResult {
             status: STATUS_OK,
             result,
-        included: std::collections::HashMap::new(),
+            included: std::collections::HashMap::new(),
         })
     }
 
@@ -501,10 +501,7 @@ impl SubscriptionHandler {
                     entity_ecf::text("capacity"),
                     entity_ecf::integer(max as i64),
                 ),
-                (
-                    entity_ecf::text("prefix"),
-                    entity_ecf::text(pattern),
-                ),
+                (entity_ecf::text("prefix"), entity_ecf::text(pattern)),
                 (
                     entity_ecf::text("reason"),
                     entity_ecf::text("max_subscribers_per_prefix reached"),
@@ -566,6 +563,7 @@ impl SubscriptionHandler {
         None
     }
 
+    #[allow(clippy::too_many_arguments)] // renewal carries the full §4.2 subscription tuple
     fn handle_renewal(
         &self,
         existing_id: &str,
@@ -580,7 +578,10 @@ impl SubscriptionHandler {
         self.engine.remove(existing_id);
 
         // Remove old entity from tree
-        let sub_path = format!("/{}/system/subscription/{}", self.local_peer_id, existing_id);
+        let sub_path = format!(
+            "/{}/system/subscription/{}",
+            self.local_peer_id, existing_id
+        );
         self.location_index.remove(&sub_path);
 
         // Build updated subscription data (use caller's pattern/author directly)
@@ -624,10 +625,7 @@ impl SubscriptionHandler {
                 entity_ecf::text("events"),
                 entity_ecf::Value::Array(events.iter().map(entity_ecf::text).collect()),
             ),
-            (
-                entity_ecf::text("pattern"),
-                entity_ecf::text(pattern),
-            ),
+            (entity_ecf::text("pattern"), entity_ecf::text(pattern)),
             (entity_ecf::text("renewed"), entity_ecf::bool_val(true)),
             (
                 entity_ecf::text("subscription_id"),
@@ -639,7 +637,7 @@ impl SubscriptionHandler {
         Ok(HandlerResult {
             status: STATUS_OK,
             result,
-        included: std::collections::HashMap::new(),
+            included: std::collections::HashMap::new(),
         })
     }
 }
@@ -661,7 +659,10 @@ impl SubscriptionHandler {
         );
 
         // Look up subscription
-        let sub_path = format!("/{}/system/subscription/{}", self.local_peer_id, subscription_id);
+        let sub_path = format!(
+            "/{}/system/subscription/{}",
+            self.local_peer_id, subscription_id
+        );
         let hash = match self.location_index.get(&sub_path) {
             Some(h) => h,
             None => {
@@ -701,7 +702,7 @@ impl SubscriptionHandler {
         Ok(HandlerResult {
             status: STATUS_OK,
             result,
-        included: std::collections::HashMap::new(),
+            included: std::collections::HashMap::new(),
         })
     }
 }
@@ -804,9 +805,7 @@ fn decode_unsubscribe_request(params_data: &[u8]) -> Result<String, HandlerError
             return pv
                 .as_text()
                 .map(|s| s.to_string())
-                .ok_or_else(|| {
-                    HandlerError::InvalidParams("subscription_id not a string".into())
-                });
+                .ok_or_else(|| HandlerError::InvalidParams("subscription_id not a string".into()));
         }
     }
     Err(HandlerError::InvalidParams(
@@ -923,10 +922,7 @@ pub fn encode_subscription_entity(sub: &SubscriptionData) -> Result<Entity, Hand
             entity_ecf::text("events"),
             entity_ecf::Value::Array(sub.events.iter().map(entity_ecf::text).collect()),
         ),
-        (
-            entity_ecf::text("pattern"),
-            entity_ecf::text(&sub.pattern),
-        ),
+        (entity_ecf::text("pattern"), entity_ecf::text(&sub.pattern)),
         (
             entity_ecf::text("subscriber_identity"),
             entity_ecf::Value::Bytes(sub.subscriber_identity.to_bytes().to_vec()),
@@ -1105,7 +1101,11 @@ fn error_result(status: u32, code: &str, message: &str) -> HandlerResult {
     // TypeError so cross-impl SDKs read {code,message} from the entity
     // instead of falling back to status-default codes.
     let result = Entity::new("system/protocol/error", data).unwrap();
-    HandlerResult { status, result, included: std::collections::HashMap::new() }
+    HandlerResult {
+        status,
+        result,
+        included: std::collections::HashMap::new(),
+    }
 }
 
 #[cfg(test)]
@@ -1121,7 +1121,8 @@ mod tests {
         let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
         let index: Arc<dyn LocationIndex> = Arc::new(MemoryLocationIndex::new());
         let engine = Arc::new(Engine::new(store.clone(), index.clone(), test_peer_id()));
-        let handler = SubscriptionHandler::new(engine.clone(), store, index, test_peer_id(), Hash::zero());
+        let handler =
+            SubscriptionHandler::new(engine.clone(), store, index, test_peer_id(), Hash::zero());
         (handler, engine)
     }
 
@@ -1167,19 +1168,23 @@ mod tests {
     }
 
     fn make_execute() -> Entity {
-        let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-            (entity_ecf::text("request_id"), entity_ecf::text("r1")),
-        ]));
+        let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+            entity_ecf::text("request_id"),
+            entity_ecf::text("r1"),
+        )]));
         Entity::new(entity_types::TYPE_EXECUTE, data).unwrap()
     }
 
     #[tokio::test]
     async fn test_unsubscribe_not_found() {
         let (handler, _) = make_handler();
-        let params = make_params("system/subscription/cancel-params", entity_ecf::Value::Map(vec![(
-            entity_ecf::text("subscription_id"),
-            entity_ecf::text("sub-nonexistent"),
-        )]));
+        let params = make_params(
+            "system/subscription/cancel-params",
+            entity_ecf::Value::Map(vec![(
+                entity_ecf::text("subscription_id"),
+                entity_ecf::text("sub-nonexistent"),
+            )]),
+        );
         let execute = make_execute();
         let ctx = HandlerContext {
             handler_grant: None,
@@ -1228,7 +1233,11 @@ mod tests {
             delegation_caveats: None,
         };
         assert!(validate_delivery_token_scope(&cap, "user/inbox", "receive"));
-        assert!(!validate_delivery_token_scope(&cap, "other/inbox", "receive"));
+        assert!(!validate_delivery_token_scope(
+            &cap,
+            "other/inbox",
+            "receive"
+        ));
         // Wrong operation must fail
         assert!(!validate_delivery_token_scope(&cap, "user/inbox", "write"));
 
@@ -1250,7 +1259,11 @@ mod tests {
             not_before: None,
             delegation_caveats: None,
         };
-        assert!(validate_delivery_token_scope(&wildcard_cap, "any/uri", "any_op"));
+        assert!(validate_delivery_token_scope(
+            &wildcard_cap,
+            "any/uri",
+            "any_op"
+        ));
 
         // Subtree: "system/inbox/*" matches base "system/inbox"
         let subtree_cap = CapabilityToken {
@@ -1270,9 +1283,21 @@ mod tests {
             not_before: None,
             delegation_caveats: None,
         };
-        assert!(validate_delivery_token_scope(&subtree_cap, "user/inbox", "receive"));
-        assert!(validate_delivery_token_scope(&subtree_cap, "user/inbox/sub", "receive"));
-        assert!(!validate_delivery_token_scope(&subtree_cap, "other/path", "receive"));
+        assert!(validate_delivery_token_scope(
+            &subtree_cap,
+            "user/inbox",
+            "receive"
+        ));
+        assert!(validate_delivery_token_scope(
+            &subtree_cap,
+            "user/inbox/sub",
+            "receive"
+        ));
+        assert!(!validate_delivery_token_scope(
+            &subtree_cap,
+            "other/path",
+            "receive"
+        ));
     }
 
     #[test]
@@ -1285,7 +1310,10 @@ mod tests {
         // Subtree: base path matches
         assert!(scope_includes(&["system/inbox/*".into()], "system/inbox"));
         // Subtree: child path matches
-        assert!(scope_includes(&["system/inbox/*".into()], "system/inbox/child"));
+        assert!(scope_includes(
+            &["system/inbox/*".into()],
+            "system/inbox/child"
+        ));
         // Subtree: unrelated path doesn't match
         assert!(!scope_includes(&["system/inbox/*".into()], "system/other"));
         // Empty include list
@@ -1347,7 +1375,10 @@ mod tests {
         // include_payload absent (default false): the field key MUST NOT appear
         // in the encoded ECF bytes — V7 optional-field convention.
         let s = String::from_utf8_lossy(&entity.data);
-        assert!(!s.contains("include_payload"), "include_payload should not be emitted when false");
+        assert!(
+            !s.contains("include_payload"),
+            "include_payload should not be emitted when false"
+        );
         let decoded = decode_subscription_entity(&entity).expect("decode");
         assert!(!decoded.include_payload);
     }
@@ -1361,7 +1392,10 @@ mod tests {
                 entity_ecf::text("deliver_to"),
                 entity_ecf::Value::Map(vec![
                     (entity_ecf::text("operation"), entity_ecf::text("receive")),
-                    (entity_ecf::text("uri"), entity_ecf::text("system/inbox/test")),
+                    (
+                        entity_ecf::text("uri"),
+                        entity_ecf::text("system/inbox/test"),
+                    ),
                 ]),
             ),
             (
@@ -1439,7 +1473,10 @@ mod tests {
 
         let req = decode_subscribe_request(&params_data).unwrap();
         assert_eq!(req.deliver_uri, "system/inbox/test-maxevents");
-        assert!(req.limits.is_some(), "limits should be decoded from ciborium");
+        assert!(
+            req.limits.is_some(),
+            "limits should be decoded from ciborium"
+        );
         let limits = req.limits.unwrap();
         assert_eq!(limits.max_events, Some(2), "max_events should be 2");
     }
@@ -1469,7 +1506,10 @@ mod tests {
 
         // No subscriptions yet — should be under limit
         let result = handler.check_capacity("app/*").unwrap();
-        assert!(result.is_none(), "should be under limit with 0 subscriptions");
+        assert!(
+            result.is_none(),
+            "should be under limit with 0 subscriptions"
+        );
     }
 
     #[test]
@@ -1510,10 +1550,7 @@ mod tests {
         assert!(result.is_some(), "should be at capacity");
         let redirect = result.unwrap();
         assert_eq!(redirect.status, STATUS_REDIRECT);
-        assert_eq!(
-            redirect.result.entity_type,
-            "system/subscription/redirect"
-        );
+        assert_eq!(redirect.result.entity_type, "system/subscription/redirect");
     }
 
     #[test]
@@ -1551,7 +1588,10 @@ mod tests {
 
         // Different prefix "other/*" — should NOT be at capacity
         let result = handler.check_capacity("other/*").unwrap();
-        assert!(result.is_none(), "different prefix should not be at capacity");
+        assert!(
+            result.is_none(),
+            "different prefix should not be at capacity"
+        );
     }
 
     #[test]
@@ -1751,8 +1791,7 @@ mod tests {
             result.status, STATUS_FORBIDDEN,
             "sensitive prefix without operator-class must return 403"
         );
-        let val: ciborium::Value =
-            ciborium::from_reader(result.result.data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
         let code = map
             .iter()
@@ -1836,11 +1875,7 @@ mod tests {
         ops: &[&str],
         handlers: &[&str],
     ) -> entity_capability::CapabilityToken {
-        let to_arr = |xs: &[&str]| {
-            xs.iter()
-                .map(|s| entity_ecf::text(*s))
-                .collect::<Vec<_>>()
-        };
+        let to_arr = |xs: &[&str]| xs.iter().map(|s| entity_ecf::text(*s)).collect::<Vec<_>>();
         let token_entity = Entity::new(
             entity_types::TYPE_CAP_TOKEN,
             entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
@@ -1927,12 +1962,8 @@ mod tests {
             [(token_hash, token.clone())].into();
 
         // Caller has subscribe on system/subscription but NOT get on system/tree.
-        let caller_cap = make_caller_token(
-            author,
-            author,
-            &["subscribe"],
-            &["system/subscription"],
-        );
+        let caller_cap =
+            make_caller_token(author, author, &["subscribe"], &["system/subscription"]);
 
         let mut ctx = make_subscribe_ctx(author, token_hash, "user/inbox", included);
         ctx.caller_capability = Some(caller_cap);
@@ -1940,8 +1971,7 @@ mod tests {
 
         let result = handler.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_FORBIDDEN);
-        let val: ciborium::Value =
-            ciborium::from_reader(result.result.data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
         let code = map
             .iter()
@@ -1987,12 +2017,8 @@ mod tests {
         let included: std::collections::HashMap<Hash, Entity> =
             [(token_hash, token.clone())].into();
 
-        let caller_cap = make_caller_token(
-            author,
-            author,
-            &["subscribe"],
-            &["system/subscription"],
-        );
+        let caller_cap =
+            make_caller_token(author, author, &["subscribe"], &["system/subscription"]);
 
         let mut ctx = make_subscribe_ctx(author, token_hash, "user/inbox", included);
         ctx.caller_capability = Some(caller_cap);

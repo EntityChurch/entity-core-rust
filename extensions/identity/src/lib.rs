@@ -24,6 +24,13 @@
 //! - Storage path conventions (per audience tier)
 //! - Identity-resolved signer-resolution mode registration
 
+// result_large_err: this crate's internal ops use `Result<_,
+// HandlerResult>` — the Err IS the ready-to-return 4xx HandlerResult
+// (an Entity-carrying value) so `?` short-circuits straight to the
+// response. Boxing the error channel would churn every op for a lint
+// budget on a cold path.
+#![allow(clippy::result_large_err)]
+
 pub mod attestation_store;
 pub mod data;
 pub mod handler;

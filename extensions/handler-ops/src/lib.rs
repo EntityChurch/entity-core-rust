@@ -202,19 +202,18 @@ impl HandlersHandler {
             "operations" => clone_value(manifest.get("operations").unwrap_or(&Value::Map(vec![]))),
             "pattern" => entity_ecf::text(&pattern)
         };
-        let interface_entity =
-            match Entity::new("system/handler/interface", entity_ecf::to_ecf(&interface_data)) {
-                Ok(e) => e,
-                Err(err) => {
-                    return Ok(HandlerResult::error(
-                        STATUS_INTERNAL,
-                        error_entity(
-                            "internal",
-                            &format!("build interface entity: {}", err),
-                        ),
-                    ))
-                }
-            };
+        let interface_entity = match Entity::new(
+            "system/handler/interface",
+            entity_ecf::to_ecf(&interface_data),
+        ) {
+            Ok(e) => e,
+            Err(err) => {
+                return Ok(HandlerResult::error(
+                    STATUS_INTERNAL,
+                    error_entity("internal", &format!("build interface entity: {}", err)),
+                ))
+            }
+        };
 
         let now_ms = web_time::SystemTime::now()
             .duration_since(web_time::UNIX_EPOCH)
@@ -342,18 +341,19 @@ impl HandlersHandler {
                     None => continue,
                 };
                 let type_path = self.qualify(&format!("system/type/{}", type_name));
-                let type_entity = match Entity::new("system/type", entity_ecf::to_ecf(&clone_value(v))) {
-                    Ok(e) => e,
-                    Err(err) => {
-                        return Ok(HandlerResult::error(
-                            STATUS_INTERNAL,
-                            error_entity(
-                                "internal",
-                                &format!("build type entity for {}: {}", type_name, err),
-                            ),
-                        ))
-                    }
-                };
+                let type_entity =
+                    match Entity::new("system/type", entity_ecf::to_ecf(&clone_value(v))) {
+                        Ok(e) => e,
+                        Err(err) => {
+                            return Ok(HandlerResult::error(
+                                STATUS_INTERNAL,
+                                error_entity(
+                                    "internal",
+                                    &format!("build type entity for {}: {}", type_name, err),
+                                ),
+                            ))
+                        }
+                    };
                 if let Err(e) = self.put_at(&type_path, type_entity) {
                     return Ok(HandlerResult::error(STATUS_INTERNAL, e));
                 }
@@ -424,10 +424,7 @@ impl HandlersHandler {
                 STATUS_FORBIDDEN,
                 error_entity(
                     "forbidden_pattern",
-                    &format!(
-                        "V7 §6.2: cannot unregister system/* handlers: {}",
-                        pattern
-                    ),
+                    &format!("V7 §6.2: cannot unregister system/* handlers: {}", pattern),
                 ),
             ));
         }
@@ -638,7 +635,11 @@ mod tests {
         )
     }
 
-    fn build_register_request(pattern: &str, with_scope: bool, expression_path: Option<&str>) -> Entity {
+    fn build_register_request(
+        pattern: &str,
+        with_scope: bool,
+        expression_path: Option<&str>,
+    ) -> Entity {
         let mut manifest_fields = vec![
             (Value::Text("name".into()), entity_ecf::text("testhandler")),
             (
@@ -674,7 +675,7 @@ mod tests {
                     entity_ecf::text("resources"),
                     Value::Map(vec![(
                         entity_ecf::text("include"),
-                        Value::Array(vec![entity_ecf::text(&format!("{}/*", pattern))]),
+                        Value::Array(vec![entity_ecf::text(format!("{}/*", pattern))]),
                     )]),
                 ),
             ]);
@@ -684,10 +685,7 @@ mod tests {
             ));
         }
         if let Some(p) = expression_path {
-            manifest_fields.push((
-                Value::Text("expression_path".into()),
-                entity_ecf::text(p),
-            ));
+            manifest_fields.push((Value::Text("expression_path".into()), entity_ecf::text(p)));
         }
         manifest_fields.sort_by(|(a, _), (b, _)| {
             let ab = entity_ecf::to_ecf(a);
@@ -718,10 +716,13 @@ mod tests {
         HandlerContext {
             handler_grant: None,
             caller_capability: None,
-            execute: Entity::new("system/protocol/execute", entity_ecf::to_ecf(&entity_ecf::cbor_map! {
-                "operation" => entity_ecf::text(op),
-                "uri" => entity_ecf::text("entity://test/system/handler")
-            }))
+            execute: Entity::new(
+                "system/protocol/execute",
+                entity_ecf::to_ecf(&entity_ecf::cbor_map! {
+                    "operation" => entity_ecf::text(op),
+                    "uri" => entity_ecf::text("entity://test/system/handler")
+                }),
+            )
             .unwrap(),
             params,
             pattern: format!("/{}/system/handler", TEST_PID),
@@ -758,7 +759,10 @@ mod tests {
         // All three locations populated
         let pid = TEST_PID;
         assert!(
-            handler.location_index.get(&format!("/{}/{}", pid, pattern)).is_some(),
+            handler
+                .location_index
+                .get(&format!("/{}/{}", pid, pattern))
+                .is_some(),
             "manifest at pattern path"
         );
         assert!(
@@ -902,7 +906,11 @@ mod tests {
             .unwrap();
         let grant_ent = handler.content_store.get(&grant_h).unwrap();
         let token = entity_capability::CapabilityToken::from_entity(&grant_ent).unwrap();
-        assert_eq!(token.parent, Some(parent), "grant chains to handlers handler");
+        assert_eq!(
+            token.parent,
+            Some(parent),
+            "grant chains to handlers handler"
+        );
     }
 
     #[test]

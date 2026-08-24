@@ -29,9 +29,18 @@ impl EncryptionHandoffData {
     /// (`created` < `next_pubkey` < `previous_pubkey`).
     pub fn to_ecf_value(&self) -> Value {
         Value::Map(vec![
-            (Value::Text("previous_pubkey".into()), Value::Bytes(self.previous_pubkey.to_bytes())),
-            (Value::Text("next_pubkey".into()), Value::Bytes(self.next_pubkey.to_bytes())),
-            (Value::Text("created".into()), Value::Integer(self.created.into())),
+            (
+                Value::Text("previous_pubkey".into()),
+                Value::Bytes(self.previous_pubkey.to_bytes()),
+            ),
+            (
+                Value::Text("next_pubkey".into()),
+                Value::Bytes(self.next_pubkey.to_bytes()),
+            ),
+            (
+                Value::Text("created".into()),
+                Value::Integer(self.created.into()),
+            ),
         ])
     }
 
@@ -53,8 +62,14 @@ impl EncryptionRevocationData {
     /// optional, matching Go's `omitempty`).
     pub fn to_ecf_value(&self) -> Value {
         let mut entries = vec![
-            (Value::Text("revokes".into()), Value::Bytes(self.revokes.to_bytes())),
-            (Value::Text("created".into()), Value::Integer(self.created.into())),
+            (
+                Value::Text("revokes".into()),
+                Value::Bytes(self.revokes.to_bytes()),
+            ),
+            (
+                Value::Text("created".into()),
+                Value::Integer(self.created.into()),
+            ),
         ];
         if let Some(reason) = &self.reason {
             entries.push((Value::Text("reason".into()), Value::Text(reason.clone())));

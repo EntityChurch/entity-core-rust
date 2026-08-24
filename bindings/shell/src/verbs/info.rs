@@ -17,10 +17,7 @@ use crate::shell::Shell;
 /// Verb-op (§8.1). Assemble the info rows given a wd string and the
 /// peer-binding. Reusable from non-shell consumers (e.g., an admin
 /// panel rendering peer status) by passing any wd-like string or `""`.
-pub fn info_op(
-    binding: &dyn PeerBinding,
-    wd: &str,
-) -> Result<VerbOutput, ShellError> {
+pub fn info_op(binding: &dyn PeerBinding, wd: &str) -> Result<VerbOutput, ShellError> {
     let bound = binding.peer_id().to_string();
     let primary = binding.primary_peer_id();
     let local_count = binding.peer_ids().len();
@@ -66,16 +63,30 @@ mod tests {
     }
 
     impl PeerBinding for StubBinding {
-        fn peer_id(&self) -> &str { &self.bound }
-        fn primary_peer_id(&self) -> String { self.primary.clone() }
-        fn peer_ids(&self) -> Vec<String> { self.peers.clone() }
-        fn connected_peers(&self) -> Vec<String> { self.remotes.clone() }
-        fn peer_label(&self, _pid: &str) -> Option<String> { None }
+        fn peer_id(&self) -> &str {
+            &self.bound
+        }
+        fn primary_peer_id(&self) -> String {
+            self.primary.clone()
+        }
+        fn peer_ids(&self) -> Vec<String> {
+            self.peers.clone()
+        }
+        fn connected_peers(&self) -> Vec<String> {
+            self.remotes.clone()
+        }
+        fn peer_label(&self, _pid: &str) -> Option<String> {
+            None
+        }
         fn tree_listing(&self, _pid: &str, _prefix: &str) -> Vec<TreeListingEntry> {
             Vec::new()
         }
-        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> { None }
-        fn primary_arm(&self) -> &'static str { self.arm }
+        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> {
+            None
+        }
+        fn primary_arm(&self) -> &'static str {
+            self.arm
+        }
     }
 
     #[test]
@@ -108,15 +119,27 @@ mod tests {
     fn default_arm_is_local() {
         struct Minimal;
         impl PeerBinding for Minimal {
-            fn peer_id(&self) -> &str { "x" }
-            fn primary_peer_id(&self) -> String { "x".into() }
-            fn peer_ids(&self) -> Vec<String> { vec!["x".into()] }
-            fn connected_peers(&self) -> Vec<String> { Vec::new() }
-            fn peer_label(&self, _pid: &str) -> Option<String> { None }
+            fn peer_id(&self) -> &str {
+                "x"
+            }
+            fn primary_peer_id(&self) -> String {
+                "x".into()
+            }
+            fn peer_ids(&self) -> Vec<String> {
+                vec!["x".into()]
+            }
+            fn connected_peers(&self) -> Vec<String> {
+                Vec::new()
+            }
+            fn peer_label(&self, _pid: &str) -> Option<String> {
+                None
+            }
             fn tree_listing(&self, _pid: &str, _prefix: &str) -> Vec<TreeListingEntry> {
                 Vec::new()
             }
-            fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> { None }
+            fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> {
+                None
+            }
         }
         let shell = Shell::with_wd("x", "/x/");
         match info(&shell, &[], &Minimal).unwrap() {

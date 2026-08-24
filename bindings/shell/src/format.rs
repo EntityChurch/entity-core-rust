@@ -47,8 +47,11 @@ pub fn cbor(value: &ciborium::Value, depth: usize, buf: &mut String) {
                 let hex: String = b.iter().map(|byte| format!("{:02x}", byte)).collect();
                 let _ = write!(buf, "h'{}'", hex);
             } else {
-                let hex: String =
-                    b.iter().take(8).map(|byte| format!("{:02x}", byte)).collect();
+                let hex: String = b
+                    .iter()
+                    .take(8)
+                    .map(|byte| format!("{:02x}", byte))
+                    .collect();
                 let _ = write!(buf, "h'{}...' ({} bytes)", hex, b.len());
             }
         }

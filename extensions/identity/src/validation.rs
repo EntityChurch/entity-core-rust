@@ -10,22 +10,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use entity_attestation::{
-    find_revocations_for, is_attestation_live,
-    verify_attestation_signature, verify_specific_signer, walk_attesting_chain_default,
-    AttestationCtx, AttestationData, AttestationIndex,
+    find_revocations_for, is_attestation_live, verify_attestation_signature,
+    verify_specific_signer, walk_attesting_chain_default, AttestationCtx, AttestationData,
+    AttestationIndex,
 };
 use entity_entity::Entity;
 use entity_hash::Hash;
 use entity_quorum::{
-    current_signer_set, is_quorum_id, verify_k_of_n_signatures, QuorumCtx,
-    ResolverRegistry, SignerSetCache,
+    current_signer_set, is_quorum_id, verify_k_of_n_signatures, QuorumCtx, ResolverRegistry,
+    SignerSetCache,
 };
 use entity_store::{ContentStore, LocationIndex};
 
 use crate::kinds::{
     identity_lifecycle_kinds, valid_functions, Function, KIND_IDENTITY_CERT,
-    KIND_IDENTITY_RETIREMENT, KIND_IDENTITY_ROTATION_HANDOFF,
-    KIND_IDENTITY_ROTATION_RECOVERY,
+    KIND_IDENTITY_RETIREMENT, KIND_IDENTITY_ROTATION_HANDOFF, KIND_IDENTITY_ROTATION_RECOVERY,
 };
 
 /// Topology dispatch result (§3.6 `identity_topology_for`).
@@ -82,10 +81,13 @@ impl<'a> IdentityCtx<'a> {
 /// `lookup_target_cert` per §3.6 — resolves a `properties.target_cert`
 /// reference (from a lifecycle event) to the cert entity it targets.
 pub fn lookup_target_cert(att: &AttestationData, ctx: &IdentityCtx) -> Option<AttestationData> {
-    let target = att
-        .properties
-        .iter()
-        .find_map(|(k, v)| if k.as_text() == Some("target_cert") { Some(v) } else { None })?;
+    let target = att.properties.iter().find_map(|(k, v)| {
+        if k.as_text() == Some("target_cert") {
+            Some(v)
+        } else {
+            None
+        }
+    })?;
     let bytes = target.as_bytes()?;
     let target_hash = Hash::from_bytes(bytes).ok()?;
     ctx.attestation_index.get(&target_hash)
@@ -100,16 +102,24 @@ pub fn identity_is_quorum_link(att: &AttestationData, ctx: &IdentityCtx) -> bool
 /// Read `properties.function` from an attestation if present and
 /// well-typed.
 pub fn read_function(att: &AttestationData) -> Option<&str> {
-    att.properties
-        .iter()
-        .find_map(|(k, v)| if k.as_text() == Some("function") { v.as_text() } else { None })
+    att.properties.iter().find_map(|(k, v)| {
+        if k.as_text() == Some("function") {
+            v.as_text()
+        } else {
+            None
+        }
+    })
 }
 
 /// Read `properties.mode` from an attestation if present.
 pub fn read_mode(att: &AttestationData) -> Option<&str> {
-    att.properties
-        .iter()
-        .find_map(|(k, v)| if k.as_text() == Some("mode") { v.as_text() } else { None })
+    att.properties.iter().find_map(|(k, v)| {
+        if k.as_text() == Some("mode") {
+            v.as_text()
+        } else {
+            None
+        }
+    })
 }
 
 /// `identity_confers_function` per spec v3.3 §3.6 (SI-13). Returns `true`
@@ -216,18 +226,26 @@ pub fn identity_is_authorized_revoker(
     ctx: &IdentityCtx,
 ) -> bool {
     let actx = ctx.attestation_ctx();
-    let chain = walk_attesting_chain_default(target_cert_hash, target_cert, |a, c| {
-        // closure lifetime: borrow of QuorumCtx can't outlive AttestationCtx;
-        // re-derive locally using is_quorum_id against the same stores.
-        is_quorum_id(&a.attesting, &QuorumCtx {
-            attestation_index: c.index,
-            content_store: c.content_store,
-            location_index: c.location_index,
-            included: c.included,
-            resolver_registry: ctx.resolver_registry,
-            signer_set_cache: ctx.signer_set_cache,
-        })
-    }, &actx);
+    let chain = walk_attesting_chain_default(
+        target_cert_hash,
+        target_cert,
+        |a, c| {
+            // closure lifetime: borrow of QuorumCtx can't outlive AttestationCtx;
+            // re-derive locally using is_quorum_id against the same stores.
+            is_quorum_id(
+                &a.attesting,
+                &QuorumCtx {
+                    attestation_index: c.index,
+                    content_store: c.content_store,
+                    location_index: c.location_index,
+                    included: c.included,
+                    resolver_registry: ctx.resolver_registry,
+                    signer_set_cache: ctx.signer_set_cache,
+                },
+            )
+        },
+        &actx,
+    );
     let chain = match chain {
         Some(c) => c,
         None => return false,
@@ -291,7 +309,9 @@ fn diagnose_topology_failure(att: &AttestationData, ctx: &IdentityCtx) -> String
                 "controller_no_quorum_link_but_topology_for_returned_none_unexpected".into()
             } else {
                 match current_signer_set(&att.attesting, &qctx) {
-                    Ok(_) => "current_signer_set_ok_but_topology_for_returned_none_unexpected".into(),
+                    Ok(_) => {
+                        "current_signer_set_ok_but_topology_for_returned_none_unexpected".into()
+                    }
                     Err(e) => format!("current_signer_set_failed: {}", e),
                 }
             }

@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use entity_capability::{GrantEntry, IdScope, PathScope};
 use entity_entity::EntityUri;
 use entity_handler::{
-    error_entity, Handler, HandlerContext, HandlerError, HandlerResult,
-    STATUS_BAD_REQUEST, STATUS_FORBIDDEN, STATUS_NOT_FOUND,
+    error_entity, Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST,
+    STATUS_FORBIDDEN, STATUS_NOT_FOUND,
 };
 use entity_store::{ContentStore, LocationIndex};
 
@@ -192,10 +192,10 @@ impl LocalFilesHandler {
         let roots = self.roots.read().unwrap();
         let mut best: Option<&RootMapping> = None;
         for (_, m) in roots.iter() {
-            if bare_tree_path.starts_with(&m.prefix) {
-                if best.map_or(true, |b| m.prefix.len() > b.prefix.len()) {
-                    best = Some(m);
-                }
+            if bare_tree_path.starts_with(&m.prefix)
+                && best.is_none_or(|b| m.prefix.len() > b.prefix.len())
+            {
+                best = Some(m);
             }
         }
         best.cloned()
@@ -294,6 +294,9 @@ pub(crate) fn forbidden(code: &str, message: &str) -> HandlerResult {
 
 /// Extract the bare (peer-stripped) target tree path from the handler
 /// context's `resource_target`. Returns `Err` when no resource is set.
+// result_large_err: the Err IS the ready-to-return HandlerResult (an
+// Entity-carrying 4xx) — boxing it would churn every `?` call site.
+#[allow(clippy::result_large_err)]
 pub(crate) fn resource_bare_path(ctx: &HandlerContext) -> Result<String, HandlerResult> {
     let target = ctx
         .resource_target

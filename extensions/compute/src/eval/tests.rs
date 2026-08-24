@@ -79,9 +79,10 @@ fn make_tree_lookup(path: &str) -> Entity {
 }
 
 fn make_hash_lookup(hash: Hash, path: Option<&str>) -> Entity {
-    let mut fields = vec![
-        (Value::Text("hash".into()), Value::Bytes(hash.to_bytes().to_vec())),
-    ];
+    let mut fields = vec![(
+        Value::Text("hash".into()),
+        Value::Bytes(hash.to_bytes().to_vec()),
+    )];
     if let Some(p) = path {
         fields.push((Value::Text("path".into()), entity_ecf::text(p)));
     }
@@ -108,11 +109,17 @@ fn make_compare(op: &str, left: Hash, right: Hash) -> Entity {
 
 fn make_logic(op: &str, left: Hash, right: Option<Hash>) -> Entity {
     let mut fields = vec![
-        (Value::Text("left".into()), Value::Bytes(left.to_bytes().to_vec())),
+        (
+            Value::Text("left".into()),
+            Value::Bytes(left.to_bytes().to_vec()),
+        ),
         (Value::Text("op".into()), entity_ecf::text(op)),
     ];
     if let Some(r) = right {
-        fields.push((Value::Text("right".into()), Value::Bytes(r.to_bytes().to_vec())));
+        fields.push((
+            Value::Text("right".into()),
+            Value::Bytes(r.to_bytes().to_vec()),
+        ));
     }
     let data = Value::Map(fields);
     Entity::new(TYPE_LOGIC, entity_ecf::to_ecf(&data)).unwrap()
@@ -120,11 +127,20 @@ fn make_logic(op: &str, left: Hash, right: Option<Hash>) -> Entity {
 
 fn make_if(cond: Hash, then: Hash, else_branch: Option<Hash>) -> Entity {
     let mut fields = vec![
-        (Value::Text("condition".into()), Value::Bytes(cond.to_bytes().to_vec())),
-        (Value::Text("then".into()), Value::Bytes(then.to_bytes().to_vec())),
+        (
+            Value::Text("condition".into()),
+            Value::Bytes(cond.to_bytes().to_vec()),
+        ),
+        (
+            Value::Text("then".into()),
+            Value::Bytes(then.to_bytes().to_vec()),
+        ),
     ];
     if let Some(e) = else_branch {
-        fields.push((Value::Text("else".into()), Value::Bytes(e.to_bytes().to_vec())));
+        fields.push((
+            Value::Text("else".into()),
+            Value::Bytes(e.to_bytes().to_vec()),
+        ));
     }
     let data = Value::Map(fields);
     Entity::new(TYPE_IF, entity_ecf::to_ecf(&data)).unwrap()
@@ -136,7 +152,10 @@ fn make_let(bindings: &[(&str, Hash)], body: Hash) -> Entity {
         .map(|(name, hash)| {
             Value::Map(vec![
                 (Value::Text("name".into()), Value::Text(name.to_string())),
-                (Value::Text("value".into()), Value::Bytes(hash.to_bytes().to_vec())),
+                (
+                    Value::Text("value".into()),
+                    Value::Bytes(hash.to_bytes().to_vec()),
+                ),
             ])
         })
         .collect();
@@ -286,9 +305,13 @@ fn test_lookup_tree_entity() {
     let li = MemoryLocationIndex::new();
     let pid = "testpeer123456789012345678901234567890123456";
 
-    let stored = Entity::new("app/data", entity_ecf::to_ecf(&entity_ecf::cbor_map! {
-        "value" => entity_ecf::integer(7)
-    })).unwrap();
+    let stored = Entity::new(
+        "app/data",
+        entity_ecf::to_ecf(&entity_ecf::cbor_map! {
+            "value" => entity_ecf::integer(7)
+        }),
+    )
+    .unwrap();
     let hash = cs.put(stored.clone()).unwrap();
     li.set(&format!("/{}/app/data/x", pid), hash);
 
@@ -684,10 +707,14 @@ fn test_field_extract() {
 
     // Store a non-compute entity at a tree path — field extraction works
     // on entities returned by tree lookup (which bypasses D2 hash scoping).
-    let target = Entity::new("app/person", entity_ecf::to_ecf(&entity_ecf::cbor_map! {
-        "age" => entity_ecf::integer(30),
-        "name" => entity_ecf::text("Alice")
-    })).unwrap();
+    let target = Entity::new(
+        "app/person",
+        entity_ecf::to_ecf(&entity_ecf::cbor_map! {
+            "age" => entity_ecf::integer(30),
+            "name" => entity_ecf::text("Alice")
+        }),
+    )
+    .unwrap();
     let th = cs.put(target).unwrap();
     li.set(&format!("/{}/app/people/alice", TEST_PID), th);
 
@@ -712,9 +739,13 @@ fn test_field_not_found() {
     let cs = MemoryContentStore::new();
     let li = MemoryLocationIndex::new();
 
-    let target = Entity::new("app/data", entity_ecf::to_ecf(&entity_ecf::cbor_map! {
-        "x" => entity_ecf::integer(1)
-    })).unwrap();
+    let target = Entity::new(
+        "app/data",
+        entity_ecf::to_ecf(&entity_ecf::cbor_map! {
+            "x" => entity_ecf::integer(1)
+        }),
+    )
+    .unwrap();
     let th = cs.put(target).unwrap();
     li.set(&format!("/{}/app/data/item", TEST_PID), th);
 
@@ -1164,8 +1195,7 @@ fn test_v319c_inline_vs_builtin_construct_hash_agreement() {
 /// `ecf-sha256:3edc51381d12e22a22412890d329cbab87d98970362b5a4c1b3e0328effb9efd`.
 #[test]
 fn test_v319b_n2_scope_hash_three_way_agreement() {
-    const EXPECTED: &str =
-        "3edc51381d12e22a22412890d329cbab87d98970362b5a4c1b3e0328effb9efd";
+    const EXPECTED: &str = "3edc51381d12e22a22412890d329cbab87d98970362b5a4c1b3e0328effb9efd";
 
     let cs = MemoryContentStore::new();
     let li = MemoryLocationIndex::new();
@@ -1507,9 +1537,13 @@ fn test_lookup_hash_noncompute_rejected_without_seal() {
     let li = MemoryLocationIndex::new();
 
     // Store a non-compute entity
-    let data_entity = Entity::new("app/data", entity_ecf::to_ecf(&entity_ecf::cbor_map! {
-        "x" => entity_ecf::integer(42)
-    })).unwrap();
+    let data_entity = Entity::new(
+        "app/data",
+        entity_ecf::to_ecf(&entity_ecf::cbor_map! {
+            "x" => entity_ecf::integer(42)
+        }),
+    )
+    .unwrap();
     let dh = cs.put(data_entity).unwrap();
 
     // Without authorized_data_hashes, non-compute entity rejected (D2)
@@ -1524,9 +1558,13 @@ fn test_lookup_hash_noncompute_authorized_via_sealed_set() {
     let li = MemoryLocationIndex::new();
 
     // Store a non-compute entity
-    let data_entity = Entity::new("app/data", entity_ecf::to_ecf(&entity_ecf::cbor_map! {
-        "x" => entity_ecf::integer(42)
-    })).unwrap();
+    let data_entity = Entity::new(
+        "app/data",
+        entity_ecf::to_ecf(&entity_ecf::cbor_map! {
+            "x" => entity_ecf::integer(42)
+        }),
+    )
+    .unwrap();
     let dh = cs.put(data_entity).unwrap();
 
     // With authorized_data_hashes (sealed set from install), it resolves
@@ -1535,8 +1573,7 @@ fn test_lookup_hash_noncompute_authorized_via_sealed_set() {
     let mut budget = Budget::default_budget();
     let mut authorized = HashSet::new();
     authorized.insert(dh);
-    let mut ctx = EvalContext::new(&cs, &li, &included, &pid)
-        .with_authorized_hashes(authorized);
+    let mut ctx = EvalContext::new(&cs, &li, &included, &pid).with_authorized_hashes(authorized);
     let result = evaluate(&lookup, &Scope::new(), &mut budget, &mut ctx);
     match result {
         ComputeValue::Entity(e) => assert_eq!(e.entity_type, "app/data"),
@@ -1553,14 +1590,26 @@ fn make_literal_float(f: f64) -> Entity {
     Entity::new(TYPE_LITERAL, entity_ecf::to_ecf(&data)).unwrap()
 }
 
-fn arith(cs: &dyn ContentStore, li: &dyn LocationIndex, op: &str, l: Entity, r: Entity) -> ComputeValue {
+fn arith(
+    cs: &dyn ContentStore,
+    li: &dyn LocationIndex,
+    op: &str,
+    l: Entity,
+    r: Entity,
+) -> ComputeValue {
     let lh = cs.put(l).unwrap();
     let rh = cs.put(r).unwrap();
     let expr = make_arithmetic(op, lh, rh);
     eval_entity(cs, li, &expr)
 }
 
-fn cmp(cs: &dyn ContentStore, li: &dyn LocationIndex, op: &str, l: Entity, r: Entity) -> ComputeValue {
+fn cmp(
+    cs: &dyn ContentStore,
+    li: &dyn LocationIndex,
+    op: &str,
+    l: Entity,
+    r: Entity,
+) -> ComputeValue {
     let lh = cs.put(l).unwrap();
     let rh = cs.put(r).unwrap();
     let expr = make_compare(op, lh, rh);
@@ -1600,17 +1649,35 @@ fn test_v36_mod_truncated() {
     // v3.16 rule 4: signed mod with truncated remainder; rule 9: signed-default.
     let cs = MemoryContentStore::new();
     let li = MemoryLocationIndex::new();
-    assert_eq!(arith(&cs, &li, "mod", make_literal_int(7), make_literal_int(3)).as_i128(), Some(1));
-    assert_eq!(arith(&cs, &li, "mod", make_literal_int(-7), make_literal_int(3)).as_i128(), Some(-1));
-    assert_eq!(arith(&cs, &li, "mod", make_literal_int(7), make_literal_int(-3)).as_i128(), Some(1));
-    assert_eq!(arith(&cs, &li, "mod", make_literal_int(-7), make_literal_int(-3)).as_i128(), Some(-1));
+    assert_eq!(
+        arith(&cs, &li, "mod", make_literal_int(7), make_literal_int(3)).as_i128(),
+        Some(1)
+    );
+    assert_eq!(
+        arith(&cs, &li, "mod", make_literal_int(-7), make_literal_int(3)).as_i128(),
+        Some(-1)
+    );
+    assert_eq!(
+        arith(&cs, &li, "mod", make_literal_int(7), make_literal_int(-3)).as_i128(),
+        Some(1)
+    );
+    assert_eq!(
+        arith(&cs, &li, "mod", make_literal_int(-7), make_literal_int(-3)).as_i128(),
+        Some(-1)
+    );
 }
 
 #[test]
 fn test_v36_mixed_type_promotion() {
     let cs = MemoryContentStore::new();
     let li = MemoryLocationIndex::new();
-    let r = arith(&cs, &li, "add", make_literal_int(1), make_literal_float(2.5));
+    let r = arith(
+        &cs,
+        &li,
+        "add",
+        make_literal_int(1),
+        make_literal_float(2.5),
+    );
     assert_eq!(r.as_f64(), Some(3.5));
 }
 
@@ -1618,7 +1685,13 @@ fn test_v36_mixed_type_promotion() {
 fn test_v36_float_mul() {
     let cs = MemoryContentStore::new();
     let li = MemoryLocationIndex::new();
-    let r = arith(&cs, &li, "mul", make_literal_int(3), make_literal_float(2.0));
+    let r = arith(
+        &cs,
+        &li,
+        "mul",
+        make_literal_int(3),
+        make_literal_float(2.0),
+    );
     assert_eq!(r.as_f64(), Some(6.0));
 }
 
@@ -1626,7 +1699,13 @@ fn test_v36_float_mul() {
 fn test_v36_float_div_by_zero_inf() {
     let cs = MemoryContentStore::new();
     let li = MemoryLocationIndex::new();
-    let r = arith(&cs, &li, "div", make_literal_float(1.0), make_literal_float(0.0));
+    let r = arith(
+        &cs,
+        &li,
+        "div",
+        make_literal_float(1.0),
+        make_literal_float(0.0),
+    );
     assert_eq!(r.as_f64(), Some(f64::INFINITY));
 }
 
@@ -1634,7 +1713,13 @@ fn test_v36_float_div_by_zero_inf() {
 fn test_v36_float_div_by_zero_nan() {
     let cs = MemoryContentStore::new();
     let li = MemoryLocationIndex::new();
-    let r = arith(&cs, &li, "div", make_literal_float(0.0), make_literal_float(0.0));
+    let r = arith(
+        &cs,
+        &li,
+        "div",
+        make_literal_float(0.0),
+        make_literal_float(0.0),
+    );
     assert!(r.as_f64().map(|f| f.is_nan()).unwrap_or(false));
 }
 
@@ -1662,7 +1747,13 @@ fn test_v36_eq_incompatible_types() {
 fn test_v36_string_comparison() {
     let cs = MemoryContentStore::new();
     let li = MemoryLocationIndex::new();
-    match cmp(&cs, &li, "lt", make_literal_str("abc"), make_literal_str("abd")) {
+    match cmp(
+        &cs,
+        &li,
+        "lt",
+        make_literal_str("abc"),
+        make_literal_str("abd"),
+    ) {
         ComputeValue::Primitive(Value::Bool(b)) => assert!(b),
         other => panic!("expected true, got {:?}", other),
     }
@@ -1708,7 +1799,11 @@ fn build_tail_recursive_counter(cs: &dyn ContentStore) -> (Hash, Hash) {
     // Tail-recursive call: apply(self, {self: self, n: n-1, acc: acc+1})
     let recurse = make_apply_closure(
         lookup_selfh,
-        &[("acc", acc_plus_1h), ("n", n_minus_1h), ("self", lookup_selfh)],
+        &[
+            ("acc", acc_plus_1h),
+            ("n", n_minus_1h),
+            ("self", lookup_selfh),
+        ],
     );
     let recurseh = cs.put(recurse).unwrap();
 
@@ -1755,7 +1850,11 @@ fn test_tco_tail_recursive_iteration() {
 
     let call = make_apply_closure(
         closure_hash,
-        &[("acc", lit_0h), ("n", lit_2000h), ("self", closure_lookup_h)],
+        &[
+            ("acc", lit_0h),
+            ("n", lit_2000h),
+            ("self", closure_lookup_h),
+        ],
     );
 
     let mut budget2 = Budget::new(200_000, 1_024);
@@ -1795,7 +1894,10 @@ fn perf_tco_if_chain_eval() {
     let elapsed = start.elapsed();
 
     assert_eq!(result.as_i128(), Some(42));
-    eprintln!("perf_tco_if_chain_eval: 1101-deep if-chain in {:?}", elapsed);
+    eprintln!(
+        "perf_tco_if_chain_eval: 1101-deep if-chain in {:?}",
+        elapsed
+    );
 }
 
 /// Same shape but `let(_=lit, body=next)` — let-chain test mirror. Each
@@ -1826,7 +1928,10 @@ fn perf_tco_let_chain_eval() {
     let elapsed = start.elapsed();
 
     assert_eq!(result.as_i128(), Some(99));
-    eprintln!("perf_tco_let_chain_eval: 1101-deep let-chain in {:?}", elapsed);
+    eprintln!(
+        "perf_tco_let_chain_eval: 1101-deep let-chain in {:?}",
+        elapsed
+    );
 }
 
 #[test]
@@ -1853,10 +1958,7 @@ fn test_tco_non_tail_recursion_still_bounded() {
     let n_minus_1h = cs.put(n_minus_1).unwrap();
 
     // Non-tail: apply(self, {self, n-1}) is inside add, not in tail position
-    let recurse = make_apply_closure(
-        lookup_selfh,
-        &[("n", n_minus_1h), ("self", lookup_selfh)],
-    );
+    let recurse = make_apply_closure(lookup_selfh, &[("n", n_minus_1h), ("self", lookup_selfh)]);
     let recurseh = cs.put(recurse).unwrap();
 
     let add_expr = make_arithmetic("add", recurseh, lit_1h);
@@ -2038,10 +2140,7 @@ fn test_resolve_relative_path_helper() {
         resolve_relative_path(Some("app/root"), "/data/x"),
         "app/root/data/x"
     );
-    assert_eq!(
-        resolve_relative_path(None, "data/x"),
-        "data/x"
-    );
+    assert_eq!(resolve_relative_path(None, "data/x"), "data/x");
 }
 
 // --- §7.2 capability check tests ---
@@ -2155,7 +2254,10 @@ fn make_apply_handler(path: &str, operation: &str, args: &[(&str, Hash)]) -> Ent
     fields.sort_by(|(a, _), (b, _)| {
         let a_bytes = entity_ecf::to_ecf(a);
         let b_bytes = entity_ecf::to_ecf(b);
-        a_bytes.len().cmp(&b_bytes.len()).then(a_bytes.cmp(&b_bytes))
+        a_bytes
+            .len()
+            .cmp(&b_bytes.len())
+            .then(a_bytes.cmp(&b_bytes))
     });
     Entity::new(TYPE_APPLY, entity_ecf::to_ecf(&Value::Map(fields))).unwrap()
 }
@@ -2183,8 +2285,7 @@ fn test_handler_dispatch_with_callback() {
         ComputeValue::Primitive(entity_ecf::integer(42))
     });
 
-    let mut ctx = EvalContext::new(&cs, &li, &included, &pid)
-        .with_dispatch_execute(Some(dispatch));
+    let mut ctx = EvalContext::new(&cs, &li, &included, &pid).with_dispatch_execute(Some(dispatch));
     let result = evaluate(&apply, &Scope::new(), &mut budget, &mut ctx);
     assert_eq!(result.as_i128(), Some(42));
 }
@@ -2243,7 +2344,10 @@ fn make_apply_handler_with_cap(
     fields.sort_by(|(a, _), (b, _)| {
         let a_bytes = entity_ecf::to_ecf(a);
         let b_bytes = entity_ecf::to_ecf(b);
-        a_bytes.len().cmp(&b_bytes.len()).then(a_bytes.cmp(&b_bytes))
+        a_bytes
+            .len()
+            .cmp(&b_bytes.len())
+            .then(a_bytes.cmp(&b_bytes))
     });
     Entity::new(TYPE_APPLY, entity_ecf::to_ecf(&Value::Map(fields))).unwrap()
 }
@@ -2297,13 +2401,8 @@ fn test_apply_capability_field_dual_check_denies_outside_handler_grant() {
     let resource_h = cs.put(resource_lit).unwrap();
     let included: HashMap<Hash, Entity> = HashMap::new();
 
-    let apply = make_apply_handler_with_cap(
-        "system/tree",
-        "get",
-        &[],
-        admin_cap_h,
-        Some(resource_h),
-    );
+    let apply =
+        make_apply_handler_with_cap("system/tree", "get", &[], admin_cap_h, Some(resource_h));
 
     let pid = TEST_PID.to_string();
     let mut budget = Budget::default_budget();
@@ -2331,7 +2430,8 @@ fn test_apply_capability_field_dual_check_denies_outside_handler_grant() {
         delegation_caveats: None,
     };
 
-    let dispatch: TestDispatchFn = Box::new(|_, _, _, _, _| ComputeValue::Primitive(entity_ecf::integer(0)));
+    let dispatch: TestDispatchFn =
+        Box::new(|_, _, _, _, _| ComputeValue::Primitive(entity_ecf::integer(0)));
 
     let mut ctx = EvalContext::new(&cs, &li, &included, &pid)
         .with_capability(Some(&handler_grant))
@@ -2340,7 +2440,11 @@ fn test_apply_capability_field_dual_check_denies_outside_handler_grant() {
     let result = evaluate(&apply, &Scope::new(), &mut budget, &mut ctx);
     match result {
         ComputeValue::Error(ComputeError::PermissionDenied(msg)) => {
-            assert!(msg.contains("Handler grant does not cover target"), "{}", msg);
+            assert!(
+                msg.contains("Handler grant does not cover target"),
+                "{}",
+                msg
+            );
         }
         other => panic!("expected PermissionDenied, got {:?}", other),
     }
@@ -2363,13 +2467,8 @@ fn test_apply_capability_field_dual_check_passes_within_handler_grant() {
     let resource_h = cs.put(resource_lit).unwrap();
     let included: HashMap<Hash, Entity> = HashMap::new();
 
-    let apply = make_apply_handler_with_cap(
-        "system/tree",
-        "get",
-        &[],
-        provided_cap_h,
-        Some(resource_h),
-    );
+    let apply =
+        make_apply_handler_with_cap("system/tree", "get", &[], provided_cap_h, Some(resource_h));
 
     let pid = TEST_PID.to_string();
     let mut budget = Budget::default_budget();
@@ -2426,7 +2525,8 @@ fn test_apply_capability_field_without_resource_is_invalid() {
     let mut budget = Budget::default_budget();
     let handler_grant = wildcard_test_cap();
 
-    let dispatch: TestDispatchFn = Box::new(|_, _, _, _, _| ComputeValue::Primitive(entity_ecf::integer(0)));
+    let dispatch: TestDispatchFn =
+        Box::new(|_, _, _, _, _| ComputeValue::Primitive(entity_ecf::integer(0)));
 
     let mut ctx = EvalContext::new(&cs, &li, &included, &pid)
         .with_capability(Some(&handler_grant))
@@ -2463,7 +2563,11 @@ fn test_apply_params_entity_uses_handler_input_type() {
         ]),
         "pattern" => entity_ecf::text("app/echo")
     };
-    let interface = Entity::new("system/handler/interface", entity_ecf::to_ecf(&interface_data)).unwrap();
+    let interface = Entity::new(
+        "system/handler/interface",
+        entity_ecf::to_ecf(&interface_data),
+    )
+    .unwrap();
     let interface_h = cs.put(interface).unwrap();
     li.set(&format!("/{}/system/handler/app/echo", pid), interface_h);
 
@@ -2537,7 +2641,9 @@ fn test_apply_no_capability_field_uses_default() {
     let (included, pid) = test_ctx();
     let mut budget = Budget::default_budget();
 
-    let saw_override = std::sync::Arc::new(std::sync::Mutex::new(Some(make_capability_token_entity("sentinel"))));
+    let saw_override = std::sync::Arc::new(std::sync::Mutex::new(Some(
+        make_capability_token_entity("sentinel"),
+    )));
     let saw_override_clone = std::sync::Arc::clone(&saw_override);
     let dispatch: TestDispatchFn = Box::new(move |_path, _op, _resource, _params, cap_override| {
         *saw_override_clone.lock().unwrap() = cap_override.clone();
@@ -2550,7 +2656,10 @@ fn test_apply_no_capability_field_uses_default() {
         .with_dispatch_execute(Some(dispatch));
     let result = evaluate(&apply, &Scope::new(), &mut budget, &mut ctx);
     assert_eq!(result.as_i128(), Some(1));
-    assert!(saw_override.lock().unwrap().is_none(), "no override expected");
+    assert!(
+        saw_override.lock().unwrap().is_none(),
+        "no override expected"
+    );
 }
 
 // =====================================================================
@@ -2941,9 +3050,7 @@ fn test_cast_at_point_of_use_gives_unsigned() {
     let y_cast = cs
         .put(make_numeric_cast(y_ref, TYPE_PRIMITIVE_UINT))
         .unwrap();
-    let two_cast = cs
-        .put(make_numeric_cast(two, TYPE_PRIMITIVE_UINT))
-        .unwrap();
+    let two_cast = cs.put(make_numeric_cast(two, TYPE_PRIMITIVE_UINT)).unwrap();
     let div = cs.put(make_arithmetic("div", y_cast, two_cast)).unwrap();
     let let_expr = make_let(&[("y", high_bit)], div);
 
@@ -3002,9 +3109,7 @@ fn test_cast_at_point_of_use_under_if_still_unsigned() {
     let if_cast = cs
         .put(make_numeric_cast(if_expr, TYPE_PRIMITIVE_UINT))
         .unwrap();
-    let two_cast = cs
-        .put(make_numeric_cast(two, TYPE_PRIMITIVE_UINT))
-        .unwrap();
+    let two_cast = cs.put(make_numeric_cast(two, TYPE_PRIMITIVE_UINT)).unwrap();
     let div = make_arithmetic("div", if_cast, two_cast);
     let result = eval_entity(&cs, &li, &div);
 

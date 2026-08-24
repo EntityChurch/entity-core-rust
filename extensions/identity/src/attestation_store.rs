@@ -51,10 +51,7 @@ impl AttestationStore for IdentityAttestationStore {
         // Find live identity-cert(function=agent) with attested = peer.
         let candidates = find_attestations_targeting(
             peer_identity_hash,
-            |a| {
-                a.kind() == Some(KIND_IDENTITY_CERT)
-                    && read_function(a) == Some("agent")
-            },
+            |a| a.kind() == Some(KIND_IDENTITY_CERT) && read_function(a) == Some("agent"),
             &ctx,
         );
         for (h, a) in candidates {

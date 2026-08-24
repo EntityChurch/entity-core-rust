@@ -72,11 +72,17 @@ pub struct ListingSection {
 
 impl ListingSection {
     pub fn flat(entries: Vec<String>) -> Self {
-        Self { header: None, entries }
+        Self {
+            header: None,
+            entries,
+        }
     }
 
     pub fn with_header(header: impl Into<String>, entries: Vec<String>) -> Self {
-        Self { header: Some(header.into()), entries }
+        Self {
+            header: Some(header.into()),
+            entries,
+        }
     }
 }
 
@@ -119,11 +125,17 @@ pub struct InfoRow {
 
 impl InfoRow {
     pub fn labeled(label: impl Into<String>, value: impl Into<String>) -> Self {
-        Self { label: Some(label.into()), value: value.into() }
+        Self {
+            label: Some(label.into()),
+            value: value.into(),
+        }
     }
 
     pub fn text(value: impl Into<String>) -> Self {
-        Self { label: None, value: value.into() }
+        Self {
+            label: None,
+            value: value.into(),
+        }
     }
 }
 
@@ -211,7 +223,11 @@ impl ShellError {
     }
 
     fn new(code: ErrorCode, message: impl Into<String>) -> Self {
-        Self { code, message: message.into(), cause: None }
+        Self {
+            code,
+            message: message.into(),
+            cause: None,
+        }
     }
 
     pub fn with_cause(mut self, cause: impl Into<String>) -> Self {
@@ -273,7 +289,10 @@ mod tests {
         let _t: VerbOutput = VerbOutput::Tree(TreeView {
             root: "/p/".into(),
             depth_limit: Some(2),
-            entries: vec![TreeEntry { path: "/p/a".into(), depth: 1 }],
+            entries: vec![TreeEntry {
+                path: "/p/a".into(),
+                depth: 1,
+            }],
         });
         let (_tx, rx) = mpsc::channel::<DispatchChunk>(1);
         let _d: VerbOutput = VerbOutput::Dispatch(rx);

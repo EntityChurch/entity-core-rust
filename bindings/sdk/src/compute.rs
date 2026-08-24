@@ -464,8 +464,7 @@ fn build_eval_params(budget: Option<u64>) -> Entity {
         Vec::new()
     };
     let data = entity_ecf::to_ecf(&Value::Map(fields));
-    Entity::new("primitive/any", data)
-        .expect("eval-params entity construction is infallible")
+    Entity::new("primitive/any", data).expect("eval-params entity construction is infallible")
 }
 
 /// Build the install-params body — only `result_path` (optional)
@@ -477,8 +476,7 @@ fn build_install_params(result_path: Option<String>) -> Entity {
         Vec::new()
     };
     let data = entity_ecf::to_ecf(&Value::Map(fields));
-    Entity::new("primitive/any", data)
-        .expect("install-params entity construction is infallible")
+    Entity::new("primitive/any", data).expect("install-params entity construction is infallible")
 }
 
 /// Decode whatever entity the eval handler returned into a typed
@@ -676,7 +674,9 @@ mod tests {
         let path = format!("/{}/no/such/expr", pid);
         let r = ctx.compute().eval(path, EvalOptions::default()).await;
         match r {
-            Err(SdkError::NotFound { status: 404, code, .. }) if code.as_deref() == Some("not_found") => {}
+            Err(SdkError::NotFound {
+                status: 404, code, ..
+            }) if code.as_deref() == Some("not_found") => {}
             other => panic!("expected 404 not_found, got {:?}", other),
         }
     }
@@ -696,8 +696,9 @@ mod tests {
 
         let r = ctx.compute().eval(path, EvalOptions::default()).await;
         match r {
-            Err(SdkError::BadRequest { status: 400, code, .. })
-                if code.as_deref() == Some("invalid_expression") => {}
+            Err(SdkError::BadRequest {
+                status: 400, code, ..
+            }) if code.as_deref() == Some("invalid_expression") => {}
             other => panic!("expected 400 invalid_expression, got {:?}", other),
         }
     }
@@ -769,7 +770,9 @@ mod tests {
         let path = format!("/{}/system/compute/processes/no-such-subgraph", pid);
         let r = ctx.compute().uninstall(path).await;
         match r {
-            Err(SdkError::NotFound { status: 404, code, .. }) if code.as_deref() == Some("not_found") => {}
+            Err(SdkError::NotFound {
+                status: 404, code, ..
+            }) if code.as_deref() == Some("not_found") => {}
             other => panic!("expected 404 not_found, got {:?}", other),
         }
     }

@@ -154,7 +154,9 @@ impl<'a> AttestationOps<'a> {
     {
         let params = build_create_request(&att);
         let opts = path_resource_opts(path.into());
-        let fut = self.ctx.execute("system/attestation", "create", params, opts);
+        let fut = self
+            .ctx
+            .execute("system/attestation", "create", params, opts);
         async move {
             decode_or_err(fut.await?, "create", |e| {
                 decode_attestation_hash_result(e, "create-result")
@@ -168,10 +170,13 @@ impl<'a> AttestationOps<'a> {
         &self,
         path: impl Into<String>,
         att: NewAttestation,
-    ) -> impl std::future::Future<Output = Result<AttestationCreateResult, SdkError>> + 'static {
+    ) -> impl std::future::Future<Output = Result<AttestationCreateResult, SdkError>> + 'static
+    {
         let params = build_create_request(&att);
         let opts = path_resource_opts(path.into());
-        let fut = self.ctx.execute("system/attestation", "create", params, opts);
+        let fut = self
+            .ctx
+            .execute("system/attestation", "create", params, opts);
         async move {
             decode_or_err(fut.await?, "create", |e| {
                 decode_attestation_hash_result(e, "create-result")
@@ -197,9 +202,12 @@ impl<'a> AttestationOps<'a> {
         expires_at: Option<u64>,
     ) -> impl std::future::Future<Output = Result<AttestationSupersedeResult, SdkError>> + Send + 'static
     {
-        let params = build_supersede_request(previous_hash, property_overrides, not_before, expires_at);
+        let params =
+            build_supersede_request(previous_hash, property_overrides, not_before, expires_at);
         let opts = path_resource_opts(path.into());
-        let fut = self.ctx.execute("system/attestation", "supersede", params, opts);
+        let fut = self
+            .ctx
+            .execute("system/attestation", "supersede", params, opts);
         async move {
             decode_or_err(fut.await?, "supersede", |e| {
                 decode_attestation_hash_result(e, "supersede-result")
@@ -216,10 +224,14 @@ impl<'a> AttestationOps<'a> {
         property_overrides: Option<Vec<(ciborium::Value, ciborium::Value)>>,
         not_before: Option<u64>,
         expires_at: Option<u64>,
-    ) -> impl std::future::Future<Output = Result<AttestationSupersedeResult, SdkError>> + 'static {
-        let params = build_supersede_request(previous_hash, property_overrides, not_before, expires_at);
+    ) -> impl std::future::Future<Output = Result<AttestationSupersedeResult, SdkError>> + 'static
+    {
+        let params =
+            build_supersede_request(previous_hash, property_overrides, not_before, expires_at);
         let opts = path_resource_opts(path.into());
-        let fut = self.ctx.execute("system/attestation", "supersede", params, opts);
+        let fut = self
+            .ctx
+            .execute("system/attestation", "supersede", params, opts);
         async move {
             decode_or_err(fut.await?, "supersede", |e| {
                 decode_attestation_hash_result(e, "supersede-result")
@@ -244,7 +256,9 @@ impl<'a> AttestationOps<'a> {
     {
         let params = build_revoke_request(target_hash, attesting, &reason.into());
         let opts = path_resource_opts(path.into());
-        let fut = self.ctx.execute("system/attestation", "revoke", params, opts);
+        let fut = self
+            .ctx
+            .execute("system/attestation", "revoke", params, opts);
         async move {
             decode_or_err(fut.await?, "revoke", |e| {
                 decode_attestation_hash_result(e, "revoke-result")
@@ -260,10 +274,13 @@ impl<'a> AttestationOps<'a> {
         target_hash: Hash,
         attesting: Hash,
         reason: impl Into<String>,
-    ) -> impl std::future::Future<Output = Result<AttestationRevokeResult, SdkError>> + 'static {
+    ) -> impl std::future::Future<Output = Result<AttestationRevokeResult, SdkError>> + 'static
+    {
         let params = build_revoke_request(target_hash, attesting, &reason.into());
         let opts = path_resource_opts(path.into());
-        let fut = self.ctx.execute("system/attestation", "revoke", params, opts);
+        let fut = self
+            .ctx
+            .execute("system/attestation", "revoke", params, opts);
         async move {
             decode_or_err(fut.await?, "revoke", |e| {
                 decode_attestation_hash_result(e, "revoke-result")
@@ -284,9 +301,12 @@ impl<'a> AttestationOps<'a> {
     ) -> impl std::future::Future<Output = Result<AttestationVerifyResult, SdkError>> + Send + 'static
     {
         let params = build_verify_request(attestation_hash, as_of);
-        let fut = self
-            .ctx
-            .execute("system/attestation", "verify", params, ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/attestation",
+            "verify",
+            params,
+            ExecuteOptions::default(),
+        );
         async move { decode_or_err(fut.await?, "verify", decode_verify_result) }
     }
 
@@ -295,11 +315,15 @@ impl<'a> AttestationOps<'a> {
         &self,
         attestation_hash: Hash,
         as_of: Option<u64>,
-    ) -> impl std::future::Future<Output = Result<AttestationVerifyResult, SdkError>> + 'static {
+    ) -> impl std::future::Future<Output = Result<AttestationVerifyResult, SdkError>> + 'static
+    {
         let params = build_verify_request(attestation_hash, as_of);
-        let fut = self
-            .ctx
-            .execute("system/attestation", "verify", params, ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/attestation",
+            "verify",
+            params,
+            ExecuteOptions::default(),
+        );
         async move { decode_or_err(fut.await?, "verify", decode_verify_result) }
     }
 }
@@ -477,8 +501,7 @@ fn decode_verify_result(entity: &Entity) -> Result<AttestationVerifyResult, SdkE
         }
     }
     Ok(AttestationVerifyResult {
-        valid: valid
-            .ok_or_else(|| SdkError::HandlerError("verify-result missing valid".into()))?,
+        valid: valid.ok_or_else(|| SdkError::HandlerError("verify-result missing valid".into()))?,
         reason,
     })
 }
@@ -515,10 +538,7 @@ mod tests {
         let att = NewAttestation {
             attesting: me,
             attested: me,
-            properties: vec![(
-                entity_ecf::text("kind"),
-                entity_ecf::text("app/test-claim"),
-            )],
+            properties: vec![(entity_ecf::text("kind"), entity_ecf::text("app/test-claim"))],
             supersedes: None,
             not_before: None,
             expires_at: None,
@@ -553,8 +573,9 @@ mod tests {
             .supersede(path, bogus, None, None, None)
             .await;
         match result {
-            Err(SdkError::NotFound { status: 404, code, .. })
-                if code.as_deref() == Some("previous_not_found") => {}
+            Err(SdkError::NotFound {
+                status: 404, code, ..
+            }) if code.as_deref() == Some("previous_not_found") => {}
             other => panic!(
                 "expected 404 previous_not_found for synthetic predecessor, got {:?}",
                 other

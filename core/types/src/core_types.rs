@@ -276,12 +276,18 @@ fn system_capability_id_scope() -> TypeDefinition {
 
 fn system_capability_grant_entry() -> TypeDefinition {
     TypeDefBuilder::new("system/capability/grant-entry")
-        .field("allowances", FieldSpec::optional_map(FieldSpec::type_ref("primitive/any"), None))
+        .field(
+            "allowances",
+            FieldSpec::optional_map(FieldSpec::type_ref("primitive/any"), None),
+        )
         .field("handlers", t("system/capability/path-scope"))
         .field("resources", t("system/capability/path-scope"))
         .field("operations", t("system/capability/id-scope"))
         .field("peers", opt("system/capability/id-scope"))
-        .field("constraints", FieldSpec::optional_map(FieldSpec::type_ref("primitive/any"), None))
+        .field(
+            "constraints",
+            FieldSpec::optional_map(FieldSpec::type_ref("primitive/any"), None),
+        )
         .build()
 }
 
@@ -416,6 +422,161 @@ fn system_peer_self_status() -> TypeDefinition {
         .build()
 }
 
+/// `system/peer/status` — the §3.13 operational liveness entity for an
+/// OBSERVED REMOTE peer (the local peer's own status is
+/// `system/peer/self/status`). Stored at
+/// `system/peer/status/{peer_id_hex}`; state transitions `(unknown) →
+/// connected → suspect → disconnected`, reconnection returns to
+/// `connected` (3-state enum — EXTENSION-NETWORK Amendment 12 rung-1
+/// ruling D). `reason`/`last_error` are the Amendment 12 §A2 additive
+/// OPTIONAL fields, declaration home ruled §3.13 upstream (ruling A).
+/// Put-sites are minimal writes; bare `{peer_id, status}` is conformant.
+fn system_peer_status() -> TypeDefinition {
+    TypeDefBuilder::new("system/peer/status")
+        .field("peer_id", t("system/peer-id"))
+        .field("status", t("primitive/string"))
+        .field("connected_at", opt("primitive/uint"))
+        .field("last_seen", opt("primitive/uint"))
+        .field("connection", opt("system/tree/path"))
+        .field("reason", opt("primitive/string"))
+        .field("last_error", opt("primitive/string"))
+        .build()
+}
+
+/// `system/connection` — the §3.13 operational connection-state entity:
+/// "how am I attached right now" (transport + address diagnostics), the
+/// read-on-demand complement to `system/peer/status`'s
+/// subscribe-for-liveness "is the peer here". Per Amendment 12 rung-1
+/// ruling C: MUST at full NETWORK conformance (§12.1), NOT part of the
+/// §A3 liveness floor — a consumer of a floor-only peer MUST NOT assume
+/// this entity exists. Stored at `system/connection/{peer_id_hex}`;
+/// write-on-transition: `active` at establishment, `closed` on
+/// close/failure — never per-activity. Referenced by
+/// `system/peer/status` via its `connection` path field.
+fn system_connection() -> TypeDefinition {
+    TypeDefBuilder::new("system/connection")
+        .field("peer_id", t("system/peer-id"))
+        .field("transport", t("primitive/string"))
+        .field("address", t("primitive/string"))
+        .field("status", t("primitive/string"))
+        .field("established_at", t("primitive/uint"))
+        .field("parameters", opt_map(t("primitive/any")))
+        .build()
+}
+
+/// `system/network/keepalive-config` — EXTENSION-NETWORK §2.3. All
+/// fields optional with spec defaults (interval_ms 30000, timeout_ms
+/// 10000, max_missed 3); §12.4 makes the effective values impl-defined.
+fn system_network_keepalive_config() -> TypeDefinition {
+    TypeDefBuilder::new("system/network/keepalive-config")
+        .field("interval_ms", opt("primitive/uint"))
+        .field("timeout_ms", opt("primitive/uint"))
+        .field("max_missed", opt("primitive/uint"))
+        .build()
+}
+
+/// `system/network/backoff-config` — EXTENSION-NETWORK §2.2 (defaults:
+/// min_ms 1000, max_ms 60000, strategy "exponential"). Landed with the
+/// rung-2 keepalive types; consumed by the rung-3 reconnect lifecycle.
+fn system_network_backoff_config() -> TypeDefinition {
+    TypeDefBuilder::new("system/network/backoff-config")
+        .field("min_ms", opt("primitive/uint"))
+        .field("max_ms", opt("primitive/uint"))
+        .field("strategy", opt("primitive/string"))
+        .build()
+}
+
+/// `system/network/ping` — EXTENSION-NETWORK §5.2. Params of the §5.1
+/// app-level keepalive EXECUTE on `system/protocol/connect`.
+fn system_network_ping() -> TypeDefinition {
+    TypeDefBuilder::new("system/network/ping")
+        .field("timestamp", t("primitive/uint"))
+        .field("sequence", t("primitive/uint"))
+        .build()
+}
+
+/// `system/network/pong` — EXTENSION-NETWORK §5.3. Result of the §5.1
+/// keepalive exchange; echoes the ping's timestamp/sequence and adds
+/// the responder's clock.
+fn system_network_pong() -> TypeDefinition {
+    TypeDefBuilder::new("system/network/pong")
+        .field("timestamp", t("primitive/uint"))
+        .field("sequence", t("primitive/uint"))
+        .field("server_time", t("primitive/uint"))
+        .build()
+}
+
+/// `system/network/maintain-request` — EXTENSION-NETWORK §2.1, the
+/// maintain-peer input (rung 3). Field-identical to Go/Py.
+fn system_network_maintain_request() -> TypeDefinition {
+    TypeDefBuilder::new("system/network/maintain-request")
+        .field("peer_id", t("system/peer-id"))
+        .field("address", opt("primitive/string"))
+        .field("reconnect", opt("primitive/bool"))
+        .field("resubscribe", opt("primitive/bool"))
+        .field("keepalive", opt("system/network/keepalive-config"))
+        .field("backoff", opt("system/network/backoff-config"))
+        .build()
+}
+
+/// `system/network/maintain-result` — EXTENSION-NETWORK §2.4.
+fn system_network_maintain_result() -> TypeDefinition {
+    TypeDefBuilder::new("system/network/maintain-result")
+        .field("peer_id", t("system/peer-id"))
+        .field("session_id", t("primitive/string"))
+        .field("subscriptions", opt_arr(t("primitive/string")))
+        .field("chain_id", t("primitive/string"))
+        .build()
+}
+
+/// `system/network/release-request` — EXTENSION-NETWORK §2.5. `reason`
+/// defaults to "shutdown" when absent.
+fn system_network_release_request() -> TypeDefinition {
+    TypeDefBuilder::new("system/network/release-request")
+        .field("peer_id", t("system/peer-id"))
+        .field("reason", opt("primitive/string"))
+        .build()
+}
+
+/// `system/network/release-result` — EXTENSION-NETWORK §2.6.
+fn system_network_release_result() -> TypeDefinition {
+    TypeDefBuilder::new("system/network/release-result")
+        .field("peer_id", t("system/peer-id"))
+        .field("cleaned_up", arr(t("system/tree/path")))
+        .build()
+}
+
+/// `system/network/status` — EXTENSION-NETWORK §2.7, the status-operation
+/// output. `pending_count` is bare zero cohort-wide: no impl ships the §8
+/// outbox (Amendment 11; rung 4 stays optional).
+fn system_network_status() -> TypeDefinition {
+    TypeDefBuilder::new("system/network/status")
+        .field("maintained_peers", arr(t("system/network/peer-summary")))
+        .field("pending_count", t("primitive/uint"))
+        .build()
+}
+
+/// `system/network/peer-summary` — EXTENSION-NETWORK §2.8, one row of the
+/// §4.3 read-model.
+fn system_network_peer_summary() -> TypeDefinition {
+    TypeDefBuilder::new("system/network/peer-summary")
+        .field("peer_id", t("system/peer-id"))
+        .field("session_id", t("primitive/string"))
+        .field("status", t("primitive/string"))
+        .field("pending_count", t("primitive/uint"))
+        .field("subscriptions", t("primitive/uint"))
+        .build()
+}
+
+/// `system/network/close-request` — EXTENSION-NETWORK §2.9, the §4.4
+/// graceful-close input (reason per the §9.1 table).
+fn system_network_close_request() -> TypeDefinition {
+    TypeDefBuilder::new("system/network/close-request")
+        .field("peer_id", t("system/peer-id"))
+        .field("reason", t("primitive/string"))
+        .build()
+}
+
 /// `system/peer/published-root` — the signed static anchor for a peer's
 /// current tree root (PROPOSAL-PEER-MANIFEST-STATIC-HANDSHAKE §4,
 /// NORMATIVE-LOCKED). `peer_id` is the Base58 id `system/peer-id`
@@ -447,7 +608,10 @@ fn system_handler() -> TypeDefinition {
     TypeDefBuilder::new("system/handler")
         .field("interface", t("system/tree/path"))
         .field("max_scope", opt_arr(t("system/capability/grant-entry")))
-        .field("internal_scope", opt_arr(t("system/capability/grant-entry")))
+        .field(
+            "internal_scope",
+            opt_arr(t("system/capability/grant-entry")),
+        )
         .field("expression_path", opt("system/tree/path"))
         .build()
 }
@@ -459,7 +623,10 @@ fn system_handler_manifest() -> TypeDefinition {
         .field("name", t("primitive/string"))
         .field("operations", map(t("system/handler/operation-spec")))
         .field("max_scope", opt_arr(t("system/capability/grant-entry")))
-        .field("internal_scope", opt_arr(t("system/capability/grant-entry")))
+        .field(
+            "internal_scope",
+            opt_arr(t("system/capability/grant-entry")),
+        )
         .field("expression_path", opt("system/tree/path"))
         .build()
 }
@@ -517,7 +684,10 @@ fn system_handler_register_request() -> TypeDefinition {
     TypeDefBuilder::new("system/handler/register-request")
         .field("manifest", t("system/handler/manifest"))
         .field("types", opt_map(t("system/type")))
-        .field("requested_scope", opt_arr(t("system/capability/grant-entry")))
+        .field(
+            "requested_scope",
+            opt_arr(t("system/capability/grant-entry")),
+        )
         .build()
 }
 
@@ -918,7 +1088,10 @@ fn system_type_compare_result() -> TypeDefinition {
         .field("shared", map(t("system/type/field-comparison")))
         .field("only_a", arr(t("primitive/string")))
         .field("only_b", arr(t("primitive/string")))
-        .field("incompatible", opt_arr(t("system/type/field-incompatibility")))
+        .field(
+            "incompatible",
+            opt_arr(t("system/type/field-incompatibility")),
+        )
         .build()
 }
 
@@ -937,7 +1110,10 @@ fn system_type_compatibility_report() -> TypeDefinition {
         .field("direction", t("primitive/string"))
         .field("level", t("primitive/string"))
         .field("shared_fields", arr(t("primitive/string")))
-        .field("incompatible_fields", opt_arr(t("system/type/field-incompatibility")))
+        .field(
+            "incompatible_fields",
+            opt_arr(t("system/type/field-incompatibility")),
+        )
         .field("missing_required_a", opt_arr(t("primitive/string")))
         .field("missing_required_b", opt_arr(t("primitive/string")))
         .build()
@@ -1109,7 +1285,10 @@ fn system_continuation_transform() -> TypeDefinition {
         .field("select", opt_map(t("primitive/string")))
         // EXTENSION-CONTINUATION v1.9 G1 §2.2: ordered closed/total/pure/bounded
         // field ops applied after extract/select, before the *_extract fields.
-        .field("transform_ops", opt_arr(t("system/continuation/transform-op")))
+        .field(
+            "transform_ops",
+            opt_arr(t("system/continuation/transform-op")),
+        )
         .field("resource_extract", opt("primitive/string"))
         .field("target_extract", opt("primitive/string"))
         .field("operation_extract", opt("primitive/string"))
@@ -1347,7 +1526,10 @@ fn system_revision_commit_result() -> TypeDefinition {
 
 fn system_revision_merge_result() -> TypeDefinition {
     TypeDefBuilder::new("system/revision/merge-result")
-        .field("cascade_warnings", opt_arr(t("system/revision/cascade-warning")))
+        .field(
+            "cascade_warnings",
+            opt_arr(t("system/revision/cascade-warning")),
+        )
         .field("conflicts", opt_arr(t("primitive/string")))
         .field("deleted_count", opt("primitive/uint"))
         .field("merged_count", opt("primitive/uint"))
@@ -1359,7 +1541,10 @@ fn system_revision_merge_result() -> TypeDefinition {
 fn system_revision_checkout_result() -> TypeDefinition {
     TypeDefBuilder::new("system/revision/checkout-result")
         .field("branch", opt("primitive/string"))
-        .field("cascade_warnings", opt_arr(t("system/revision/cascade-warning")))
+        .field(
+            "cascade_warnings",
+            opt_arr(t("system/revision/cascade-warning")),
+        )
         .field("head", t("system/hash"))
         .field("note", opt("primitive/string"))
         .field("status", t("primitive/string"))
@@ -1370,7 +1555,10 @@ fn system_revision_checkout_result() -> TypeDefinition {
 
 fn system_revision_cherry_pick_result() -> TypeDefinition {
     TypeDefBuilder::new("system/revision/cherry-pick-result")
-        .field("cascade_warnings", opt_arr(t("system/revision/cascade-warning")))
+        .field(
+            "cascade_warnings",
+            opt_arr(t("system/revision/cascade-warning")),
+        )
         .field("conflicts", opt("primitive/uint"))
         .field("source", t("system/hash"))
         .field("status", t("primitive/string"))
@@ -1380,7 +1568,10 @@ fn system_revision_cherry_pick_result() -> TypeDefinition {
 
 fn system_revision_revert_result() -> TypeDefinition {
     TypeDefBuilder::new("system/revision/revert-result")
-        .field("cascade_warnings", opt_arr(t("system/revision/cascade-warning")))
+        .field(
+            "cascade_warnings",
+            opt_arr(t("system/revision/cascade-warning")),
+        )
         .field("conflicts", opt("primitive/uint"))
         .field("reverted", t("system/hash"))
         .field("status", t("primitive/string"))
@@ -2241,6 +2432,19 @@ pub fn all_core_types() -> Vec<TypeDefinition> {
         // Supporting types
         system_peer(),
         system_peer_self_status(),
+        system_peer_status(),
+        system_connection(),
+        system_network_keepalive_config(),
+        system_network_backoff_config(),
+        system_network_ping(),
+        system_network_pong(),
+        system_network_maintain_request(),
+        system_network_maintain_result(),
+        system_network_release_request(),
+        system_network_release_result(),
+        system_network_status(),
+        system_network_peer_summary(),
+        system_network_close_request(),
         system_peer_published_root(),
         system_signature(),
         system_handler(),
@@ -2542,7 +2746,10 @@ pub fn all_core_types() -> Vec<TypeDefinition> {
 fn system_query_expression() -> TypeDefinition {
     TypeDefBuilder::new("system/query/expression")
         .field("type_filter", opt("primitive/string"))
-        .field("field_filters", FieldSpec::optional_array(FieldSpec::type_ref("system/query/field-predicate")))
+        .field(
+            "field_filters",
+            FieldSpec::optional_array(FieldSpec::type_ref("system/query/field-predicate")),
+        )
         .field("ref_filter", opt("system/hash"))
         .field("path_filter", opt("system/tree/path"))
         .field("path_prefix", opt("system/tree/path"))
@@ -2556,7 +2763,10 @@ fn system_query_expression() -> TypeDefinition {
 
 fn system_query_result() -> TypeDefinition {
     TypeDefBuilder::new("system/query/result")
-        .field("matches", FieldSpec::array(FieldSpec::type_ref("system/query/match")))
+        .field(
+            "matches",
+            FieldSpec::array(FieldSpec::type_ref("system/query/match")),
+        )
         .field("total", t("primitive/uint"))
         .field("has_more", t("primitive/bool"))
         .field("cursor", opt("primitive/string"))
@@ -2595,7 +2805,10 @@ fn system_query_allowances() -> TypeDefinition {
 fn system_query_index_config() -> TypeDefinition {
     TypeDefBuilder::new("system/query/index-config")
         .field("type_name", t("system/type/name"))
-        .field("fields", FieldSpec::array(FieldSpec::type_ref("primitive/string")))
+        .field(
+            "fields",
+            FieldSpec::array(FieldSpec::type_ref("primitive/string")),
+        )
         .build()
 }
 
@@ -3336,8 +3549,8 @@ mod tests {
     fn test_all_types_count() {
         let types = all_core_types();
         assert!(
-            types.len() >= 94,
-            "Expected at least 94 types, got {}",
+            types.len() >= 101,
+            "Expected at least 101 types, got {}",
             types.len()
         );
     }
@@ -3355,9 +3568,9 @@ mod tests {
     #[test]
     fn test_all_types_to_entity() {
         for td in all_core_types() {
-            let entity = td.to_entity().unwrap_or_else(|e| {
-                panic!("Failed to create entity for type {}: {}", td.name, e)
-            });
+            let entity = td
+                .to_entity()
+                .unwrap_or_else(|e| panic!("Failed to create entity for type {}: {}", td.name, e));
             assert_eq!(entity.entity_type, "system/type");
             assert!(
                 entity.validate().is_ok(),
@@ -3473,11 +3686,7 @@ mod tests {
             "system/identity/publish-attestation-request",
             "system/identity/publish-attestation-result",
         ] {
-            assert!(
-                registry.has(name),
-                "v3.3 type {} not registered",
-                name
-            );
+            assert!(registry.has(name), "v3.3 type {} not registered", name);
         }
         // v2.2 names that MUST NOT be present after v3.2 migration.
         for absent in ["system/identity/quorum", "system/identity/attestation"] {

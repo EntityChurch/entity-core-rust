@@ -34,8 +34,8 @@ use godot::prelude::*;
 use tokio::sync::mpsc;
 
 use entity_shell::{
-    DispatchChunk, EntityRead, PeerBinding, Shell, ShellError, StreamChunk,
-    TreeListingEntry, VerbOutput, EntityView, InfoRow, ListingSection, TreeView,
+    DispatchChunk, EntityRead, EntityView, InfoRow, ListingSection, PeerBinding, Shell, ShellError,
+    StreamChunk, TreeListingEntry, TreeView, VerbOutput,
 };
 
 use crate::peer_node::EntityPeer;
@@ -140,11 +140,9 @@ impl PeerBinding for GodotPeerBinding {
         // without a body writes an empty entity; `put ... <json>`
         // errors with a clear message.
         if params_text.is_some() {
-            return Err(
-                "put: JSON body parsing not yet supported by Godot binding \
+            return Err("put: JSON body parsing not yet supported by Godot binding \
                  (use `put <path> <type>` without a body for now)"
-                    .into(),
-            );
+                .into());
         }
         let peer = self.peer_node.bind();
         let Some(ctx) = peer.peer_ctx() else {
@@ -210,13 +208,18 @@ impl PeerBinding for GodotPeerBinding {
             let bound = self.peer_id.clone();
             let got = peer_id.to_string();
             return Box::pin(async move {
-                Err(format!("compute eval: wrong peer (bound to {}, got {})", bound, got))
+                Err(format!(
+                    "compute eval: wrong peer (bound to {}, got {})",
+                    bound, got
+                ))
             });
         }
         let Some(ctx) = self.peer_node.bind().peer_ctx_arc() else {
             return Box::pin(async move { Err("compute eval: peer not started".into()) });
         };
-        let fut = ctx.compute().eval(expr_path, entity_sdk::compute::EvalOptions { budget });
+        let fut = ctx
+            .compute()
+            .eval(expr_path, entity_sdk::compute::EvalOptions { budget });
         Box::pin(async move {
             fut.await
                 .map(format_compute_eval_result)
@@ -236,9 +239,10 @@ impl PeerBinding for GodotPeerBinding {
         let Some(ctx) = self.peer_node.bind().peer_ctx_arc() else {
             return Box::pin(async move { Err("compute install: peer not started".into()) });
         };
-        let fut = ctx
-            .compute()
-            .install(root_expression_path, entity_sdk::compute::InstallOptions { result_path });
+        let fut = ctx.compute().install(
+            root_expression_path,
+            entity_sdk::compute::InstallOptions { result_path },
+        );
         Box::pin(async move {
             fut.await
                 .map(|r| (r.subgraph_path, r.result_path))
@@ -305,7 +309,10 @@ impl PeerBinding for GodotPeerBinding {
                 ("result path".into(), s.result_path),
                 ("status".into(), s.status),
                 ("installed by".into(), short_hash(&s.installed_by)),
-                ("installation grant".into(), short_hash(&s.installation_grant)),
+                (
+                    "installation grant".into(),
+                    short_hash(&s.installation_grant),
+                ),
             ])
         });
         Box::pin(async move { Ok(rows) })
@@ -397,11 +404,7 @@ impl PeerBinding for GodotPeerBinding {
 }
 
 fn short_hash(h: &entity_hash::Hash) -> String {
-    let hex: String = h
-        .to_bytes()
-        .iter()
-        .map(|b| format!("{:02x}", b))
-        .collect();
+    let hex: String = h.to_bytes().iter().map(|b| format!("{:02x}", b)).collect();
     if hex.len() >= 8 {
         format!("{}…{}", &hex[..4], &hex[hex.len() - 4..])
     } else {
@@ -432,10 +435,15 @@ fn format_compute_eval_result(r: entity_sdk::compute::ComputeEvalResult) -> Stri
     )
 }
 
-fn format_bootstrap_result(r: entity_sdk::identity_bootstrap::BootstrapResult) -> Vec<(String, String)> {
+fn format_bootstrap_result(
+    r: entity_sdk::identity_bootstrap::BootstrapResult,
+) -> Vec<(String, String)> {
     use entity_sdk::identity_bootstrap::BootstrapResult::*;
     match r {
-        AlreadyBootstrapped { identity_hash, quorum_id } => vec![
+        AlreadyBootstrapped {
+            identity_hash,
+            quorum_id,
+        } => vec![
             ("status".into(), "already bootstrapped".into()),
             ("identity".into(), short_hash(&identity_hash)),
             ("quorum".into(), short_hash(&quorum_id)),
@@ -571,7 +579,9 @@ impl EntityShell {
         let runtime = self.peer_node.bind().runtime_handle();
         let spawn = |fut: entity_shell::runtime::BoxFuture<'static, ()>| {
             match &runtime {
-                Some(handle) => { handle.spawn(fut); }
+                Some(handle) => {
+                    handle.spawn(fut);
+                }
                 None => { /* drop unrun — see comment above */ }
             }
         };

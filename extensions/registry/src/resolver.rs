@@ -21,9 +21,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use entity_crypto::Keypair;
 use entity_entity::{Entity, TYPE_SIGNATURE};
-use entity_handler::{
-    Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST,
-};
+use entity_handler::{Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST};
 use entity_hash::Hash;
 use entity_store::{ContentStore, LocationIndex};
 use entity_types::SignatureData;
@@ -33,11 +31,9 @@ use crate::data::{
     KIND_LOCAL_NAME, KIND_SELF_CERTIFYING, TRUST_OUT_OF_BAND,
 };
 use crate::local_name::{load_local_name_config, resolve_one};
-use crate::result::{error, status_result};
 use crate::log::ResolutionLog;
-use crate::{
-    resolver_config_path, BACKEND_KIND_LOCAL_NAME, BACKEND_KIND_PEER_ISSUED,
-};
+use crate::result::{error, status_result};
+use crate::{resolver_config_path, BACKEND_KIND_LOCAL_NAME, BACKEND_KIND_PEER_ISSUED};
 
 /// `system/registry` meta-resolver handler.
 pub struct RegistryHandler {
@@ -110,9 +106,10 @@ impl RegistryHandler {
             if !restricted.contains(kind) {
                 return true;
             }
-            config.name_format_dispatch.iter().any(|r| {
-                r.backend_kinds.iter().any(|k| k == kind) && glob_match(&r.pattern, name)
-            })
+            config
+                .name_format_dispatch
+                .iter()
+                .any(|r| r.backend_kinds.iter().any(|k| k == kind) && glob_match(&r.pattern, name))
         };
 
         // Step 3: filtered chain in ascending priority order; first validated hit.
@@ -126,8 +123,11 @@ impl RegistryHandler {
         for entry in chain {
             let candidate = match entry.backend_kind.as_str() {
                 BACKEND_KIND_LOCAL_NAME => {
-                    let pcfg =
-                        load_local_name_config(&self.content_store, &self.location_index, &self.peer_id);
+                    let pcfg = load_local_name_config(
+                        &self.content_store,
+                        &self.location_index,
+                        &self.peer_id,
+                    );
                     resolve_one(
                         &self.content_store,
                         &self.location_index,
@@ -145,7 +145,10 @@ impl RegistryHandler {
                 other => {
                     // Unknown / unsupported backend kind in v1 — skip-with-warning
                     // (§4.2 forward-compat). Backends ship in their own proposals.
-                    tracing::warn!(backend_kind = other, "registry: skipping unsupported backend");
+                    tracing::warn!(
+                        backend_kind = other,
+                        "registry: skipping unsupported backend"
+                    );
                     None
                 }
             };
@@ -311,7 +314,10 @@ impl RegistryHandler {
     /// (re-resolves each call), so there is no positive-resolution cache to
     /// flush; returns ok. TTL-based caching is a SHOULD layered on top (§11.2).
     fn handle_invalidate_cache(&self, _ctx: &HandlerContext) -> HandlerResult {
-        status_result(vec![(entity_ecf::text("invalidated"), ciborium::Value::Bool(true))])
+        status_result(vec![(
+            entity_ecf::text("invalidated"),
+            ciborium::Value::Bool(true),
+        )])
     }
 }
 
@@ -341,11 +347,12 @@ pub fn verify_binding_signature(
                     .is_ok()
         }
         _ => {
-            let sig = match find_binding_signature(binding_hash, content_store, location_index, included)
-            {
-                Some(s) => s,
-                None => return false,
-            };
+            let sig =
+                match find_binding_signature(binding_hash, content_store, location_index, included)
+                {
+                    Some(s) => s,
+                    None => return false,
+                };
             let pubkey = match resolve_peer_pubkey(&sig.signer, content_store) {
                 Some(pk) => pk,
                 None => return false,
@@ -491,11 +498,7 @@ fn class_match(spec: &[u8], ch: u8) -> Option<usize> {
         let c = spec[i];
         if c == b']' && i > start {
             // closing bracket
-            return if matched != negate {
-                Some(i + 1)
-            } else {
-                None
-            };
+            return if matched != negate { Some(i + 1) } else { None };
         }
         // range a-z
         if i + 2 < spec.len() && spec[i + 1] == b'-' && spec[i + 2] != b']' {

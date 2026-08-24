@@ -32,13 +32,28 @@ use crate::verbs;
 /// inspect this list (e.g., for tab completion or to decide whether
 /// to route through the crate).
 pub const VERBS: &[&str] = &[
-    "help", "pwd", "cd", "ls", "cat", "tree", "info",
-    "disconnect", "connect", "exec",
-    "put", "rm",
-    "query", "count",
-    "peer", "peers", "open",
-    "tail", "tails", "untail",
-    "compute", "bootstrap",
+    "help",
+    "pwd",
+    "cd",
+    "ls",
+    "cat",
+    "tree",
+    "info",
+    "disconnect",
+    "connect",
+    "exec",
+    "put",
+    "rm",
+    "query",
+    "count",
+    "peer",
+    "peers",
+    "open",
+    "tail",
+    "tails",
+    "untail",
+    "compute",
+    "bootstrap",
     "inspect",
 ];
 
@@ -98,9 +113,9 @@ where
         "cd" => dispatch_with_path_arg("cd", &args, &[0], binding, |a| {
             verbs::cd(shell, a, binding, sink)
         }),
-        "ls" => dispatch_with_path_arg("ls", &args, &[0], binding, |a| {
-            verbs::ls(shell, a, binding)
-        }),
+        "ls" => {
+            dispatch_with_path_arg("ls", &args, &[0], binding, |a| verbs::ls(shell, a, binding))
+        }
         "cat" => dispatch_with_path_arg("cat", &args, &[0], binding, |a| {
             verbs::cat(shell, a, binding)
         }),
@@ -116,9 +131,9 @@ where
         "put" => dispatch_with_path_arg("put", &args, &[0], binding, |a| {
             verbs::put(shell, a, binding)
         }),
-        "rm" | "remove" => dispatch_with_path_arg("rm", &args, &[0], binding, |a| {
-            verbs::rm(shell, a, binding)
-        }),
+        "rm" | "remove" => {
+            dispatch_with_path_arg("rm", &args, &[0], binding, |a| verbs::rm(shell, a, binding))
+        }
         "query" => verbs::query(&args, binding, spawn), // type-filter arg, no path → no dispatcher-tier alias expansion
         "count" => verbs::count(&args, binding, spawn), // type-filter arg, no path → no dispatcher-tier alias expansion
         "peer" | "peers" => verbs::peer(&args, binding, action_sink),
@@ -255,23 +270,41 @@ mod tests {
 
     struct StubBinding;
     impl PeerBinding for StubBinding {
-        fn peer_id(&self) -> &str { "alice" }
-        fn primary_peer_id(&self) -> String { "alice".into() }
-        fn peer_ids(&self) -> Vec<String> { vec!["alice".into()] }
-        fn connected_peers(&self) -> Vec<String> { Vec::new() }
-        fn peer_label(&self, _pid: &str) -> Option<String> { None }
+        fn peer_id(&self) -> &str {
+            "alice"
+        }
+        fn primary_peer_id(&self) -> String {
+            "alice".into()
+        }
+        fn peer_ids(&self) -> Vec<String> {
+            vec!["alice".into()]
+        }
+        fn connected_peers(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn peer_label(&self, _pid: &str) -> Option<String> {
+            None
+        }
         fn tree_listing(&self, _pid: &str, _prefix: &str) -> Vec<TreeListingEntry> {
             Vec::new()
         }
-        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> { None }
+        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> {
+            None
+        }
     }
 
     #[test]
     fn parse_splits_verb_and_args() {
         assert_eq!(parse("pwd").unwrap(), ("pwd", vec![]));
-        assert_eq!(parse("cd /alice/system").unwrap(), ("cd", vec!["/alice/system"]));
+        assert_eq!(
+            parse("cd /alice/system").unwrap(),
+            ("cd", vec!["/alice/system"])
+        );
         assert_eq!(parse("  cd  /alice/  ").unwrap(), ("cd", vec!["/alice/"]));
-        assert_eq!(parse("tree --depth 2").unwrap(), ("tree", vec!["--depth", "2"]));
+        assert_eq!(
+            parse("tree --depth 2").unwrap(),
+            ("tree", vec!["--depth", "2"])
+        );
         assert!(parse("").is_none());
         assert!(parse("   ").is_none());
     }
@@ -286,7 +319,7 @@ mod tests {
         assert!(handles("open"));
         assert!(handles("tail"));
         assert!(!handles("nonexistent"));
-        assert!(!handles("clear"));  // UI op, not a verb
+        assert!(!handles("clear")); // UI op, not a verb
     }
 
     #[test]
@@ -306,7 +339,14 @@ mod tests {
     #[test]
     fn unknown_verb_returns_none() {
         let mut shell = Shell::with_wd("alice", "/alice/");
-        let result = dispatch("not-a-real-verb", &mut shell, &StubBinding, None, &(), |_| {});
+        let result = dispatch(
+            "not-a-real-verb",
+            &mut shell,
+            &StubBinding,
+            None,
+            &(),
+            |_| {},
+        );
         assert!(result.is_none());
     }
 

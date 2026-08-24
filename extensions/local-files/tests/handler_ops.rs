@@ -25,11 +25,20 @@ use tempfile::TempDir;
 
 const TEST_PEER: &str = "1111111111111111111111111111111111111111111111";
 
-fn build_handler() -> (Arc<LocalFilesHandler>, Arc<dyn ContentStore>, Arc<dyn LocationIndex>, TempDir) {
+fn build_handler() -> (
+    Arc<LocalFilesHandler>,
+    Arc<dyn ContentStore>,
+    Arc<dyn LocationIndex>,
+    TempDir,
+) {
     let cs: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
     let li: Arc<dyn LocationIndex> = Arc::new(MemoryLocationIndex::new());
     let tmp = tempfile::tempdir().unwrap();
-    let h = Arc::new(LocalFilesHandler::new(TEST_PEER.to_string(), cs.clone(), li.clone()));
+    let h = Arc::new(LocalFilesHandler::new(
+        TEST_PEER.to_string(),
+        cs.clone(),
+        li.clone(),
+    ));
     let cfg = RootConfigData {
         prefix: "local/files/shared/".into(),
         filesystem_root: tmp.path().to_string_lossy().to_string(),
@@ -100,7 +109,12 @@ async fn cross_handler_blob_hash_convergence() {
     let res = h.handle(&ctx).await.unwrap();
     let file_blob_hash = file_content_hash(&res.result);
 
-    let direct_hash = create_blob_fastcdc(&cs, payload, entity_types::CONTENT_DEFAULT_CHUNK_SIZE as usize).unwrap();
+    let direct_hash = create_blob_fastcdc(
+        &cs,
+        payload,
+        entity_types::CONTENT_DEFAULT_CHUNK_SIZE as usize,
+    )
+    .unwrap();
     assert_eq!(
         file_blob_hash, direct_hash,
         "local/files blob hash must match direct content chunking",
@@ -117,11 +131,19 @@ async fn inline_include_boundary_at_64kib() {
     std::fs::write(tmp.path().join("above.bin"), &above).unwrap();
 
     let res_below = h
-        .handle(&make_ctx("read", "local/files/shared/below.bin", empty_params()))
+        .handle(&make_ctx(
+            "read",
+            "local/files/shared/below.bin",
+            empty_params(),
+        ))
         .await
         .unwrap();
     let res_above = h
-        .handle(&make_ctx("read", "local/files/shared/above.bin", empty_params()))
+        .handle(&make_ctx(
+            "read",
+            "local/files/shared/above.bin",
+            empty_params(),
+        ))
         .await
         .unwrap();
 
@@ -151,7 +173,12 @@ async fn write_content_mode_dedup() {
     // exists in the content store → file entity's content == input blob hash.
     let (h, cs, _li, tmp) = build_handler();
     let payload = b"dedup mode bytes".to_vec();
-    let blob_hash = create_blob_fastcdc(&cs, &payload, entity_types::CONTENT_DEFAULT_CHUNK_SIZE as usize).unwrap();
+    let blob_hash = create_blob_fastcdc(
+        &cs,
+        &payload,
+        entity_types::CONTENT_DEFAULT_CHUNK_SIZE as usize,
+    )
+    .unwrap();
 
     let params = write_params(None, Some(blob_hash));
     let res = h
@@ -160,7 +187,10 @@ async fn write_content_mode_dedup() {
         .unwrap();
     assert_eq!(res.status, 200);
     let result_blob = file_content_hash(&res.result);
-    assert_eq!(result_blob, blob_hash, "content-mode write preserves blob hash");
+    assert_eq!(
+        result_blob, blob_hash,
+        "content-mode write preserves blob hash"
+    );
     // And the file is on disk with the original bytes.
     let disk = std::fs::read(tmp.path().join("dedup.txt")).unwrap();
     assert_eq!(disk, payload);
@@ -202,7 +232,10 @@ async fn list_returns_directory_entries() {
         .unwrap();
     assert_eq!(res.status, 200);
     let v: Value = ciborium::from_reader(res.result.data.as_slice()).unwrap();
-    let arr = v.get("children").and_then(|x| x.as_array()).expect("children");
+    let arr = v
+        .get("children")
+        .and_then(|x| x.as_array())
+        .expect("children");
     assert_eq!(arr.len(), 3);
 }
 
@@ -213,14 +246,22 @@ async fn delete_removes_file_and_unbinds_tree_path() {
     std::fs::write(&fs_path, b"bye").unwrap();
     // Seed binding via read.
     let _ = h
-        .handle(&make_ctx("read", "local/files/shared/gone.txt", empty_params()))
+        .handle(&make_ctx(
+            "read",
+            "local/files/shared/gone.txt",
+            empty_params(),
+        ))
         .await
         .unwrap();
     let qualified = format!("/{}/local/files/shared/gone.txt", TEST_PEER);
     assert!(li.get(&qualified).is_some());
 
     let res = h
-        .handle(&make_ctx("delete", "local/files/shared/gone.txt", empty_params()))
+        .handle(&make_ctx(
+            "delete",
+            "local/files/shared/gone.txt",
+            empty_params(),
+        ))
         .await
         .unwrap();
     assert_eq!(res.status, 200);
@@ -242,17 +283,21 @@ async fn rejects_leaf_symlink_to_outside_root() {
     let outside = tempfile::tempdir().unwrap();
     std::fs::write(outside.path().join("secret.txt"), b"OUTSIDE SANDBOX").unwrap();
     // Place a symlink inside the root pointing outside.
-    std::os::unix::fs::symlink(
-        outside.path().join("secret.txt"),
-        tmp.path().join("escape"),
-    )
-    .unwrap();
+    std::os::unix::fs::symlink(outside.path().join("secret.txt"), tmp.path().join("escape"))
+        .unwrap();
 
     let res = h
-        .handle(&make_ctx("read", "local/files/shared/escape", empty_params()))
+        .handle(&make_ctx(
+            "read",
+            "local/files/shared/escape",
+            empty_params(),
+        ))
         .await
         .unwrap();
-    assert_eq!(res.status, 403, "leaf-symlink read must be rejected (was 200 before §8.3 fix)");
+    assert_eq!(
+        res.status, 403,
+        "leaf-symlink read must be rejected (was 200 before §8.3 fix)"
+    );
 
     // Same for write to a path whose leaf is a symlink (overwriting the symlink target would escape).
     let res_w = h
@@ -313,7 +358,11 @@ async fn read_only_root_rejects_write() {
         ..Default::default()
     };
     h.add_root("ro", cfg).unwrap();
-    let ctx = make_ctx("write", "local/files/ro/x.txt", write_params(Some(vec![1, 2]), None));
+    let ctx = make_ctx(
+        "write",
+        "local/files/ro/x.txt",
+        write_params(Some(vec![1, 2]), None),
+    );
     let res = h.handle(&ctx).await.unwrap();
     assert_eq!(res.status, 403);
 }
@@ -335,8 +384,8 @@ async fn read_only_root_rejects_write() {
 /// the chunk_size parameter (the fix premise).
 #[test]
 fn s5_5_circuit_breaker_honors_incoming_chunk_size() {
-    use entity_store::MemoryContentStore;
     use entity_content::{blob_chunk_size, create_blob_fastcdc};
+    use entity_store::MemoryContentStore;
     use std::sync::Arc;
 
     let store: Arc<dyn entity_store::ContentStore> = Arc::new(MemoryContentStore::new());
@@ -348,16 +397,16 @@ fn s5_5_circuit_breaker_honors_incoming_chunk_size() {
     let mut raw = vec![0u8; 1 << 18]; // 256 KiB
     let mut rng: u64 = 0xC0FFEE_DEADBEEF;
     for b in &mut raw {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *b = (rng >> 24) as u8;
     }
-    let target_producer: usize = 4096;  // "incoming" chunk size
-    let target_local: usize = 8192;     // local DEFAULT_CHUNK_SIZE (different!)
+    let target_producer: usize = 4096; // "incoming" chunk size
+    let target_local: usize = 8192; // local DEFAULT_CHUNK_SIZE (different!)
 
-    let producer_blob_hash =
-        create_blob_fastcdc(&store, &raw, target_producer).unwrap();
-    let local_blob_hash =
-        create_blob_fastcdc(&store, &raw, target_local).unwrap();
+    let producer_blob_hash = create_blob_fastcdc(&store, &raw, target_producer).unwrap();
+    let local_blob_hash = create_blob_fastcdc(&store, &raw, target_local).unwrap();
 
     // Bug premise: same bytes, different chunk_size, different blob hash.
     assert_ne!(
@@ -381,9 +430,12 @@ fn s5_5_circuit_breaker_honors_incoming_chunk_size() {
     // rewrite). Pre-fix this used DEFAULT_CHUNK_SIZE, would have
     // produced local_blob_hash, missed the match, and spuriously
     // rewritten identical content.
-    let recomputed =
-        create_blob_fastcdc(&store, &std::fs::read(&fs_path).unwrap(), incoming_chunk_size)
-            .unwrap();
+    let recomputed = create_blob_fastcdc(
+        &store,
+        &std::fs::read(&fs_path).unwrap(),
+        incoming_chunk_size,
+    )
+    .unwrap();
     assert_eq!(
         recomputed, producer_blob_hash,
         "§5.5 recompute with incoming chunk_size MUST match producer's blob hash"
@@ -409,12 +461,18 @@ async fn streaming_content_mode_write_round_trip_above_threshold() {
     let mut raw: Vec<u8> = Vec::with_capacity(size);
     let mut rng: u64 = 0xABCD_1234;
     for _ in 0..size {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         raw.push((rng >> 24) as u8);
     }
     // Pre-ingest the bytes as a blob in the content store.
-    let blob_hash =
-        entity_content::create_blob_fastcdc(&cs, &raw, entity_types::CONTENT_DEFAULT_CHUNK_SIZE as usize).unwrap();
+    let blob_hash = entity_content::create_blob_fastcdc(
+        &cs,
+        &raw,
+        entity_types::CONTENT_DEFAULT_CHUNK_SIZE as usize,
+    )
+    .unwrap();
 
     let params = write_params(None, Some(blob_hash));
     let res = h
@@ -424,8 +482,15 @@ async fn streaming_content_mode_write_round_trip_above_threshold() {
     assert_eq!(res.status, 200);
 
     let disk = std::fs::read(tmp.path().join("big.bin")).unwrap();
-    assert_eq!(disk.len(), raw.len(), "streaming write produced wrong byte count");
-    assert_eq!(disk, raw, "streaming write content diverged from source bytes");
+    assert_eq!(
+        disk.len(),
+        raw.len(),
+        "streaming write produced wrong byte count"
+    );
+    assert_eq!(
+        disk, raw,
+        "streaming write content diverged from source bytes"
+    );
 }
 
 #[tokio::test]
@@ -437,7 +502,9 @@ async fn edit_stability_chunk_reuse() {
     let mut raw: Vec<u8> = Vec::with_capacity(6 * 1024 * 1024);
     let mut rng: u64 = 0xC0FFEE_DEADBEEF;
     for _ in 0..raw.capacity() {
-        rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        rng = rng
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         raw.push((rng >> 24) as u8);
     }
     let target_size = 1024 * 1024usize;
@@ -466,11 +533,20 @@ async fn edit_stability_chunk_reuse() {
 
 fn build_handler_with_descriptors(
     publish_descriptors: bool,
-) -> (Arc<LocalFilesHandler>, Arc<dyn ContentStore>, Arc<dyn LocationIndex>, TempDir) {
+) -> (
+    Arc<LocalFilesHandler>,
+    Arc<dyn ContentStore>,
+    Arc<dyn LocationIndex>,
+    TempDir,
+) {
     let cs: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
     let li: Arc<dyn LocationIndex> = Arc::new(MemoryLocationIndex::new());
     let tmp = tempfile::tempdir().unwrap();
-    let h = Arc::new(LocalFilesHandler::new(TEST_PEER.to_string(), cs.clone(), li.clone()));
+    let h = Arc::new(LocalFilesHandler::new(
+        TEST_PEER.to_string(),
+        cs.clone(),
+        li.clone(),
+    ));
     let cfg = RootConfigData {
         prefix: "local/files/shared/".into(),
         filesystem_root: tmp.path().to_string_lossy().to_string(),
@@ -521,7 +597,10 @@ async fn descriptor_published_when_enabled_and_media_type_known() {
     let descriptor = cs.get(&d_hash).expect("descriptor in store");
     assert_eq!(descriptor.entity_type, "system/content/descriptor");
     let dv: Value = ciborium::from_reader(descriptor.data.as_slice()).unwrap();
-    assert_eq!(decode_hash(dv.get("content").expect("content field")), blob_hash);
+    assert_eq!(
+        decode_hash(dv.get("content").expect("content field")),
+        blob_hash
+    );
     assert_eq!(
         dv.get("media_type").and_then(|v| v.as_str()),
         Some(file_media_type.as_str()),
@@ -552,7 +631,10 @@ async fn descriptor_skipped_when_media_type_unknown() {
     h.handle(&ctx).await.unwrap();
 
     let prefix = format!("/{}/system/content/descriptor/", TEST_PEER);
-    assert!(li.list(&prefix).is_empty(), "no descriptor for unknown media type");
+    assert!(
+        li.list(&prefix).is_empty(),
+        "no descriptor for unknown media type"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -72,7 +72,10 @@ impl Handler for EchoHandler {
                 STATUS_NOT_SUPPORTED,
                 error_entity(
                     "unsupported_operation",
-                    &format!("system/validate/echo: operation {:?} not supported", ctx.operation),
+                    &format!(
+                        "system/validate/echo: operation {:?} not supported",
+                        ctx.operation
+                    ),
                 ),
             ));
         }
@@ -131,19 +134,18 @@ impl DispatchOutboundHandler {
         };
 
         // Text fields — no byte-fidelity concern.
-        let data: ciborium::value::Value =
-            match ciborium::from_reader(ctx.params.data.as_slice()) {
-                Ok(v) => v,
-                Err(e) => {
-                    return HandlerResult::error(
-                        STATUS_BAD_REQUEST,
-                        error_entity(
-                            "invalid_params",
-                            &format!("decode dispatch-outbound params: {}", e),
-                        ),
-                    )
-                }
-            };
+        let data: ciborium::value::Value = match ciborium::from_reader(ctx.params.data.as_slice()) {
+            Ok(v) => v,
+            Err(e) => {
+                return HandlerResult::error(
+                    STATUS_BAD_REQUEST,
+                    error_entity(
+                        "invalid_params",
+                        &format!("decode dispatch-outbound params: {}", e),
+                    ),
+                )
+            }
+        };
         let target = field_text(&data, "target");
         let operation = field_text(&data, "operation");
         if target.is_empty() || operation.is_empty() {
@@ -204,7 +206,10 @@ impl DispatchOutboundHandler {
             Err(e) => {
                 return HandlerResult::error(
                     STATUS_BAD_REQUEST,
-                    error_entity("invalid_params", &format!("build outbound params entity: {}", e)),
+                    error_entity(
+                        "invalid_params",
+                        &format!("build outbound params entity: {}", e),
+                    ),
                 )
             }
         };
@@ -243,13 +248,18 @@ impl DispatchOutboundHandler {
         entity_ecf::encode_cbor_text(&mut out, "result");
         out.extend_from_slice(&result_entity_bytes);
         entity_ecf::encode_cbor_text(&mut out, "status");
-        out.extend_from_slice(&entity_ecf::to_ecf(&entity_ecf::integer(downstream.status as i64)));
+        out.extend_from_slice(&entity_ecf::to_ecf(&entity_ecf::integer(
+            downstream.status as i64,
+        )));
 
         match Entity::new("primitive/any", out) {
             Ok(e) => HandlerResult::ok(e),
             Err(e) => HandlerResult::error(
                 STATUS_INTERNAL_ERROR,
-                error_entity("internal", &format!("build dispatch-outbound result: {}", e)),
+                error_entity(
+                    "internal",
+                    &format!("build dispatch-outbound result: {}", e),
+                ),
             ),
         }
     }
@@ -353,8 +363,7 @@ mod tests {
     }
 
     fn err_code(r: &HandlerResult) -> String {
-        let v: ciborium::value::Value =
-            ciborium::from_reader(r.result.data.as_slice()).unwrap();
+        let v: ciborium::value::Value = ciborium::from_reader(r.result.data.as_slice()).unwrap();
         field_text(&v, "code")
     }
 

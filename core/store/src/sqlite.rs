@@ -150,8 +150,10 @@ impl ContentStore for SqliteContentStore {
 
     fn len(&self) -> usize {
         let conn = self.conn.lock().unwrap();
-        conn.query_row("SELECT COUNT(*) FROM entities", [], |row| row.get::<_, i64>(0))
-            .expect("sqlite len failed") as usize
+        conn.query_row("SELECT COUNT(*) FROM entities", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .expect("sqlite len failed") as usize
     }
 }
 
@@ -226,12 +228,7 @@ impl LocationIndex for SqliteLocationIndex {
         }
     }
 
-    fn compare_and_swap(
-        &self,
-        path: &str,
-        expected: Hash,
-        new_hash: Hash,
-    ) -> Result<(), CasError> {
+    fn compare_and_swap(&self, path: &str, expected: Hash, new_hash: Hash) -> Result<(), CasError> {
         let expected_bytes = expected.to_bytes();
         let new_bytes = new_hash.to_bytes();
         let conn = self.conn.lock().unwrap();
@@ -255,8 +252,8 @@ impl LocationIndex for SqliteLocationIndex {
         {
             None => Err(CasError::NotFound),
             Some(bytes) => {
-                let actual = Hash::from_bytes(&bytes)
-                    .expect("corrupted hash bytes in locations table");
+                let actual =
+                    Hash::from_bytes(&bytes).expect("corrupted hash bytes in locations table");
                 Err(CasError::Mismatch(actual))
             }
         }
@@ -285,8 +282,8 @@ impl LocationIndex for SqliteLocationIndex {
         {
             None => Err(CasError::NotFound),
             Some(bytes) => {
-                let actual = Hash::from_bytes(&bytes)
-                    .expect("corrupted hash bytes in locations table");
+                let actual =
+                    Hash::from_bytes(&bytes).expect("corrupted hash bytes in locations table");
                 Err(CasError::Mismatch(actual))
             }
         }
@@ -324,8 +321,8 @@ impl LocationIndex for SqliteLocationIndex {
                 Err(CasError::NotFound)
             }
             Some(bytes) => {
-                let actual = Hash::from_bytes(&bytes)
-                    .expect("corrupted hash bytes in locations table");
+                let actual =
+                    Hash::from_bytes(&bytes).expect("corrupted hash bytes in locations table");
                 Err(CasError::Mismatch(actual))
             }
         }
@@ -474,19 +471,33 @@ mod tests {
     // --- ContentStore tests (via shared suite) ---
 
     #[test]
-    fn test_content_store_put_get() { test_suite::test_content_store_put_get(&test_store().content_store()); }
+    fn test_content_store_put_get() {
+        test_suite::test_content_store_put_get(&test_store().content_store());
+    }
     #[test]
-    fn test_content_store_has() { test_suite::test_content_store_has(&test_store().content_store()); }
+    fn test_content_store_has() {
+        test_suite::test_content_store_has(&test_store().content_store());
+    }
     #[test]
-    fn test_content_store_remove() { test_suite::test_content_store_remove(&test_store().content_store()); }
+    fn test_content_store_remove() {
+        test_suite::test_content_store_remove(&test_store().content_store());
+    }
     #[test]
-    fn test_content_store_len() { test_suite::test_content_store_len(&test_store().content_store()); }
+    fn test_content_store_len() {
+        test_suite::test_content_store_len(&test_store().content_store());
+    }
     #[test]
-    fn test_content_store_get_missing() { test_suite::test_content_store_get_missing(&test_store().content_store()); }
+    fn test_content_store_get_missing() {
+        test_suite::test_content_store_get_missing(&test_store().content_store());
+    }
     #[test]
-    fn test_content_store_put_overwrite() { test_suite::test_content_store_put_overwrite(&test_store().content_store()); }
+    fn test_content_store_put_overwrite() {
+        test_suite::test_content_store_put_overwrite(&test_store().content_store());
+    }
     #[test]
-    fn test_content_store_multiple_entities() { test_suite::test_content_store_multiple_entities(&test_store().content_store()); }
+    fn test_content_store_multiple_entities() {
+        test_suite::test_content_store_multiple_entities(&test_store().content_store());
+    }
 
     // --- SQLite-specific ContentStore tests ---
 
@@ -504,42 +515,74 @@ mod tests {
     // --- LocationIndex tests (via shared suite) ---
 
     #[test]
-    fn test_location_index_set_get() { test_suite::test_location_index_set_get(&test_store().location_index()); }
+    fn test_location_index_set_get() {
+        test_suite::test_location_index_set_get(&test_store().location_index());
+    }
     #[test]
-    fn test_location_index_has() { test_suite::test_location_index_has(&test_store().location_index()); }
+    fn test_location_index_has() {
+        test_suite::test_location_index_has(&test_store().location_index());
+    }
     #[test]
-    fn test_location_index_remove() { test_suite::test_location_index_remove(&test_store().location_index()); }
+    fn test_location_index_remove() {
+        test_suite::test_location_index_remove(&test_store().location_index());
+    }
     #[test]
-    fn test_location_index_get_missing() { test_suite::test_location_index_get_missing(&test_store().location_index()); }
+    fn test_location_index_get_missing() {
+        test_suite::test_location_index_get_missing(&test_store().location_index());
+    }
     #[test]
-    fn test_location_index_overwrite() { test_suite::test_location_index_overwrite(&test_store().location_index()); }
+    fn test_location_index_overwrite() {
+        test_suite::test_location_index_overwrite(&test_store().location_index());
+    }
     #[test]
-    fn test_location_index_list_prefix() { test_suite::test_location_index_list_prefix(&test_store().location_index()); }
+    fn test_location_index_list_prefix() {
+        test_suite::test_location_index_list_prefix(&test_store().location_index());
+    }
     #[test]
-    fn test_location_index_list_all() { test_suite::test_location_index_list_all(&test_store().location_index()); }
+    fn test_location_index_list_all() {
+        test_suite::test_location_index_list_all(&test_store().location_index());
+    }
     #[test]
-    fn test_location_index_list_empty() { test_suite::test_location_index_list_empty(&test_store().location_index()); }
+    fn test_location_index_list_empty() {
+        test_suite::test_location_index_list_empty(&test_store().location_index());
+    }
 
     #[test]
-    fn test_location_index_list_no_match() { test_suite::test_location_index_list_no_match(&test_store().location_index()); }
+    fn test_location_index_list_no_match() {
+        test_suite::test_location_index_list_no_match(&test_store().location_index());
+    }
 
     #[test]
-    fn test_location_index_len_prefix() { test_suite::test_location_index_len_prefix(&test_store().location_index()); }
+    fn test_location_index_len_prefix() {
+        test_suite::test_location_index_len_prefix(&test_store().location_index());
+    }
 
     // --- CAS tests (sqlite) ---
 
     #[test]
-    fn test_cas_swap_match_succeeds() { test_suite::test_cas_swap_match_succeeds(&test_store().location_index()); }
+    fn test_cas_swap_match_succeeds() {
+        test_suite::test_cas_swap_match_succeeds(&test_store().location_index());
+    }
     #[test]
-    fn test_cas_swap_mismatch_returns_actual() { test_suite::test_cas_swap_mismatch_returns_actual(&test_store().location_index()); }
+    fn test_cas_swap_mismatch_returns_actual() {
+        test_suite::test_cas_swap_mismatch_returns_actual(&test_store().location_index());
+    }
     #[test]
-    fn test_cas_swap_missing_returns_not_found() { test_suite::test_cas_swap_missing_returns_not_found(&test_store().location_index()); }
+    fn test_cas_swap_missing_returns_not_found() {
+        test_suite::test_cas_swap_missing_returns_not_found(&test_store().location_index());
+    }
     #[test]
-    fn test_cas_remove_match_succeeds() { test_suite::test_cas_remove_match_succeeds(&test_store().location_index()); }
+    fn test_cas_remove_match_succeeds() {
+        test_suite::test_cas_remove_match_succeeds(&test_store().location_index());
+    }
     #[test]
-    fn test_cas_remove_mismatch_returns_actual() { test_suite::test_cas_remove_mismatch_returns_actual(&test_store().location_index()); }
+    fn test_cas_remove_mismatch_returns_actual() {
+        test_suite::test_cas_remove_mismatch_returns_actual(&test_store().location_index());
+    }
     #[test]
-    fn test_cas_remove_missing_returns_not_found() { test_suite::test_cas_remove_missing_returns_not_found(&test_store().location_index()); }
+    fn test_cas_remove_missing_returns_not_found() {
+        test_suite::test_cas_remove_missing_returns_not_found(&test_store().location_index());
+    }
 
     // --- Persistence tests ---
 

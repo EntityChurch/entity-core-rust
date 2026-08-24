@@ -17,9 +17,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use entity_ecf::Value;
-use entity_handler::{
-    Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST,
-};
+use entity_handler::{Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST};
 use entity_store::{ContentStore, LocationIndex};
 
 use crate::data::{ForwardRequest, ForwardResult, PollRequest, PollResult, PutResult, StoreEntry};
@@ -494,7 +492,6 @@ impl RelayHandler {
         .expect("status entity");
         ok_result(result, HashMap::new())
     }
-
 }
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]

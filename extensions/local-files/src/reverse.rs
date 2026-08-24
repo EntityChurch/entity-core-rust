@@ -12,9 +12,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use entity_content::{
-    blob_chunk_size, create_blob_fastcdc, reassemble, reassemble_stream,
-};
+use entity_content::{blob_chunk_size, create_blob_fastcdc, reassemble, reassemble_stream};
 use entity_entity::EntityUri;
 use entity_hash::Hash;
 use entity_store::{ChangeType, ContentStore, TreeChangeEvent};
@@ -27,7 +25,7 @@ use crate::types::{FileData, TYPE_FILE};
 /// Only used as the fallback in current_disk_blob_hash when the
 /// incoming blob's chunk_size is unreadable; the §5.5 MUST primary
 /// path uses the incoming blob's chunk_size.
-const DEFAULT_CHUNK_SIZE: usize = 1 * 1024 * 1024;
+const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
 const RECENT_WRITE_WINDOW: Duration = Duration::from_secs(5);
 /// L4 streaming cutoff per DOMAIN-LOCAL-FILES v1.3 §5.3 (RECOMMENDED 64 MiB).
 const STREAMING_THRESHOLD: u64 = 64 * 1024 * 1024;
@@ -183,8 +181,7 @@ fn reverse_write_file(
                 // write. Fall through to reassemble + write; the new
                 // hash will be cached after the write.
             }
-            crate::stat_cache::ProbeResult::Miss
-            | crate::stat_cache::ProbeResult::RacyMiss => {
+            crate::stat_cache::ProbeResult::Miss | crate::stat_cache::ProbeResult::RacyMiss => {
                 // Fall back to the legacy rechunk circuit breaker —
                 // MUST use the incoming blob's chunk_size, not local
                 // default. Otherwise mixed-size peer exchanges
@@ -218,7 +215,7 @@ fn reverse_write_file(
         crate::atomic::atomic_write_stream(fs_path, |w| {
             reassemble_stream(&store, &blob_hash, w)
                 .map(|_| ())
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+                .map_err(|e| std::io::Error::other(e.to_string()))
         })
         .map_err(|e| format!("write (stream): {e}"))?;
     } else {
@@ -254,13 +251,19 @@ fn current_disk_blob_hash(
 
 fn decode_file_data(entity: &entity_entity::Entity) -> Result<FileData, String> {
     use entity_ecf::ValueExt;
-    let v: ciborium::Value = ciborium::from_reader(entity.data.as_slice())
-        .map_err(|e| format!("cbor: {e}"))?;
-    let path = v.get("path").and_then(|x| x.as_text().map(String::from)).unwrap_or_default();
-    let size = v.get("size").and_then(|x| match x {
-        ciborium::Value::Integer(i) => (*i).try_into().ok(),
-        _ => None,
-    }).unwrap_or(0u64);
+    let v: ciborium::Value =
+        ciborium::from_reader(entity.data.as_slice()).map_err(|e| format!("cbor: {e}"))?;
+    let path = v
+        .get("path")
+        .and_then(|x| x.as_text().map(String::from))
+        .unwrap_or_default();
+    let size = v
+        .get("size")
+        .and_then(|x| match x {
+            ciborium::Value::Integer(i) => (*i).try_into().ok(),
+            _ => None,
+        })
+        .unwrap_or(0u64);
     let modified_at = v.get("modified_at").and_then(|x| match x {
         ciborium::Value::Integer(i) => (*i).try_into().ok(),
         _ => None,
@@ -269,7 +272,9 @@ fn decode_file_data(entity: &entity_entity::Entity) -> Result<FileData, String> 
         Some(c) => crate::types::decode_hash_record(c)?,
         None => Hash::zero(),
     };
-    let media_type = v.get("media_type").and_then(|x| x.as_text().map(String::from));
+    let media_type = v
+        .get("media_type")
+        .and_then(|x| x.as_text().map(String::from));
     let written = v.get("written").and_then(|x| x.as_bool()).unwrap_or(false);
     Ok(FileData {
         path,

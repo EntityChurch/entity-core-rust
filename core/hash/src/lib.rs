@@ -19,6 +19,14 @@
 //! sites (V7 §4.5a); this type provides the format-aware compute, encode,
 //! decode, and equality primitives those sites build on.
 
+// `HashError::HashMismatch` inlines two full `Hash` values (each a
+// 64-byte [`HASH_MAX_DIGEST_LEN`] buffer, sized for the reserved
+// SHA-512 format), putting the Err variant past clippy's 128-byte
+// `result_large_err` threshold. Hash errors are cold paths, and boxing
+// (or shrinking the buffer) would trade the `Copy`-value design the
+// v7.69 unification is built on for a lint budget — suppressed instead.
+#![allow(clippy::result_large_err)]
+
 use sha2::{Digest, Sha256, Sha384};
 use thiserror::Error;
 
@@ -219,8 +227,8 @@ impl Hash {
         let algorithm: u8 = format_value
             .try_into()
             .map_err(|_| HashError::UnsupportedAlgorithm(0xFE))?;
-        let expected = digest_len_for_format(algorithm)
-            .ok_or(HashError::UnsupportedAlgorithm(algorithm))?;
+        let expected =
+            digest_len_for_format(algorithm).ok_or(HashError::UnsupportedAlgorithm(algorithm))?;
         let total = consumed + expected;
         if bytes.len() != total {
             return Err(HashError::InvalidLength {
@@ -290,8 +298,8 @@ impl Hash {
         })?;
         let algorithm = format_code_for_string(tag)
             .ok_or_else(|| HashError::InvalidFormat(format!("unknown format tag {:?}", tag)))?;
-        let expected = digest_len_for_format(algorithm)
-            .ok_or(HashError::UnsupportedAlgorithm(algorithm))?;
+        let expected =
+            digest_len_for_format(algorithm).ok_or(HashError::UnsupportedAlgorithm(algorithm))?;
         if hex.len() != expected * 2 {
             return Err(HashError::InvalidFormat(format!(
                 "expected {} hex chars for {}, got {}",
@@ -507,7 +515,10 @@ mod tests {
         // varint 0x00 (SHA-256) wants 32 digest bytes; only 9 follow.
         assert!(matches!(
             Hash::from_bytes(&[0u8; 10]),
-            Err(HashError::InvalidLength { expected: 33, actual: 10 })
+            Err(HashError::InvalidLength {
+                expected: 33,
+                actual: 10
+            })
         ));
     }
 

@@ -26,9 +26,7 @@ use entity_capability::{CapabilityToken, GrantEntry};
 use entity_crypto::Keypair;
 use entity_ecf::{text, Value};
 use entity_entity::Entity;
-use entity_handler::{
-    Handler, HandlerContext, HandlerError, HandlerRegistry, HandlerResult,
-};
+use entity_handler::{Handler, HandlerContext, HandlerError, HandlerRegistry, HandlerResult};
 use entity_store::{ContentStore, LocationIndex};
 
 use crate::sdk::{PeerContext, SdkError};
@@ -327,9 +325,9 @@ impl PeerContext {
         let grant_written = if let Some(scope) = &spec.internal_scope {
             match write_handler_grant(
                 scope.clone(),
-                peer.keypair()
-                    .as_ed25519()
-                    .expect("entity-sdk peers are Ed25519-only (Ed448 backends use core PeerBuilder)"),
+                peer.keypair().as_ed25519().expect(
+                    "entity-sdk peers are Ed25519-only (Ed448 backends use core PeerBuilder)",
+                ),
                 &store,
                 &index,
                 &grant_path,
@@ -364,7 +362,11 @@ impl PeerContext {
         Ok(RegisteredHandler {
             pattern: handler_path,
             interface_path,
-            grant_path: if grant_written { Some(grant_path) } else { None },
+            grant_path: if grant_written {
+                Some(grant_path)
+            } else {
+                None
+            },
             peer_handler_registry: registry,
             location_index: index,
             closed: AtomicBool::new(false),
@@ -441,10 +443,7 @@ fn build_handler_entity(interface_rel: &str) -> Result<Entity, String> {
     // `max_scope`, `internal_scope`, and `expression_path` are declared
     // as optional on the type (V7 §3.7); the scope is separately captured
     // in the grant entity and on the Handler trait adapter.
-    let data = entity_ecf::to_ecf(&Value::Map(vec![(
-        text("interface"),
-        text(interface_rel),
-    )]));
+    let data = entity_ecf::to_ecf(&Value::Map(vec![(text("interface"), text(interface_rel))]));
     Entity::new(entity_types::TYPE_HANDLER, data).map_err(|e| e.to_string())
 }
 
@@ -530,11 +529,7 @@ mod tests {
     }
 
     fn basic_spec(pattern: &str) -> HandlerSpec {
-        HandlerSpec::new(
-            pattern,
-            "test-handler",
-            vec![OperationSpec::new("ping")],
-        )
+        HandlerSpec::new(pattern, "test-handler", vec![OperationSpec::new("ping")])
     }
 
     #[test]
@@ -550,10 +545,7 @@ mod tests {
         let iface_path = format!("/{}/system/handler/app/test/reg", pid);
         let handler_path = format!("/{}/app/test/reg", pid);
 
-        assert!(
-            store.get(&iface_path).is_some(),
-            "interface entity written"
-        );
+        assert!(store.get(&iface_path).is_some(), "interface entity written");
         let handler_entity = store.get(&handler_path).expect("handler entity written");
         assert_eq!(handler_entity.entity_type, entity_types::TYPE_HANDLER);
         assert_eq!(handle.pattern(), handler_path);
@@ -581,12 +573,8 @@ mod tests {
 
         let scope = entity_capability::wildcard_handler_grant();
 
-        let spec = HandlerSpec::new(
-            "app/test/gr",
-            "scoped",
-            vec![OperationSpec::new("do")],
-        )
-        .with_internal_scope(scope);
+        let spec = HandlerSpec::new("app/test/gr", "scoped", vec![OperationSpec::new("do")])
+            .with_internal_scope(scope);
 
         let _h = ctx
             .register_handler(spec, noop_body())

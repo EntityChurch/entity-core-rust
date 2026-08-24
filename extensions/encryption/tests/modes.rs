@@ -7,12 +7,12 @@
 //! placeholder bytes the spec lists and are marked PENDING the 3-way lock; the
 //! round-trip tests are the unconditional correctness guarantee.
 
+use entity_encryption::ecdh::x25519_public;
 use entity_encryption::{
     enc_kat_inner_plaintext, group_add_member, group_decrypt, group_encrypt, group_rekey,
     peer_decrypt, peer_encrypt, self_decrypt, self_encrypt, EncryptionError, EncryptionPubkeyData,
     GroupDecryptInput, GroupEncryptInput, GroupMember, PeerEncryptInput, SelfEncryptParams,
 };
-use entity_encryption::ecdh::x25519_public;
 
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -38,8 +38,13 @@ fn kat_pubkey(public_key: Vec<u8>) -> EncryptionPubkeyData {
 #[test]
 fn self_roundtrip() {
     let passphrase = b"correct horse battery staple";
-    let ed = self_encrypt(passphrase, "user-passphrase", b"secret at rest", SelfEncryptParams::default())
-        .unwrap();
+    let ed = self_encrypt(
+        passphrase,
+        "user-passphrase",
+        b"secret at rest",
+        SelfEncryptParams::default(),
+    )
+    .unwrap();
     let pt = self_decrypt(passphrase, &ed).unwrap();
     assert_eq!(pt, b"secret at rest");
 }
@@ -116,7 +121,10 @@ fn enc_peer_kat_1_ciphertext() {
     let pubkey = kat_pubkey(recipient_pub.to_vec());
     let recipient_hash = pubkey.content_hash();
     eprintln!("ENC-PEER-KAT-1 recipient_pubkey = {}", hex(&recipient_pub));
-    eprintln!("ENC-PEER-KAT-1 recipient_pubkey_hash = {}", hex(&recipient_hash.to_bytes()));
+    eprintln!(
+        "ENC-PEER-KAT-1 recipient_pubkey_hash = {}",
+        hex(&recipient_hash.to_bytes())
+    );
 
     let plaintext = enc_kat_inner_plaintext();
     let ed = peer_encrypt(PeerEncryptInput {
@@ -227,8 +235,16 @@ fn enc_group_kat_1_ciphertext() {
     ];
     assert_eq!(ed.wrapped_keys.len(), 3);
     for (i, (eph, wrapped)) in want_wraps.iter().enumerate() {
-        assert_eq!(hex(&ed.wrapped_keys[i].ephemeral_key), *eph, "wrap[{i}] eph");
-        assert_eq!(hex(&ed.wrapped_keys[i].wrapped_aead_key), *wrapped, "wrap[{i}] wrapped");
+        assert_eq!(
+            hex(&ed.wrapped_keys[i].ephemeral_key),
+            *eph,
+            "wrap[{i}] eph"
+        );
+        assert_eq!(
+            hex(&ed.wrapped_keys[i].wrapped_aead_key),
+            *wrapped,
+            "wrap[{i}] wrapped"
+        );
     }
 }
 
@@ -258,7 +274,8 @@ fn enc_group_commit_1_equivocation_rejected() {
         group_aead_key: Some(vec![0xBB; 32]), // key B != A
     })
     .unwrap();
-    ed.wrapped_keys.push(forged.wrapped_keys.into_iter().next().unwrap());
+    ed.wrapped_keys
+        .push(forged.wrapped_keys.into_iter().next().unwrap());
 
     // Victim recovers B, reconstructs outer AAD with commitment(B) != the bound
     // commitment(A), so AEAD.Open fails — equivocation rejected.
@@ -293,7 +310,10 @@ fn group_add_and_rekey() {
     // Add B: same key, wrap appended; outer ciphertext unchanged.
     let ed_ab = group_add_member(&ed_a, &group_key, &b).unwrap();
     assert_eq!(ed_ab.wrapped_keys.len(), 2);
-    assert_eq!(ed_ab.ciphertext, ed_a.ciphertext, "add reuses the outer ciphertext");
+    assert_eq!(
+        ed_ab.ciphertext, ed_a.ciphertext,
+        "add reuses the outer ciphertext"
+    );
     for (m, priv_seed) in [(&a, &a_priv), (&b, &b_priv)] {
         let got = group_decrypt(GroupDecryptInput {
             wrapper: &ed_ab,
@@ -333,7 +353,10 @@ fn group_add_and_rekey() {
         my_priv: b_priv.clone(),
     })
     .unwrap_err();
-    assert!(matches!(err, EncryptionError::RecipientUnknown(_)), "got {err:?}");
+    assert!(
+        matches!(err, EncryptionError::RecipientUnknown(_)),
+        "got {err:?}"
+    );
     // …but B still opens the OLD wrapper (group-snapshot forward secrecy, §8.5).
     assert_eq!(
         group_decrypt(GroupDecryptInput {

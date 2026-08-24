@@ -16,6 +16,7 @@
 //! 2. crash-window (only the unflushed writes are lost),
 //! 3. checkpoint durability (a checkpointed write survives an immediate reopen,
 //!    no debounce elapsed),
+//!
 //! plus CAS-against-mirror correctness and burst coalescing.
 
 #![cfg(all(target_arch = "wasm32", feature = "wasm-idb-persist"))]
@@ -107,15 +108,26 @@ async fn crash_window_loses_only_unflushed() {
     // debounce. These are the "in the unflushed window" writes.
     let volatile = cs.put(entity("volatile")).unwrap();
     li.set(&path("volatile"), volatile);
-    assert!(cp.health().pending_count > 0, "writes are pending, not durable");
+    assert!(
+        cp.health().pending_count > 0,
+        "writes are pending, not durable"
+    );
 
     // Observe durable state via a second connection, immediately (no 250ms wait).
     let store2 = IdbStore::open(&name).await.expect("reopen");
     let (cs2, li2) = store2.into_parts();
     assert!(cs2.has(&durable), "checkpointed entity survived");
-    assert_eq!(li2.get(&path("durable")), Some(durable), "checkpointed binding survived");
+    assert_eq!(
+        li2.get(&path("durable")),
+        Some(durable),
+        "checkpointed binding survived"
+    );
     assert!(!cs2.has(&volatile), "unflushed entity is the only loss");
-    assert_eq!(li2.get(&path("volatile")), None, "unflushed binding is the only loss");
+    assert_eq!(
+        li2.get(&path("volatile")),
+        None,
+        "unflushed binding is the only loss"
+    );
 }
 
 /// 3. Checkpoint durability: put → checkpoint().await → immediate reopen (no
@@ -132,12 +144,19 @@ async fn checkpoint_makes_write_durable_without_debounce() {
     let h = cs.put(entity("identity-op")).unwrap();
     li.set(&path("identity"), h);
     cp.checkpoint().await.expect("checkpoint");
-    assert_eq!(cp.health().pending_count, 0, "nothing pending after checkpoint");
+    assert_eq!(
+        cp.health().pending_count,
+        0,
+        "nothing pending after checkpoint"
+    );
 
     // Immediate reopen — far less than the 250ms debounce.
     let store2 = IdbStore::open(&name).await.expect("reopen");
     let (cs2, li2) = store2.into_parts();
-    assert!(cs2.has(&h), "checkpointed write durable without waiting for debounce");
+    assert!(
+        cs2.has(&h),
+        "checkpointed write durable without waiting for debounce"
+    );
     assert_eq!(li2.get(&path("identity")), Some(h));
 }
 
@@ -162,7 +181,11 @@ async fn checkpointed_delete_stays_deleted() {
     let store2 = IdbStore::open(&name).await.expect("reopen");
     let (cs2, li2) = store2.into_parts();
     assert!(!cs2.has(&h), "deleted entity does not resurrect");
-    assert_eq!(li2.get(&path("doomed")), None, "deleted binding does not resurrect");
+    assert_eq!(
+        li2.get(&path("doomed")),
+        None,
+        "deleted binding does not resurrect"
+    );
 }
 
 /// CAS resolves against the sync mirror and the resulting binding is durable.
@@ -179,9 +202,15 @@ async fn cas_against_mirror_then_durable() {
 
     // create
     li.compare_and_create(&p, h1).expect("create on empty");
-    assert!(li.compare_and_create(&p, h2).is_err(), "create on occupied fails");
+    assert!(
+        li.compare_and_create(&p, h2).is_err(),
+        "create on occupied fails"
+    );
     // swap with wrong expected
-    assert!(li.compare_and_swap(&p, h2, h1).is_err(), "swap mismatch fails");
+    assert!(
+        li.compare_and_swap(&p, h2, h1).is_err(),
+        "swap mismatch fails"
+    );
     // swap with right expected
     li.compare_and_swap(&p, h1, h2).expect("swap match");
     cp.checkpoint().await.expect("checkpoint");
@@ -213,5 +242,9 @@ async fn burst_coalesces_to_last_write() {
     let store2 = IdbStore::open(&name).await.expect("reopen");
     let (_cs2, li2) = store2.into_parts();
     assert_eq!(li2.get(&p), Some(last), "coalesced to last write");
-    assert_eq!(li2.len_prefix(&path("hot")), 1, "exactly one binding for the hot path");
+    assert_eq!(
+        li2.len_prefix(&path("hot")),
+        1,
+        "exactly one binding for the hot path"
+    );
 }

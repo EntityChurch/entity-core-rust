@@ -34,7 +34,9 @@ pub enum BackendEvent {
     Arrived(Observation),
     /// Departed — mDNS goodbye (TTL=0) or TTL-expiry reap (§3.0.1). Carries the
     /// observation `key` so the handler can remove the matching candidate.
-    Departed { key: String },
+    Departed {
+        key: String,
+    },
 }
 
 /// What a peer advertises when it `:announce`s itself (§3). The backend maps

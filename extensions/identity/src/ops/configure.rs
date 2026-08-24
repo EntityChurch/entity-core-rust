@@ -160,11 +160,7 @@ impl IdentityHandler {
             match self.issue_peer_to_controller_cap(&cert.attested, &controller_grants) {
                 Ok(h) => issued.push(h),
                 Err(e) => {
-                    return Ok(error(
-                        STATUS_BAD_REQUEST,
-                        "cap_issuance_failed",
-                        &e,
-                    ));
+                    return Ok(error(STATUS_BAD_REQUEST, "cap_issuance_failed", &e));
                 }
             }
         }
@@ -219,7 +215,11 @@ impl IdentityHandler {
         // Three-key default: handle_cert.function ∈ {controller, identifier};
         // agent_cert.function == agent. Both kind == identity-cert.
         for (label, cert_hash, expected_functions) in [
-            ("handle_cert", &binding.handle_cert, &["controller", "identifier"][..]),
+            (
+                "handle_cert",
+                &binding.handle_cert,
+                &["controller", "identifier"][..],
+            ),
             ("agent_cert", &binding.agent_cert, &["agent"][..]),
         ] {
             let cert = match self.attestation_index.get(cert_hash) {
@@ -368,8 +368,9 @@ impl IdentityHandler {
         // For install-time registration, log+ignore — the only legitimate
         // collision is a second IdentityHandler instance with a fresh resolver
         // closure (in which case the first one stays bound, fail-closed).
-        if let Err(e) =
-            self.resolver_registry.register("identity-resolved", resolver)
+        if let Err(e) = self
+            .resolver_registry
+            .register("identity-resolved", resolver)
         {
             tracing::warn!("identity-resolved resolver already registered: {}", e);
         }

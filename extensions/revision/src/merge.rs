@@ -127,7 +127,12 @@ pub fn normalize_merge_sides<'a>(
     local_version: Hash,
     remote_version: Hash,
     merge_order: &str,
-) -> (&'a BTreeMap<String, Hash>, &'a BTreeMap<String, Hash>, Hash, Hash) {
+) -> (
+    &'a BTreeMap<String, Hash>,
+    &'a BTreeMap<String, Hash>,
+    Hash,
+    Hash,
+) {
     if merge_order == "deterministic" && remote_version < local_version {
         (remote, local, remote_version, local_version)
     } else {
@@ -240,7 +245,8 @@ pub fn merge_snapshots(
                         }
                     } else {
                         // Both changed differently — `deletion_resolution`.
-                        let dr = find_deletion_resolution(path, location_index, store, local_peer_id);
+                        let dr =
+                            find_deletion_resolution(path, location_index, store, local_peer_id);
                         let entity_side_hash = if l_marker { *r } else { *l };
                         match dr {
                             DeletionResolution::PreserveOnConflict => {
@@ -282,8 +288,13 @@ pub fn merge_snapshots(
                 } else {
                     // Standard edit-vs-edit divergence — both real entities.
                     let strategy = find_merge_strategy(
-                        path, strategy_override, location_index, store,
-                        Some(l), Some(r), local_peer_id,
+                        path,
+                        strategy_override,
+                        location_index,
+                        store,
+                        Some(l),
+                        Some(r),
+                        local_peer_id,
                     );
                     match strategy {
                         MergeStrategy::SourceWins => {
@@ -316,10 +327,8 @@ pub fn merge_snapshots(
                                 .iter()
                                 .map(|b| format!("{:02x}", b))
                                 .collect();
-                            additional_bindings.push((
-                                format!("{}.keep-both-{}", path, hash_prefix),
-                                *r,
-                            ));
+                            additional_bindings
+                                .push((format!("{}.keep-both-{}", path, hash_prefix), *r));
                         }
                         MergeStrategy::Manual => {
                             conflicts.push(ConflictInfo {
@@ -355,10 +364,7 @@ fn find_deletion_resolution(
     store: &dyn ContentStore,
     local_peer_id: &str,
 ) -> DeletionResolution {
-    let path_config_prefix = format!(
-        "/{}/system/revision/config/merge/path/",
-        local_peer_id,
-    );
+    let path_config_prefix = format!("/{}/system/revision/config/merge/path/", local_peer_id,);
     let mut best_match: Option<(usize, DeletionResolution)> = None;
     for entry in location_index.list(&path_config_prefix) {
         if let Some(config_entity) = store.get(&entry.hash) {
@@ -406,7 +412,10 @@ pub fn store_conflict(
     remote_version: Hash,
     local_peer_id: &str,
 ) -> Result<Hash, String> {
-    let conflict_path = format!("/{}/system/revision/{}/conflicts/{}", local_peer_id, prefix_hash, info.path);
+    let conflict_path = format!(
+        "/{}/system/revision/{}/conflicts/{}",
+        local_peer_id, prefix_hash, info.path
+    );
 
     // Check for existing conflict to supersede
     let supersedes = location_index.get(&conflict_path);
@@ -425,10 +434,7 @@ pub fn store_conflict(
             entity_ecf::Value::Bytes(local.to_bytes().to_vec()),
         ));
     }
-    fields.push((
-        entity_ecf::text("path"),
-        entity_ecf::text(&info.path),
-    ));
+    fields.push((entity_ecf::text("path"), entity_ecf::text(&info.path)));
     if let Some(remote) = &info.remote {
         fields.push((
             entity_ecf::text("remote"),
@@ -456,9 +462,20 @@ pub fn store_conflict(
 
     // Sort by key for ECF determinism
     fields.sort_by(|(a, _), (b, _)| {
-        let a_text = if let entity_ecf::Value::Text(s) = a { s.as_str() } else { "" };
-        let b_text = if let entity_ecf::Value::Text(s) = b { s.as_str() } else { "" };
-        a_text.len().cmp(&b_text.len()).then_with(|| a_text.cmp(b_text))
+        let a_text = if let entity_ecf::Value::Text(s) = a {
+            s.as_str()
+        } else {
+            ""
+        };
+        let b_text = if let entity_ecf::Value::Text(s) = b {
+            s.as_str()
+        } else {
+            ""
+        };
+        a_text
+            .len()
+            .cmp(&b_text.len())
+            .then_with(|| a_text.cmp(b_text))
     });
 
     let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(fields));
@@ -512,10 +529,7 @@ pub fn find_merge_strategy(
     }
 
     // Per-path config: global at system/revision/config/merge/path/
-    let path_config_prefix = format!(
-        "/{}/system/revision/config/merge/path/",
-        local_peer_id,
-    );
+    let path_config_prefix = format!("/{}/system/revision/config/merge/path/", local_peer_id,);
     let mut best_match: Option<(usize, MergeStrategy)> = None;
     for entry in location_index.list(&path_config_prefix) {
         if let Some(config_entity) = store.get(&entry.hash) {
@@ -598,8 +612,16 @@ mod tests {
         remote.insert("c".to_string(), h3); // remote added
 
         let result = merge_snapshots(
-            Some(&base), &local, &remote, "data/",
-            None, &store, &li, Hash::zero(), Hash::zero(), "test-peer",
+            Some(&base),
+            &local,
+            &remote,
+            "data/",
+            None,
+            &store,
+            &li,
+            Hash::zero(),
+            Hash::zero(),
+            "test-peer",
         );
 
         assert!(result.conflicts.is_empty());
@@ -626,8 +648,16 @@ mod tests {
         remote.insert("a".to_string(), h2);
 
         let result = merge_snapshots(
-            Some(&base), &local, &remote, "data/",
-            None, &store, &li, Hash::zero(), Hash::zero(), "test-peer",
+            Some(&base),
+            &local,
+            &remote,
+            "data/",
+            None,
+            &store,
+            &li,
+            Hash::zero(),
+            Hash::zero(),
+            "test-peer",
         );
 
         assert!(result.conflicts.is_empty());
@@ -650,8 +680,16 @@ mod tests {
         remote.insert("a".to_string(), h2); // changed
 
         let result = merge_snapshots(
-            Some(&base), &local, &remote, "data/",
-            None, &store, &li, Hash::zero(), Hash::zero(), "test-peer",
+            Some(&base),
+            &local,
+            &remote,
+            "data/",
+            None,
+            &store,
+            &li,
+            Hash::zero(),
+            Hash::zero(),
+            "test-peer",
         );
 
         assert!(result.conflicts.is_empty());
@@ -675,8 +713,16 @@ mod tests {
         remote.insert("a".to_string(), h2);
 
         let result = merge_snapshots(
-            Some(&base), &local, &remote, "data/",
-            None, &store, &li, Hash::zero(), Hash::zero(), "test-peer",
+            Some(&base),
+            &local,
+            &remote,
+            "data/",
+            None,
+            &store,
+            &li,
+            Hash::zero(),
+            Hash::zero(),
+            "test-peer",
         );
 
         assert_eq!(result.conflicts.len(), 1);
@@ -707,8 +753,16 @@ mod tests {
         remote.insert("a".to_string(), h1);
 
         let result = merge_snapshots(
-            Some(&base), &local, &remote, "data/",
-            None, &store, &li, Hash::zero(), Hash::zero(), "test-peer",
+            Some(&base),
+            &local,
+            &remote,
+            "data/",
+            None,
+            &store,
+            &li,
+            Hash::zero(),
+            Hash::zero(),
+            "test-peer",
         );
 
         // Default preserve-on-conflict: no conflict; remote entity wins.
@@ -734,8 +788,16 @@ mod tests {
         remote.insert("a".to_string(), h1);
 
         let result = merge_snapshots(
-            Some(&base), &local, &remote, "data/",
-            None, &store, &li, Hash::zero(), Hash::zero(), "test-peer",
+            Some(&base),
+            &local,
+            &remote,
+            "data/",
+            None,
+            &store,
+            &li,
+            Hash::zero(),
+            Hash::zero(),
+            "test-peer",
         );
 
         assert_eq!(result.conflicts.len(), 0);
@@ -759,8 +821,16 @@ mod tests {
         remote.insert("a".to_string(), h2);
 
         let result = merge_snapshots(
-            Some(&base), &local, &remote, "data/",
-            Some("source-wins"), &store, &li, Hash::zero(), Hash::zero(), "test-peer",
+            Some(&base),
+            &local,
+            &remote,
+            "data/",
+            Some("source-wins"),
+            &store,
+            &li,
+            Hash::zero(),
+            Hash::zero(),
+            "test-peer",
         );
 
         assert!(result.conflicts.is_empty());
@@ -784,8 +854,16 @@ mod tests {
         remote.insert("a".to_string(), h2);
 
         let result = merge_snapshots(
-            Some(&base), &local, &remote, "data/",
-            Some("target-wins"), &store, &li, Hash::zero(), Hash::zero(), "test-peer",
+            Some(&base),
+            &local,
+            &remote,
+            "data/",
+            Some("target-wins"),
+            &store,
+            &li,
+            Hash::zero(),
+            Hash::zero(),
+            "test-peer",
         );
 
         assert!(result.conflicts.is_empty());
@@ -805,11 +883,13 @@ mod tests {
         };
 
         let ph = crate::prefix_hash(&crate::resolve_prefix("data/", "peer1"));
-        let h1 = store_conflict(&store, &li, &ph, &info, Hash::zero(), Hash::zero(), "peer1").unwrap();
+        let h1 =
+            store_conflict(&store, &li, &ph, &info, Hash::zero(), Hash::zero(), "peer1").unwrap();
         assert!(h1 != Hash::zero());
 
         // Store again — should supersede
-        let h2 = store_conflict(&store, &li, &ph, &info, Hash::zero(), Hash::zero(), "peer1").unwrap();
+        let h2 =
+            store_conflict(&store, &li, &ph, &info, Hash::zero(), Hash::zero(), "peer1").unwrap();
         assert!(h2 != Hash::zero());
 
         // The second conflict should have a supersedes field pointing to h1
@@ -837,8 +917,16 @@ mod tests {
         remote.insert("a".to_string(), h2);
 
         let result = merge_snapshots(
-            Some(&base), &local, &remote, "data/",
-            Some("keep-both"), &store, &li, Hash::zero(), Hash::zero(), "test-peer",
+            Some(&base),
+            &local,
+            &remote,
+            "data/",
+            Some("keep-both"),
+            &store,
+            &li,
+            Hash::zero(),
+            Hash::zero(),
+            "test-peer",
         );
 
         assert!(result.conflicts.is_empty());
@@ -875,8 +963,16 @@ mod tests {
         remote.insert("a".to_string(), h1);
 
         let result = merge_snapshots(
-            Some(&base), &local, &remote, "data/",
-            Some("keep-both"), &store, &li, Hash::zero(), Hash::zero(), "test-peer",
+            Some(&base),
+            &local,
+            &remote,
+            "data/",
+            Some("keep-both"),
+            &store,
+            &li,
+            Hash::zero(),
+            Hash::zero(),
+            "test-peer",
         );
 
         assert_eq!(result.conflicts.len(), 0);
@@ -910,8 +1006,16 @@ mod tests {
 
         // No strategy override — should discover from config
         let result = merge_snapshots(
-            Some(&base), &local, &remote, "data/",
-            None, &store, &li, Hash::zero(), Hash::zero(), "test-peer",
+            Some(&base),
+            &local,
+            &remote,
+            "data/",
+            None,
+            &store,
+            &li,
+            Hash::zero(),
+            Hash::zero(),
+            "test-peer",
         );
 
         assert!(result.conflicts.is_empty());
@@ -929,7 +1033,10 @@ mod tests {
         });
         let cfg_entity = Entity::new("system/revision/merge-config", cfg_data).unwrap();
         let cfg_hash = store.put(cfg_entity).unwrap();
-        li.set("/test-peer/system/revision/config/merge/path/docs-rule", cfg_hash);
+        li.set(
+            "/test-peer/system/revision/config/merge/path/docs-rule",
+            cfg_hash,
+        );
 
         let h0 = put_test_entity(&store, "test/type", "base");
         let h1 = put_test_entity(&store, "test/type", "local");
@@ -943,8 +1050,16 @@ mod tests {
         remote.insert("docs/readme".to_string(), h2);
 
         let result = merge_snapshots(
-            Some(&base), &local, &remote, "data/",
-            None, &store, &li, Hash::zero(), Hash::zero(), "test-peer",
+            Some(&base),
+            &local,
+            &remote,
+            "data/",
+            None,
+            &store,
+            &li,
+            Hash::zero(),
+            Hash::zero(),
+            "test-peer",
         );
 
         assert!(result.conflicts.is_empty());
@@ -976,14 +1091,27 @@ mod tests {
         remote.insert("shared".to_string(), h2);
 
         let result = merge_snapshots(
-            Some(&base), &local, &remote, "data/",
-            None, &store, &li, Hash::zero(), Hash::zero(), "test-peer",
+            Some(&base),
+            &local,
+            &remote,
+            "data/",
+            None,
+            &store,
+            &li,
+            Hash::zero(),
+            Hash::zero(),
+            "test-peer",
         );
 
-        assert!(result.conflicts.is_empty(), "keep-both via config should resolve edit-vs-edit");
+        assert!(
+            result.conflicts.is_empty(),
+            "keep-both via config should resolve edit-vs-edit"
+        );
         assert_eq!(result.merged_bindings["shared"], h1);
         assert_eq!(result.additional_bindings.len(), 1);
-        assert!(result.additional_bindings[0].0.starts_with("shared.keep-both-"));
+        assert!(result.additional_bindings[0]
+            .0
+            .starts_with("shared.keep-both-"));
         assert_eq!(result.additional_bindings[0].1, h2);
     }
 }

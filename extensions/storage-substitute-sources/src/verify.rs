@@ -27,7 +27,12 @@ pub fn verify_entry_signature_against(
     content_store: &dyn ContentStore,
     location_index: &dyn LocationIndex,
 ) -> bool {
-    let sig = match find_signature_tree_resident(entry_hash, source_peer_id, content_store, location_index) {
+    let sig = match find_signature_tree_resident(
+        entry_hash,
+        source_peer_id,
+        content_store,
+        location_index,
+    ) {
         Some(s) => s,
         None => return false,
     };
@@ -107,4 +112,3 @@ fn hex_of(hash: &Hash) -> String {
     }
     s
 }
-

@@ -13,7 +13,9 @@ use entity_crypto::IdentityKeypair;
 use entity_entity::{Entity, EntityUri, Envelope};
 use entity_hash::Hash;
 use entity_store::{ContentStore, LocationIndex};
-use entity_wire::{decode_envelope, encode_envelope, read_frame, write_frame, DEFAULT_MAX_FRAME_SIZE};
+use entity_wire::{
+    decode_envelope, encode_envelope, read_frame, write_frame, DEFAULT_MAX_FRAME_SIZE,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::oneshot;
 
@@ -125,10 +127,7 @@ pub type DispatchFuture<'a> = std::pin::Pin<
 >;
 #[cfg(target_arch = "wasm32")]
 pub type DispatchFuture<'a> = std::pin::Pin<
-    Box<
-        dyn std::future::Future<Output = Result<entity_protocol::ParsedResponse, PeerError>>
-            + 'a,
-    >,
+    Box<dyn std::future::Future<Output = Result<entity_protocol::ParsedResponse, PeerError>> + 'a>,
 >;
 
 /// Outbound endpoint trait — implemented by `RemoteConnection` (stream)
@@ -173,6 +172,16 @@ pub trait RemoteEndpoint: Send + Sync {
     ) -> DispatchFuture<'a> {
         let frame = encode_envelope(&envelope);
         self.dispatch_raw(request_id, frame)
+    }
+
+    /// Wall-clock ms of the last successful exchange on this endpoint,
+    /// or 0 when unknown/never. Drives the §5.4 adaptive keepalive
+    /// suppression ("skip ping during active message exchange") — a
+    /// diagnostic hint, never a correctness input. Default 0 keeps
+    /// endpoints that don't track activity (reentry, test fakes) on the
+    /// always-ping path.
+    fn last_activity_ms(&self) -> u64 {
+        0
     }
 }
 
@@ -228,6 +237,9 @@ pub struct RemoteConnection {
     /// write half is dropped).
     #[allow(dead_code)]
     reader_task: ReaderTaskHandle,
+    /// Wall-clock ms of the last successful response on this connection
+    /// (see `RemoteEndpoint::last_activity_ms`). 0 = none yet.
+    last_activity_ms: AtomicU64,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -251,17 +263,16 @@ impl RemoteEndpoint for RemoteConnection {
         &self.auth_included
     }
     fn next_request_id(&self) -> String {
-        let seq = self.request_seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let seq = self
+            .request_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         format!("req-{}", seq)
     }
     fn transport_type(&self) -> &'static str {
         "stream"
     }
-    fn dispatch_raw<'a>(
-        &'a self,
-        request_id: String,
-        frame: Vec<u8>,
-    ) -> DispatchFuture<'a> {
+    fn dispatch_raw<'a>(&'a self, request_id: String, frame: Vec<u8>) -> DispatchFuture<'a> {
         Box::pin(async move {
             let (tx, rx) = oneshot::channel();
             {
@@ -279,7 +290,11 @@ impl RemoteEndpoint for RemoteConnection {
             }
 
             match request_timeout(DEFAULT_REQUEST_TIMEOUT, rx).await {
-                Ok(Ok(r)) => Ok(r),
+                Ok(Ok(r)) => {
+                    self.last_activity_ms
+                        .store(crate::liveness::now_ms(), Ordering::Relaxed);
+                    Ok(r)
+                }
                 Ok(Err(_)) => {
                     self.pending.lock().unwrap().remove(&request_id);
                     Err(PeerError::ConnectionError(
@@ -295,6 +310,10 @@ impl RemoteEndpoint for RemoteConnection {
                 }
             }
         })
+    }
+
+    fn last_activity_ms(&self) -> u64 {
+        self.last_activity_ms.load(Ordering::Relaxed)
     }
 }
 
@@ -369,17 +388,16 @@ impl RemoteEndpoint for InboundReentryEndpoint {
         &self.auth_included
     }
     fn next_request_id(&self) -> String {
-        let seq = self.request_seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let seq = self
+            .request_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         format!("reentry-{}", seq)
     }
     fn transport_type(&self) -> &'static str {
         "inbound-reentry"
     }
-    fn dispatch_raw<'a>(
-        &'a self,
-        request_id: String,
-        frame: Vec<u8>,
-    ) -> DispatchFuture<'a> {
+    fn dispatch_raw<'a>(&'a self, request_id: String, frame: Vec<u8>) -> DispatchFuture<'a> {
         Box::pin(async move {
             let (tx, rx) = oneshot::channel();
             {
@@ -476,6 +494,23 @@ impl RemoteState {
         endpoint
     }
 
+    /// Unconditionally bind `endpoint` as the pooled outbound connection
+    /// for `peer_id`, replacing (and dropping) any prior binding.
+    ///
+    /// For EXPLICIT (re-)dials — `Peer::connect_to` — where the caller
+    /// just completed a fresh handshake and intends it to be the live
+    /// binding. `insert_endpoint`'s keep-existing semantics are the race
+    /// resolution for concurrent implicit dials; applied to an explicit
+    /// re-dial they would pin a stale dead connection until a dispatch
+    /// error evicts it. A replaced binding's keepalive loop notices the
+    /// swap on its next tick and exits.
+    pub fn rebind_endpoint(&self, peer_id: &str, endpoint: Arc<dyn RemoteEndpoint>) {
+        self.conns
+            .lock()
+            .unwrap()
+            .insert(peer_id.to_string(), endpoint);
+    }
+
     /// Remove an endpoint from the pool (e.g., on error). The dropped
     /// `Arc` may keep the endpoint alive for any in-flight callers;
     /// transport-specific resources (e.g., the stream's reader task)
@@ -508,13 +543,111 @@ impl RemoteState {
     /// (older) connection later closes it MUST NOT clobber the second's live
     /// endpoint. Each connection removes only the endpoint it registered.
     pub fn remove_inbound(&self, peer_id: &str, endpoint: &Arc<dyn RemoteEndpoint>) {
+        self.evict_inbound_if_bound(peer_id, endpoint);
+    }
+
+    /// Evict `endpoint` from the outbound pool iff it is still the bound
+    /// entry for `peer_id` (`Arc::ptr_eq`), returning whether it was.
+    ///
+    /// This is the Amendment 12 §A1 no-clobber guard at the pool: a
+    /// transport-error demotion fires only when the failed connection is
+    /// still the currently-bound one — a concurrent re-dial that already
+    /// replaced it owns liveness now and MUST NOT be clobbered.
+    pub fn evict_outbound_if_bound(
+        &self,
+        peer_id: &str,
+        endpoint: &Arc<dyn RemoteEndpoint>,
+    ) -> bool {
+        let mut map = self.conns.lock().unwrap();
+        if let Some(existing) = map.get(peer_id) {
+            if Arc::ptr_eq(existing, endpoint) {
+                map.remove(peer_id);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// [`evict_outbound_if_bound`](Self::evict_outbound_if_bound) for the
+    /// §6.11(b) inbound-reentry registry (its registration is that path's
+    /// binding).
+    pub fn evict_inbound_if_bound(
+        &self,
+        peer_id: &str,
+        endpoint: &Arc<dyn RemoteEndpoint>,
+    ) -> bool {
         let mut map = self.inbound.lock().unwrap();
         if let Some(existing) = map.get(peer_id) {
             if Arc::ptr_eq(existing, endpoint) {
                 map.remove(peer_id);
+                return true;
             }
         }
+        false
     }
+}
+
+/// Dial `addr`, perform the handshake, and rebind the result as the pooled
+/// outbound endpoint — the shared body of `Peer::connect_to` and the network
+/// handler's connect-if-needed seam (`network_link::PeerNetworkLink::
+/// ensure_connected`). Writes the R6 held-session entity, the §3.13
+/// `active` connection transition, and the §A3 `connected` status (both
+/// dialer-side), then rebinds the endpoint (explicit dial ⇒ this fresh
+/// connection becomes the binding unconditionally — a re-dial after the old
+/// conn died must not leave the corpse pooled) and starts §5 keepalive.
+pub(crate) async fn connect_and_pool(
+    shared: &Arc<crate::PeerShared>,
+    addr: &str,
+) -> Result<Arc<dyn RemoteEndpoint>, PeerError> {
+    let conn = shared
+        .connector
+        .connect(addr)
+        .await
+        .map_err(|e| PeerError::ConnectionError(format!("connect to {}: {}", addr, e)))?;
+    // §6.11(b): hand the reader a reentry dispatch context so deliveries
+    // the remote pushes back over this connection (e.g. subscription
+    // notifications when we run no listener it could dial) are dispatched
+    // locally and answered, rather than dropped as unexpected EXECUTEs.
+    let remote = perform_connect_with_dispatch(
+        conn,
+        &shared.keypair,
+        shared.config.home_hash_format,
+        Some(shared.clone()),
+    )
+    .await?;
+    let remote_peer_id = remote.remote_peer_id.clone();
+    // R6 §9: write dialer-side held_capability before pooling.
+    write_held_session_entity(
+        shared.content_store.as_ref(),
+        shared.location_index.as_ref(),
+        shared.peer_id.as_str(),
+        &remote,
+    );
+    // §3.13 establish transition (ruling C) + §A3 `connected` write
+    // (§6.2, dialer side) carrying the `connection` path ref.
+    let conn_path = crate::connection_state::write_connection_active(
+        shared.content_store.as_ref(),
+        shared.location_index.as_ref(),
+        shared.peer_id.as_str(),
+        &remote.remote_peer_id,
+        &remote.remote_identity_hash,
+        crate::connection_state::transport_label(addr),
+        addr,
+    );
+    crate::liveness::write_connected_status(
+        shared.content_store.as_ref(),
+        shared.location_index.as_ref(),
+        shared.peer_id.as_str(),
+        &remote.remote_peer_id,
+        &remote.remote_identity_hash,
+        conn_path,
+    );
+    let endpoint: Arc<dyn RemoteEndpoint> = Arc::new(remote);
+    shared
+        .remote
+        .rebind_endpoint(&remote_peer_id, endpoint.clone());
+    crate::keepalive::spawn_keepalive(shared, remote_peer_id, &endpoint);
+    Ok(endpoint)
 }
 
 /// Get or create a pooled connection to a remote peer.
@@ -551,8 +684,12 @@ pub async fn get_or_connect(
     // peers that ARE independently dialable keep the normal dial path
     // (matches Go's "inbound fallback fires only when transport-profile
     // resolution misses" ruling).
-    let addr = match resolve_transport_address(peer_id, content_store, location_index, local_peer_id)
-    {
+    let addr = match resolve_transport_address(
+        peer_id,
+        content_store,
+        location_index,
+        local_peer_id,
+    ) {
         Ok(a) => a,
         Err(e) => {
             if let Some(inbound) = pool.get_inbound(peer_id) {
@@ -586,7 +723,35 @@ pub async fn get_or_connect(
                         peer_id, addr, e
                     ))
                 })?;
-            return Ok(pool.insert_endpoint(peer_id, Arc::new(http)));
+            // §3.13 establish transition (ruling C, full-conformance
+            // surface): record how we are attached, then the Amendment 12
+            // §A3 `connected` write (§6.2, dialer side) carrying the
+            // `connection` path ref.
+            let conn_path = crate::connection_state::write_connection_active(
+                content_store,
+                location_index,
+                local_peer_id,
+                http.remote_peer_id(),
+                &http.remote_identity_hash(),
+                crate::connection_state::transport_label(&addr),
+                &addr,
+            );
+            crate::liveness::write_connected_status(
+                content_store,
+                location_index,
+                local_peer_id,
+                http.remote_peer_id(),
+                &http.remote_identity_hash(),
+                conn_path,
+            );
+            let endpoint: Arc<dyn RemoteEndpoint> = Arc::new(http);
+            let won = pool.insert_endpoint(peer_id, endpoint.clone());
+            if Arc::ptr_eq(&won, &endpoint) {
+                if let Some(ref shared) = reentry {
+                    crate::keepalive::spawn_keepalive(shared, peer_id.to_string(), &won);
+                }
+            }
+            return Ok(won);
         }
     }
 
@@ -594,11 +759,12 @@ pub async fn get_or_connect(
         PeerError::ConnectionError(format!("connect to {} at {}: {}", peer_id, addr, e))
     })?;
 
+    // The dispatch context is threaded to the reader (reentry) AND to the
+    // §5 keepalive spawn below — clone the Arc before the move.
+    let keepalive_shared = reentry.clone();
     let conn = perform_connect_with_dispatch(transport_conn, keypair, home_format, reentry)
         .await
-        .map_err(|e| {
-            PeerError::ConnectionError(format!("handshake with {}: {}", peer_id, e))
-        })?;
+        .map_err(|e| PeerError::ConnectionError(format!("handshake with {}: {}", peer_id, e)))?;
 
     // R6 (PROPOSAL §9 rulings) — write the dialer-side
     // `held_capability` on `/{local_peer_id}/system/peer/session/
@@ -607,8 +773,39 @@ pub async fn get_or_connect(
     // (§9.1 R6-a — one entity per peer, two cap fields).
     write_held_session_entity(content_store, location_index, local_peer_id, &conn);
 
-    // Insert into pool (handles race if another task connected simultaneously)
-    Ok(pool.insert(peer_id, conn))
+    // §3.13 establish transition (ruling C, full-conformance surface):
+    // record how we are attached, then the Amendment 12 §A3 `connected`
+    // write (§6.2, dialer side) carrying the `connection` path ref.
+    let conn_path = crate::connection_state::write_connection_active(
+        content_store,
+        location_index,
+        local_peer_id,
+        &conn.remote_peer_id,
+        &conn.remote_identity_hash,
+        crate::connection_state::transport_label(&addr),
+        &addr,
+    );
+    crate::liveness::write_connected_status(
+        content_store,
+        location_index,
+        local_peer_id,
+        &conn.remote_peer_id,
+        &conn.remote_identity_hash,
+        conn_path,
+    );
+
+    // Insert into pool (handles race if another task connected
+    // simultaneously). §5 keepalive runs per pooled outbound connection:
+    // only the endpoint that WON the slot spawns a loop (a race loser is
+    // dropped and must not ping).
+    let endpoint: Arc<dyn RemoteEndpoint> = Arc::new(conn);
+    let won = pool.insert_endpoint(peer_id, endpoint.clone());
+    if Arc::ptr_eq(&won, &endpoint) {
+        if let Some(ref shared) = keepalive_shared {
+            crate::keepalive::spawn_keepalive(shared, peer_id.to_string(), &won);
+        }
+    }
+    Ok(won)
 }
 
 /// R6 dialer-side write: record the cap received from remote at handshake
@@ -652,7 +849,7 @@ pub(crate) fn write_held_session_entity(
         .auth_included
         .values()
         .find(|e| e.entity_type == entity_crypto::TYPE_PEER)
-        .and_then(|peer_entity| extract_pubkey_from_peer_entity(peer_entity));
+        .and_then(extract_pubkey_from_peer_entity);
 
     // Read existing session entity (if any) and merge, preserving
     // any pre-existing minted_capability.
@@ -829,6 +1026,7 @@ pub(crate) fn resolve_peer_id_hex(
 /// 1. The reserved profile-id `primary` first, if present.
 /// 2. Then the remaining live profiles **sorted lexicographically by
 ///    profile-id**.
+///
 /// Try each in order; return the first profile whose `endpoint.url` is
 /// non-empty and decodes cleanly. `advertised_at` is **NOT** a selection
 /// key (D3 — wall-clock, skew-prone). Malformed siblings logged into
@@ -886,14 +1084,19 @@ pub fn resolve_transport_address(
     // from the store are treated as low-priority fallbacks via the
     // default; the inner loop's decode will then surface them as
     // diagnostics.
-    let mut triples: Vec<(u32, &str, &entity_store::LocationEntry)> = Vec::with_capacity(entries.len());
+    let mut triples: Vec<(u32, &str, &entity_store::LocationEntry)> =
+        Vec::with_capacity(entries.len());
     for e in entries.iter() {
         let profile_id = profile_id_from_path(&e.path, &prefix);
         let explicit_priority = content_store
             .get(&e.hash)
             .and_then(|ent| extract_priority_from_entity(&ent));
         let effective = explicit_priority.unwrap_or_else(|| {
-            if profile_id == PROFILE_ID_PRIMARY { 0 } else { 100 }
+            if profile_id == PROFILE_ID_PRIMARY {
+                0
+            } else {
+                100
+            }
         });
         triples.push((effective, profile_id, e));
     }
@@ -1053,8 +1256,9 @@ pub async fn perform_connect_with_dispatch(
     let hello_entity = hello
         .to_entity()
         .map_err(|e| PeerError::ConnectionError(format!("build hello: {}", e)))?;
-    let hello_execute = entity_protocol::build_connect_execute("connect-hello", "hello", &hello_entity)
-        .map_err(|e| PeerError::ConnectionError(format!("build hello execute: {}", e)))?;
+    let hello_execute =
+        entity_protocol::build_connect_execute("connect-hello", "hello", &hello_entity)
+            .map_err(|e| PeerError::ConnectionError(format!("build hello execute: {}", e)))?;
     let hello_envelope = Envelope::new(hello_execute);
 
     let frame = encode_envelope(&hello_envelope);
@@ -1090,13 +1294,11 @@ pub async fn perform_connect_with_dispatch(
     // `content_hash_format` from the responder's advertised set, using our
     // own preference order (converges on the value the responder computed).
     // Empty intersection → the responder shares no format we support.
-    let active_format = entity_protocol::negotiate_active_format(
-        &local_hash_formats,
-        &remote_hello.hash_formats,
-    )
-    .ok_or_else(|| {
-        PeerError::ConnectionError("no common content_hash_format with remote peer".into())
-    })?;
+    let active_format =
+        entity_protocol::negotiate_active_format(&local_hash_formats, &remote_hello.hash_formats)
+            .ok_or_else(|| {
+            PeerError::ConnectionError("no common content_hash_format with remote peer".into())
+        })?;
 
     let remote_nonce = remote_hello.nonce;
     let remote_peer_id = remote_hello.peer_id;
@@ -1160,7 +1362,9 @@ pub async fn perform_connect_with_dispatch(
         .find_included(&cap_hash)
         .cloned()
         .ok_or_else(|| {
-            PeerError::ConnectionError("capability token entity not in auth response included".into())
+            PeerError::ConnectionError(
+                "capability token entity not in auth response included".into(),
+            )
         })?;
 
     // Collect all included entities for chain verification on subsequent requests
@@ -1202,6 +1406,7 @@ pub async fn perform_connect_with_dispatch(
         remote_identity_hash,
         request_seq: AtomicU64::new(0),
         reader_task,
+        last_activity_ms: AtomicU64::new(0),
     })
 }
 
@@ -1368,8 +1573,14 @@ pub fn build_authenticated_execute(
 
     // Build EXECUTE data
     let mut fields = vec![
-        (entity_ecf::text("author"), entity_ecf::Value::Bytes(identity.content_hash.to_bytes().to_vec())),
-        (entity_ecf::text("capability"), entity_ecf::Value::Bytes(capability.content_hash.to_bytes().to_vec())),
+        (
+            entity_ecf::text("author"),
+            entity_ecf::Value::Bytes(identity.content_hash.to_bytes().to_vec()),
+        ),
+        (
+            entity_ecf::text("capability"),
+            entity_ecf::Value::Bytes(capability.content_hash.to_bytes().to_vec()),
+        ),
         (entity_ecf::text("operation"), entity_ecf::text(operation)),
         (entity_ecf::text("request_id"), entity_ecf::text(request_id)),
         (entity_ecf::text("uri"), entity_ecf::text(uri)),
@@ -1382,7 +1593,8 @@ pub fn build_authenticated_execute(
             entity_ecf::Value::Array(targets_arr),
         )];
         if !rt.exclude.is_empty() {
-            let exclude_arr: Vec<entity_ecf::Value> = rt.exclude.iter().map(entity_ecf::text).collect();
+            let exclude_arr: Vec<entity_ecf::Value> =
+                rt.exclude.iter().map(entity_ecf::text).collect();
             resource_fields.push((
                 entity_ecf::text("exclude"),
                 entity_ecf::Value::Array(exclude_arr),
@@ -1396,12 +1608,17 @@ pub fn build_authenticated_execute(
 
     // Build params as inline entity map (matching wire format §3.4)
     let params_data_val: entity_ecf::Value =
-        ciborium::from_reader(params.data.as_slice())
-            .unwrap_or(entity_ecf::Value::Null);
+        ciborium::from_reader(params.data.as_slice()).unwrap_or(entity_ecf::Value::Null);
     let params_entity_val = entity_ecf::Value::Map(vec![
-        (entity_ecf::text("content_hash"), entity_ecf::Value::Bytes(params.content_hash.to_bytes().to_vec())),
+        (
+            entity_ecf::text("content_hash"),
+            entity_ecf::Value::Bytes(params.content_hash.to_bytes().to_vec()),
+        ),
         (entity_ecf::text("data"), params_data_val),
-        (entity_ecf::text("type"), entity_ecf::text(&params.entity_type)),
+        (
+            entity_ecf::text("type"),
+            entity_ecf::text(&params.entity_type),
+        ),
     ]);
     fields.push((entity_ecf::text("params"), params_entity_val));
 
@@ -1410,8 +1627,14 @@ pub fn build_authenticated_execute(
         fields.push((
             entity_ecf::text("deliver_to"),
             entity_ecf::Value::Map(vec![
-                (entity_ecf::text("operation"), entity_ecf::text(&dt.deliver_to_operation)),
-                (entity_ecf::text("uri"), entity_ecf::text(&dt.deliver_to_uri)),
+                (
+                    entity_ecf::text("operation"),
+                    entity_ecf::text(&dt.deliver_to_operation),
+                ),
+                (
+                    entity_ecf::text("uri"),
+                    entity_ecf::text(&dt.deliver_to_uri),
+                ),
             ]),
         ));
         fields.push((
@@ -1427,10 +1650,22 @@ pub fn build_authenticated_execute(
     // Sign the EXECUTE entity
     let sig_bytes = keypair.sign(&execute.content_hash.to_bytes());
     let sig_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-        (entity_ecf::text("algorithm"), entity_ecf::text(keypair.key_type().label())),
-        (entity_ecf::text("signature"), entity_ecf::Value::Bytes(sig_bytes)),
-        (entity_ecf::text("signer"), entity_ecf::Value::Bytes(identity.content_hash.to_bytes().to_vec())),
-        (entity_ecf::text("target"), entity_ecf::Value::Bytes(execute.content_hash.to_bytes().to_vec())),
+        (
+            entity_ecf::text("algorithm"),
+            entity_ecf::text(keypair.key_type().label()),
+        ),
+        (
+            entity_ecf::text("signature"),
+            entity_ecf::Value::Bytes(sig_bytes),
+        ),
+        (
+            entity_ecf::text("signer"),
+            entity_ecf::Value::Bytes(identity.content_hash.to_bytes().to_vec()),
+        ),
+        (
+            entity_ecf::text("target"),
+            entity_ecf::Value::Bytes(execute.content_hash.to_bytes().to_vec()),
+        ),
     ]));
     let sig_entity = Entity::new(entity_entity::TYPE_SIGNATURE, sig_data)
         .map_err(|e| PeerError::ConnectionError(format!("build signature: {}", e)))?;
@@ -1465,7 +1700,10 @@ pub fn build_authenticated_execute(
         envelope.include(dt.deliver_token_sig.clone());
         // Include the granter identity (already in envelope as our identity,
         // but ensure it's there for chain verification)
-        if envelope.find_included(&dt.local_identity.content_hash).is_none() {
+        if envelope
+            .find_included(&dt.local_identity.content_hash)
+            .is_none()
+        {
             envelope.include(dt.local_identity.clone());
         }
     }
@@ -1585,18 +1823,13 @@ pub fn generate_deliver_token(
 
     let token = entity_capability::CapabilityToken {
         grants: vec![entity_capability::GrantEntry {
-            handlers: entity_capability::PathScope::new(
-                vec!["system/inbox".to_string(), "system/inbox/*".to_string()],
-            ),
-            operations: entity_capability::IdScope::new(
-                vec!["receive".to_string()],
-            ),
-            resources: entity_capability::PathScope::new(
-                vec![deliver_to_uri.to_string()],
-            ),
-            peers: Some(entity_capability::IdScope::new(
-                vec!["*".to_string()],
-            )),
+            handlers: entity_capability::PathScope::new(vec![
+                "system/inbox".to_string(),
+                "system/inbox/*".to_string(),
+            ]),
+            operations: entity_capability::IdScope::new(vec!["receive".to_string()]),
+            resources: entity_capability::PathScope::new(vec![deliver_to_uri.to_string()]),
+            peers: Some(entity_capability::IdScope::new(vec!["*".to_string()])),
             constraints: None,
             allowances: None,
         }],
@@ -1620,10 +1853,22 @@ pub fn generate_deliver_token(
     // Sign the token
     let sig_bytes = keypair.sign(&token_entity.content_hash.to_bytes());
     let sig_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-        (entity_ecf::text("algorithm"), entity_ecf::text(keypair.key_type().label())),
-        (entity_ecf::text("signature"), entity_ecf::Value::Bytes(sig_bytes)),
-        (entity_ecf::text("signer"), entity_ecf::Value::Bytes(identity.content_hash.to_bytes().to_vec())),
-        (entity_ecf::text("target"), entity_ecf::Value::Bytes(token_entity.content_hash.to_bytes().to_vec())),
+        (
+            entity_ecf::text("algorithm"),
+            entity_ecf::text(keypair.key_type().label()),
+        ),
+        (
+            entity_ecf::text("signature"),
+            entity_ecf::Value::Bytes(sig_bytes),
+        ),
+        (
+            entity_ecf::text("signer"),
+            entity_ecf::Value::Bytes(identity.content_hash.to_bytes().to_vec()),
+        ),
+        (
+            entity_ecf::text("target"),
+            entity_ecf::Value::Bytes(token_entity.content_hash.to_bytes().to_vec()),
+        ),
     ]));
     let sig_entity = Entity::new(entity_entity::TYPE_SIGNATURE, sig_data)
         .map_err(|e| PeerError::ConnectionError(format!("build token sig: {}", e)))?;
@@ -1689,12 +1934,14 @@ pub fn extract_peer_id_from_uri(uri: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use entity_crypto::Keypair;
     use crate::transport_profile::TcpProfileData;
+    use entity_crypto::Keypair;
     use entity_store::{MemoryContentStore, MemoryLocationIndex};
 
     fn test_peer_id() -> String {
-        entity_crypto::Keypair::from_seed([42u8; 32]).peer_id().to_string()
+        entity_crypto::Keypair::from_seed([42u8; 32])
+            .peer_id()
+            .to_string()
     }
 
     /// v7.64 §1.4: convert a Base58 PeerID (identity-form) to its
@@ -1728,17 +1975,20 @@ mod tests {
         let store = MemoryContentStore::default();
         let index = MemoryLocationIndex::default();
 
-        let profile =
-            TcpProfileData::for_local_listener(&remote, "tcp://127.0.0.1:4040", 1_000);
+        let profile = TcpProfileData::for_local_listener(&remote, "tcp://127.0.0.1:4040", 1_000);
         write_tcp_profile_at(
             &store,
             &index,
-            &format!("/{}/system/peer/transport/{}/primary", local, b58_to_hex(&remote)),
+            &format!(
+                "/{}/system/peer/transport/{}/primary",
+                local,
+                b58_to_hex(&remote)
+            ),
             &profile,
         );
 
-        let addr = resolve_transport_address(&remote, &store, &index, &local)
-            .expect("resolve succeeds");
+        let addr =
+            resolve_transport_address(&remote, &store, &index, &local).expect("resolve succeeds");
         assert_eq!(addr, "tcp://127.0.0.1:4040");
     }
 
@@ -1851,24 +2101,28 @@ mod tests {
             entity_ecf::text("peer_id"),
             entity_ecf::text(&remote),
         )]));
-        let bad_entity = Entity::new(
-            crate::transport_profile::TYPE_PEER_TRANSPORT_TCP,
-            bad_data,
-        )
-        .unwrap();
+        let bad_entity =
+            Entity::new(crate::transport_profile::TYPE_PEER_TRANSPORT_TCP, bad_data).unwrap();
         let bad_hash = store.put(bad_entity).unwrap();
         index.set(
-            &format!("/{}/system/peer/transport/{}/broken", local, b58_to_hex(&remote)),
+            &format!(
+                "/{}/system/peer/transport/{}/broken",
+                local,
+                b58_to_hex(&remote)
+            ),
             bad_hash,
         );
 
         // Sibling slot 2: a real, usable profile.
-        let profile =
-            TcpProfileData::for_local_listener(&remote, "tcp://10.0.0.5:9000", 5_000);
+        let profile = TcpProfileData::for_local_listener(&remote, "tcp://10.0.0.5:9000", 5_000);
         write_tcp_profile_at(
             &store,
             &index,
-            &format!("/{}/system/peer/transport/{}/secondary", local, b58_to_hex(&remote)),
+            &format!(
+                "/{}/system/peer/transport/{}/secondary",
+                local,
+                b58_to_hex(&remote)
+            ),
             &profile,
         );
 
@@ -1913,11 +2167,8 @@ mod tests {
             entity_ecf::text("address"),
             entity_ecf::text("127.0.0.1:4040"),
         )]));
-        let flat_entity = Entity::new(
-            crate::transport_profile::TYPE_PEER_TRANSPORT_TCP,
-            flat_data,
-        )
-        .unwrap();
+        let flat_entity =
+            Entity::new(crate::transport_profile::TYPE_PEER_TRANSPORT_TCP, flat_data).unwrap();
         let flat_hash = store.put(flat_entity).unwrap();
         // Legacy path was `/{local}/system/peer/transport/{remote}`
         // (no trailing /<profile-id>). New prefix `…/{remote}/` MUST
@@ -1953,7 +2204,11 @@ mod tests {
         let entity = profile.to_entity();
         let hash = store.put(entity).expect("put http profile");
         index.set(
-            &format!("/{}/system/peer/transport/{}/primary", local, b58_to_hex(&remote)),
+            &format!(
+                "/{}/system/peer/transport/{}/primary",
+                local,
+                b58_to_hex(&remote)
+            ),
             hash,
         );
 
@@ -1979,7 +2234,11 @@ mod tests {
         write_tcp_profile_at(
             &store,
             &index,
-            &format!("/{}/system/peer/transport/{}/alpha", local, b58_to_hex(&remote)),
+            &format!(
+                "/{}/system/peer/transport/{}/alpha",
+                local,
+                b58_to_hex(&remote)
+            ),
             &tcp,
         );
 
@@ -1991,12 +2250,16 @@ mod tests {
         );
         let hash = store.put(http.to_entity()).unwrap();
         index.set(
-            &format!("/{}/system/peer/transport/{}/primary", local, b58_to_hex(&remote)),
+            &format!(
+                "/{}/system/peer/transport/{}/primary",
+                local,
+                b58_to_hex(&remote)
+            ),
             hash,
         );
 
-        let addr = resolve_transport_address(&remote, &store, &index, &local)
-            .expect("resolve succeeds");
+        let addr =
+            resolve_transport_address(&remote, &store, &index, &local).expect("resolve succeeds");
         assert_eq!(addr, "https://example.com/entity");
     }
 
@@ -2016,26 +2279,32 @@ mod tests {
 
         // "alpha" sorts before "primary" lexicographically — proves
         // the rule isn't just "first lexicographically."
-        let alpha =
-            TcpProfileData::for_local_listener(&remote, "tcp://alpha:1111", 1_000);
+        let alpha = TcpProfileData::for_local_listener(&remote, "tcp://alpha:1111", 1_000);
         write_tcp_profile_at(
             &store,
             &index,
-            &format!("/{}/system/peer/transport/{}/alpha", local, b58_to_hex(&remote)),
+            &format!(
+                "/{}/system/peer/transport/{}/alpha",
+                local,
+                b58_to_hex(&remote)
+            ),
             &alpha,
         );
 
-        let primary =
-            TcpProfileData::for_local_listener(&remote, "tcp://primary:4040", 2_000);
+        let primary = TcpProfileData::for_local_listener(&remote, "tcp://primary:4040", 2_000);
         write_tcp_profile_at(
             &store,
             &index,
-            &format!("/{}/system/peer/transport/{}/primary", local, b58_to_hex(&remote)),
+            &format!(
+                "/{}/system/peer/transport/{}/primary",
+                local,
+                b58_to_hex(&remote)
+            ),
             &primary,
         );
 
-        let addr = resolve_transport_address(&remote, &store, &index, &local)
-            .expect("resolve succeeds");
+        let addr =
+            resolve_transport_address(&remote, &store, &index, &local).expect("resolve succeeds");
         assert_eq!(addr, "tcp://primary:4040", "primary MUST win over alpha");
     }
 
@@ -2051,33 +2320,42 @@ mod tests {
         let index = MemoryLocationIndex::default();
 
         // Insert in non-lex order to confirm sorting is happening.
-        let gamma =
-            TcpProfileData::for_local_listener(&remote, "tcp://gamma:3333", 3_000);
+        let gamma = TcpProfileData::for_local_listener(&remote, "tcp://gamma:3333", 3_000);
         write_tcp_profile_at(
             &store,
             &index,
-            &format!("/{}/system/peer/transport/{}/gamma", local, b58_to_hex(&remote)),
+            &format!(
+                "/{}/system/peer/transport/{}/gamma",
+                local,
+                b58_to_hex(&remote)
+            ),
             &gamma,
         );
-        let alpha =
-            TcpProfileData::for_local_listener(&remote, "tcp://alpha:1111", 1_000);
+        let alpha = TcpProfileData::for_local_listener(&remote, "tcp://alpha:1111", 1_000);
         write_tcp_profile_at(
             &store,
             &index,
-            &format!("/{}/system/peer/transport/{}/alpha", local, b58_to_hex(&remote)),
+            &format!(
+                "/{}/system/peer/transport/{}/alpha",
+                local,
+                b58_to_hex(&remote)
+            ),
             &alpha,
         );
-        let beta =
-            TcpProfileData::for_local_listener(&remote, "tcp://beta:2222", 2_000);
+        let beta = TcpProfileData::for_local_listener(&remote, "tcp://beta:2222", 2_000);
         write_tcp_profile_at(
             &store,
             &index,
-            &format!("/{}/system/peer/transport/{}/beta", local, b58_to_hex(&remote)),
+            &format!(
+                "/{}/system/peer/transport/{}/beta",
+                local,
+                b58_to_hex(&remote)
+            ),
             &beta,
         );
 
-        let addr = resolve_transport_address(&remote, &store, &index, &local)
-            .expect("resolve succeeds");
+        let addr =
+            resolve_transport_address(&remote, &store, &index, &local).expect("resolve succeeds");
         assert_eq!(addr, "tcp://alpha:1111", "alpha should beat beta+gamma");
     }
 
@@ -2105,17 +2383,24 @@ mod tests {
         .unwrap();
         let bad_hash = store.put(bad_primary).unwrap();
         index.set(
-            &format!("/{}/system/peer/transport/{}/primary", local, b58_to_hex(&remote)),
+            &format!(
+                "/{}/system/peer/transport/{}/primary",
+                local,
+                b58_to_hex(&remote)
+            ),
             bad_hash,
         );
 
         // Secondary is usable.
-        let secondary =
-            TcpProfileData::for_local_listener(&remote, "tcp://backup:9999", 5_000);
+        let secondary = TcpProfileData::for_local_listener(&remote, "tcp://backup:9999", 5_000);
         write_tcp_profile_at(
             &store,
             &index,
-            &format!("/{}/system/peer/transport/{}/zzz-backup", local, b58_to_hex(&remote)),
+            &format!(
+                "/{}/system/peer/transport/{}/zzz-backup",
+                local,
+                b58_to_hex(&remote)
+            ),
             &secondary,
         );
 
@@ -2136,11 +2421,7 @@ mod tests {
     // What's new is gated below.
 
     /// Helper: build a TCP profile with an explicit priority value.
-    fn tcp_profile_with_priority(
-        remote: &str,
-        url: &str,
-        priority: Option<u32>,
-    ) -> TcpProfileData {
+    fn tcp_profile_with_priority(remote: &str, url: &str, priority: Option<u32>) -> TcpProfileData {
         let mut p = TcpProfileData::for_local_listener(remote, url, 1_000);
         p.priority = priority;
         p
@@ -2163,19 +2444,27 @@ mod tests {
         write_tcp_profile_at(
             &store,
             &index,
-            &format!("/{}/system/peer/transport/{}/alpha", local, b58_to_hex(&remote)),
+            &format!(
+                "/{}/system/peer/transport/{}/alpha",
+                local,
+                b58_to_hex(&remote)
+            ),
             &alpha,
         );
         let beta = tcp_profile_with_priority(&remote, "tcp://beta:2222", Some(50));
         write_tcp_profile_at(
             &store,
             &index,
-            &format!("/{}/system/peer/transport/{}/beta", local, b58_to_hex(&remote)),
+            &format!(
+                "/{}/system/peer/transport/{}/beta",
+                local,
+                b58_to_hex(&remote)
+            ),
             &beta,
         );
 
-        let addr = resolve_transport_address(&remote, &store, &index, &local)
-            .expect("resolve succeeds");
+        let addr =
+            resolve_transport_address(&remote, &store, &index, &local).expect("resolve succeeds");
         assert_eq!(
             addr, "tcp://beta:2222",
             "Q1: explicit priority=50 MUST beat default-100 lex winner"
@@ -2197,19 +2486,27 @@ mod tests {
         write_tcp_profile_at(
             &store,
             &index,
-            &format!("/{}/system/peer/transport/{}/aaa", local, b58_to_hex(&remote)),
+            &format!(
+                "/{}/system/peer/transport/{}/aaa",
+                local,
+                b58_to_hex(&remote)
+            ),
             &aaa,
         );
         let zzz = tcp_profile_with_priority(&remote, "tcp://zzz:2222", Some(10));
         write_tcp_profile_at(
             &store,
             &index,
-            &format!("/{}/system/peer/transport/{}/zzz", local, b58_to_hex(&remote)),
+            &format!(
+                "/{}/system/peer/transport/{}/zzz",
+                local,
+                b58_to_hex(&remote)
+            ),
             &zzz,
         );
 
-        let addr = resolve_transport_address(&remote, &store, &index, &local)
-            .expect("resolve succeeds");
+        let addr =
+            resolve_transport_address(&remote, &store, &index, &local).expect("resolve succeeds");
         assert_eq!(
             addr, "tcp://aaa:1111",
             "Q1: equal priorities MUST tie-break by profile-id lex"
@@ -2232,19 +2529,27 @@ mod tests {
         write_tcp_profile_at(
             &store,
             &index,
-            &format!("/{}/system/peer/transport/{}/primary", local, b58_to_hex(&remote)),
+            &format!(
+                "/{}/system/peer/transport/{}/primary",
+                local,
+                b58_to_hex(&remote)
+            ),
             &primary,
         );
         let zeta = tcp_profile_with_priority(&remote, "tcp://zeta:9999", None);
         write_tcp_profile_at(
             &store,
             &index,
-            &format!("/{}/system/peer/transport/{}/zeta", local, b58_to_hex(&remote)),
+            &format!(
+                "/{}/system/peer/transport/{}/zeta",
+                local,
+                b58_to_hex(&remote)
+            ),
             &zeta,
         );
 
-        let addr = resolve_transport_address(&remote, &store, &index, &local)
-            .expect("resolve succeeds");
+        let addr =
+            resolve_transport_address(&remote, &store, &index, &local).expect("resolve succeeds");
         assert_eq!(
             addr, "tcp://primary:4040",
             "Q1: unset `primary` defaults to priority 0, beats unset non-primary (100)"
@@ -2271,19 +2576,27 @@ mod tests {
         write_tcp_profile_at(
             &store,
             &index,
-            &format!("/{}/system/peer/transport/{}/primary", local, b58_to_hex(&remote)),
+            &format!(
+                "/{}/system/peer/transport/{}/primary",
+                local,
+                b58_to_hex(&remote)
+            ),
             &primary,
         );
         let aaaa = tcp_profile_with_priority(&remote, "tcp://aaaa:1111", Some(0));
         write_tcp_profile_at(
             &store,
             &index,
-            &format!("/{}/system/peer/transport/{}/aaaa", local, b58_to_hex(&remote)),
+            &format!(
+                "/{}/system/peer/transport/{}/aaaa",
+                local,
+                b58_to_hex(&remote)
+            ),
             &aaaa,
         );
 
-        let addr = resolve_transport_address(&remote, &store, &index, &local)
-            .expect("resolve succeeds");
+        let addr =
+            resolve_transport_address(&remote, &store, &index, &local).expect("resolve succeeds");
         assert_eq!(
             addr, "tcp://aaaa:1111",
             "Q1: explicit priority=0 + lex-before-primary wins the tie-break"
@@ -2292,8 +2605,7 @@ mod tests {
 
     /// Read the `capability` hash off the built EXECUTE envelope root.
     fn execute_capability_hash(env: &Envelope) -> Hash {
-        let v: ciborium::Value =
-            ciborium::from_reader(env.root.data.as_slice()).unwrap();
+        let v: ciborium::Value = ciborium::from_reader(env.root.data.as_slice()).unwrap();
         for (k, val) in v.as_map().unwrap() {
             if k.as_text() == Some("capability") {
                 return Hash::from_bytes(val.as_bytes().unwrap()).unwrap();
@@ -2316,8 +2628,11 @@ mod tests {
         let parent_cap = Entity::new("system/capability", vec![0xD2]).unwrap();
         let granter_id = Entity::new(entity_crypto::TYPE_PEER, vec![0xAA]).unwrap();
         let cap_sig = Entity::new(entity_entity::TYPE_SIGNATURE, vec![0xBB]).unwrap();
-        let params =
-            Entity::new("primitive/any", entity_ecf::to_ecf(&entity_ecf::Value::Null)).unwrap();
+        let params = Entity::new(
+            "primitive/any",
+            entity_ecf::to_ecf(&entity_ecf::Value::Null),
+        )
+        .unwrap();
         let auth: HashMap<Hash, Entity> = HashMap::new();
 
         // The bundle collect_chain_bundle would produce for the scoped cap.
@@ -2386,8 +2701,11 @@ mod tests {
     fn test_build_authenticated_execute_forwards_parent_included() {
         let kp = IdentityKeypair::Ed25519(Keypair::generate());
         let conn_cap = Entity::new("system/capability", vec![0xC0]).unwrap();
-        let params =
-            Entity::new("primitive/any", entity_ecf::to_ecf(&entity_ecf::Value::Null)).unwrap();
+        let params = Entity::new(
+            "primitive/any",
+            entity_ecf::to_ecf(&entity_ecf::Value::Null),
+        )
+        .unwrap();
         let auth: HashMap<Hash, Entity> = HashMap::new();
 
         // Simulate a parent envelope's `included`: one bundled application
@@ -2396,8 +2714,7 @@ mod tests {
         // in is that arbitrary parent-included content survives the wire.
         let bundled_entity =
             Entity::new("app/mirror/payload", b"v7.51 round-trip carrier".to_vec()).unwrap();
-        let bundled_sig =
-            Entity::new(entity_entity::TYPE_SIGNATURE, vec![0x51, 0x51]).unwrap();
+        let bundled_sig = Entity::new(entity_entity::TYPE_SIGNATURE, vec![0x51, 0x51]).unwrap();
         let mut parent_included: HashMap<Hash, Entity> = HashMap::new();
         parent_included.insert(bundled_entity.content_hash, bundled_entity.clone());
         parent_included.insert(bundled_sig.content_hash, bundled_sig.clone());
@@ -2427,7 +2744,9 @@ mod tests {
     }
 
     fn other_peer_id() -> String {
-        entity_crypto::Keypair::from_seed([99u8; 32]).peer_id().to_string()
+        entity_crypto::Keypair::from_seed([99u8; 32])
+            .peer_id()
+            .to_string()
     }
 
     #[test]
@@ -2511,8 +2830,12 @@ mod tests {
         )
         .unwrap();
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let reader_task =
-            spawn_reader_loop(client_read, pending.clone(), "memory:test".to_string(), None);
+        let reader_task = spawn_reader_loop(
+            client_read,
+            pending.clone(),
+            "memory:test".to_string(),
+            None,
+        );
         RemoteConnection {
             writer: Arc::new(tokio::sync::Mutex::new(client_write)),
             pending,
@@ -2522,6 +2845,7 @@ mod tests {
             remote_identity_hash: Hash::zero(),
             request_seq: AtomicU64::new(0),
             reader_task,
+            last_activity_ms: AtomicU64::new(0),
         }
     }
 
@@ -2536,7 +2860,9 @@ mod tests {
     ) {
         let mut request_ids: Vec<String> = Vec::with_capacity(n);
         for _ in 0..n {
-            let frame = read_frame(&mut reader, DEFAULT_MAX_FRAME_SIZE).await.unwrap();
+            let frame = read_frame(&mut reader, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .unwrap();
             let env = decode_envelope(&frame).unwrap();
             // Extract request_id from the EXECUTE root entity's data.
             let v: ciborium::Value = ciborium::from_reader(env.root.data.as_slice()).unwrap();
@@ -2588,8 +2914,11 @@ mod tests {
         let server = tokio::spawn(fake_server_reverse_order(server_read, server_write, N));
 
         let kp = Arc::new(IdentityKeypair::Ed25519(Keypair::generate()));
-        let params =
-            Entity::new("primitive/any", entity_ecf::to_ecf(&entity_ecf::Value::Null)).unwrap();
+        let params = Entity::new(
+            "primitive/any",
+            entity_ecf::to_ecf(&entity_ecf::Value::Null),
+        )
+        .unwrap();
         let no_chain: HashMap<Hash, Entity> = HashMap::new();
 
         // Spawn N concurrent send_execute calls.
@@ -2620,9 +2949,11 @@ mod tests {
         let budget = Duration::from_secs(5);
         let started = std::time::Instant::now();
         for h in handles {
-            let res = tokio::time::timeout(budget, h).await.expect("F-WB28: \
+            let res = tokio::time::timeout(budget, h).await.expect(
+                "F-WB28: \
                 concurrent send_execute exceeded budget — multiplexing \
-                is not in place (would be the deadlock symptom)");
+                is not in place (would be the deadlock symptom)",
+            );
             let send_res = res.expect("task panicked").expect("send_execute failed");
             assert_eq!(send_res.status, 200, "F-WB28: response status mismatch");
         }
@@ -2630,7 +2961,8 @@ mod tests {
         assert!(
             elapsed < budget,
             "F-WB28: total elapsed {:?} exceeded budget {:?}",
-            elapsed, budget
+            elapsed,
+            budget
         );
 
         server.await.unwrap();
@@ -2654,8 +2986,11 @@ mod tests {
         let server = tokio::spawn(fake_server_reverse_order(server_read, server_write, 2));
 
         let kp = Arc::new(IdentityKeypair::Ed25519(Keypair::generate()));
-        let params =
-            Entity::new("primitive/any", entity_ecf::to_ecf(&entity_ecf::Value::Null)).unwrap();
+        let params = Entity::new(
+            "primitive/any",
+            entity_ecf::to_ecf(&entity_ecf::Value::Null),
+        )
+        .unwrap();
         let no_chain: HashMap<Hash, Entity> = HashMap::new();
 
         let h1 = {
@@ -2666,7 +3001,14 @@ mod tests {
             tokio::spawn(async move {
                 send_execute(
                     conn.as_ref() as &dyn RemoteEndpoint,
-                    &kp, "entity://peerB/h1", "op", &params, None, None, None, &no_chain,
+                    &kp,
+                    "entity://peerB/h1",
+                    "op",
+                    &params,
+                    None,
+                    None,
+                    None,
+                    &no_chain,
                 )
                 .await
             })
@@ -2679,7 +3021,14 @@ mod tests {
             tokio::spawn(async move {
                 send_execute(
                     conn.as_ref() as &dyn RemoteEndpoint,
-                    &kp, "entity://peerB/h2", "op", &params, None, None, None, &no_chain,
+                    &kp,
+                    "entity://peerB/h2",
+                    "op",
+                    &params,
+                    None,
+                    None,
+                    None,
+                    &no_chain,
                 )
                 .await
             })

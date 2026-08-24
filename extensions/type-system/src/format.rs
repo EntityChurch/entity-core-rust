@@ -180,9 +180,7 @@ fn parse_uint(b: &[u8]) -> Option<u64> {
         if !ch.is_ascii_digit() {
             return None;
         }
-        v = v
-            .checked_mul(10)?
-            .checked_add((ch - b'0') as u64)?;
+        v = v.checked_mul(10)?.checked_add((ch - b'0') as u64)?;
     }
     Some(v)
 }
@@ -195,7 +193,8 @@ fn valid_date(month: u32, day: u32, year: u32) -> bool {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
         2 => {
-            let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+            let leap =
+                (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
             if leap {
                 29
             } else {
@@ -240,17 +239,9 @@ mod tests {
 
     #[test]
     fn uuid() {
-        assert!(validate_format(
-            "550e8400-e29b-41d4-a716-446655440000",
-            "uuid"
-        )
-        .unwrap());
+        assert!(validate_format("550e8400-e29b-41d4-a716-446655440000", "uuid").unwrap());
         assert!(!validate_format("not-a-uuid", "uuid").unwrap());
-        assert!(!validate_format(
-            "550e8400-e29b-41d4-a716-44665544000G",
-            "uuid"
-        )
-        .unwrap());
+        assert!(!validate_format("550e8400-e29b-41d4-a716-44665544000G", "uuid").unwrap());
     }
 
     #[test]

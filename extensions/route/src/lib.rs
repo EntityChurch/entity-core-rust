@@ -232,15 +232,21 @@ pub fn resolve(routes: &[RouteData], destination: &str, now_ms: i64) -> Option<R
 // ---------------------------------------------------------------------------
 
 fn decode_map(data: &[u8]) -> Result<Vec<(Value, Value)>, RouteError> {
-    let value: Value = ciborium::from_reader(data).map_err(|e| RouteError::Decode(e.to_string()))?;
+    let value: Value =
+        ciborium::from_reader(data).map_err(|e| RouteError::Decode(e.to_string()))?;
     value
         .into_map()
         .map_err(|_| RouteError::Decode("expected CBOR map".into()))
 }
 
 fn get_field<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
-    map.iter()
-        .find_map(|(k, v)| if k.as_text() == Some(key) { Some(v) } else { None })
+    map.iter().find_map(|(k, v)| {
+        if k.as_text() == Some(key) {
+            Some(v)
+        } else {
+            None
+        }
+    })
 }
 
 fn field_text(map: &[(Value, Value)], key: &str) -> Result<String, RouteError> {
@@ -251,7 +257,9 @@ fn field_text(map: &[(Value, Value)], key: &str) -> Result<String, RouteError> {
 }
 
 fn field_text_opt(map: &[(Value, Value)], key: &str) -> Option<String> {
-    get_field(map, key).and_then(|v| v.as_text()).map(|s| s.to_string())
+    get_field(map, key)
+        .and_then(|v| v.as_text())
+        .map(|s| s.to_string())
 }
 
 fn field_u64_opt(map: &[(Value, Value)], key: &str) -> Option<u64> {

@@ -26,18 +26,16 @@ impl RootMapping {
             prefix.push('/');
         }
         let fs_root_path = Path::new(&cfg.filesystem_root);
-        let fs_root = fs_root_path
-            .canonicalize()
-            .unwrap_or_else(|_| {
-                // Root may not exist yet; absolutize without canonicalizing.
-                if fs_root_path.is_absolute() {
-                    fs_root_path.to_path_buf()
-                } else {
-                    std::env::current_dir()
-                        .map(|c| c.join(fs_root_path))
-                        .unwrap_or_else(|_| fs_root_path.to_path_buf())
-                }
-            });
+        let fs_root = fs_root_path.canonicalize().unwrap_or_else(|_| {
+            // Root may not exist yet; absolutize without canonicalizing.
+            if fs_root_path.is_absolute() {
+                fs_root_path.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map(|c| c.join(fs_root_path))
+                    .unwrap_or_else(|_| fs_root_path.to_path_buf())
+            }
+        });
         Ok(RootMapping {
             name,
             prefix,
@@ -87,10 +85,7 @@ pub fn resolve_fs_path(root: &RootMapping, tree_path: &str) -> Result<(PathBuf, 
 /// Same as `resolve_fs_path` but takes a relative path directly. Used by
 /// watcher and reverse-write paths that already have the relative path
 /// in hand (from notify event stripping or tree-event prefix-trim).
-pub fn resolve_fs_path_relative(
-    root: &RootMapping,
-    relative: &str,
-) -> Result<PathBuf, String> {
+pub fn resolve_fs_path_relative(root: &RootMapping, relative: &str) -> Result<PathBuf, String> {
     if !is_safe_relative(relative) {
         return Err(format!("path traversal rejected: {relative}"));
     }
@@ -141,9 +136,11 @@ fn is_safe_relative(rel: &str) -> bool {
 /// True if `name` matches any of the exclude patterns (filename glob match
 /// via `glob::Pattern`, identical wire semantics to Go's `filepath.Match`).
 pub fn matches_exclude(name: &str, patterns: &[String]) -> bool {
-    patterns
-        .iter()
-        .any(|p| glob::Pattern::new(p).map(|pat| pat.matches(name)).unwrap_or(false))
+    patterns.iter().any(|p| {
+        glob::Pattern::new(p)
+            .map(|pat| pat.matches(name))
+            .unwrap_or(false)
+    })
 }
 
 /// True if `name` passes the include filter. Empty include = pass through
@@ -152,9 +149,11 @@ pub fn matches_include(name: &str, patterns: &[String]) -> bool {
     if patterns.is_empty() {
         return true;
     }
-    patterns
-        .iter()
-        .any(|p| glob::Pattern::new(p).map(|pat| pat.matches(name)).unwrap_or(false))
+    patterns.iter().any(|p| {
+        glob::Pattern::new(p)
+            .map(|pat| pat.matches(name))
+            .unwrap_or(false)
+    })
 }
 
 /// Combined file-admission check (§2.5 admission rule).

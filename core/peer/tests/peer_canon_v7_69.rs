@@ -29,7 +29,7 @@
 //!   SHA-384↔SHA-384 handshake authors every transmitted entity under
 //!   SHA-384 (§4.5a) with the §1.8 authored-signer captured as grantee.
 
-use entity_crypto::{IdentityKeypair, Keypair, KeyType};
+use entity_crypto::{IdentityKeypair, KeyType, Keypair};
 use entity_entity::{Envelope, TYPE_SIGNATURE};
 use entity_hash::{HASH_ALGORITHM_SHA256, HASH_ALGORITHM_SHA384};
 use entity_protocol::{
@@ -54,7 +54,8 @@ fn hello_envelope(
         timestamp: None,
     };
     let hello_entity = hello.to_entity().expect("hello entity");
-    let exec = build_connect_execute("nego-hello", "hello", &hello_entity).expect("connect execute");
+    let exec =
+        build_connect_execute("nego-hello", "hello", &hello_entity).expect("connect execute");
     Envelope::new(exec)
 }
 
@@ -83,7 +84,10 @@ fn negotiate_format_1_format_advertised() {
         vec!["ed25519".to_string()],
     );
     let (response, _req) = conn.process_hello(&env).expect("hello negotiates");
-    assert!(!response.hash_formats.is_empty(), "responder advertises hash_formats");
+    assert!(
+        !response.hash_formats.is_empty(),
+        "responder advertises hash_formats"
+    );
     assert!(
         response.hash_formats.iter().any(|f| f == "ecfv1-sha256"),
         "responder advertises the ecfv1-sha256 floor"
@@ -103,7 +107,9 @@ fn negotiate_format_1_disjoint_reject() {
         vec!["ecfv1-fake-disjoint-format".to_string()],
         vec!["ed25519".to_string()],
     );
-    let err = conn.process_hello(&env).expect_err("disjoint hash_formats rejected");
+    let err = conn
+        .process_hello(&env)
+        .expect_err("disjoint hash_formats rejected");
     assert!(
         matches!(err, ProtocolError::IncompatibleHashFormat),
         "expected IncompatibleHashFormat, got {:?}",
@@ -130,7 +136,10 @@ fn negotiate_keytype_1_keytype_advertised() {
         vec!["ed25519".to_string(), "ed448".to_string()],
     );
     let (response, _req) = conn.process_hello(&env).expect("hello negotiates");
-    assert!(!response.key_types.is_empty(), "responder advertises key_types");
+    assert!(
+        !response.key_types.is_empty(),
+        "responder advertises key_types"
+    );
     assert!(
         response.key_types.iter().any(|k| k == "ed25519"),
         "responder advertises the ed25519 floor"
@@ -150,7 +159,9 @@ fn negotiate_keytype_1_disjoint_reject() {
         vec!["ecfv1-sha256".to_string()],
         vec!["fake-disjoint-key-type".to_string()],
     );
-    let err = conn.process_hello(&env).expect_err("disjoint key_types rejected");
+    let err = conn
+        .process_hello(&env)
+        .expect_err("disjoint key_types rejected");
     assert!(
         matches!(err, ProtocolError::UnsupportedKeyType(_)),
         "expected UnsupportedKeyType, got {:?}",
@@ -186,7 +197,10 @@ fn negotiate_active_sha384_responder_down_to_sha256() {
     // Initiator re-derives the same active value from the response.
     let initiator_active = negotiate_active_format(&initiator_formats, &response.hash_formats)
         .expect("initiator derives active");
-    assert_eq!(initiator_active, HASH_ALGORITHM_SHA256, "both sides converge");
+    assert_eq!(
+        initiator_active, HASH_ALGORITHM_SHA256,
+        "both sides converge"
+    );
 }
 
 /// Two SHA-384 peers negotiate **up** to SHA-384 (first match in the
@@ -304,5 +318,9 @@ fn m3_cross_format_handshake_both_sha384_authors_sha384() {
     let (active, grantee) = run_handshake(HASH_ALGORITHM_SHA384, HASH_ALGORITHM_SHA384);
     assert_eq!(active, HASH_ALGORITHM_SHA384);
     assert_eq!(grantee.algorithm, HASH_ALGORITHM_SHA384);
-    assert_eq!(grantee.digest().len(), 48, "SHA-384 grantee digest is 48 bytes");
+    assert_eq!(
+        grantee.digest().len(),
+        48,
+        "SHA-384 grantee digest is 48 bytes"
+    );
 }

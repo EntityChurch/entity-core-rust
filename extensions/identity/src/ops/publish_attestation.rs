@@ -61,8 +61,7 @@ impl IdentityHandler {
                 "per-relationship mode requires contact_id",
             ));
         }
-        let new_path = match canonical_cert_path(new_mode, contact_id.as_ref(), &attestation_hash)
-        {
+        let new_path = match canonical_cert_path(new_mode, contact_id.as_ref(), &attestation_hash) {
             Some(p) => self.qualify(&p),
             None => {
                 return Ok(error(

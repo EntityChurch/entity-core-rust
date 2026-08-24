@@ -211,14 +211,7 @@ impl Drop for L1SubscriptionHandle {
                 None,
             );
             let opts = ExecuteOptions::default();
-            match execute_fn(
-                unsub_target,
-                "unsubscribe".into(),
-                params,
-                opts,
-            )
-            .await
-            {
+            match execute_fn(unsub_target, "unsubscribe".into(), params, opts).await {
                 Ok(r) if r.status == 200 => {
                     tracing::debug!(subscription_id = %subscription_id, "L1 unsubscribe: ok");
                 }
@@ -301,7 +294,12 @@ impl PeerContext {
     where
         F: Fn(L1SubscriptionEvent) + Send + Sync + 'static,
     {
-        self.subscribe_internal(pattern.into(), SubscribeOptions::default(), Arc::new(callback), None)
+        self.subscribe_internal(
+            pattern.into(),
+            SubscribeOptions::default(),
+            Arc::new(callback),
+            None,
+        )
     }
 
     /// WASM variant — same logic, no `Send` bound required for spawn_local.
@@ -314,7 +312,12 @@ impl PeerContext {
     where
         F: Fn(L1SubscriptionEvent) + Send + Sync + 'static,
     {
-        self.subscribe_internal(pattern.into(), SubscribeOptions::default(), Arc::new(callback), None)
+        self.subscribe_internal(
+            pattern.into(),
+            SubscribeOptions::default(),
+            Arc::new(callback),
+            None,
+        )
     }
 
     /// Configurable subscribe — per SDK-EXTENSION-OPERATIONS §3 (v0.7),
@@ -510,9 +513,9 @@ impl PeerContext {
             ))
         } else {
             mint_delivery_grant(
-                peer.keypair()
-                    .as_ed25519()
-                    .expect("entity-sdk peers are Ed25519-only (Ed448 backends use core PeerBuilder)"),
+                peer.keypair().as_ed25519().expect(
+                    "entity-sdk peers are Ed25519-only (Ed448 backends use core PeerBuilder)",
+                ),
                 &deliver_uri,
                 peer.content_store(),
             )
@@ -637,13 +640,7 @@ impl PeerContext {
                 Some(pid) => format!("entity://{}/system/subscription", pid),
                 None => "system/subscription".to_string(),
             };
-            let result = execute_fn(
-                subscribe_target,
-                "subscribe".into(),
-                params,
-                opts,
-            )
-            .await;
+            let result = execute_fn(subscribe_target, "subscribe".into(), params, opts).await;
 
             let result = match result {
                 Ok(r) if r.status == 200 => r,
@@ -746,7 +743,11 @@ impl SubscriptionInfo {
         if subscription_id.is_empty() {
             return None;
         }
-        Some(SubscriptionInfo { subscription_id, pattern, events })
+        Some(SubscriptionInfo {
+            subscription_id,
+            pattern,
+            events,
+        })
     }
 }
 
@@ -900,9 +901,11 @@ fn unsubscribe_dispatch(
         if result.status == 200 {
             Ok(())
         } else {
-            Err(SdkError::from_handler_result(&result, "unsubscribe").unwrap_or_else(|| {
-                SdkError::HandlerError(format!("unsubscribe: status {}", result.status))
-            }))
+            Err(
+                SdkError::from_handler_result(&result, "unsubscribe").unwrap_or_else(|| {
+                    SdkError::HandlerError(format!("unsubscribe: status {}", result.status))
+                }),
+            )
         }
     }
 }
@@ -1354,8 +1357,8 @@ mod tests {
             .build()
             .expect("ctx_b build");
         let b_pid = ctx_b.peer_id().to_string();
-        let listener = MemoryListener::bind(b_pid.clone(), reg.clone())
-            .expect("bind MemoryListener");
+        let listener =
+            MemoryListener::bind(b_pid.clone(), reg.clone()).expect("bind MemoryListener");
         let b_shared = ctx_b.peer_shared();
         let server_task = tokio::spawn(async move {
             let _ = entity_peer::server::run(listener, b_shared).await;
@@ -1456,9 +1459,18 @@ mod tests {
         let ctx = make_peer_context();
         let pid = ctx.peer_id().to_string();
 
-        let _h1 = ctx.subscribe(format!("/{}/a/*", pid), |_| {}).await.unwrap();
-        let _h2 = ctx.subscribe(format!("/{}/b/*", pid), |_| {}).await.unwrap();
-        let _h3 = ctx.subscribe(format!("/{}/c/*", pid), |_| {}).await.unwrap();
+        let _h1 = ctx
+            .subscribe(format!("/{}/a/*", pid), |_| {})
+            .await
+            .unwrap();
+        let _h2 = ctx
+            .subscribe(format!("/{}/b/*", pid), |_| {})
+            .await
+            .unwrap();
+        let _h3 = ctx
+            .subscribe(format!("/{}/c/*", pid), |_| {})
+            .await
+            .unwrap();
 
         let subs = ctx.list_subscriptions();
         assert_eq!(subs.len(), 3);
@@ -1480,7 +1492,9 @@ mod tests {
         assert_eq!(ctx.list_subscriptions().len(), 1);
 
         // Explicit unsubscribe by id removes the tree entry.
-        ctx.unsubscribe(&id).await.expect("unsubscribe should succeed");
+        ctx.unsubscribe(&id)
+            .await
+            .expect("unsubscribe should succeed");
         // Drop the handle separately — its drop will redundantly fire
         // unsubscribe (already done) but won't error.
         drop(handle);

@@ -27,10 +27,8 @@ use async_trait::async_trait;
 use ciborium::Value;
 use entity_ecf::ValueExt;
 use entity_entity::Entity;
+use entity_handler::{Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST};
 use entity_hash::Hash;
-use entity_handler::{
-    Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST,
-};
 use entity_store::{ContentStore, LocationIndex};
 
 use crate::miss_hook::{MissOutcome, MissResolver};
@@ -286,9 +284,7 @@ impl SystemContentHandler {
             (true, true) => {
                 return bad_request("ambiguous_input", "specify envelope or entity, not both")
             }
-            (false, false) => {
-                return bad_request("missing_input", "specify envelope or entity")
-            }
+            (false, false) => return bad_request("missing_input", "specify envelope or entity"),
             _ => {}
         }
 
@@ -380,10 +376,7 @@ impl SystemContentHandler {
                 let key_hash = match decode_hash_record(key) {
                     Ok(h) => h,
                     Err(msg) => {
-                        return bad_request(
-                            "invalid_envelope",
-                            &format!("included key: {}", msg),
-                        )
+                        return bad_request("invalid_envelope", &format!("included key: {}", msg))
                     }
                 };
                 let entity = match decode_core_entity(ent_v) {
@@ -397,10 +390,7 @@ impl SystemContentHandler {
                 };
                 let actual = entity.content_hash;
                 if actual != key_hash {
-                    return bad_request(
-                        "hash_mismatch",
-                        "included entity hash does not match key",
-                    );
+                    return bad_request("hash_mismatch", "included entity hash does not match key");
                 }
                 if let Err(e) = self.content_store.put(entity) {
                     return bad_request("store_failed", &e.to_string());
@@ -507,8 +497,7 @@ fn encode_ingest_result(root: Option<&Entity>, root_hash: &Hash, count: u64) -> 
         // The data field carries the raw CBOR bytes the entity's data
         // already holds, so we decode them back into a Value for the
         // inline shape (the result is itself ECF-encoded below).
-        let data_v: Value = ciborium::from_reader(r.data.as_slice())
-            .unwrap_or(Value::Map(vec![]));
+        let data_v: Value = ciborium::from_reader(r.data.as_slice()).unwrap_or(Value::Map(vec![]));
         let h = r.content_hash;
         let inline = Value::Map(vec![
             (entity_ecf::text("type"), entity_ecf::text(&r.entity_type)),
@@ -548,7 +537,9 @@ fn decode_hash_record(value: &Value) -> Result<Hash, String> {
 /// back into a typed `Entity`. We re-encode `data` to CBOR bytes to
 /// preserve byte fidelity for hashing.
 fn decode_core_entity(value: &Value) -> Result<Entity, String> {
-    let m = value.as_map().ok_or_else(|| "entity not a map".to_string())?;
+    let m = value
+        .as_map()
+        .ok_or_else(|| "entity not a map".to_string())?;
     let mut etype: Option<String> = None;
     let mut edata: Option<Value> = None;
     for (k, v) in m {
@@ -604,4 +595,3 @@ fn hex_encode_hash(h: &Hash) -> String {
     }
     s
 }
-

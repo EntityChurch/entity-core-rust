@@ -17,10 +17,7 @@ use crate::shell::Shell;
 /// Verb-op (§8.1). List children at `prefix` (an absolute path —
 /// already alias-expanded by the dispatcher). Empty result becomes a
 /// single section with `(empty: <prefix>)` as the header.
-pub fn ls_op(
-    binding: &dyn PeerBinding,
-    prefix: &str,
-) -> Result<VerbOutput, ShellError> {
+pub fn ls_op(binding: &dyn PeerBinding, prefix: &str) -> Result<VerbOutput, ShellError> {
     let entries = binding.tree_listing(binding.peer_id(), prefix);
     if entries.is_empty() {
         return Ok(VerbOutput::Listing {
@@ -65,11 +62,21 @@ mod tests {
     }
 
     impl PeerBinding for StubBinding {
-        fn peer_id(&self) -> &str { &self.bound }
-        fn primary_peer_id(&self) -> String { self.bound.clone() }
-        fn peer_ids(&self) -> Vec<String> { vec![self.bound.clone()] }
-        fn connected_peers(&self) -> Vec<String> { Vec::new() }
-        fn peer_label(&self, _pid: &str) -> Option<String> { None }
+        fn peer_id(&self) -> &str {
+            &self.bound
+        }
+        fn primary_peer_id(&self) -> String {
+            self.bound.clone()
+        }
+        fn peer_ids(&self) -> Vec<String> {
+            vec![self.bound.clone()]
+        }
+        fn connected_peers(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn peer_label(&self, _pid: &str) -> Option<String> {
+            None
+        }
         fn tree_listing(&self, _pid: &str, prefix: &str) -> Vec<TreeListingEntry> {
             self.listing
                 .iter()

@@ -2,14 +2,9 @@
 //! the canonical path computed from its `properties.mode` / `kind`. Per
 //! EXTENSION-IDENTITY §6 + EXTENSION-ATTESTATION §6.1.
 
-use entity_attestation::{persist_attestation, AttestationData};
-use entity_ecf::{text, to_ecf, Value};
-use entity_entity::Entity;
-use entity_handler::{
-    HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST,
-};
 use crate::data::{
-    decode_map, field_hash, field_hash_opt, field_map, field_string, field_string_opt, field_u64_opt,
+    decode_map, field_hash, field_hash_opt, field_map, field_string, field_string_opt,
+    field_u64_opt,
 };
 use crate::handler::{
     create_attestation_result, create_attestation_result_embedded, error, IdentityHandler,
@@ -18,6 +13,10 @@ use crate::kinds::{
     is_valid_mode_for_function, valid_modes_for_function, Function, Mode, KIND_IDENTITY_CERT,
     KIND_IDENTITY_RETIREMENT, KIND_IDENTITY_ROTATION_HANDOFF, KIND_IDENTITY_ROTATION_RECOVERY,
 };
+use entity_attestation::{persist_attestation, AttestationData};
+use entity_ecf::{text, to_ecf, Value};
+use entity_entity::Entity;
+use entity_handler::{HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST};
 
 impl IdentityHandler {
     pub(crate) async fn handle_create_attestation(
@@ -130,7 +129,7 @@ impl IdentityHandler {
                     (text("function"), text(function_label)),
                     (
                         text("message"),
-                        text(&format!(
+                        text(format!(
                             "mode `{}` not valid for function `{}`",
                             attempted, function_label
                         )),
@@ -188,7 +187,8 @@ impl IdentityHandler {
 
         // Resolve storage path.
         let provided_path = self.resource_path(ctx);
-        let computed_path = self.compute_storage_path(&att, &kind, mode_str.as_deref(), contact_id.as_ref())?;
+        let computed_path =
+            self.compute_storage_path(&att, &kind, mode_str.as_deref(), contact_id.as_ref())?;
 
         let path = match (provided_path.as_deref(), computed_path.as_deref()) {
             (Some(p), Some(c)) if p == c => p.to_string(),
@@ -219,7 +219,9 @@ impl IdentityHandler {
                 // binding is created and no `attestation_hash` field is
                 // emitted (presence of the hash field signals "bound in
                 // tree" per Go's reference shape).
-                let entity = att.to_entity().map_err(|e| HandlerError::Internal(e.to_string()))?;
+                let entity = att
+                    .to_entity()
+                    .map_err(|e| HandlerError::Internal(e.to_string()))?;
                 let hash = entity.content_hash;
                 let entity_data = entity.data.clone();
                 if let Err(e) = self.content_store.put(entity) {

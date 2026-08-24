@@ -5,7 +5,8 @@
 use entity_ecf::Value;
 
 use crate::registry::{
-    ARGON2ID_VERSION, KDF_ID_ARGON2ID, // re-exported for callers; kept explicit
+    ARGON2ID_VERSION,
+    KDF_ID_ARGON2ID, // re-exported for callers; kept explicit
 };
 
 // §4–§11 entity-type names.

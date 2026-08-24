@@ -8,8 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use entity_capability::{
-    encode_grant_entry, CapabilityToken, GrantEntry, Granter, IdScope, PathScope,
-    ResourceTarget,
+    encode_grant_entry, CapabilityToken, GrantEntry, Granter, IdScope, PathScope, ResourceTarget,
 };
 use entity_crypto::Keypair;
 use entity_ecf::{text, to_ecf, Value};
@@ -21,12 +20,13 @@ use entity_store::{ContentStore, LocationIndex, MemoryContentStore, MemoryLocati
 use crate::data::{RoleAssignmentData, RoleData, RoleDerivedTokenLinkData, RoleExclusionData};
 use crate::handler::RoleHandler;
 use crate::paths::{
-    path_role_assignment, path_role_definition, path_role_derived_link,
-    path_role_exclusion, peer_segment_from_hash, prefix_role_derived_peer,
+    path_role_assignment, path_role_definition, path_role_derived_link, path_role_exclusion,
+    peer_segment_from_hash, prefix_role_derived_peer,
 };
 
 const TEST_SEED: [u8; 32] = [0x42; 32];
 
+#[allow(clippy::type_complexity)] // test fixture tuple; naming it adds nothing
 fn fixture() -> (
     Arc<RoleHandler>,
     Arc<dyn ContentStore>,
@@ -162,11 +162,7 @@ fn build_ctx(
 /// subtree), not as siblings here — so this prefix holds caps + linkage
 /// entities; we count the caps. Cap removal also unbinds the invariant
 /// sig (`revoke_via_linkage` / sweep paths).
-fn count_caps(
-    li: &Arc<dyn LocationIndex>,
-    cs: &Arc<dyn ContentStore>,
-    prefix: &str,
-) -> usize {
+fn count_caps(li: &Arc<dyn LocationIndex>, cs: &Arc<dyn ContentStore>, prefix: &str) -> usize {
     li.list(prefix)
         .iter()
         .filter(|e| {
@@ -219,7 +215,11 @@ async fn assign_writes_assignment_and_derives_token_with_real_grantee() {
     );
 
     let result = handler.handle(&ctx).await.unwrap();
-    assert_eq!(result.status, STATUS_OK, "expected 200, got {}", result.status);
+    assert_eq!(
+        result.status, STATUS_OK,
+        "expected 200, got {}",
+        result.status
+    );
 
     // Assignment entity is bound at the expected path.
     let assignment_hash = li.get(&assignment_path).expect("assignment bound");
@@ -306,7 +306,14 @@ async fn assign_returns_404_when_role_not_defined() {
 #[tokio::test]
 async fn assign_rejects_malformed_assignee_segment() {
     let (handler, cs, li, pid, identity_hash) = fixture();
-    put_role_definition(&cs, &li, &pid, "admin", "operator", vec![shared_template_grant()]);
+    put_role_definition(
+        &cs,
+        &li,
+        &pid,
+        "admin",
+        "operator",
+        vec![shared_template_grant()],
+    );
     // Garbage hex segment that isn't a valid hash.
     let path = format!(
         "/{}/system/role/admin/assignment/notreallyhex/operator",
@@ -327,7 +334,14 @@ async fn assign_rejects_malformed_assignee_segment() {
 #[tokio::test]
 async fn assign_rejected_when_role_path_mismatches_params() {
     let (handler, cs, li, pid, identity_hash) = fixture();
-    put_role_definition(&cs, &li, &pid, "admin", "operator", vec![shared_template_grant()]);
+    put_role_definition(
+        &cs,
+        &li,
+        &pid,
+        "admin",
+        "operator",
+        vec![shared_template_grant()],
+    );
     let (_, alice_seg) = make_assignee(&cs, 0xA3);
     let path = format!(
         "/{}/{}",
@@ -390,7 +404,14 @@ async fn assign_rl2_fails_closed_when_caller_authority_insufficient() {
 #[tokio::test]
 async fn assign_rejected_when_caller_capability_missing() {
     let (handler, cs, li, pid, identity_hash) = fixture();
-    put_role_definition(&cs, &li, &pid, "admin", "operator", vec![shared_template_grant()]);
+    put_role_definition(
+        &cs,
+        &li,
+        &pid,
+        "admin",
+        "operator",
+        vec![shared_template_grant()],
+    );
     let (_, alice_seg) = make_assignee(&cs, 0xA5);
     let path = format!(
         "/{}/{}",
@@ -449,7 +470,14 @@ async fn assign_blocked_by_layer2_exclusion() {
 #[tokio::test]
 async fn unassign_removes_assignment_and_revokes_via_linkage() {
     let (handler, cs, li, pid, identity_hash) = fixture();
-    put_role_definition(&cs, &li, &pid, "admin", "operator", vec![shared_template_grant()]);
+    put_role_definition(
+        &cs,
+        &li,
+        &pid,
+        "admin",
+        "operator",
+        vec![shared_template_grant()],
+    );
     let (_, alice_seg) = make_assignee(&cs, 0xA7);
     let assignment_path = format!(
         "/{}/{}",
@@ -545,9 +573,11 @@ async fn exclude_writes_exclusion_no_peer_id_field_and_sweeps_tokens() {
         .await
         .unwrap();
     assert_eq!(result.status, STATUS_OK);
-    assert!(li.list(&derived_prefix).is_empty(),
+    assert!(
+        li.list(&derived_prefix).is_empty(),
         "exclude broad sweep removes the role-derived cap (its invariant \
-         pointer sig is unbound separately, V7 §3.5 v7.44)");
+         pointer sig is unbound separately, V7 §3.5 v7.44)"
+    );
 
     // SI-3: exclusion entity has no peer_id body field.
     let exclusion_hash = li.get(&exclusion_path).unwrap();
@@ -585,7 +615,14 @@ async fn unexclude_removes_entity_does_not_restore_tokens() {
 #[tokio::test]
 async fn multi_role_per_peer_creates_distinct_assignments() {
     let (handler, cs, li, pid, identity_hash) = fixture();
-    put_role_definition(&cs, &li, &pid, "admin", "operator", vec![shared_template_grant()]);
+    put_role_definition(
+        &cs,
+        &li,
+        &pid,
+        "admin",
+        "operator",
+        vec![shared_template_grant()],
+    );
     // Different grants for auditor so the resolved cap hashes differ
     // (otherwise content-addressed dedup would collapse them — correct
     // V7 behavior, but obscures the multi-role assertion).
@@ -646,8 +683,11 @@ async fn multi_role_per_peer_creates_distinct_assignments() {
 
     // Both linkage entities must be present (one per role).
     for role in ["operator", "auditor"] {
-        let link_path =
-            format!("/{}/{}", pid, path_role_derived_link("admin", &alice_seg, role));
+        let link_path = format!(
+            "/{}/{}",
+            pid,
+            path_role_derived_link("admin", &alice_seg, role)
+        );
         assert!(li.get(&link_path).is_some(), "linkage for {} missing", role);
     }
 }
@@ -655,7 +695,14 @@ async fn multi_role_per_peer_creates_distinct_assignments() {
 #[tokio::test]
 async fn unassign_role_omitted_form_removes_all_roles_for_peer() {
     let (handler, cs, li, pid, identity_hash) = fixture();
-    put_role_definition(&cs, &li, &pid, "admin", "operator", vec![shared_template_grant()]);
+    put_role_definition(
+        &cs,
+        &li,
+        &pid,
+        "admin",
+        "operator",
+        vec![shared_template_grant()],
+    );
     put_role_definition(
         &cs,
         &li,
@@ -666,7 +713,11 @@ async fn unassign_role_omitted_form_removes_all_roles_for_peer() {
     );
     let (_, alice_seg) = make_assignee(&cs, 0xA9);
     for role in ["operator", "auditor"] {
-        let p = format!("/{}/{}", pid, path_role_assignment("admin", &alice_seg, role));
+        let p = format!(
+            "/{}/{}",
+            pid,
+            path_role_assignment("admin", &alice_seg, role)
+        );
         handler
             .handle(&build_ctx(
                 "assign",
@@ -679,10 +730,7 @@ async fn unassign_role_omitted_form_removes_all_roles_for_peer() {
             .await
             .unwrap();
     }
-    let all_roles_path = format!(
-        "/{}/system/role/admin/assignment/{}",
-        pid, alice_seg
-    );
+    let all_roles_path = format!("/{}/system/role/admin/assignment/{}", pid, alice_seg);
     let result = handler
         .handle(&build_ctx(
             "unassign",
@@ -696,7 +744,11 @@ async fn unassign_role_omitted_form_removes_all_roles_for_peer() {
         .unwrap();
     assert_eq!(result.status, STATUS_OK);
     for role in ["operator", "auditor"] {
-        let p = format!("/{}/{}", pid, path_role_assignment("admin", &alice_seg, role));
+        let p = format!(
+            "/{}/{}",
+            pid,
+            path_role_assignment("admin", &alice_seg, role)
+        );
         assert!(li.get(&p).is_none(), "assignment {} still present", role);
     }
     let prefix = format!("/{}/{}", pid, prefix_role_derived_peer("admin", &alice_seg));
@@ -799,7 +851,11 @@ async fn define_cascades_re_derive_for_existing_assignees() {
     );
     let assignees: Vec<(Hash, String)> = (0..2).map(|i| make_assignee(&cs, 0xB0 + i)).collect();
     for (_, seg) in &assignees {
-        let p = format!("/{}/{}", pid, path_role_assignment("admin", seg, "operator"));
+        let p = format!(
+            "/{}/{}",
+            pid,
+            path_role_assignment("admin", seg, "operator")
+        );
         handler
             .handle(&build_ctx(
                 "assign",
@@ -829,7 +885,11 @@ async fn define_cascades_re_derive_for_existing_assignees() {
 
     for (_, seg) in &assignees {
         let prefix = format!("/{}/{}", pid, prefix_role_derived_peer("admin", seg));
-        assert_eq!(count_caps(&li, &cs, &prefix), 1, "single token after re-derive cascade");
+        assert_eq!(
+            count_caps(&li, &cs, &prefix),
+            1,
+            "single token after re-derive cascade"
+        );
         let entries = li.list(&prefix);
         let cap_entry = entries
             .iter()
@@ -855,11 +915,22 @@ async fn define_cascades_re_derive_for_existing_assignees() {
 #[tokio::test]
 async fn re_derive_skips_excluded_assignees() {
     let (handler, cs, li, pid, identity_hash) = fixture();
-    put_role_definition(&cs, &li, &pid, "admin", "operator", vec![shared_template_grant()]);
+    put_role_definition(
+        &cs,
+        &li,
+        &pid,
+        "admin",
+        "operator",
+        vec![shared_template_grant()],
+    );
     let (_, alice_seg) = make_assignee(&cs, 0xC1);
     let (_, bob_seg) = make_assignee(&cs, 0xC2);
     for seg in [&alice_seg, &bob_seg] {
-        let p = format!("/{}/{}", pid, path_role_assignment("admin", seg, "operator"));
+        let p = format!(
+            "/{}/{}",
+            pid,
+            path_role_assignment("admin", seg, "operator")
+        );
         handler
             .handle(&build_ctx(
                 "assign",
@@ -949,10 +1020,7 @@ fn delegate_params(
     let scope_arr: Vec<Value> = scope.iter().map(encode_grant_entry).collect();
     let mut fields = vec![
         (text("context"), text(context)),
-        (
-            text("delegate"),
-            Value::Bytes(delegate.to_bytes().to_vec()),
-        ),
+        (text("delegate"), Value::Bytes(delegate.to_bytes().to_vec())),
         (text("role"), text(role)),
         (text("scope"), Value::Array(scope_arr)),
     ];
@@ -1016,7 +1084,11 @@ async fn delegate_issues_subset_cap_rooted_at_local_peer() {
         identity_hash,
     );
     let result = handler.handle(&ctx).await.unwrap();
-    assert_eq!(result.status, STATUS_OK, "delegate failed: {}", result.status);
+    assert_eq!(
+        result.status, STATUS_OK,
+        "delegate failed: {}",
+        result.status
+    );
 
     let prefix = format!(
         "/{}/{}",
@@ -1039,7 +1111,10 @@ async fn delegate_issues_subset_cap_rooted_at_local_peer() {
         _ => panic!("expected single-sig granter"),
     }
     assert_eq!(token.grantee, carol_hash);
-    assert!(token.parent.is_some(), "delegation cap parent must be linkage cap");
+    assert!(
+        token.parent.is_some(),
+        "delegation cap parent must be linkage cap"
+    );
     assert_eq!(token.grants[0].operations.include, vec!["get".to_string()]);
 
     // v7.44: delegation cap sig at the invariant pointer path (no sibling).
@@ -1057,7 +1132,14 @@ async fn delegate_issues_subset_cap_rooted_at_local_peer() {
 #[tokio::test]
 async fn delegate_locality_invariant_rejects_remote_caller() {
     let (handler, cs, li, pid, identity_hash) = fixture();
-    put_role_definition(&cs, &li, &pid, "admin", "operator", vec![shared_template_grant()]);
+    put_role_definition(
+        &cs,
+        &li,
+        &pid,
+        "admin",
+        "operator",
+        vec![shared_template_grant()],
+    );
     let local_seg = peer_segment_from_hash(&identity_hash);
     let assignment_path = format!(
         "/{}/{}",
@@ -1099,7 +1181,14 @@ async fn delegate_locality_invariant_rejects_remote_caller() {
 #[tokio::test]
 async fn delegate_rejected_when_delegator_does_not_hold_role() {
     let (handler, cs, li, pid, identity_hash) = fixture();
-    put_role_definition(&cs, &li, &pid, "admin", "operator", vec![shared_template_grant()]);
+    put_role_definition(
+        &cs,
+        &li,
+        &pid,
+        "admin",
+        "operator",
+        vec![shared_template_grant()],
+    );
     // Local peer (delegator) does NOT have an assignment.
     let (carol_hash, _) = make_assignee(&cs, 0xC5);
     // SI-20: scope must be literal (no `{context}` substrings).
@@ -1184,7 +1273,14 @@ async fn delegate_rejected_when_scope_amplifies_delegator_authority() {
 #[tokio::test]
 async fn delegate_rejected_when_delegate_excluded() {
     let (handler, cs, li, pid, identity_hash) = fixture();
-    put_role_definition(&cs, &li, &pid, "admin", "operator", vec![shared_template_grant()]);
+    put_role_definition(
+        &cs,
+        &li,
+        &pid,
+        "admin",
+        "operator",
+        vec![shared_template_grant()],
+    );
     let local_seg = peer_segment_from_hash(&identity_hash);
     let assignment_path = format!(
         "/{}/{}",
@@ -1205,8 +1301,7 @@ async fn delegate_rejected_when_delegate_excluded() {
     let (carol_hash, carol_seg) = make_assignee(&cs, 0xC7);
     // Pre-exclude carol.
     let dummy = Hash::compute("system/role/exclusion", b"x");
-    let exclusion_path =
-        format!("/{}/{}", pid, path_role_exclusion("admin", &carol_seg));
+    let exclusion_path = format!("/{}/{}", pid, path_role_exclusion("admin", &carol_seg));
     li.set(&exclusion_path, dummy);
 
     // SI-20: scope must be literal.
@@ -1233,7 +1328,14 @@ async fn delegate_rejected_when_delegate_excluded() {
 #[tokio::test]
 async fn delegate_rejected_when_scope_contains_template() {
     let (handler, cs, li, pid, identity_hash) = fixture();
-    put_role_definition(&cs, &li, &pid, "admin", "operator", vec![shared_template_grant()]);
+    put_role_definition(
+        &cs,
+        &li,
+        &pid,
+        "admin",
+        "operator",
+        vec![shared_template_grant()],
+    );
     let local_seg = peer_segment_from_hash(&identity_hash);
     let assignment_path = format!(
         "/{}/{}",
@@ -1264,7 +1366,10 @@ async fn delegate_rejected_when_scope_contains_template() {
         identity_hash,
     );
     let result = handler.handle(&ctx).await.unwrap();
-    assert_eq!(result.status, 400, "SI-20: scope_must_be_literal returns 400");
+    assert_eq!(
+        result.status, 400,
+        "SI-20: scope_must_be_literal returns 400"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1283,11 +1388,22 @@ async fn delegate_rejected_when_scope_contains_template() {
 #[tokio::test]
 async fn re_derive_does_not_abort_cascade_when_some_assignees_skipped() {
     let (handler, cs, li, pid, identity_hash) = fixture();
-    put_role_definition(&cs, &li, &pid, "admin", "operator", vec![shared_template_grant()]);
+    put_role_definition(
+        &cs,
+        &li,
+        &pid,
+        "admin",
+        "operator",
+        vec![shared_template_grant()],
+    );
     let (_, alice_seg) = make_assignee(&cs, 0xE1);
     let (_, bob_seg) = make_assignee(&cs, 0xE2);
     for seg in [&alice_seg, &bob_seg] {
-        let p = format!("/{}/{}", pid, path_role_assignment("admin", seg, "operator"));
+        let p = format!(
+            "/{}/{}",
+            pid,
+            path_role_assignment("admin", seg, "operator")
+        );
         handler
             .handle(&build_ctx(
                 "assign",
@@ -1321,10 +1437,18 @@ async fn re_derive_does_not_abort_cascade_when_some_assignees_skipped() {
         ))
         .await
         .unwrap();
-    assert_eq!(result.status, STATUS_OK, "v1.7 SI-15: cascade MUST NOT abort");
+    assert_eq!(
+        result.status, STATUS_OK,
+        "v1.7 SI-15: cascade MUST NOT abort"
+    );
     for seg in [&alice_seg, &bob_seg] {
         let prefix = format!("/{}/{}", pid, prefix_role_derived_peer("admin", seg));
-        assert_eq!(count_caps(&li, &cs, &prefix), 1, "{} got their re-derived cap", seg);
+        assert_eq!(
+            count_caps(&li, &cs, &prefix),
+            1,
+            "{} got their re-derived cap",
+            seg
+        );
     }
 }
 
@@ -1337,7 +1461,14 @@ async fn re_derive_does_not_abort_cascade_when_some_assignees_skipped() {
 #[tokio::test]
 async fn role_derived_cap_has_invariant_signature_binding() {
     let (handler, cs, li, pid, identity_hash) = fixture();
-    put_role_definition(&cs, &li, &pid, "admin", "operator", vec![shared_template_grant()]);
+    put_role_definition(
+        &cs,
+        &li,
+        &pid,
+        "admin",
+        "operator",
+        vec![shared_template_grant()],
+    );
     let (_, alice_seg) = make_assignee(&cs, 0xE3);
     let assignment_path = format!(
         "/{}/{}",
@@ -1385,7 +1516,14 @@ async fn role_derived_cap_has_invariant_signature_binding() {
 #[tokio::test]
 async fn issued_cap_inherits_caller_expires_at() {
     let (handler, cs, li, pid, identity_hash) = fixture();
-    put_role_definition(&cs, &li, &pid, "admin", "operator", vec![shared_template_grant()]);
+    put_role_definition(
+        &cs,
+        &li,
+        &pid,
+        "admin",
+        "operator",
+        vec![shared_template_grant()],
+    );
     let (_, alice_seg) = make_assignee(&cs, 0xE4);
     let assignment_path = format!(
         "/{}/{}",
@@ -1422,13 +1560,14 @@ async fn issued_cap_inherits_caller_expires_at() {
         })
         .unwrap();
     let token = CapabilityToken::from_entity(&cs.get(&cap_entry.hash).unwrap()).unwrap();
-    let exp = token.expires_at.expect(
-        "v1.7 §5.3: cap MUST have finite expires_at when caller cap is finite (not nil)",
-    );
+    let exp = token
+        .expires_at
+        .expect("v1.7 §5.3: cap MUST have finite expires_at when caller cap is finite (not nil)");
     assert!(
         exp <= caller_expires,
         "v1.7 §5.3 MIN_DEFINED: cap.expires_at ({}) MUST NOT exceed caller.expires_at ({})",
-        exp, caller_expires
+        exp,
+        caller_expires
     );
 }
 
@@ -1581,11 +1720,7 @@ async fn pr2_tv_rd_race_ae_assign_vs_exclude_atomicity() {
             pid,
             path_role_assignment("race-ctx", &alice_seg, "operator")
         );
-        let exclusion_path = format!(
-            "/{}/{}",
-            pid,
-            path_role_exclusion("race-ctx", &alice_seg)
-        );
+        let exclusion_path = format!("/{}/{}", pid, path_role_exclusion("race-ctx", &alice_seg));
         let cap_prefix = format!(
             "/{}/{}",
             pid,
@@ -1822,8 +1957,7 @@ async fn unknown_op_returns_400() {
 mod policy_tests {
     use super::*;
     use crate::data::{
-        RoleInitialGrantPolicyData, MODE_ANONYMOUS_ALLOW,
-        MODE_RECOGNIZE_ON_ATTESTATION,
+        RoleInitialGrantPolicyData, MODE_ANONYMOUS_ALLOW, MODE_RECOGNIZE_ON_ATTESTATION,
     };
     use crate::policy::{resolve_grants, PolicyResolverDeps};
     use entity_attestation::{AttestationData, AttestationIndex};

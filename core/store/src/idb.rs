@@ -662,9 +662,7 @@ async fn replay(
     locations: &MemoryLocationIndex,
 ) -> Result<(), IdbError> {
     let store_names = js_sys::Array::of2(&STORE_ENTITIES.into(), &STORE_LOCATIONS.into());
-    let txn = db
-        .transaction_with_str_sequence(&store_names)
-        .map_err(io)?;
+    let txn = db.transaction_with_str_sequence(&store_names).map_err(io)?;
 
     // entities
     let es = txn.object_store(STORE_ENTITIES).map_err(io)?;

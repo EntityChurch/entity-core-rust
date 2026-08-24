@@ -22,12 +22,10 @@ pub use cache::{SignerSet, SignerSetCache};
 pub use data::{hex_segment, path_quorum, path_quorum_event, QuorumData};
 pub use handler::QuorumHandler;
 pub use helpers::{
-    current_signer_set, current_signer_set_as_of, is_quorum_id, verify_k_of_n_signatures,
-    QuorumCtx,
+    current_signer_set, current_signer_set_as_of, is_quorum_id, verify_k_of_n_signatures, QuorumCtx,
 };
 pub use resolver::{
-    RegisterError, ResolverContext, ResolverError, ResolverFn, ResolverRegistry,
-    MAX_RESOLVER_DEPTH,
+    RegisterError, ResolverContext, ResolverError, ResolverFn, ResolverRegistry, MAX_RESOLVER_DEPTH,
 };
 
 use thiserror::Error;

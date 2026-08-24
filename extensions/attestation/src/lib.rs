@@ -19,7 +19,6 @@ mod tests;
 
 pub use data::{hex_segment, AttestationData};
 pub use handler::{persist_attestation, AttestationHandler};
-pub use hook::AttestationIndexHook;
 pub use helpers::{
     default_find_authorizing, find_attestations_by, find_attestations_targeting,
     find_attestations_with_kind, find_attestations_with_supersedes, find_live_head,
@@ -27,6 +26,7 @@ pub use helpers::{
     verify_specific_signer, walk_attesting_chain, walk_attesting_chain_default,
     walk_supersedes_chain, AttestationCtx,
 };
+pub use hook::AttestationIndexHook;
 pub use index::AttestationIndex;
 
 use thiserror::Error;

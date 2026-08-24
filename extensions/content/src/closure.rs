@@ -220,11 +220,9 @@ fn build_get_request(hashes: &[Hash]) -> Entity {
     let data = to_ecf(&cbor_map! {
         "hashes" => Value::Array(arr)
     });
-    Entity::new("system/content/get-request", data)
-        .expect("get-request type is valid")
+    Entity::new("system/content/get-request", data).expect("get-request type is valid")
 }
 
 fn hash_to_bstr(h: &Hash) -> Value {
     Value::Bytes(h.to_bytes())
 }
-

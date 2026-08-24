@@ -45,12 +45,8 @@ impl EntityData {
             Ok(h) => h,
             Err(_) => return false,
         };
-        entity_hash::Hash::validate(
-            &self.entity_type.to_string(),
-            &self.data.to_vec(),
-            &claimed,
-        )
-        .is_ok()
+        entity_hash::Hash::validate(&self.entity_type.to_string(), &self.data.to_vec(), &claimed)
+            .is_ok()
     }
 }
 

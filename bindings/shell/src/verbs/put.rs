@@ -56,7 +56,11 @@ pub fn put(
     let target = path::resolve(shell.wd(), path_arg);
     let params_text = if args.len() > 2 {
         let joined = args[2..].join(" ");
-        if joined.trim().is_empty() { None } else { Some(joined) }
+        if joined.trim().is_empty() {
+            None
+        } else {
+            Some(joined)
+        }
     } else {
         None
     };
@@ -76,15 +80,27 @@ mod tests {
     }
 
     impl PeerBinding for StubBinding {
-        fn peer_id(&self) -> &str { &self.bound }
-        fn primary_peer_id(&self) -> String { self.bound.clone() }
-        fn peer_ids(&self) -> Vec<String> { vec![self.bound.clone()] }
-        fn connected_peers(&self) -> Vec<String> { Vec::new() }
-        fn peer_label(&self, _pid: &str) -> Option<String> { None }
+        fn peer_id(&self) -> &str {
+            &self.bound
+        }
+        fn primary_peer_id(&self) -> String {
+            self.bound.clone()
+        }
+        fn peer_ids(&self) -> Vec<String> {
+            vec![self.bound.clone()]
+        }
+        fn connected_peers(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn peer_label(&self, _pid: &str) -> Option<String> {
+            None
+        }
         fn tree_listing(&self, _pid: &str, _prefix: &str) -> Vec<TreeListingEntry> {
             Vec::new()
         }
-        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> { None }
+        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> {
+            None
+        }
         fn put_entity(
             &self,
             _pid: &str,
@@ -92,19 +108,23 @@ mod tests {
             entity_type: &str,
             params_text: Option<String>,
         ) -> Result<(), String> {
-            if let Some(e) = &self.err { return Err(e.clone()); }
-            self.writes.borrow_mut().push((
-                path.to_string(),
-                entity_type.to_string(),
-                params_text,
-            ));
+            if let Some(e) = &self.err {
+                return Err(e.clone());
+            }
+            self.writes
+                .borrow_mut()
+                .push((path.to_string(), entity_type.to_string(), params_text));
             Ok(())
         }
     }
 
     #[test]
     fn too_few_args_returns_usage() {
-        let b = StubBinding { bound: "alice".into(), writes: RefCell::new(Vec::new()), err: None };
+        let b = StubBinding {
+            bound: "alice".into(),
+            writes: RefCell::new(Vec::new()),
+            err: None,
+        };
         let shell = Shell::with_wd("alice", "/alice/");
         let err = put(&shell, &["only-path"], &b).unwrap_err();
         assert_eq!(err.code, crate::result::ErrorCode::Usage);
@@ -112,7 +132,11 @@ mod tests {
 
     #[test]
     fn writes_entity_and_returns_message() {
-        let b = StubBinding { bound: "alice".into(), writes: RefCell::new(Vec::new()), err: None };
+        let b = StubBinding {
+            bound: "alice".into(),
+            writes: RefCell::new(Vec::new()),
+            err: None,
+        };
         let shell = Shell::with_wd("alice", "/alice/");
         let result = put(&shell, &["notes/today", "app/note"], &b).unwrap();
         assert!(matches!(result, VerbOutput::Message(ref m) if m.contains("/alice/notes/today")));
@@ -125,7 +149,11 @@ mod tests {
 
     #[test]
     fn forwards_json_body_to_binding() {
-        let b = StubBinding { bound: "alice".into(), writes: RefCell::new(Vec::new()), err: None };
+        let b = StubBinding {
+            bound: "alice".into(),
+            writes: RefCell::new(Vec::new()),
+            err: None,
+        };
         let shell = Shell::with_wd("alice", "/alice/");
         put(&shell, &["x", "t", "{\"k\":1}"], &b).unwrap();
         let writes = b.writes.borrow();
@@ -146,7 +174,11 @@ mod tests {
 
     #[test]
     fn put_op_writes_at_resolved_target() {
-        let b = StubBinding { bound: "alice".into(), writes: RefCell::new(Vec::new()), err: None };
+        let b = StubBinding {
+            bound: "alice".into(),
+            writes: RefCell::new(Vec::new()),
+            err: None,
+        };
         put_op(&b, "/alice/notes/today", "app/note", None).unwrap();
         let writes = b.writes.borrow();
         assert_eq!(writes[0].0, "/alice/notes/today");

@@ -13,9 +13,7 @@
 
 use std::sync::Arc;
 
-use entity_store::{
-    CascadeHalt, ContentStore, ExecutionContext, SyncTreeHook, TreeChangeEvent,
-};
+use entity_store::{CascadeHalt, ContentStore, ExecutionContext, SyncTreeHook, TreeChangeEvent};
 use entity_types::TYPE_ATTESTATION;
 
 use crate::data::AttestationData;

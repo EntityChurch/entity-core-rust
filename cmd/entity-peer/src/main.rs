@@ -11,6 +11,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // clap CLI enum: one value at a time, size is irrelevant
 enum Commands {
     /// Manage identity keypairs
     Identity {
@@ -279,12 +280,9 @@ async fn main() -> anyhow::Result<()> {
                     admin,
                     admin_key,
                     key_type,
-                } => commands::peer::init(
-                    &name,
-                    admin.as_deref(),
-                    admin_key.as_deref(),
-                    &key_type,
-                )?,
+                } => {
+                    commands::peer::init(&name, admin.as_deref(), admin_key.as_deref(), &key_type)?
+                }
                 PeerAction::Start {
                     name,
                     listen,

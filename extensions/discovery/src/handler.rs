@@ -89,7 +89,13 @@ impl DiscoveryHandler {
 
         let observations = match backend.scan(filter).await {
             Ok(o) => o,
-            Err(e) => return error(entity_handler::STATUS_UNAVAILABLE, "backend_error", &e.to_string()),
+            Err(e) => {
+                return error(
+                    entity_handler::STATUS_UNAVAILABLE,
+                    "backend_error",
+                    &e.to_string(),
+                )
+            }
         };
 
         // §3.1 ceiling: truncate to the bound, dropping the overflow from this
@@ -117,7 +123,11 @@ impl DiscoveryHandler {
             match self.write_candidate(&backend_name, obs, now) {
                 Ok(h) => hashes.push(h),
                 Err(e) => {
-                    return error(entity_handler::STATUS_INTERNAL_ERROR, "candidate_write_failed", &e)
+                    return error(
+                        entity_handler::STATUS_INTERNAL_ERROR,
+                        "candidate_write_failed",
+                        &e,
+                    )
                 }
             }
         }
@@ -150,10 +160,7 @@ impl DiscoveryHandler {
             supersedes: None,
         };
         let entity = candidate.to_entity().map_err(|e| e.to_string())?;
-        let hash = self
-            .content_store
-            .put(entity)
-            .map_err(|e| e.to_string())?;
+        let hash = self.content_store.put(entity).map_err(|e| e.to_string())?;
         let path = candidate_path(&self.peer_id, backend, &hash.to_hex());
         self.location_index.set(&path, hash);
         Ok(hash)
@@ -193,9 +200,16 @@ impl DiscoveryHandler {
         match backend.announce(&params).await {
             Ok(()) => status_result(vec![
                 (entity_ecf::text("announced"), Value::Bool(true)),
-                (entity_ecf::text("profile_ref"), entity_ecf::text(&profile_ref)),
+                (
+                    entity_ecf::text("profile_ref"),
+                    entity_ecf::text(&profile_ref),
+                ),
             ]),
-            Err(e) => error(entity_handler::STATUS_UNAVAILABLE, "backend_error", &e.to_string()),
+            Err(e) => error(
+                entity_handler::STATUS_UNAVAILABLE,
+                "backend_error",
+                &e.to_string(),
+            ),
         }
     }
 
@@ -221,7 +235,11 @@ impl DiscoveryHandler {
         };
         match backend.announce_stop(&profile_ref).await {
             Ok(()) => status_result(vec![(entity_ecf::text("stopped"), Value::Bool(true))]),
-            Err(e) => error(entity_handler::STATUS_UNAVAILABLE, "backend_error", &e.to_string()),
+            Err(e) => error(
+                entity_handler::STATUS_UNAVAILABLE,
+                "backend_error",
+                &e.to_string(),
+            ),
         }
     }
 }
@@ -268,7 +286,8 @@ fn now_ms() -> i64 {
 
 fn decode_map(data: &[u8]) -> Result<Vec<(Value, Value)>, String> {
     let v: Value = ciborium::from_reader(data).map_err(|e| e.to_string())?;
-    v.into_map().map_err(|_| "expected CBOR map params".to_string())
+    v.into_map()
+        .map_err(|_| "expected CBOR map params".to_string())
 }
 
 fn field_text(map: &[(Value, Value)], key: &str) -> Option<String> {

@@ -36,8 +36,8 @@ fn verify_peer_data_sig(
     message: &[u8],
     signature: &[u8],
 ) -> Result<(), ProtocolError> {
-    let kt = KeyType::from_label(&id.key_type)
-        .map_err(|e| ProtocolError::Invalid(e.to_string()))?;
+    let kt =
+        KeyType::from_label(&id.key_type).map_err(|e| ProtocolError::Invalid(e.to_string()))?;
     verify_for_key_type(kt, &id.public_key, message, signature)
         .map_err(|_| ProtocolError::InvalidSignature)
 }
@@ -117,9 +117,9 @@ pub fn verify_request(
 
     // 3. Find and verify signature. §5.2 step-2 is authentication (401),
     //    distinct from the step-3+ capability-chain signature checks (403).
-    let sig_entity = envelope
-        .find_signature_for(&execute.content_hash)
-        .ok_or(ProtocolError::AuthenticationFailed("missing execute signature"))?;
+    let sig_entity = envelope.find_signature_for(&execute.content_hash).ok_or(
+        ProtocolError::AuthenticationFailed("missing execute signature"),
+    )?;
 
     let sig_data = SignatureData::from_entity(sig_entity)
         .map_err(|e| ProtocolError::Invalid(e.to_string()))?;
@@ -132,18 +132,19 @@ pub fn verify_request(
     }
 
     // 4. Verify author identity exists and signature is valid
-    let author_entity = envelope
-        .find_included(&author_hash)
-        .ok_or(ProtocolError::AuthenticationFailed(
-            "author identity not in included",
-        ))?;
+    let author_entity =
+        envelope
+            .find_included(&author_hash)
+            .ok_or(ProtocolError::AuthenticationFailed(
+                "author identity not in included",
+            ))?;
 
     if author_entity.entity_type != TYPE_PEER {
         return Err(ProtocolError::Invalid("author is not system/peer".into()));
     }
 
-    let author_identity = PeerData::from_entity(author_entity)
-        .map_err(|e| ProtocolError::Invalid(e.to_string()))?;
+    let author_identity =
+        PeerData::from_entity(author_entity).map_err(|e| ProtocolError::Invalid(e.to_string()))?;
 
     verify_peer_data_sig(
         &author_identity,
@@ -245,7 +246,10 @@ pub struct VerifyContext<'a> {
 
 impl<'a> VerifyContext<'a> {
     pub fn new(local_peer_id: &'a str) -> Self {
-        Self { local_peer_id, supports_revocation: false }
+        Self {
+            local_peer_id,
+            supports_revocation: false,
+        }
     }
 
     pub fn with_revocation(mut self, on: bool) -> Self {
@@ -373,7 +377,6 @@ where
     }
 }
 
-
 /// Determine whether a capability chain is **operator-class** with respect
 /// to a target path family per GUIDE-CAPABILITIES §10 (v1.2.1 Ruling 1).
 ///
@@ -434,17 +437,13 @@ where
             Ok(t) => t,
             Err(_) => return false,
         };
-        if !token
-            .grants
-            .iter()
-            .any(|grant| {
-                grant
-                    .resources
-                    .include
-                    .iter()
-                    .any(|pat| explicitly_enumerates(pat, target_pattern))
-            })
-        {
+        if !token.grants.iter().any(|grant| {
+            grant
+                .resources
+                .include
+                .iter()
+                .any(|pat| explicitly_enumerates(pat, target_pattern))
+        }) {
             return false;
         }
     }
@@ -754,7 +753,10 @@ where
     // Strip fields for the public result — preserves the existing
     // `CreatorAuthorityResult.chain: Vec<Entity>` shape used by extensions.
     let chain_entities = chain.into_iter().map(|(e, _)| e).collect();
-    Ok(CreatorAuthorityResult { found, chain: chain_entities })
+    Ok(CreatorAuthorityResult {
+        found,
+        chain: chain_entities,
+    })
 }
 
 /// Verify a capability chain back to a root capability (§5.5).
@@ -774,11 +776,12 @@ pub fn verify_capability_chain(
 ) -> Result<(), ProtocolError> {
     // 1. Collect the full chain. Reachability errors fire here, before any
     //    per-level validation runs. Fields are decoded once during the walk.
-    let chain = collect_authority_chain(capability_hash, |h| included.get(h).cloned())
-        .map_err(|e| match e {
+    let chain = collect_authority_chain(capability_hash, |h| included.get(h).cloned()).map_err(
+        |e| match e {
             ChainWalkError::TooDeep => ProtocolError::ChainTooDeep,
             ChainWalkError::Unreachable => ProtocolError::MissingEntity("capability in chain"),
-        })?;
+        },
+    )?;
 
     // 1b. V7 §5.5 v7.66 cap-chain format-code freeze (Reading A). All
     //     chain links MUST share the same `content_hash_format` for the
@@ -875,8 +878,9 @@ pub fn verify_capability_chain(
         match &fields.granter {
             // ---------- Single-sig path (V7 §5.5, unchanged) ----------
             Granter::Single(granter_id) => {
-                let sig = entity_entity::find_signature_for_target(included.values(), &current_hash)
-                    .ok_or(ProtocolError::MissingSignature)?;
+                let sig =
+                    entity_entity::find_signature_for_target(included.values(), &current_hash)
+                        .ok_or(ProtocolError::MissingSignature)?;
                 let sig_data = SignatureData::from_entity(sig)
                     .map_err(|e| ProtocolError::Invalid(e.to_string()))?;
                 if sig_data.signer != *granter_id {
@@ -919,9 +923,9 @@ pub fn verify_capability_chain(
                         .unwrap_or_else(|| local_peer_id.to_string());
                     let parent_granter_peer_id = match &parent_fields.granter {
                         Granter::Single(parent_granter_id) => {
-                            let pe = included.get(parent_granter_id).ok_or(
-                                ProtocolError::MissingEntity("parent granter identity"),
-                            )?;
+                            let pe = included
+                                .get(parent_granter_id)
+                                .ok_or(ProtocolError::MissingEntity("parent granter identity"))?;
                             PeerData::from_entity(pe)
                                 .map_err(|e| ProtocolError::Invalid(e.to_string()))?
                                 .canonical_peer_id()
@@ -992,9 +996,8 @@ pub fn verify_capability_chain(
                         Some(e) => e,
                         None => continue,
                     };
-                    let candidate_identity = match PeerData::from_entity(
-                        candidate_identity_entity,
-                    ) {
+                    let candidate_identity = match PeerData::from_entity(candidate_identity_entity)
+                    {
                         Ok(i) => i,
                         Err(_) => continue,
                     };
@@ -1020,11 +1023,7 @@ pub fn verify_capability_chain(
                     valid += 1;
                     // V7 §1.5 v7.65: derive canonical peer_id for local-
                     // peer-signed comparison; entity no longer carries it.
-                    if candidate_identity
-                        .canonical_peer_id()
-                        .as_deref()
-                        == Some(local_peer_id)
-                    {
+                    if candidate_identity.canonical_peer_id().as_deref() == Some(local_peer_id) {
                         local_peer_signed = true;
                     }
                 }
@@ -1043,7 +1042,6 @@ pub fn verify_capability_chain(
 
     Ok(())
 }
-
 
 // ---------------------------------------------------------------------------
 // EXECUTE field decoding
@@ -1090,11 +1088,9 @@ pub(crate) fn decode_execute_fields(data: &[u8]) -> Result<ExecuteFields, Protoc
     }
 
     Ok(ExecuteFields {
-        request_id: request_id
-            .ok_or(ProtocolError::MissingField("request_id"))?,
+        request_id: request_id.ok_or(ProtocolError::MissingField("request_id"))?,
         uri: uri.ok_or(ProtocolError::MissingField("uri"))?,
-        operation: operation
-            .ok_or(ProtocolError::MissingField("operation"))?,
+        operation: operation.ok_or(ProtocolError::MissingField("operation"))?,
         author,
         capability,
     })
@@ -1118,7 +1114,9 @@ pub struct CapabilityChainFields {
     pub expires_at: Option<u64>,
 }
 
-pub(crate) fn decode_capability_chain_fields(data: &[u8]) -> Result<CapabilityChainFields, ProtocolError> {
+pub(crate) fn decode_capability_chain_fields(
+    data: &[u8],
+) -> Result<CapabilityChainFields, ProtocolError> {
     let value: ciborium::Value =
         ciborium::from_reader(data).map_err(|e| ProtocolError::Invalid(e.to_string()))?;
     let map = value
@@ -1160,10 +1158,8 @@ pub(crate) fn decode_capability_chain_fields(data: &[u8]) -> Result<CapabilityCh
     }
 
     Ok(CapabilityChainFields {
-        granter: granter
-            .ok_or(ProtocolError::MissingField("granter"))?,
-        grantee: grantee
-            .ok_or(ProtocolError::MissingField("grantee"))?,
+        granter: granter.ok_or(ProtocolError::MissingField("granter"))?,
+        grantee: grantee.ok_or(ProtocolError::MissingField("grantee"))?,
         parent,
         not_before,
         expires_at,

@@ -42,7 +42,7 @@ pub fn peer_segment_from_hash(h: &Hash) -> String {
 /// segments (wrong length, non-hex characters, or an algorithm byte the
 /// `Hash` constructor rejects).
 pub fn hash_from_peer_segment(seg: &str) -> Option<Hash> {
-    if seg.len() % 2 != 0 {
+    if !seg.len().is_multiple_of(2) {
         return None;
     }
     let mut bytes = Vec::with_capacity(seg.len() / 2);
@@ -99,11 +99,7 @@ pub fn path_role_exclusion(context: &str, peer_id_hex: &str) -> String {
 /// `system/role/{context}/derived-tokens/{peer_id_hex}/{role_name}`.
 /// One per (peer, role, context) tuple under default grace=0; multiple
 /// during overlap windows per §5.5.
-pub fn path_role_derived_link(
-    context: &str,
-    peer_id_hex: &str,
-    role_name: &str,
-) -> String {
+pub fn path_role_derived_link(context: &str, peer_id_hex: &str, role_name: &str) -> String {
     format!(
         "{}{}/derived-tokens/{}/{}",
         ROLE_PREFIX, context, peer_id_hex, role_name
@@ -112,19 +108,12 @@ pub fn path_role_derived_link(
 
 /// Prefix for all linkage entities for a (context, peer) pair.
 pub fn prefix_role_derived_links_peer(context: &str, peer_id_hex: &str) -> String {
-    format!(
-        "{}{}/derived-tokens/{}/",
-        ROLE_PREFIX, context, peer_id_hex
-    )
+    format!("{}{}/derived-tokens/{}/", ROLE_PREFIX, context, peer_id_hex)
 }
 
 /// Path to a role-derived capability token (per R4):
 /// `system/capability/grants/role-derived/{context}/{peer_id_hex}/{token_hash_hex}`.
-pub fn path_role_derived_token(
-    context: &str,
-    peer_id_hex: &str,
-    token_hash_hex: &str,
-) -> String {
+pub fn path_role_derived_token(context: &str, peer_id_hex: &str, token_hash_hex: &str) -> String {
     format!(
         "{}{}/{}/{}",
         ROLE_DERIVED_PREFIX, context, peer_id_hex, token_hash_hex

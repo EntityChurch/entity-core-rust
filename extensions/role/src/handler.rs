@@ -21,9 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use entity_capability::{
-    is_attenuated, CapabilityToken, GrantEntry, Granter, IdScope, PathScope,
-};
+use entity_capability::{is_attenuated, CapabilityToken, GrantEntry, Granter, IdScope, PathScope};
 use entity_crypto::IdentityKeypair;
 use entity_ecf::{text, to_ecf, Value};
 use entity_entity::{Entity, TYPE_SIGNATURE};
@@ -33,22 +31,18 @@ use entity_handler::{
 };
 use entity_hash::{invariant_signature_path, Hash};
 use entity_store::{ContentStore, LocationIndex};
-use entity_types::{
-    TYPE_ROLE, TYPE_ROLE_ASSIGN_RESULT, TYPE_ROLE_EXCLUDE_RESULT,
-};
+use entity_types::{TYPE_ROLE, TYPE_ROLE_ASSIGN_RESULT, TYPE_ROLE_EXCLUDE_RESULT};
 
 use crate::data::{
-    decode_grant_array_value, decode_map, field_hash, field_text, field_u64_opt,
-    get_field, hex_segment, RoleAssignmentData, RoleData, RoleDerivedTokenLinkData,
-    RoleExclusionData,
+    decode_grant_array_value, decode_map, field_hash, field_text, field_u64_opt, get_field,
+    hex_segment, RoleAssignmentData, RoleData, RoleDerivedTokenLinkData, RoleExclusionData,
 };
 use crate::helpers::{is_excluded, resolve_grant_templates};
 use crate::paths::{
     hash_from_peer_segment, parse_assignment_path, parse_exclusion_path,
-    parse_role_definition_path, path_role_assignment, path_role_definition,
-    path_role_derived_link, path_role_derived_token, peer_segment_from_hash,
-    prefix_role_assignment, prefix_role_assignment_peer,
-    prefix_role_derived_links_peer, prefix_role_derived_peer,
+    parse_role_definition_path, path_role_assignment, path_role_definition, path_role_derived_link,
+    path_role_derived_token, peer_segment_from_hash, prefix_role_assignment,
+    prefix_role_assignment_peer, prefix_role_derived_links_peer, prefix_role_derived_peer,
     ParsedAssignmentPath, ParsedExclusionPath, ParsedRoleDefPath,
 };
 use crate::{
@@ -151,10 +145,7 @@ impl RoleHandler {
     // §4.3 assign
     // -------------------------------------------------------------------
 
-    async fn handle_assign(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_assign(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         // Step 1: resource decomposition (§4.3 step 1)
         let path = match self.resource_path(ctx) {
             Some(p) => p,
@@ -186,9 +177,7 @@ impl RoleHandler {
         // Step 2: validate params.role and confirm it matches the path
         let map = match decode_map(&ctx.params.data) {
             Ok(m) => m,
-            Err(e) => {
-                return Ok(error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string()))
-            }
+            Err(e) => return Ok(error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string())),
         };
         let role_name = match field_text(&map, "role") {
             Ok(r) => r,
@@ -282,8 +271,7 @@ impl RoleHandler {
             .duration_since(web_time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let parent_expires =
-            ctx.handler_grant.as_ref().and_then(|c| c.expires_at);
+        let parent_expires = ctx.handler_grant.as_ref().and_then(|c| c.expires_at);
         let role_ttl = role_metadata_ttl(&role_def.metadata);
         let cap_expires_at =
             effective_expires_at(parent_expires, role_ttl, caller_cap.expires_at, now_ms);
@@ -319,16 +307,15 @@ impl RoleHandler {
         // validation now terminates at the role-derived cap regardless of
         // how narrow the handler grant is, which is required for non-dev
         // peers (TV-RD-NON-DEV-PEER).
-        let grantee_hash = match hash_from_peer_segment(&assignee) {
-            Some(h) => h,
-            None => {
-                return Ok(error(
+        let grantee_hash =
+            match hash_from_peer_segment(&assignee) {
+                Some(h) => h,
+                None => return Ok(error(
                     STATUS_BAD_REQUEST,
                     "malformed_resource",
                     "assignee path segment must be lowercase hex of identity-entity hash (SI-1)",
-                ))
-            }
-        };
+                )),
+            };
         // SEC-18 / V7 v7.39 PR-3: reject zero-hash assignee at the role layer.
         // Zero-hash never resolves to a `system/peer` entity, so the minted cap
         // would fail chain-walk anyway (PR-3 `unresolvable_grantee` at use time).
@@ -352,26 +339,13 @@ impl RoleHandler {
         };
         let assignment_entity = match assignment.to_entity() {
             Ok(e) => e,
-            Err(e) => {
-                return Ok(error(
-                    STATUS_BAD_REQUEST,
-                    "encode_failed",
-                    &e.to_string(),
-                ))
-            }
+            Err(e) => return Ok(error(STATUS_BAD_REQUEST, "encode_failed", &e.to_string())),
         };
         let assignment_hash = match self.content_store.put(assignment_entity) {
             Ok(h) => h,
-            Err(e) => {
-                return Ok(error(
-                    STATUS_BAD_REQUEST,
-                    "store_failed",
-                    &e.to_string(),
-                ))
-            }
+            Err(e) => return Ok(error(STATUS_BAD_REQUEST, "store_failed", &e.to_string())),
         };
-        let assignment_path =
-            self.qualify(&path_role_assignment(&context, &assignee, &role_name));
+        let assignment_path = self.qualify(&path_role_assignment(&context, &assignee, &role_name));
         self.location_index.set(&assignment_path, assignment_hash);
 
         // Step 8: derive + persist token (§5.1) + linkage entity (SI-5).
@@ -386,13 +360,7 @@ impl RoleHandler {
             cap_expires_at,
         ) {
             Ok(h) => h,
-            Err(e) => {
-                return Ok(error(
-                    STATUS_BAD_REQUEST,
-                    "token_derivation_failed",
-                    &e,
-                ))
-            }
+            Err(e) => return Ok(error(STATUS_BAD_REQUEST, "token_derivation_failed", &e)),
         };
 
         // Step 9 — PR-2 (SEC-2 atomicity, §6.6): post-issue exclusion
@@ -424,10 +392,7 @@ impl RoleHandler {
     // §4.4 unassign — remove assignment + revoke role-derived tokens (IA12)
     // -------------------------------------------------------------------
 
-    async fn handle_unassign(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_unassign(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let path = match self.resource_path(ctx) {
             Some(p) => p,
             None => {
@@ -462,8 +427,7 @@ impl RoleHandler {
         let mut revoked: Vec<Hash> = Vec::new();
         match &role_name {
             Some(rn) => {
-                let assignment_path =
-                    self.qualify(&path_role_assignment(&context, &assignee, rn));
+                let assignment_path = self.qualify(&path_role_assignment(&context, &assignee, rn));
                 self.location_index.remove(&assignment_path);
                 if let Some(h) = self.revoke_via_linkage(&context, &assignee, rn) {
                     revoked.push(h);
@@ -475,18 +439,12 @@ impl RoleHandler {
                 let link_prefix =
                     self.qualify(&prefix_role_derived_links_peer(&context, &assignee));
                 for link_entry in self.location_index.list(&link_prefix) {
-                    let role_seg = link_entry
-                        .path
-                        .rsplit('/')
-                        .next()
-                        .unwrap_or("")
-                        .to_string();
+                    let role_seg = link_entry.path.rsplit('/').next().unwrap_or("").to_string();
                     if let Some(h) = self.revoke_via_linkage(&context, &assignee, &role_seg) {
                         revoked.push(h);
                     }
                 }
-                let assn_prefix =
-                    self.qualify(&prefix_role_assignment_peer(&context, &assignee));
+                let assn_prefix = self.qualify(&prefix_role_assignment_peer(&context, &assignee));
                 for entry in self.location_index.list(&assn_prefix) {
                     self.location_index.remove(&entry.path);
                 }
@@ -506,8 +464,7 @@ impl RoleHandler {
         peer_id_hex: &str,
         role_name: &str,
     ) -> Option<Hash> {
-        let link_path =
-            self.qualify(&path_role_derived_link(context, peer_id_hex, role_name));
+        let link_path = self.qualify(&path_role_derived_link(context, peer_id_hex, role_name));
         let link_hash = self.location_index.get(&link_path)?;
         let link_entity = match self.content_store.get(&link_hash) {
             Some(e) => e,
@@ -543,10 +500,7 @@ impl RoleHandler {
     // §4.4 exclude — write exclusion entity + layer-1 token sweep (R7 L1)
     // -------------------------------------------------------------------
 
-    async fn handle_exclude(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_exclude(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let path = match self.resource_path(ctx) {
             Some(p) => p,
             None => {
@@ -591,30 +545,16 @@ impl RoleHandler {
         };
         let entity = match exclusion.to_entity() {
             Ok(e) => e,
-            Err(e) => {
-                return Ok(error(
-                    STATUS_BAD_REQUEST,
-                    "encode_failed",
-                    &e.to_string(),
-                ))
-            }
+            Err(e) => return Ok(error(STATUS_BAD_REQUEST, "encode_failed", &e.to_string())),
         };
         let exclusion_hash = match self.content_store.put(entity) {
             Ok(h) => h,
-            Err(e) => {
-                return Ok(error(
-                    STATUS_BAD_REQUEST,
-                    "store_failed",
-                    &e.to_string(),
-                ))
-            }
+            Err(e) => return Ok(error(STATUS_BAD_REQUEST, "store_failed", &e.to_string())),
         };
         let exclusion_path = self.qualify(&path);
         // The resource path may already be peer-qualified; if so, qualify()
         // would double-prefix. Detect and normalize.
-        let exclusion_path = if path.starts_with(&self.qualified_prefix)
-            || path.starts_with('/')
-        {
+        let exclusion_path = if path.starts_with(&self.qualified_prefix) || path.starts_with('/') {
             path.clone()
         } else {
             exclusion_path
@@ -631,10 +571,7 @@ impl RoleHandler {
     // §4.4 unexclude — remove exclusion entity (no auto-restore, per §6.4)
     // -------------------------------------------------------------------
 
-    async fn handle_unexclude(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_unexclude(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let path = match self.resource_path(ctx) {
             Some(p) => p,
             None => {
@@ -676,6 +613,7 @@ impl RoleHandler {
     /// caller; assign / re-derive callers pass `None`. Use-time chain
     /// validation terminates at the role-derived cap regardless of how
     /// narrow the handler grant is — required for non-dev peers.
+    #[allow(clippy::too_many_arguments)] // SI-2 derivation inputs are all load-bearing
     fn derive_and_persist_token(
         &self,
         context: &str,
@@ -724,8 +662,7 @@ impl RoleHandler {
                 Value::Bytes(cap_entity.content_hash.to_bytes().to_vec()),
             ),
         ]));
-        let sig_entity =
-            Entity::new(TYPE_SIGNATURE, sig_data).map_err(|e| e.to_string())?;
+        let sig_entity = Entity::new(TYPE_SIGNATURE, sig_data).map_err(|e| e.to_string())?;
         let sig_hash = self
             .content_store
             .put(sig_entity)
@@ -760,11 +697,7 @@ impl RoleHandler {
             .content_store
             .put(link_entity)
             .map_err(|e| e.to_string())?;
-        let link_path = self.qualify(&path_role_derived_link(
-            context,
-            assignee_id_hex,
-            role_name,
-        ));
+        let link_path = self.qualify(&path_role_derived_link(context, assignee_id_hex, role_name));
         self.location_index.set(&link_path, link_hash);
 
         Ok(cap_hash)
@@ -794,13 +727,10 @@ impl RoleHandler {
         ));
         self.location_index.remove(&cap_path);
         // V7 §3.5 v7.44: signature lives at the invariant pointer path.
-        self.location_index.remove(&invariant_signature_path(
-            &self.local_peer_id,
-            &cap_hash,
-        ));
+        self.location_index
+            .remove(&invariant_signature_path(&self.local_peer_id, &cap_hash));
         if delete_link {
-            let link_path =
-                self.qualify(&path_role_derived_link(context, peer_id_hex, role_name));
+            let link_path = self.qualify(&path_role_derived_link(context, peer_id_hex, role_name));
             self.location_index.remove(&link_path);
         }
     }
@@ -809,10 +739,7 @@ impl RoleHandler {
     // §4.2 / IA11 define — write/replace a role definition + re-derive
     // -------------------------------------------------------------------
 
-    async fn handle_define(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_define(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let path = match self.resource_path(ctx) {
             Some(p) => p,
             None => {
@@ -823,24 +750,21 @@ impl RoleHandler {
                 ))
             }
         };
-        let parsed = match parse_role_definition_path(&path) {
-            Some(p) => p,
-            None => {
-                return Ok(error(
+        let parsed =
+            match parse_role_definition_path(&path) {
+                Some(p) => p,
+                None => return Ok(error(
                     STATUS_BAD_REQUEST,
                     "malformed_resource",
                     "expected system/role/{context}/{role_name} (reserved names rejected per R10)",
-                ))
-            }
-        };
+                )),
+            };
         let ParsedRoleDefPath { context, role_name } = parsed;
 
         // Decode params: { grants: [grant-entry], metadata?: any }
         let map = match decode_map(&ctx.params.data) {
             Ok(m) => m,
-            Err(e) => {
-                return Ok(error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string()))
-            }
+            Err(e) => return Ok(error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string())),
         };
         let grants_value = match get_field(&map, "grants") {
             Some(v) => v,
@@ -854,9 +778,7 @@ impl RoleHandler {
         };
         let grants = match decode_grant_array_value(grants_value) {
             Ok(g) => g,
-            Err(e) => {
-                return Ok(error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string()))
-            }
+            Err(e) => return Ok(error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string())),
         };
         let metadata = match get_field(&map, "metadata") {
             None | Some(ciborium::Value::Null) => None,
@@ -924,23 +846,11 @@ impl RoleHandler {
         };
         let entity = match role_def.to_entity() {
             Ok(e) => e,
-            Err(e) => {
-                return Ok(error(
-                    STATUS_BAD_REQUEST,
-                    "encode_failed",
-                    &e.to_string(),
-                ))
-            }
+            Err(e) => return Ok(error(STATUS_BAD_REQUEST, "encode_failed", &e.to_string())),
         };
         let role_hash = match self.content_store.put(entity) {
             Ok(h) => h,
-            Err(e) => {
-                return Ok(error(
-                    STATUS_BAD_REQUEST,
-                    "store_failed",
-                    &e.to_string(),
-                ))
-            }
+            Err(e) => return Ok(error(STATUS_BAD_REQUEST, "store_failed", &e.to_string())),
         };
         let role_def_path = self.qualify(&path_role_definition(&context, &role_name));
         self.location_index.set(&role_def_path, role_hash);
@@ -948,11 +858,8 @@ impl RoleHandler {
         // Re-derive cascade per §5.5 / IA9 (issue-first ordering). The
         // caller's cap is passed for the per-assignee RL2 re-check
         // (SI-15 skip-and-continue).
-        let re_derived = self.re_derive_role_assignees(
-            &context,
-            &role_name,
-            ctx.caller_capability.as_ref(),
-        )?;
+        let re_derived =
+            self.re_derive_role_assignees(&context, &role_name, ctx.caller_capability.as_ref())?;
 
         Ok(define_result(&role_def_path, re_derived))
     }
@@ -961,10 +868,7 @@ impl RoleHandler {
     // §4.2 / R5 re-derive — re-issue tokens for all assignees of a role
     // -------------------------------------------------------------------
 
-    async fn handle_re_derive(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_re_derive(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let path = match self.resource_path(ctx) {
             Some(p) => p,
             None => {
@@ -1029,11 +933,8 @@ impl RoleHandler {
             ));
         }
 
-        let summary = self.re_derive_role_assignees(
-            &context,
-            &role_name,
-            ctx.caller_capability.as_ref(),
-        )?;
+        let summary =
+            self.re_derive_role_assignees(&context, &role_name, ctx.caller_capability.as_ref())?;
         Ok(re_derive_result(summary))
     }
 
@@ -1041,15 +942,10 @@ impl RoleHandler {
     // §4.2 / §5.6 / IA22 delegate — member-to-member delegation
     // -------------------------------------------------------------------
 
-    async fn handle_delegate(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_delegate(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let map = match decode_map(&ctx.params.data) {
             Ok(m) => m,
-            Err(e) => {
-                return Ok(error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string()))
-            }
+            Err(e) => return Ok(error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string())),
         };
 
         // SI-21 v1.6: no `delegator` field on the request. Caller is
@@ -1078,9 +974,7 @@ impl RoleHandler {
         // SI-4 v1.6: context/role are primitive/string.
         let delegate_hash = match field_hash(&map, "delegate") {
             Ok(h) => h,
-            Err(e) => {
-                return Ok(error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string()))
-            }
+            Err(e) => return Ok(error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string())),
         };
         // SEC-18 / V7 v7.39 PR-3: reject zero-hash delegate. Mirrors the
         // assign-time check (Go reference). The minted delegation
@@ -1094,15 +988,11 @@ impl RoleHandler {
         }
         let context = match field_text(&map, "context") {
             Ok(s) => s,
-            Err(e) => {
-                return Ok(error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string()))
-            }
+            Err(e) => return Ok(error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string())),
         };
         let role_name = match field_text(&map, "role") {
             Ok(s) => s,
-            Err(e) => {
-                return Ok(error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string()))
-            }
+            Err(e) => return Ok(error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string())),
         };
         let scope_value = match get_field(&map, "scope") {
             Some(v) => v,
@@ -1116,15 +1006,11 @@ impl RoleHandler {
         };
         let scope = match decode_grant_array_value(scope_value) {
             Ok(g) => g,
-            Err(e) => {
-                return Ok(error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string()))
-            }
+            Err(e) => return Ok(error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string())),
         };
         let expires_at = match field_u64_opt(&map, "expires_at") {
             Ok(v) => v,
-            Err(e) => {
-                return Ok(error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string()))
-            }
+            Err(e) => return Ok(error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string())),
         };
 
         // SI-20 v1.6: scope MUST be literal — no `{context}` or
@@ -1156,8 +1042,11 @@ impl RoleHandler {
         }
 
         // §5.6 step 2: verify B holds the named role.
-        let assignment_path =
-            self.qualify(&path_role_assignment(&context, &delegator_segment, &role_name));
+        let assignment_path = self.qualify(&path_role_assignment(
+            &context,
+            &delegator_segment,
+            &role_name,
+        ));
         if self.location_index.get(&assignment_path).is_none() {
             return Ok(error(
                 STATUS_FORBIDDEN,
@@ -1167,8 +1056,11 @@ impl RoleHandler {
         }
 
         // SI-22 v1.6: parent selection via the linkage entity.
-        let link_path =
-            self.qualify(&path_role_derived_link(&context, &delegator_segment, &role_name));
+        let link_path = self.qualify(&path_role_derived_link(
+            &context,
+            &delegator_segment,
+            &role_name,
+        ));
         let link_hash = match self.location_index.get(&link_path) {
             Some(h) => h,
             None => {
@@ -1231,7 +1123,7 @@ impl RoleHandler {
             .as_millis() as u64;
         let delegation_expires_at = effective_expires_at(
             parent_token.expires_at,
-            None, // no role TTL — delegation isn't role-derived from a fresh role def
+            None,       // no role TTL — delegation isn't role-derived from a fresh role def
             expires_at, // request-supplied cap (acts as caller's cap bound here)
             now_ms,
         );
@@ -1264,23 +1156,11 @@ impl RoleHandler {
         };
         let cap_entity = match delegation_token.to_entity() {
             Ok(e) => e,
-            Err(e) => {
-                return Ok(error(
-                    STATUS_BAD_REQUEST,
-                    "encode_failed",
-                    &e.to_string(),
-                ))
-            }
+            Err(e) => return Ok(error(STATUS_BAD_REQUEST, "encode_failed", &e.to_string())),
         };
         let cap_hash = match self.content_store.put(cap_entity.clone()) {
             Ok(h) => h,
-            Err(e) => {
-                return Ok(error(
-                    STATUS_BAD_REQUEST,
-                    "store_failed",
-                    &e.to_string(),
-                ))
-            }
+            Err(e) => return Ok(error(STATUS_BAD_REQUEST, "store_failed", &e.to_string())),
         };
         let sig_bytes = self.keypair.sign(&cap_entity.content_hash.to_bytes());
         let sig_data = to_ecf(&Value::Map(vec![
@@ -1307,13 +1187,7 @@ impl RoleHandler {
         };
         let sig_hash = match self.content_store.put(sig_entity) {
             Ok(h) => h,
-            Err(e) => {
-                return Ok(error(
-                    STATUS_BAD_REQUEST,
-                    "store_failed",
-                    &e.to_string(),
-                ))
-            }
+            Err(e) => return Ok(error(STATUS_BAD_REQUEST, "store_failed", &e.to_string())),
         };
 
         let cap_path = self.qualify(&path_role_derived_token(
@@ -1342,7 +1216,13 @@ impl RoleHandler {
             &context,
             &delegate_segment,
         ) {
-            self.rollback_role_derived_cap(&context, &delegate_segment, &role_name, cap_hash, false);
+            self.rollback_role_derived_cap(
+                &context,
+                &delegate_segment,
+                &role_name,
+                cap_hash,
+                false,
+            );
             return Ok(error(
                 STATUS_FORBIDDEN,
                 "delegate_excluded",
@@ -1390,10 +1270,11 @@ impl RoleHandler {
         // grant hash is NOT used as the issued cap's `parent` — role-derived
         // caps are root caps. We still load the handler-grant token here to
         // read its `expires_at`.
-        let handler_grant_hash = self.location_index.get(&self.qualified_pattern.replace(
-            "/system/role",
-            "/system/capability/grants/system/role",
-        ));
+        let handler_grant_hash = self.location_index.get(
+            &self
+                .qualified_pattern
+                .replace("/system/role", "/system/capability/grants/system/role"),
+        );
         let parent_expires = handler_grant_hash
             .and_then(|h| self.content_store.get(&h))
             .and_then(|e| CapabilityToken::from_entity(&e).ok())
@@ -1531,8 +1412,7 @@ impl RoleHandler {
             // path), so each swept cap's sig is unbound there explicitly.
             // The linkage entity for this (peer, role) was overwritten by
             // `derive_and_persist_token` — cascade is correct.
-            let derived_prefix =
-                self.qualify(&prefix_role_derived_peer(context, &assignee_hex));
+            let derived_prefix = self.qualify(&prefix_role_derived_peer(context, &assignee_hex));
             let new_cap_path = self.qualify(&path_role_derived_token(
                 context,
                 &assignee_hex,
@@ -1550,10 +1430,8 @@ impl RoleHandler {
                 if let Some(h) = self.location_index.remove(&prior.path) {
                     if is_cap {
                         summary.revoked_token_hashes.push(h);
-                        self.location_index.remove(&invariant_signature_path(
-                            &self.local_peer_id,
-                            &h,
-                        ));
+                        self.location_index
+                            .remove(&invariant_signature_path(&self.local_peer_id, &h));
                     }
                 }
             }
@@ -1584,10 +1462,8 @@ impl RoleHandler {
             if let Some(h) = self.location_index.remove(&entry.path) {
                 if is_cap {
                     revoked.push(h);
-                    self.location_index.remove(&invariant_signature_path(
-                        &self.local_peer_id,
-                        &h,
-                    ));
+                    self.location_index
+                        .remove(&invariant_signature_path(&self.local_peer_id, &h));
                 }
             }
         }
@@ -1627,10 +1503,7 @@ fn build_hypothetical_token(
 /// `None`. If all sources are `None`, return `None` (vacuous bound —
 /// child MAY have any expiry per V7 §5.6 line 643 when parent has none).
 fn min_defined(values: &[Option<u64>]) -> Option<u64> {
-    values
-        .iter()
-        .filter_map(|v| *v)
-        .min()
+    values.iter().filter_map(|v| *v).min()
 }
 
 /// v1.7 §5.3 item 4: the role's optional `metadata.ttl` (milliseconds).
@@ -1714,8 +1587,7 @@ fn error(status: u32, code: &str, message: &str) -> HandlerResult {
 }
 
 fn assign_result(path: &str, derived_tokens: &[Hash]) -> HandlerResult {
-    let mut fields: Vec<(Value, Value)> =
-        vec![(text("assignment_path"), text(path))];
+    let mut fields: Vec<(Value, Value)> = vec![(text("assignment_path"), text(path))];
     if !derived_tokens.is_empty() {
         let arr: Vec<Value> = derived_tokens
             .iter()
@@ -1752,8 +1624,7 @@ fn define_result(path: &str, summary: ReDeriveSummary) -> HandlerResult {
 }
 
 fn unassign_result(path: &str, revoked: &[Hash]) -> HandlerResult {
-    let mut fields: Vec<(Value, Value)> =
-        vec![(text("assignment_path"), text(path))];
+    let mut fields: Vec<(Value, Value)> = vec![(text("assignment_path"), text(path))];
     if !revoked.is_empty() {
         let arr: Vec<Value> = revoked
             .iter()
@@ -1868,8 +1739,7 @@ fn exclude_result(path: &str, revoked: &[Hash]) -> HandlerResult {
             .collect();
         fields.push((text("revoked_token_hashes"), Value::Array(arr)));
     }
-    let result =
-        Entity::new(TYPE_ROLE_EXCLUDE_RESULT, to_ecf(&Value::Map(fields))).unwrap();
+    let result = Entity::new(TYPE_ROLE_EXCLUDE_RESULT, to_ecf(&Value::Map(fields))).unwrap();
     HandlerResult {
         status: STATUS_OK,
         result,

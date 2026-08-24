@@ -123,10 +123,7 @@ pub fn default_connection_grants() -> Vec<GrantEntry> {
     vec![
         GrantEntry {
             handlers: PathScope::new(vec!["system/tree".into()]),
-            resources: PathScope::new(vec![
-                "system/type/*".into(),
-                "system/handler/*".into(),
-            ]),
+            resources: PathScope::new(vec!["system/type/*".into(), "system/handler/*".into()]),
             operations: IdScope::new(vec!["get".into()]),
             peers: None,
             constraints: None,
@@ -161,16 +158,12 @@ pub fn debug_open_grants() -> Vec<GrantEntry> {
     use std::collections::BTreeMap;
 
     // Query-specific grant with content_store access + wildcard type_scope
-    let mut type_scope = Vec::new();
-    type_scope.push((
+    let type_scope = vec![(
         ciborium::Value::Text("include".into()),
         ciborium::Value::Array(vec![ciborium::Value::Text("*".into())]),
-    ));
+    )];
     let mut constraints = BTreeMap::new();
-    constraints.insert(
-        "type_scope".to_string(),
-        ciborium::Value::Map(type_scope),
-    );
+    constraints.insert("type_scope".to_string(), ciborium::Value::Map(type_scope));
     let mut allowances = BTreeMap::new();
     allowances.insert(
         "scope".to_string(),
@@ -450,7 +443,9 @@ pub fn matches_pattern(path: &str, pattern: &str) -> bool {
 
     // Subtree prefix: prefix/*
     if let Some(prefix) = pattern.strip_suffix("/*") {
-        return path.starts_with(prefix) && path.len() > prefix.len() && path.as_bytes()[prefix.len()] == b'/';
+        return path.starts_with(prefix)
+            && path.len() > prefix.len()
+            && path.as_bytes()[prefix.len()] == b'/';
     }
 
     // Exact match
@@ -461,7 +456,12 @@ pub fn matches_pattern(path: &str, pattern: &str) -> bool {
 ///
 /// The value must match at least one include pattern and must not
 /// match any exclude pattern.
-pub fn matches_scope(value: &str, include: &[String], exclude: &[String], local_peer_id: &str) -> bool {
+pub fn matches_scope(
+    value: &str,
+    include: &[String],
+    exclude: &[String],
+    local_peer_id: &str,
+) -> bool {
     // Fail-closed (§1.11): a malformed value denies rather than panics.
     let cv = match canonicalize(value, local_peer_id) {
         Some(v) => v,
@@ -469,9 +469,9 @@ pub fn matches_scope(value: &str, include: &[String], exclude: &[String], local_
     };
 
     // A malformed include can never grant — it simply doesn't match.
-    let matched = include
-        .iter()
-        .any(|pattern| canonicalize(pattern, local_peer_id).is_some_and(|cp| matches_pattern(&cv, &cp)));
+    let matched = include.iter().any(|pattern| {
+        canonicalize(pattern, local_peer_id).is_some_and(|cp| matches_pattern(&cv, &cp))
+    });
 
     if !matched {
         return false;
@@ -479,9 +479,9 @@ pub fn matches_scope(value: &str, include: &[String], exclude: &[String], local_
 
     // A malformed exclude fails closed: treat it as if it matched (deny),
     // never as a silent no-op that would under-exclude.
-    let excluded = exclude
-        .iter()
-        .any(|pattern| canonicalize(pattern, local_peer_id).is_none_or(|cp| matches_pattern(&cv, &cp)));
+    let excluded = exclude.iter().any(|pattern| {
+        canonicalize(pattern, local_peer_id).is_none_or(|cp| matches_pattern(&cv, &cp))
+    });
 
     !excluded
 }
@@ -557,12 +557,7 @@ pub fn check_permission(
         // Peers
         let default_peers = IdScope::new(vec![local_peer_id.into()]);
         let peers = grant.peers.as_ref().unwrap_or(&default_peers);
-        if !matches_scope(
-            target_peer,
-            &peers.include,
-            &peers.exclude,
-            local_peer_id,
-        ) {
+        if !matches_scope(target_peer, &peers.include, &peers.exclude, local_peer_id) {
             continue;
         }
 
@@ -620,12 +615,7 @@ pub fn check_permission_with_grant(
         }
         let default_peers = IdScope::new(vec![local_peer_id.into()]);
         let peers = grant.peers.as_ref().unwrap_or(&default_peers);
-        if !matches_scope(
-            target_peer,
-            &peers.include,
-            &peers.exclude,
-            local_peer_id,
-        ) {
+        if !matches_scope(target_peer, &peers.include, &peers.exclude, local_peer_id) {
             continue;
         }
         if let Some(rt) = resource_target {
@@ -853,7 +843,12 @@ fn grant_subset(
     local_peer_id: &str,
 ) -> bool {
     // Handlers: no §PR-8 frame — both sides canonicalize under local_peer_id.
-    if !scope_subset_path(&child.handlers, &parent.handlers, local_peer_id, local_peer_id) {
+    if !scope_subset_path(
+        &child.handlers,
+        &parent.handlers,
+        local_peer_id,
+        local_peer_id,
+    ) {
         return false;
     }
     if !scope_subset_id(&child.operations, &parent.operations, local_peer_id) {
@@ -1209,12 +1204,9 @@ impl CapabilityToken {
         }
 
         Ok(CapabilityToken {
-            grants: grants
-                .ok_or_else(|| CapabilityError::Invalid("missing grants".into()))?,
-            granter: granter
-                .ok_or_else(|| CapabilityError::Invalid("missing granter".into()))?,
-            grantee: grantee
-                .ok_or_else(|| CapabilityError::Invalid("missing grantee".into()))?,
+            grants: grants.ok_or_else(|| CapabilityError::Invalid("missing grants".into()))?,
+            granter: granter.ok_or_else(|| CapabilityError::Invalid("missing granter".into()))?,
+            grantee: grantee.ok_or_else(|| CapabilityError::Invalid("missing grantee".into()))?,
             parent,
             created_at: created_at
                 .ok_or_else(|| CapabilityError::Invalid("missing created_at".into()))?,
@@ -1253,7 +1245,9 @@ pub fn encode_grant_entry(g: &GrantEntry) -> entity_ecf::Value {
 }
 
 /// Convert a BTreeMap<String, ciborium::Value> to entity_ecf::Value for encoding.
-fn string_map_to_ecf(map: &std::collections::BTreeMap<String, ciborium::Value>) -> entity_ecf::Value {
+fn string_map_to_ecf(
+    map: &std::collections::BTreeMap<String, ciborium::Value>,
+) -> entity_ecf::Value {
     use entity_ecf::{text, Value};
     Value::Map(
         map.iter()
@@ -1274,16 +1268,12 @@ fn ciborium_to_ecf(val: &ciborium::Value) -> entity_ecf::Value {
         }
         ciborium::Value::Text(s) => Value::Text(s.clone()),
         ciborium::Value::Bytes(b) => Value::Bytes(b.clone()),
-        ciborium::Value::Array(arr) => {
-            Value::Array(arr.iter().map(ciborium_to_ecf).collect())
-        }
-        ciborium::Value::Map(map) => {
-            Value::Map(
-                map.iter()
-                    .map(|(k, v)| (ciborium_to_ecf(k), ciborium_to_ecf(v)))
-                    .collect(),
-            )
-        }
+        ciborium::Value::Array(arr) => Value::Array(arr.iter().map(ciborium_to_ecf).collect()),
+        ciborium::Value::Map(map) => Value::Map(
+            map.iter()
+                .map(|(k, v)| (ciborium_to_ecf(k), ciborium_to_ecf(v)))
+                .collect(),
+        ),
         ciborium::Value::Float(f) => Value::Float(*f),
         _ => Value::Null,
     }
@@ -1362,9 +1352,7 @@ pub fn decode_granter(value: &ciborium::Value) -> Result<Granter, CapabilityErro
             match k.as_text() {
                 Some("signers") => {
                     let arr = v.as_array().ok_or_else(|| {
-                        CapabilityError::Invalid(
-                            "multi-granter signers must be an array".into(),
-                        )
+                        CapabilityError::Invalid("multi-granter signers must be an array".into())
                     })?;
                     let mut out = Vec::with_capacity(arr.len());
                     for item in arr {
@@ -1440,7 +1428,9 @@ pub fn decode_grant_entry(value: &ciborium::Value) -> Result<GrantEntry, Capabil
 
 /// Decode a CBOR map into a BTreeMap<String, ciborium::Value>.
 /// Non-map values are treated as empty maps (defensive).
-fn decode_string_keyed_map(value: &ciborium::Value) -> std::collections::BTreeMap<String, ciborium::Value> {
+fn decode_string_keyed_map(
+    value: &ciborium::Value,
+) -> std::collections::BTreeMap<String, ciborium::Value> {
     let mut result = std::collections::BTreeMap::new();
     if let Some(entries) = value.as_map() {
         for (k, v) in entries {
@@ -1453,7 +1443,9 @@ fn decode_string_keyed_map(value: &ciborium::Value) -> std::collections::BTreeMa
 }
 
 /// Decode include/exclude string lists from a CBOR scope map.
-fn decode_scope_lists(value: &ciborium::Value) -> Result<(Vec<String>, Vec<String>), CapabilityError> {
+fn decode_scope_lists(
+    value: &ciborium::Value,
+) -> Result<(Vec<String>, Vec<String>), CapabilityError> {
     let map = value
         .as_map()
         .ok_or_else(|| CapabilityError::Invalid("scope must be a map".into()))?;
@@ -1578,14 +1570,26 @@ mod tests {
     #[test]
     fn test_matches_pattern_exact() {
         assert!(matches_pattern("/peer/system/tree", "/peer/system/tree"));
-        assert!(!matches_pattern("/peer/system/tree", "/peer/system/handler"));
+        assert!(!matches_pattern(
+            "/peer/system/tree",
+            "/peer/system/handler"
+        ));
     }
 
     #[test]
     fn test_matches_pattern_prefix() {
-        assert!(matches_pattern("/peer/system/tree/foo", "/peer/system/tree/*"));
-        assert!(matches_pattern("/peer/system/tree/foo/bar", "/peer/system/tree/*"));
-        assert!(!matches_pattern("/peer/system/treefoo", "/peer/system/tree/*"));
+        assert!(matches_pattern(
+            "/peer/system/tree/foo",
+            "/peer/system/tree/*"
+        ));
+        assert!(matches_pattern(
+            "/peer/system/tree/foo/bar",
+            "/peer/system/tree/*"
+        ));
+        assert!(!matches_pattern(
+            "/peer/system/treefoo",
+            "/peer/system/tree/*"
+        ));
         assert!(!matches_pattern("/peer/system/tree", "/peer/system/tree/*"));
     }
 
@@ -1652,19 +1656,17 @@ mod tests {
     #[test]
     fn test_canonicalize_already_absolute() {
         let path = format!("/{}/system/tree", LOCAL_PEER);
-        assert_eq!(canonicalize(&path, LOCAL_PEER).as_deref(), Some(path.as_str()));
+        assert_eq!(
+            canonicalize(&path, LOCAL_PEER).as_deref(),
+            Some(path.as_str())
+        );
     }
 
     // --- matches_scope ---
 
     #[test]
     fn test_matches_scope_basic() {
-        assert!(matches_scope(
-            "get",
-            &["*".into()],
-            &[],
-            LOCAL_PEER,
-        ));
+        assert!(matches_scope("get", &["*".into()], &[], LOCAL_PEER,));
         assert!(matches_scope(
             "get",
             &["get".into(), "put".into()],
@@ -1719,21 +1721,56 @@ mod tests {
     #[test]
     fn test_check_permission_simple() {
         let token = make_token(vec![make_grant(&["system/tree"], &["*"], &["get"])]);
-        assert!(check_permission("get", "system/tree", LOCAL_PEER, None, &token, LOCAL_PEER));
-        assert!(!check_permission("put", "system/tree", LOCAL_PEER, None, &token, LOCAL_PEER));
+        assert!(check_permission(
+            "get",
+            "system/tree",
+            LOCAL_PEER,
+            None,
+            &token,
+            LOCAL_PEER
+        ));
+        assert!(!check_permission(
+            "put",
+            "system/tree",
+            LOCAL_PEER,
+            None,
+            &token,
+            LOCAL_PEER
+        ));
     }
 
     #[test]
     fn test_check_permission_wildcard_handlers() {
         let token = make_token(vec![make_grant(&["*"], &["*"], &["*"])]);
-        assert!(check_permission("get", "system/tree", LOCAL_PEER, None, &token, LOCAL_PEER));
-        assert!(check_permission("put", "system/handler", LOCAL_PEER, None, &token, LOCAL_PEER));
+        assert!(check_permission(
+            "get",
+            "system/tree",
+            LOCAL_PEER,
+            None,
+            &token,
+            LOCAL_PEER
+        ));
+        assert!(check_permission(
+            "put",
+            "system/handler",
+            LOCAL_PEER,
+            None,
+            &token,
+            LOCAL_PEER
+        ));
     }
 
     #[test]
     fn test_check_permission_wrong_handler() {
         let token = make_token(vec![make_grant(&["system/tree"], &["*"], &["get"])]);
-        assert!(!check_permission("get", "system/handler", LOCAL_PEER, None, &token, LOCAL_PEER));
+        assert!(!check_permission(
+            "get",
+            "system/handler",
+            LOCAL_PEER,
+            None,
+            &token,
+            LOCAL_PEER
+        ));
     }
 
     #[test]
@@ -1747,13 +1784,27 @@ mod tests {
             targets: vec!["system/type/foo".into()],
             exclude: vec![],
         };
-        assert!(check_permission("get", "system/tree", LOCAL_PEER, Some(&rt), &token, LOCAL_PEER));
+        assert!(check_permission(
+            "get",
+            "system/tree",
+            LOCAL_PEER,
+            Some(&rt),
+            &token,
+            LOCAL_PEER
+        ));
 
         let rt_bad = ResourceTarget {
             targets: vec!["system/handler/foo".into()],
             exclude: vec![],
         };
-        assert!(!check_permission("get", "system/tree", LOCAL_PEER, Some(&rt_bad), &token, LOCAL_PEER));
+        assert!(!check_permission(
+            "get",
+            "system/tree",
+            LOCAL_PEER,
+            Some(&rt_bad),
+            &token,
+            LOCAL_PEER
+        ));
     }
 
     #[test]
@@ -1762,8 +1813,22 @@ mod tests {
             make_grant(&["system/tree"], &["*"], &["get"]),
             make_grant(&["system/capability"], &[], &["request"]),
         ]);
-        assert!(check_permission("get", "system/tree", LOCAL_PEER, None, &token, LOCAL_PEER));
-        assert!(check_permission("request", "system/capability", LOCAL_PEER, None, &token, LOCAL_PEER));
+        assert!(check_permission(
+            "get",
+            "system/tree",
+            LOCAL_PEER,
+            None,
+            &token,
+            LOCAL_PEER
+        ));
+        assert!(check_permission(
+            "request",
+            "system/capability",
+            LOCAL_PEER,
+            None,
+            &token,
+            LOCAL_PEER
+        ));
     }
 
     /// R-5 (CROSS-IMPL-ACME-RUST): a grant whose resources use
@@ -1774,11 +1839,7 @@ mod tests {
     #[test]
     fn test_resource_wildcard_local_vs_cross_namespace() {
         // Bare `*` — local-namespace-only.
-        let local_only_token = make_token(vec![make_grant(
-            &["system/tree"],
-            &["*"],
-            &["put"],
-        )]);
+        let local_only_token = make_token(vec![make_grant(&["system/tree"], &["*"], &["put"])]);
         let local_target = ResourceTarget {
             targets: vec![format!("/{}/system/foo", LOCAL_PEER)],
             exclude: vec![],
@@ -1788,22 +1849,39 @@ mod tests {
             exclude: vec![],
         };
         assert!(
-            check_permission("put", "system/tree", LOCAL_PEER, Some(&local_target), &local_only_token, LOCAL_PEER),
+            check_permission(
+                "put",
+                "system/tree",
+                LOCAL_PEER,
+                Some(&local_target),
+                &local_only_token,
+                LOCAL_PEER
+            ),
             "bare `*` covers local-namespace paths"
         );
         assert!(
-            !check_permission("put", "system/tree", LOCAL_PEER, Some(&cross_target), &local_only_token, LOCAL_PEER),
+            !check_permission(
+                "put",
+                "system/tree",
+                LOCAL_PEER,
+                Some(&cross_target),
+                &local_only_token,
+                LOCAL_PEER
+            ),
             "bare `*` MUST NOT cover other-peer namespaces"
         );
 
         // Explicit `/*/*` — cross-namespace.
-        let cross_token = make_token(vec![make_grant(
-            &["system/tree"],
-            &["/*/*"],
-            &["put"],
-        )]);
+        let cross_token = make_token(vec![make_grant(&["system/tree"], &["/*/*"], &["put"])]);
         assert!(
-            check_permission("put", "system/tree", LOCAL_PEER, Some(&cross_target), &cross_token, LOCAL_PEER),
+            check_permission(
+                "put",
+                "system/tree",
+                LOCAL_PEER,
+                Some(&cross_target),
+                &cross_token,
+                LOCAL_PEER
+            ),
             "/*/* MUST cover any peer namespace (V7 §6.5 invariant pointer)"
         );
     }
@@ -1820,7 +1898,14 @@ mod tests {
             exclude: vec![],
         };
         assert!(
-            check_permission("put", "system/tree", LOCAL_PEER, Some(&rt), &token, LOCAL_PEER),
+            check_permission(
+                "put",
+                "system/tree",
+                LOCAL_PEER,
+                Some(&rt),
+                &token,
+                LOCAL_PEER
+            ),
             "R-5: --debug-grants MUST permit cross-namespace tree:put"
         );
     }
@@ -1898,18 +1983,26 @@ mod tests {
 
         // Malformed resource include in the grant → cannot grant (previously
         // panicked inside canonicalize, dropping the connection).
-        let bad_include = make_token(vec![make_grant(&["system/tree"], &["../escape/*"], &["get"])]);
+        let bad_include = make_token(vec![make_grant(
+            &["system/tree"],
+            &["../escape/*"],
+            &["get"],
+        )]);
         assert!(!check_permission(
-            "get", "system/tree", LOCAL_PEER, Some(&target), &bad_include, LOCAL_PEER
+            "get",
+            "system/tree",
+            LOCAL_PEER,
+            Some(&target),
+            &bad_include,
+            LOCAL_PEER
         ));
 
         // Malformed resource exclude in the grant → fails closed (deny),
         // never under-excludes into an accidental allow.
-        let scope = PathScope::with_exclude(
-            vec!["system/type/*".into()],
-            vec!["*/sneaky".into()],
-        );
-        assert!(!check_resource_scope(&target, &scope, LOCAL_PEER, LOCAL_PEER));
+        let scope = PathScope::with_exclude(vec!["system/type/*".into()], vec!["*/sneaky".into()]);
+        assert!(!check_resource_scope(
+            &target, &scope, LOCAL_PEER, LOCAL_PEER
+        ));
 
         // Malformed handler exclude → fails closed at the operation/handler
         // dimension too (no resource target needed).
@@ -1917,16 +2010,30 @@ mod tests {
         grant.handlers.exclude = vec!["*/sneaky".into()];
         let bad_handler_exclude = make_token(vec![grant]);
         assert!(!check_permission(
-            "get", "system/tree", LOCAL_PEER, None, &bad_handler_exclude, LOCAL_PEER
+            "get",
+            "system/tree",
+            LOCAL_PEER,
+            None,
+            &bad_handler_exclude,
+            LOCAL_PEER
         ));
 
         // Malformed requested resource target → deny, not panic.
-        let good = make_token(vec![make_grant(&["system/tree"], &["system/type/*"], &["get"])]);
+        let good = make_token(vec![make_grant(
+            &["system/tree"],
+            &["system/type/*"],
+            &["get"],
+        )]);
         let bad_target = ResourceTarget {
             targets: vec!["../escape".into()],
             exclude: vec![],
         };
-        assert!(!check_resource_scope(&bad_target, &good.grants[0].resources, LOCAL_PEER, LOCAL_PEER));
+        assert!(!check_resource_scope(
+            &bad_target,
+            &good.grants[0].resources,
+            LOCAL_PEER,
+            LOCAL_PEER
+        ));
     }
 
     // --- Attenuation ---

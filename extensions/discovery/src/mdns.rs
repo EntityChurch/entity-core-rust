@@ -131,7 +131,7 @@ impl DiscoveryBackend for MdnsBackend {
                 }
                 Ok(Ok(_)) => {} // SearchStarted / ServiceFound / Removed — ignored for snapshot
                 Ok(Err(_)) => break, // channel disconnected
-                Err(_) => break,     // window elapsed
+                Err(_) => break, // window elapsed
             }
         }
         let _ = daemon.stop_browse(MDNS_SERVICE_TYPE);
@@ -211,6 +211,12 @@ impl DiscoveryBackend for MdnsBackend {
 /// spaces; map anything outside `[A-Za-z0-9-]` to `-`.
 fn sanitize_host(s: &str) -> String {
     s.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }

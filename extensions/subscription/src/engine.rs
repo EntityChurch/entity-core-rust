@@ -23,7 +23,9 @@ use entity_capability::CapabilityToken;
 use entity_entity::Entity;
 use entity_handler::HandlerError;
 use entity_hash::Hash;
-use entity_store::{ChangeType, ContentStore, ExecutionContext, LocationIndex, SyncTreeHook, TreeChangeEvent};
+use entity_store::{
+    ChangeType, ContentStore, ExecutionContext, LocationIndex, SyncTreeHook, TreeChangeEvent,
+};
 
 // Platform-aware task spawning: tokio::spawn on native, wasm_bindgen_futures::spawn_local on WASM.
 // On native, the start() method uses tokio::spawn directly for JoinHandle return type,
@@ -403,10 +405,7 @@ impl Engine {
                 while let Some(work) = rx.recv().await {
                     engine.deliver_notification(work).await;
                 }
-                tracing::info!(
-                    shard,
-                    "subscription engine: delivery channel closed"
-                );
+                tracing::info!(shard, "subscription engine: delivery channel closed");
             }));
         }
         handles
@@ -431,10 +430,7 @@ impl Engine {
                 while let Some(work) = rx.recv().await {
                     engine.deliver_notification(work).await;
                 }
-                tracing::info!(
-                    shard,
-                    "subscription engine: delivery channel closed"
-                );
+                tracing::info!(shard, "subscription engine: delivery channel closed");
             });
         }
     }
@@ -449,9 +445,11 @@ impl Engine {
 const CASCADE_DEPTH_SUBSCRIPTION_SUPPRESS: u32 = 8;
 
 impl SyncTreeHook for Engine {
-    fn on_tree_change(&self, event: &TreeChangeEvent, ctx: &mut ExecutionContext)
-        -> Result<(), entity_store::CascadeHalt>
-    {
+    fn on_tree_change(
+        &self,
+        event: &TreeChangeEvent,
+        ctx: &mut ExecutionContext,
+    ) -> Result<(), entity_store::CascadeHalt> {
         if ctx.cascade_depth >= CASCADE_DEPTH_SUBSCRIPTION_SUPPRESS {
             return Ok(());
         }
@@ -1048,7 +1046,11 @@ mod tests {
         // matched subscription after notification entity is built.
         let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
         let index: Arc<dyn LocationIndex> = Arc::new(MemoryLocationIndex::new());
-        let engine = Arc::new(Engine::new(store.clone(), index.clone(), "peer1".to_string()));
+        let engine = Arc::new(Engine::new(
+            store.clone(),
+            index.clone(),
+            "peer1".to_string(),
+        ));
 
         let token_entity = Entity::new(
             "system/capability/token",
@@ -1101,7 +1103,11 @@ mod tests {
         // outcome (Ok or Err).
         let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
         let index: Arc<dyn LocationIndex> = Arc::new(MemoryLocationIndex::new());
-        let engine = Arc::new(Engine::new(store.clone(), index.clone(), "peer1".to_string()));
+        let engine = Arc::new(Engine::new(
+            store.clone(),
+            index.clone(),
+            "peer1".to_string(),
+        ));
 
         let captured: Arc<std::sync::Mutex<Vec<DeliverEvent>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -1127,9 +1133,7 @@ mod tests {
         };
 
         // Success case.
-        let ok_fn: DeliverFn = Arc::new(|_req| {
-            Box::pin(async move { Ok::<(), HandlerError>(()) })
-        });
+        let ok_fn: DeliverFn = Arc::new(|_req| Box::pin(async move { Ok::<(), HandlerError>(()) }));
         *engine.deliver.write().unwrap() = Some(ok_fn);
         engine.deliver_notification(make_work()).await;
 
@@ -1147,7 +1151,10 @@ mod tests {
         assert_eq!(evts[0].subscription_id, "sub-deliver");
         assert_eq!(evts[0].notification_hash, notification_hash);
         assert_eq!(evts[0].status, entity_handler::STATUS_OK);
-        assert!(evts[0].error_code.is_none(), "success arm has no error_code");
+        assert!(
+            evts[0].error_code.is_none(),
+            "success arm has no error_code"
+        );
 
         assert_eq!(evts[1].status, 0, "failure arm uses status=0 sentinel");
         assert_eq!(
@@ -1164,7 +1171,11 @@ mod tests {
         // `system/runtime/chain-errors/lost/{chain_id}/{subscription_id}/{reason}/{marker_hash}`.
         let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
         let index: Arc<dyn LocationIndex> = Arc::new(MemoryLocationIndex::new());
-        let engine = Arc::new(Engine::new(store.clone(), index.clone(), "peer1".to_string()));
+        let engine = Arc::new(Engine::new(
+            store.clone(),
+            index.clone(),
+            "peer1".to_string(),
+        ));
 
         let token_entity = Entity::new(
             "system/capability/token",
@@ -1201,8 +1212,10 @@ mod tests {
             change_type: ChangeType::Created,
             context: None,
         };
-        let mut ctx = ExecutionContext::default();
-        ctx.chain_id = Some("chain-xyz".to_string());
+        let mut ctx = ExecutionContext {
+            chain_id: Some("chain-xyz".to_string()),
+            ..Default::default()
+        };
         engine.on_tree_change(&event, &mut ctx).unwrap();
 
         let prefix = "/peer1/system/runtime/chain-errors/lost/chain-xyz/sub-1/max_events_reached/";
@@ -1221,7 +1234,11 @@ mod tests {
         // by the subscription is not in the content store.
         let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
         let index: Arc<dyn LocationIndex> = Arc::new(MemoryLocationIndex::new());
-        let engine = Arc::new(Engine::new(store.clone(), index.clone(), "peer1".to_string()));
+        let engine = Arc::new(Engine::new(
+            store.clone(),
+            index.clone(),
+            "peer1".to_string(),
+        ));
 
         // deliver_token points at a hash that's NEVER put into the store.
         let mut sub = make_sub_data("sub-missing-token", "app/*");
@@ -1266,15 +1283,27 @@ mod tests {
         // the new hash. When not set, included must be empty.
         let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
         let index: Arc<dyn LocationIndex> = Arc::new(MemoryLocationIndex::new());
-        let engine = Arc::new(Engine::new(store.clone(), index.clone(), "peer1".to_string()));
+        let engine = Arc::new(Engine::new(
+            store.clone(),
+            index.clone(),
+            "peer1".to_string(),
+        ));
 
         // deliver_token in store (required by hook)
-        let token_entity = Entity::new("system/capability/token", entity_ecf::to_ecf(
-            &entity_ecf::Value::Map(vec![
-                (entity_ecf::text("granter"), entity_ecf::Value::Bytes(Hash::zero().to_bytes().to_vec())),
-                (entity_ecf::text("grantee"), entity_ecf::Value::Bytes(Hash::zero().to_bytes().to_vec())),
-            ])
-        )).unwrap();
+        let token_entity = Entity::new(
+            "system/capability/token",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+                (
+                    entity_ecf::text("granter"),
+                    entity_ecf::Value::Bytes(Hash::zero().to_bytes().to_vec()),
+                ),
+                (
+                    entity_ecf::text("grantee"),
+                    entity_ecf::Value::Bytes(Hash::zero().to_bytes().to_vec()),
+                ),
+            ])),
+        )
+        .unwrap();
         let token_hash = store.put(token_entity).unwrap();
 
         // The actual changed entity that should be bundled.
@@ -1325,7 +1354,10 @@ mod tests {
                 seen_b_no_payload = true;
             }
         }
-        assert!(seen_a_payload && seen_b_no_payload, "both subs should have fired");
+        assert!(
+            seen_a_payload && seen_b_no_payload,
+            "both subs should have fired"
+        );
     }
 
     #[test]
@@ -1333,14 +1365,26 @@ mod tests {
         // No new_hash on delete → no entity to bundle, even if opted in.
         let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
         let index: Arc<dyn LocationIndex> = Arc::new(MemoryLocationIndex::new());
-        let engine = Arc::new(Engine::new(store.clone(), index.clone(), "peer1".to_string()));
+        let engine = Arc::new(Engine::new(
+            store.clone(),
+            index.clone(),
+            "peer1".to_string(),
+        ));
 
-        let token_entity = Entity::new("system/capability/token", entity_ecf::to_ecf(
-            &entity_ecf::Value::Map(vec![
-                (entity_ecf::text("granter"), entity_ecf::Value::Bytes(Hash::zero().to_bytes().to_vec())),
-                (entity_ecf::text("grantee"), entity_ecf::Value::Bytes(Hash::zero().to_bytes().to_vec())),
-            ])
-        )).unwrap();
+        let token_entity = Entity::new(
+            "system/capability/token",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+                (
+                    entity_ecf::text("granter"),
+                    entity_ecf::Value::Bytes(Hash::zero().to_bytes().to_vec()),
+                ),
+                (
+                    entity_ecf::text("grantee"),
+                    entity_ecf::Value::Bytes(Hash::zero().to_bytes().to_vec()),
+                ),
+            ])),
+        )
+        .unwrap();
         let token_hash = store.put(token_entity).unwrap();
 
         let mut sub = make_sub_data("sub-del", "app/*");
@@ -1371,15 +1415,27 @@ mod tests {
         // subscription.  We read from the delivery channel to confirm.
         let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
         let index: Arc<dyn LocationIndex> = Arc::new(MemoryLocationIndex::new());
-        let engine = Arc::new(Engine::new(store.clone(), index.clone(), "peer1".to_string()));
+        let engine = Arc::new(Engine::new(
+            store.clone(),
+            index.clone(),
+            "peer1".to_string(),
+        ));
 
         // We need a deliver_token entity in the content store
-        let token_entity = Entity::new("system/capability/token", entity_ecf::to_ecf(
-            &entity_ecf::Value::Map(vec![
-                (entity_ecf::text("granter"), entity_ecf::Value::Bytes(Hash::zero().to_bytes().to_vec())),
-                (entity_ecf::text("grantee"), entity_ecf::Value::Bytes(Hash::zero().to_bytes().to_vec())),
-            ])
-        )).unwrap();
+        let token_entity = Entity::new(
+            "system/capability/token",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+                (
+                    entity_ecf::text("granter"),
+                    entity_ecf::Value::Bytes(Hash::zero().to_bytes().to_vec()),
+                ),
+                (
+                    entity_ecf::text("grantee"),
+                    entity_ecf::Value::Bytes(Hash::zero().to_bytes().to_vec()),
+                ),
+            ])),
+        )
+        .unwrap();
         let token_hash = store.put(token_entity).unwrap();
 
         let mut sub = make_sub_data("sub-match", "app/*");
@@ -1417,8 +1473,10 @@ mod tests {
             change_type: ChangeType::Created,
             context: None,
         };
-        let mut ctx = ExecutionContext::default();
-        ctx.cascade_depth = CASCADE_DEPTH_SUBSCRIPTION_SUPPRESS;
+        let mut ctx = ExecutionContext {
+            cascade_depth: CASCADE_DEPTH_SUBSCRIPTION_SUPPRESS,
+            ..Default::default()
+        };
         engine.on_tree_change(&event, &mut ctx).unwrap();
 
         // Should not have queued anything
@@ -1456,15 +1514,27 @@ mod tests {
     fn test_sync_hook_event_filter() {
         let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
         let index: Arc<dyn LocationIndex> = Arc::new(MemoryLocationIndex::new());
-        let engine = Arc::new(Engine::new(store.clone(), index.clone(), "peer1".to_string()));
+        let engine = Arc::new(Engine::new(
+            store.clone(),
+            index.clone(),
+            "peer1".to_string(),
+        ));
 
         // Register subscription that only wants "created" events
-        let token_entity = Entity::new("system/capability/token", entity_ecf::to_ecf(
-            &entity_ecf::Value::Map(vec![
-                (entity_ecf::text("granter"), entity_ecf::Value::Bytes(Hash::zero().to_bytes().to_vec())),
-                (entity_ecf::text("grantee"), entity_ecf::Value::Bytes(Hash::zero().to_bytes().to_vec())),
-            ])
-        )).unwrap();
+        let token_entity = Entity::new(
+            "system/capability/token",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+                (
+                    entity_ecf::text("granter"),
+                    entity_ecf::Value::Bytes(Hash::zero().to_bytes().to_vec()),
+                ),
+                (
+                    entity_ecf::text("grantee"),
+                    entity_ecf::Value::Bytes(Hash::zero().to_bytes().to_vec()),
+                ),
+            ])),
+        )
+        .unwrap();
         let token_hash = store.put(token_entity).unwrap();
 
         let sub = SubscriptionData {

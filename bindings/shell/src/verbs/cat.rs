@@ -20,10 +20,7 @@ use crate::shell::Shell;
 /// already alias-expanded by the dispatcher) and produce an
 /// `EntityView`. Reusable from non-shell consumers (palette forms,
 /// admin panels) without going through the verb-parser.
-pub fn cat_op(
-    binding: &dyn PeerBinding,
-    target: &str,
-) -> Result<VerbOutput, ShellError> {
+pub fn cat_op(binding: &dyn PeerBinding, target: &str) -> Result<VerbOutput, ShellError> {
     let entity = binding
         .get_entity(binding.peer_id(), target)
         .ok_or_else(|| ShellError::not_found(format!("cat: not found: {}", target)))?;
@@ -62,11 +59,21 @@ mod tests {
     }
 
     impl PeerBinding for StubBinding {
-        fn peer_id(&self) -> &str { &self.bound }
-        fn primary_peer_id(&self) -> String { self.bound.clone() }
-        fn peer_ids(&self) -> Vec<String> { vec![self.bound.clone()] }
-        fn connected_peers(&self) -> Vec<String> { Vec::new() }
-        fn peer_label(&self, _pid: &str) -> Option<String> { None }
+        fn peer_id(&self) -> &str {
+            &self.bound
+        }
+        fn primary_peer_id(&self) -> String {
+            self.bound.clone()
+        }
+        fn peer_ids(&self) -> Vec<String> {
+            vec![self.bound.clone()]
+        }
+        fn connected_peers(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn peer_label(&self, _pid: &str) -> Option<String> {
+            None
+        }
         fn tree_listing(&self, _pid: &str, _prefix: &str) -> Vec<TreeListingEntry> {
             Vec::new()
         }
@@ -111,7 +118,10 @@ mod tests {
 
     #[test]
     fn missing_path_returns_usage() {
-        let b = StubBinding { bound: "alice".into(), entities: Vec::new() };
+        let b = StubBinding {
+            bound: "alice".into(),
+            entities: Vec::new(),
+        };
         let shell = Shell::with_wd("alice", "/alice/");
         let err = cat(&shell, &[], &b).unwrap_err();
         assert_eq!(err.code, crate::result::ErrorCode::Usage);
@@ -119,7 +129,10 @@ mod tests {
 
     #[test]
     fn missing_entity_returns_not_found() {
-        let b = StubBinding { bound: "alice".into(), entities: Vec::new() };
+        let b = StubBinding {
+            bound: "alice".into(),
+            entities: Vec::new(),
+        };
         let shell = Shell::with_wd("alice", "/alice/");
         let err = cat(&shell, &["nothing"], &b).unwrap_err();
         assert_eq!(err.code, crate::result::ErrorCode::NotFound);

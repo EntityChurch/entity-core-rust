@@ -101,15 +101,26 @@ fn matches_go_fixture_byte_for_byte() {
     let expected = hex_decode(expected_hex);
 
     if encoded != expected {
-        eprintln!("Rust encoded ({} bytes):  {}", encoded.len(), hex_encode(&encoded));
+        eprintln!(
+            "Rust encoded ({} bytes):  {}",
+            encoded.len(),
+            hex_encode(&encoded)
+        );
         eprintln!("Go fixture   ({} bytes):  {}", expected.len(), expected_hex);
         // First-diff hint.
-        if let Some(i) = (0..encoded.len().min(expected.len())).find(|&i| encoded[i] != expected[i]) {
-            eprintln!("First differing byte at offset {}: rust=0x{:02x} go=0x{:02x}", i, encoded[i], expected[i]);
+        if let Some(i) = (0..encoded.len().min(expected.len())).find(|&i| encoded[i] != expected[i])
+        {
+            eprintln!(
+                "First differing byte at offset {}: rust=0x{:02x} go=0x{:02x}",
+                i, encoded[i], expected[i]
+            );
         }
     }
     assert_eq!(encoded.len(), 161, "expected 161 bytes per Go fixture");
-    assert_eq!(encoded, expected, "Rust ECF must match Go canonical encoding");
+    assert_eq!(
+        encoded, expected,
+        "Rust ECF must match Go canonical encoding"
+    );
 }
 
 #[test]

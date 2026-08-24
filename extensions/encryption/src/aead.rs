@@ -27,10 +27,14 @@ pub fn xchacha_encrypt(
     check_lengths(key, nonce)?;
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
     cipher
-        .encrypt(XNonce::from_slice(nonce), Payload { msg: plaintext, aad })
-        .map_err(|e| {
-            EncryptionError::UnsupportedSuite(format!("XChaCha20-Poly1305 encrypt: {e}"))
-        })
+        .encrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|e| EncryptionError::UnsupportedSuite(format!("XChaCha20-Poly1305 encrypt: {e}")))
 }
 
 /// Verify + decrypt `ciphertext || tag`. On tag failure returns
@@ -44,7 +48,13 @@ pub fn xchacha_decrypt(
     check_lengths(key, nonce)?;
     let cipher = XChaCha20Poly1305::new(Key::from_slice(key));
     cipher
-        .decrypt(XNonce::from_slice(nonce), Payload { msg: ciphertext, aad })
+        .decrypt(
+            XNonce::from_slice(nonce),
+            Payload {
+                msg: ciphertext,
+                aad,
+            },
+        )
         .map_err(|_| EncryptionError::AeadFailed("AEAD tag verification failed".into()))
 }
 

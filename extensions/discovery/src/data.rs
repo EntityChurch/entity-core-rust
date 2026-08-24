@@ -303,8 +303,13 @@ fn decode_map(data: &[u8]) -> Result<Vec<(Value, Value)>, DiscoveryError> {
 }
 
 fn get_field<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
-    map.iter()
-        .find_map(|(k, v)| if k.as_text() == Some(key) { Some(v) } else { None })
+    map.iter().find_map(|(k, v)| {
+        if k.as_text() == Some(key) {
+            Some(v)
+        } else {
+            None
+        }
+    })
 }
 
 fn field_text(map: &[(Value, Value)], key: &str) -> Result<String, DiscoveryError> {

@@ -104,7 +104,7 @@ mod tests {
         assert_eq!(err.code(), "encryption_key_derived_from_identity");
 
         // (3) an independent X25519 key → accepted.
-        let independent = x25519_public(&vec![0x99u8; 32]).unwrap();
+        let independent = x25519_public(&[0x99u8; 32]).unwrap();
         assert_ne!(independent, birational, "test key must be independent");
         validate_key_separation(&identity, &independent).unwrap();
     }

@@ -63,11 +63,7 @@ pub trait ScopePredicate: Send + Sync {
     /// this" answer). `Err` is reserved for genuine infrastructure
     /// failures (storage errors, lock poison) — never use it for
     /// "this hash isn't served," which is `Ok(false)` per T4.
-    async fn in_scope(
-        &self,
-        hash: &Hash,
-        shared: &Arc<PeerShared>,
-    ) -> Result<bool, ScopeError>;
+    async fn in_scope(&self, hash: &Hash, shared: &Arc<PeerShared>) -> Result<bool, ScopeError>;
 
     /// **Tree-face.** Return `Ok(true)` iff `absolute_path` is
     /// within the published set's tree footprint. Used by the
@@ -166,11 +162,7 @@ impl ScopePredicate for NamespaceScope {
     /// Walks `location_index.list("/")` once per query; acceptable for
     /// in-memory stores at any plausible scale. A reverse hash→paths
     /// index would make this O(1) but is not load-bearing.
-    async fn in_scope(
-        &self,
-        hash: &Hash,
-        shared: &Arc<PeerShared>,
-    ) -> Result<bool, ScopeError> {
+    async fn in_scope(&self, hash: &Hash, shared: &Arc<PeerShared>) -> Result<bool, ScopeError> {
         let hex_h = super::hex_encode(&hash.to_bytes());
         // Universal-tree reading: ANY peer's `/{pid}/{namespace}/{hex(H)}`
         // satisfies. We can't enumerate peer-ids without walking the
@@ -324,11 +316,7 @@ impl ScopePredicate for CapTokenScope {
     /// Content-face per §6.5.6: §6.4.2 Hash Tree Presence within the
     /// cap's reach. For each include namespace, check if there's a
     /// binding at `/{ns}/{hex33(H)}`.
-    async fn in_scope(
-        &self,
-        hash: &Hash,
-        shared: &Arc<PeerShared>,
-    ) -> Result<bool, ScopeError> {
+    async fn in_scope(&self, hash: &Hash, shared: &Arc<PeerShared>) -> Result<bool, ScopeError> {
         let local_pid = shared.keypair.peer_id();
         let hex_h = super::hex_encode(&hash.to_bytes());
 
@@ -436,14 +424,26 @@ impl ScopePredicate for CapTokenScope {
 /// in operations? (`*` matches.) Cheap predicate; used to skip
 /// non-relevant grants when deriving content namespaces.
 fn grant_allows_tree_get(grant: &entity_capability::GrantEntry) -> bool {
-    let handler_ok = grant.handlers.include.iter().any(|h| h == "*" || h == "system/tree")
+    let handler_ok = grant
+        .handlers
+        .include
+        .iter()
+        .any(|h| h == "*" || h == "system/tree")
         && !grant
             .handlers
             .exclude
             .iter()
             .any(|h| h == "system/tree" || h == "*");
-    let op_ok = grant.operations.include.iter().any(|o| o == "*" || o == "get")
-        && !grant.operations.exclude.iter().any(|o| o == "get" || o == "*");
+    let op_ok = grant
+        .operations
+        .include
+        .iter()
+        .any(|o| o == "*" || o == "get")
+        && !grant
+            .operations
+            .exclude
+            .iter()
+            .any(|o| o == "get" || o == "*");
     handler_ok && op_ok
 }
 
@@ -541,11 +541,7 @@ impl Default for ClosureScope {
 
 #[async_trait]
 impl ScopePredicate for ClosureScope {
-    async fn in_scope(
-        &self,
-        hash: &Hash,
-        shared: &Arc<PeerShared>,
-    ) -> Result<bool, ScopeError> {
+    async fn in_scope(&self, hash: &Hash, shared: &Arc<PeerShared>) -> Result<bool, ScopeError> {
         self.refresh(shared);
         let cache = self.cache.lock().unwrap();
         Ok(cache

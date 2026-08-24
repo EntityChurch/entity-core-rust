@@ -21,11 +21,11 @@
 use async_trait::async_trait;
 use ciborium::Value;
 use entity_entity::Entity;
-use entity_hash::Hash;
 use entity_handler::{
     error_entity, Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_GATEWAY,
     STATUS_BAD_REQUEST, STATUS_NOT_FOUND, STATUS_UNAVAILABLE,
 };
+use entity_hash::Hash;
 
 use entity_storage_substitute_sources::{decode_substitute_source, TYPE_SUBSTITUTE_SOURCE};
 

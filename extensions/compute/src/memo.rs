@@ -90,18 +90,14 @@ pub fn scope_hash(scope: &Scope) -> Hash {
     for (name, value) in &scope.bindings {
         let cbor_val = match value {
             ComputeValue::Primitive(v) => v.clone(),
-            ComputeValue::Entity(e) => {
-                ciborium::Value::Bytes(e.content_hash.to_bytes().to_vec())
-            }
+            ComputeValue::Entity(e) => ciborium::Value::Bytes(e.content_hash.to_bytes().to_vec()),
             ComputeValue::Closure(c) => {
                 ciborium::Value::Bytes(c.to_entity().content_hash.to_bytes().to_vec())
             }
             ComputeValue::Error(err) => {
                 ciborium::Value::Bytes(err.to_entity().content_hash.to_bytes().to_vec())
             }
-            ComputeValue::Uint(u) => {
-                ciborium::Value::Integer(ciborium::value::Integer::from(*u))
-            }
+            ComputeValue::Uint(u) => ciborium::Value::Integer(ciborium::value::Integer::from(*u)),
         };
         entries.push((ciborium::Value::Text(name.clone()), cbor_val));
     }

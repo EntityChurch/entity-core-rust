@@ -128,7 +128,8 @@ pub(super) fn eval_logic(
 pub fn apply_arithmetic(op: &str, left: &ComputeValue, right: &ComputeValue) -> ComputeValue {
     // Rule 6
     if !left.is_numeric() || !right.is_numeric() {
-        return ComputeError::TypeMismatch("Arithmetic requires numeric operands".into()).to_value();
+        return ComputeError::TypeMismatch("Arithmetic requires numeric operands".into())
+            .to_value();
     }
 
     // Rule 4: mod is integer-only. Reject float operands BEFORE rule 1's
@@ -171,7 +172,7 @@ fn apply_div_integer(left: &ComputeValue, right: &ComputeValue) -> ComputeValue 
             return ComputeError::DivisionByZero.to_value();
         }
         // Rule 3 applied with unsigned interpretation.
-        if l % r == 0 {
+        if l.is_multiple_of(r) {
             ComputeValue::Uint(l / r)
         } else {
             ComputeValue::Primitive(Value::Float(l as f64 / r as f64))
@@ -258,10 +259,8 @@ pub(super) fn eval_numeric_cast(
     let to_type = match data_str(data, "to_type") {
         Some(t) => t,
         None => {
-            return ComputeError::InvalidExpression(
-                "compute/numeric-cast missing 'to_type'".into(),
-            )
-            .to_value()
+            return ComputeError::InvalidExpression("compute/numeric-cast missing 'to_type'".into())
+                .to_value()
         }
     };
 
@@ -297,11 +296,8 @@ fn cast_to_int(value: &ComputeValue) -> ComputeValue {
     if value.is_float() {
         let f = value.as_f64().unwrap();
         if !f.is_finite() {
-            return ComputeError::CastOutOfRange(format!(
-                "float→int: non-finite value ({})",
-                f
-            ))
-            .to_value();
+            return ComputeError::CastOutOfRange(format!("float→int: non-finite value ({})", f))
+                .to_value();
         }
         let t = f.trunc();
         // i64::MIN as f64 is exactly representable (-9.2233720368547758e18); the
@@ -326,14 +322,11 @@ fn cast_to_uint(value: &ComputeValue) -> ComputeValue {
     if value.is_float() {
         let f = value.as_f64().unwrap();
         if !f.is_finite() {
-            return ComputeError::CastOutOfRange(format!(
-                "float→uint: non-finite value ({})",
-                f
-            ))
-            .to_value();
+            return ComputeError::CastOutOfRange(format!("float→uint: non-finite value ({})", f))
+                .to_value();
         }
         let t = f.trunc();
-        if t < 0.0 || t >= 18_446_744_073_709_551_616.0 {
+        if !(0.0..18_446_744_073_709_551_616.0).contains(&t) {
             return ComputeError::CastOutOfRange(format!(
                 "float→uint: out of range ({} → {})",
                 f, t
@@ -464,9 +457,7 @@ fn compute_values_equal(a: &ComputeValue, b: &ComputeValue) -> bool {
         (ComputeValue::Primitive(va), ComputeValue::Primitive(vb)) => {
             entity_ecf::to_ecf(va) == entity_ecf::to_ecf(vb)
         }
-        (ComputeValue::Entity(ea), ComputeValue::Entity(eb)) => {
-            ea.content_hash == eb.content_hash
-        }
+        (ComputeValue::Entity(ea), ComputeValue::Entity(eb)) => ea.content_hash == eb.content_hash,
         (ComputeValue::Closure(ca), ComputeValue::Closure(cb)) => {
             ca.body == cb.body && ca.params == cb.params && ca.env == cb.env
         }

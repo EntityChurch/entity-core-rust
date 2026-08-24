@@ -53,10 +53,10 @@ pub use kat::enc_kat_inner_plaintext;
 pub use keybackup::{unwrap_private_key, wrap_private_key, EncryptionKeyBackupData};
 pub use lifecycle::{EncryptionHandoffData, EncryptionRevocationData, TierAView};
 pub use peer::{peer_decrypt, peer_encrypt, PeerEncryptInput};
-pub use separation::{birational_ed25519_to_x25519, validate_key_separation};
 pub use registry::{
     group_mode_suite_allowed, intersect_suite, peer_mode_suite_allowed, self_mode_suite_allowed,
 };
 pub use self_mode::{self_decrypt, self_encrypt, SelfEncryptParams};
+pub use separation::{birational_ed25519_to_x25519, validate_key_separation};
 pub use types::{EncryptionError, KdfParams};
 pub use wrapper::{EncryptedData, EncryptionPubkeyData, WrappedKey};

@@ -36,7 +36,9 @@ pub enum IngestError {
     /// V7 §6.5 — path conflict (existing binding has different
     /// content_hash). MUST surface as status 400 and short-circuit
     /// dispatch.
-    #[error("signature_path_conflict: path={path} existing={existing_hex} incoming={incoming_hex}")]
+    #[error(
+        "signature_path_conflict: path={path} existing={existing_hex} incoming={incoming_hex}"
+    )]
     SignaturePathConflict {
         path: String,
         existing_hex: String,
@@ -226,7 +228,10 @@ mod tests {
         included.insert(sig.content_hash, sig);
 
         let n = ingest_envelope_signatures(&included, &cs, &li).unwrap();
-        assert_eq!(n, 1, "Ed448 signature MUST bind (was silently dropped pre-fix)");
+        assert_eq!(
+            n, 1,
+            "Ed448 signature MUST bind (was silently dropped pre-fix)"
+        );
 
         // Path uses the canonical SHA-256-form PeerID — the exact form the
         // verify-side chain-bundle collector derives via canonical_peer_id().
@@ -290,7 +295,11 @@ mod tests {
             hex_segment(&target)
         );
         // Pre-bind a different hash at the canonical path.
-        let bogus = Entity::new("system/error", to_ecf(&Value::Map(vec![(text("x"), text("y"))]))).unwrap();
+        let bogus = Entity::new(
+            "system/error",
+            to_ecf(&Value::Map(vec![(text("x"), text("y"))])),
+        )
+        .unwrap();
         let bogus_hash = bogus.content_hash;
         cs.put(bogus).unwrap();
         li.set(&path, bogus_hash);

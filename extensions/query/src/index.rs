@@ -144,8 +144,7 @@ impl QueryIndexStore for QueryIndexes {
             .insert(path.to_string(), hash_refs);
 
         // Path link index — type-aware walking
-        let path_refs =
-            walker::extract_path_refs(&entity.data, entity_type, &self.type_registry);
+        let path_refs = walker::extract_path_refs(&entity.data, entity_type, &self.type_registry);
         if !path_refs.is_empty() {
             let mut idx = self.path_link_index.write().unwrap();
             for (ref_path, field_name) in &path_refs {
@@ -243,11 +242,7 @@ impl QueryIndexStore for QueryIndexes {
             .unwrap_or_default()
     }
 
-    fn rebuild(
-        &self,
-        location_index: &dyn LocationIndex,
-        content_store: &dyn ContentStore,
-    ) {
+    fn rebuild(&self, location_index: &dyn LocationIndex, content_store: &dyn ContentStore) {
         self.clear();
         for entry in location_index.list("") {
             if let Some(entity) = content_store.get(&entry.hash) {
@@ -279,9 +274,18 @@ mod tests {
     #[test]
     fn test_type_index_add_query() {
         let indexes = QueryIndexes::new();
-        let e1 = make_entity("app/user", entity_ecf::cbor_map! { "name" => entity_ecf::text("alice") });
-        let e2 = make_entity("app/user", entity_ecf::cbor_map! { "name" => entity_ecf::text("bob") });
-        let e3 = make_entity("app/order", entity_ecf::cbor_map! { "id" => entity_ecf::text("o1") });
+        let e1 = make_entity(
+            "app/user",
+            entity_ecf::cbor_map! { "name" => entity_ecf::text("alice") },
+        );
+        let e2 = make_entity(
+            "app/user",
+            entity_ecf::cbor_map! { "name" => entity_ecf::text("bob") },
+        );
+        let e3 = make_entity(
+            "app/order",
+            entity_ecf::cbor_map! { "id" => entity_ecf::text("o1") },
+        );
 
         indexes.add_entries_for_entity("users/alice", &e1);
         indexes.add_entries_for_entity("users/bob", &e2);
@@ -306,7 +310,10 @@ mod tests {
     #[test]
     fn test_type_index_remove() {
         let indexes = QueryIndexes::new();
-        let entity = make_entity("app/user", entity_ecf::cbor_map! { "name" => entity_ecf::text("alice") });
+        let entity = make_entity(
+            "app/user",
+            entity_ecf::cbor_map! { "name" => entity_ecf::text("alice") },
+        );
         indexes.add_entries_for_entity("users/alice", &entity);
         assert_eq!(indexes.query_type_index("app/user").len(), 1);
 
@@ -353,8 +360,14 @@ mod tests {
     #[test]
     fn test_update_entity_at_path() {
         let indexes = QueryIndexes::new();
-        let e1 = make_entity("app/user", entity_ecf::cbor_map! { "name" => entity_ecf::text("alice") });
-        let e2 = make_entity("app/order", entity_ecf::cbor_map! { "id" => entity_ecf::text("o1") });
+        let e1 = make_entity(
+            "app/user",
+            entity_ecf::cbor_map! { "name" => entity_ecf::text("alice") },
+        );
+        let e2 = make_entity(
+            "app/order",
+            entity_ecf::cbor_map! { "id" => entity_ecf::text("o1") },
+        );
 
         indexes.add_entries_for_entity("path/x", &e1);
         assert_eq!(indexes.query_type_index("app/user").len(), 1);
@@ -371,11 +384,17 @@ mod tests {
         let content_store = entity_store::MemoryContentStore::new();
         let location_index = entity_store::MemoryLocationIndex::new();
 
-        let e1 = make_entity("app/a", entity_ecf::cbor_map! { "x" => entity_ecf::text("1") });
+        let e1 = make_entity(
+            "app/a",
+            entity_ecf::cbor_map! { "x" => entity_ecf::text("1") },
+        );
         let h1 = content_store.put(e1).unwrap();
         location_index.set("path/a", h1);
 
-        let e2 = make_entity("app/b", entity_ecf::cbor_map! { "x" => entity_ecf::text("2") });
+        let e2 = make_entity(
+            "app/b",
+            entity_ecf::cbor_map! { "x" => entity_ecf::text("2") },
+        );
         let h2 = content_store.put(e2).unwrap();
         location_index.set("path/b", h2);
 
@@ -390,7 +409,10 @@ mod tests {
     #[test]
     fn test_clear() {
         let indexes = QueryIndexes::new();
-        let entity = make_entity("app/user", entity_ecf::cbor_map! { "name" => entity_ecf::text("a") });
+        let entity = make_entity(
+            "app/user",
+            entity_ecf::cbor_map! { "name" => entity_ecf::text("a") },
+        );
         indexes.add_entries_for_entity("users/a", &entity);
         assert_eq!(indexes.query_type_index("*").len(), 1);
 

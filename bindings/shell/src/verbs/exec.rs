@@ -113,15 +113,27 @@ mod tests {
     }
 
     impl PeerBinding for StubBinding {
-        fn peer_id(&self) -> &str { &self.bound }
-        fn primary_peer_id(&self) -> String { self.bound.clone() }
-        fn peer_ids(&self) -> Vec<String> { vec![self.bound.clone()] }
-        fn connected_peers(&self) -> Vec<String> { Vec::new() }
-        fn peer_label(&self, _pid: &str) -> Option<String> { None }
+        fn peer_id(&self) -> &str {
+            &self.bound
+        }
+        fn primary_peer_id(&self) -> String {
+            self.bound.clone()
+        }
+        fn peer_ids(&self) -> Vec<String> {
+            vec![self.bound.clone()]
+        }
+        fn connected_peers(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn peer_label(&self, _pid: &str) -> Option<String> {
+            None
+        }
         fn tree_listing(&self, _pid: &str, _prefix: &str) -> Vec<TreeListingEntry> {
             Vec::new()
         }
-        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> { None }
+        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> {
+            None
+        }
         fn execute(
             &self,
             _peer_id: &str,
@@ -152,7 +164,10 @@ mod tests {
 
     #[test]
     fn too_few_args_returns_usage() {
-        let b = StubBinding { bound: "alice".into(), result: Ok("ok".into()) };
+        let b = StubBinding {
+            bound: "alice".into(),
+            result: Ok("ok".into()),
+        };
         let shell = Shell::with_wd("alice", "/alice/");
         let err = exec(&shell, &["only-handler"], &b, |_| {}).unwrap_err();
         assert_eq!(err.code, crate::result::ErrorCode::Usage);
@@ -160,15 +175,22 @@ mod tests {
 
     #[test]
     fn success_path_streams_dispatched_then_complete() {
-        let b = StubBinding { bound: "alice".into(), result: Ok("4 entities".into()) };
+        let b = StubBinding {
+            bound: "alice".into(),
+            result: Ok("4 entities".into()),
+        };
         let shell = Shell::with_wd("alice", "/alice/");
         let result = exec(&shell, &["system/tree", "list"], &b, drive).unwrap();
         match result {
             VerbOutput::Dispatch(mut rx) => {
                 let dispatched = rx.try_recv().unwrap();
-                assert!(matches!(dispatched, DispatchChunk::Dispatched(ref s) if s.contains("→ exec")));
+                assert!(
+                    matches!(dispatched, DispatchChunk::Dispatched(ref s) if s.contains("→ exec"))
+                );
                 let complete = drive_recv(&mut rx).unwrap();
-                assert!(matches!(complete, DispatchChunk::Complete(ref s) if s.contains("4 entities")));
+                assert!(
+                    matches!(complete, DispatchChunk::Complete(ref s) if s.contains("4 entities"))
+                );
             }
             other => panic!("unexpected variant: {:?}", other),
         }
@@ -176,7 +198,10 @@ mod tests {
 
     #[test]
     fn failure_path_emits_dispatch_failed() {
-        let b = StubBinding { bound: "alice".into(), result: Err("handler not registered".into()) };
+        let b = StubBinding {
+            bound: "alice".into(),
+            result: Err("handler not registered".into()),
+        };
         let shell = Shell::with_wd("alice", "/alice/");
         let result = exec(&shell, &["system/tree", "list"], &b, drive).unwrap();
         match result {

@@ -11,9 +11,7 @@ static KEYPAIRS: LazyLock<HandleMap<entity_crypto::Keypair>> = LazyLock::new(Han
 /// Generate a new random Ed25519 keypair.
 #[no_mangle]
 pub extern "C" fn entity_keypair_generate() -> Handle {
-    ffi_fn!({
-        KEYPAIRS.insert(entity_crypto::Keypair::generate())
-    })
+    ffi_fn!({ KEYPAIRS.insert(entity_crypto::Keypair::generate()) })
 }
 
 /// Create an Ed25519 keypair from a 32-byte seed (deterministic).
@@ -99,18 +97,21 @@ pub unsafe extern "C" fn entity_verify(
     sig_ptr: *const u8,
     sig_len: usize,
 ) -> EntityCoreError {
-    ffi_fn!({
-        let pubkey_slice = unsafe { std::slice::from_raw_parts(pubkey_ptr, 32) };
-        let mut pubkey = [0u8; 32];
-        pubkey.copy_from_slice(pubkey_slice);
-        let msg = unsafe { std::slice::from_raw_parts(msg_ptr, msg_len) };
-        let sig = unsafe { std::slice::from_raw_parts(sig_ptr, sig_len) };
-        match entity_crypto::Keypair::verify(&pubkey, msg, sig) {
-            Ok(()) => EntityCoreError::Ok,
-            Err(e) => {
-                set_last_error(&format!("verify failed: {}", e));
-                EntityCoreError::CryptoError
+    ffi_fn!(
+        {
+            let pubkey_slice = unsafe { std::slice::from_raw_parts(pubkey_ptr, 32) };
+            let mut pubkey = [0u8; 32];
+            pubkey.copy_from_slice(pubkey_slice);
+            let msg = unsafe { std::slice::from_raw_parts(msg_ptr, msg_len) };
+            let sig = unsafe { std::slice::from_raw_parts(sig_ptr, sig_len) };
+            match entity_crypto::Keypair::verify(&pubkey, msg, sig) {
+                Ok(()) => EntityCoreError::Ok,
+                Err(e) => {
+                    set_last_error(&format!("verify failed: {}", e));
+                    EntityCoreError::CryptoError
+                }
             }
-        }
-    }, EntityCoreError::InternalError)
+        },
+        EntityCoreError::InternalError
+    )
 }

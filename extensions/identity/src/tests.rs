@@ -16,20 +16,14 @@ use entity_crypto::Keypair;
 use entity_ecf::{text, to_ecf, Value};
 use entity_entity::Entity;
 use entity_hash::Hash;
-use entity_quorum::{
-    path_quorum, path_quorum_event, QuorumData, ResolverRegistry, SignerSetCache,
-};
-use entity_store::{
-    ContentStore, LocationIndex, MemoryContentStore, MemoryLocationIndex,
-};
+use entity_quorum::{path_quorum, path_quorum_event, QuorumData, ResolverRegistry, SignerSetCache};
+use entity_store::{ContentStore, LocationIndex, MemoryContentStore, MemoryLocationIndex};
 use entity_types::SignatureData;
 
 use crate::handler::IdentityHandler;
 use crate::kinds::{KIND_IDENTITY_CERT, KIND_IDENTITY_ROTATION_RECOVERY};
 use crate::paths::{path_internal_cert, path_public_cert};
-use crate::validation::{
-    identity_topology_for, identity_verify_cert, IdentityCtx, Topology,
-};
+use crate::validation::{identity_topology_for, identity_verify_cert, IdentityCtx, Topology};
 
 // ---------------------------------------------------------------------------
 // Test harness
@@ -173,7 +167,10 @@ impl Harness {
         ];
         if let Some(cid) = contact_id {
             let cid_hash = self.peer(cid);
-            props.push((text("contact_id"), Value::Bytes(cid_hash.to_bytes().to_vec())));
+            props.push((
+                text("contact_id"),
+                Value::Bytes(cid_hash.to_bytes().to_vec()),
+            ));
         }
         props.sort_by(|a, b| a.0.as_text().unwrap_or("").cmp(b.0.as_text().unwrap_or("")));
         let att = AttestationData {
@@ -244,8 +241,9 @@ impl Harness {
         self.attestation_index.insert(att_hash, att);
         self.sign_with(&att_hash, sign_with);
         // Seed the contact-quorum cache (the convergence point's job).
-        let cache_path =
-            self.qualify(&crate::paths::path_contact_quorum_publish(&published_handle));
+        let cache_path = self.qualify(&crate::paths::path_contact_quorum_publish(
+            &published_handle,
+        ));
         self.location_index.set(&cache_path, att_hash);
         att_hash
     }
@@ -261,7 +259,10 @@ impl Harness {
     ) -> (Hash, AttestationData) {
         let mut props: Vec<(ciborium::Value, ciborium::Value)> = vec![
             (text("kind"), text(KIND_IDENTITY_ROTATION_RECOVERY)),
-            (text("old_handle"), Value::Bytes(old_handle.to_bytes().to_vec())),
+            (
+                text("old_handle"),
+                Value::Bytes(old_handle.to_bytes().to_vec()),
+            ),
             (
                 text("target_cert"),
                 Value::Bytes(target_cert.to_bytes().to_vec()),
@@ -318,8 +319,16 @@ fn topology_top_level_controller_is_k_of_n() {
     h.add_peer("ctrl", 20);
     let q_hash = h.add_quorum(&["k1", "k2", "k3"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32])); // unused; quorum doesn't sign as a peer
-    let cert_hash = h.add_identity_cert("quorum", "ctrl", "controller", "public", &["k1", "k2"], None);
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32])); // unused; quorum doesn't sign as a peer
+    let cert_hash = h.add_identity_cert(
+        "quorum",
+        "ctrl",
+        "controller",
+        "public",
+        &["k1", "k2"],
+        None,
+    );
     let cert = h.attestation_index.get(&cert_hash).unwrap();
     let topology = identity_topology_for(&cert, &h.ictx()).expect("topology");
     match topology {
@@ -366,7 +375,8 @@ fn three_key_default_ceremony_validates_chain() {
     // 1. Quorum entity.
     let q_hash = h.add_quorum(&["k1", "k2", "k3"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32]));
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32]));
 
     // 2. Controller cert (public, K-of-N signed).
     let ctrl_cert = h.add_identity_cert(
@@ -379,14 +389,7 @@ fn three_key_default_ceremony_validates_chain() {
     );
 
     // 3. Agent cert (internal, single-sig from controller).
-    let agent_cert = h.add_identity_cert(
-        "ctrl",
-        "agent",
-        "agent",
-        "internal",
-        &["ctrl"],
-        None,
-    );
+    let agent_cert = h.add_identity_cert("ctrl", "agent", "agent", "internal", &["ctrl"], None);
 
     // Validate both certs via identity_verify_cert.
     let ctrl_data = h.attestation_index.get(&ctrl_cert).unwrap();
@@ -406,7 +409,8 @@ fn missing_quorum_signature_fails_chain_validation() {
     h.add_peer("ctrl", 20);
     let q_hash = h.add_quorum(&["k1", "k2", "k3"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32]));
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32]));
     // Sign with only K=1 instead of K=2.
     let cert = h.add_identity_cert("quorum", "ctrl", "controller", "public", &["k1"], None);
     let cert_data = h.attestation_index.get(&cert).unwrap();
@@ -479,9 +483,16 @@ async fn create_attestation_writes_at_canonical_path_and_indexes() {
     ]));
     let ctx = build_ctx(&handler, "create_attestation", None, params);
     let result = handler.handle(&ctx).await.expect("handle ok");
-    assert_eq!(result.status, STATUS_OK, "create_attestation should succeed");
+    assert_eq!(
+        result.status, STATUS_OK,
+        "create_attestation should succeed"
+    );
     // The attestation is now in the index.
-    assert_eq!(h.attestation_index.len(), 1, "exactly one attestation indexed");
+    assert_eq!(
+        h.attestation_index.len(),
+        1,
+        "exactly one attestation indexed"
+    );
 }
 
 #[tokio::test]
@@ -580,12 +591,7 @@ async fn create_quorum_preserves_name_and_metadata_for_canonical_path() {
         ),
         (text("threshold"), entity_ecf::integer(2)),
     ]));
-    let ctx = build_ctx(
-        &handler,
-        "create_quorum",
-        Some(&canonical_path),
-        params,
-    );
+    let ctx = build_ctx(&handler, "create_quorum", Some(&canonical_path), params);
     let result = handler.handle(&ctx).await.expect("handle ok");
     assert_eq!(
         result.status, STATUS_OK,
@@ -627,7 +633,9 @@ async fn create_quorum_rejects_when_request_diverges_from_canonical_path() {
         name: None,
         metadata: None,
     };
-    let no_name_path = h.qualify(&path_quorum(&canonical_no_name.to_entity().unwrap().content_hash));
+    let no_name_path = h.qualify(&path_quorum(
+        &canonical_no_name.to_entity().unwrap().content_hash,
+    ));
 
     // Dispatch WITH a name in params (creates a different QuorumData) but
     // supply the no-name canonical path as the resource. R-3 strict +
@@ -685,7 +693,10 @@ async fn create_attestation_embedded_returns_inline_entity() {
     ]));
     let ctx = build_ctx(&handler, "create_attestation", None, params);
     let result = handler.handle(&ctx).await.expect("handle ok");
-    assert_eq!(result.status, STATUS_OK, "embedded create_attestation must succeed");
+    assert_eq!(
+        result.status, STATUS_OK,
+        "embedded create_attestation must succeed"
+    );
 
     // The result entity carries the per-op type tag (R-2).
     assert_eq!(
@@ -701,27 +712,48 @@ async fn create_attestation_embedded_returns_inline_entity() {
     // R-6: `embedded_attestation` MUST be present and be a sub-map.
     let embedded = result_map
         .iter()
-        .find_map(|(k, v)| if k.as_text() == Some("embedded_attestation") { Some(v) } else { None })
+        .find_map(|(k, v)| {
+            if k.as_text() == Some("embedded_attestation") {
+                Some(v)
+            } else {
+                None
+            }
+        })
         .expect("R-6: embedded_attestation field MUST be present");
-    let embedded_map = embedded.as_map().expect("embedded_attestation is a sub-map");
+    let embedded_map = embedded
+        .as_map()
+        .expect("embedded_attestation is a sub-map");
 
     // The embedded sub-map MUST carry the AttestationData fields.
-    let has_attesting = embedded_map.iter().any(|(k, _)| k.as_text() == Some("attesting"));
-    let has_attested = embedded_map.iter().any(|(k, _)| k.as_text() == Some("attested"));
-    let has_properties = embedded_map.iter().any(|(k, _)| k.as_text() == Some("properties"));
+    let has_attesting = embedded_map
+        .iter()
+        .any(|(k, _)| k.as_text() == Some("attesting"));
+    let has_attested = embedded_map
+        .iter()
+        .any(|(k, _)| k.as_text() == Some("attested"));
+    let has_properties = embedded_map
+        .iter()
+        .any(|(k, _)| k.as_text() == Some("properties"));
     assert!(has_attesting, "embedded_attestation MUST carry `attesting`");
     assert!(has_attested, "embedded_attestation MUST carry `attested`");
-    assert!(has_properties, "embedded_attestation MUST carry `properties`");
+    assert!(
+        has_properties,
+        "embedded_attestation MUST carry `properties`"
+    );
 
     // R-6: `attestation_hash` MUST be absent (Go's omitempty contract;
     // hash presence is the "bound in tree" wire signal).
     assert!(
-        result_map.iter().all(|(k, _)| k.as_text() != Some("attestation_hash")),
+        result_map
+            .iter()
+            .all(|(k, _)| k.as_text() != Some("attestation_hash")),
         "R-6: embedded mode MUST omit attestation_hash"
     );
     // `storage_path` MUST also be absent (no tree binding).
     assert!(
-        result_map.iter().all(|(k, _)| k.as_text() != Some("storage_path")),
+        result_map
+            .iter()
+            .all(|(k, _)| k.as_text() != Some("storage_path")),
         "R-6: embedded mode MUST omit storage_path"
     );
 }
@@ -781,7 +813,13 @@ async fn create_attestation_embedded_inline_matches_canonical_encoding() {
     let result_map = result_value.as_map().expect("result is a CBOR map");
     let embedded = result_map
         .iter()
-        .find_map(|(k, v)| if k.as_text() == Some("embedded_attestation") { Some(v.clone()) } else { None })
+        .find_map(|(k, v)| {
+            if k.as_text() == Some("embedded_attestation") {
+                Some(v.clone())
+            } else {
+                None
+            }
+        })
         .expect("embedded_attestation present");
 
     assert_eq!(
@@ -810,7 +848,8 @@ async fn pr7_configure_issues_cap_per_live_controller_under_quorum() {
     // attestation-index-populated by `add_identity_cert`.
     let q_hash = h.add_quorum(&["k1", "k2", "k3"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32]));
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32]));
     let cert_hash = h.add_identity_cert(
         "quorum",
         "ctrl",
@@ -841,8 +880,14 @@ async fn pr7_configure_issues_cap_per_live_controller_under_quorum() {
     ]);
     let params = to_ecf(&Value::Map(vec![
         (text("bindings"), Value::Array(vec![])),
-        (text("controller_grants"), Value::Array(vec![wildcard_grant])),
-        (text("trusts_quorum"), Value::Bytes(q_hash.to_bytes().to_vec())),
+        (
+            text("controller_grants"),
+            Value::Array(vec![wildcard_grant]),
+        ),
+        (
+            text("trusts_quorum"),
+            Value::Bytes(q_hash.to_bytes().to_vec()),
+        ),
     ]));
     let ctx = build_ctx(&handler, "configure", Some(&pc_path), params);
     let result = handler.handle(&ctx).await.expect("handle ok");
@@ -858,10 +903,17 @@ async fn pr7_configure_issues_cap_per_live_controller_under_quorum() {
     let result_map = result_value.as_map().expect("result is map");
     let caps = result_map
         .iter()
-        .find_map(|(k, v)| if k.as_text() == Some("local_peer_to_controller_caps") { v.as_array() } else { None })
+        .find_map(|(k, v)| {
+            if k.as_text() == Some("local_peer_to_controller_caps") {
+                v.as_array()
+            } else {
+                None
+            }
+        })
         .expect("result MUST carry local_peer_to_controller_caps");
     assert_eq!(
-        caps.len(), 1,
+        caps.len(),
+        1,
         "R-7: one live controller-cert MUST yield exactly one cap"
     );
     let cap_hash_bytes = caps[0].as_bytes().expect("cap is hash bytes");
@@ -925,7 +977,12 @@ async fn pr7_prime_configure_via_dispatch_full_acme_flow() {
         (text("threshold"), entity_ecf::integer(2)),
     ]));
     let r1 = handler
-        .handle(&build_ctx(&handler, "create_quorum", Some(&q_path), q_params))
+        .handle(&build_ctx(
+            &handler,
+            "create_quorum",
+            Some(&q_path),
+            q_params,
+        ))
         .await
         .unwrap();
     assert_eq!(r1.status, STATUS_OK, "create_quorum must succeed");
@@ -947,7 +1004,10 @@ async fn pr7_prime_configure_via_dispatch_full_acme_flow() {
     let cert_hash = canonical_cert.to_entity().unwrap().content_hash;
     let cert_path = h.qualify(&path_internal_cert(&cert_hash));
     let cert_params = to_ecf(&Value::Map(vec![
-        (text("attested"), Value::Bytes(ctrl_peer.to_bytes().to_vec())),
+        (
+            text("attested"),
+            Value::Bytes(ctrl_peer.to_bytes().to_vec()),
+        ),
         (text("attesting"), Value::Bytes(q_hash.to_bytes().to_vec())),
         (text("properties"), Value::Map(cert_props)),
     ]));
@@ -961,7 +1021,8 @@ async fn pr7_prime_configure_via_dispatch_full_acme_flow() {
         .await
         .unwrap();
     assert_eq!(
-        r2.status, STATUS_OK,
+        r2.status,
+        STATUS_OK,
         "create_attestation must succeed; got {}: {:?}",
         r2.status,
         String::from_utf8_lossy(&r2.result.data)
@@ -996,14 +1057,23 @@ async fn pr7_prime_configure_via_dispatch_full_acme_flow() {
     let cfg_params = to_ecf(&Value::Map(vec![
         (text("bindings"), Value::Array(vec![])),
         (text("controller_grants"), Value::Array(vec![])),
-        (text("trusts_quorum"), Value::Bytes(q_hash.to_bytes().to_vec())),
+        (
+            text("trusts_quorum"),
+            Value::Bytes(q_hash.to_bytes().to_vec()),
+        ),
     ]));
     let r4 = handler
-        .handle(&build_ctx(&handler, "configure", Some(&pc_path), cfg_params))
+        .handle(&build_ctx(
+            &handler,
+            "configure",
+            Some(&pc_path),
+            cfg_params,
+        ))
         .await
         .unwrap();
     assert_eq!(
-        r4.status, STATUS_OK,
+        r4.status,
+        STATUS_OK,
         "R-7' (Round-4): configure with dispatch-bound cert must succeed; got status {} body {:?}",
         r4.status,
         String::from_utf8_lossy(&r4.result.data)
@@ -1027,7 +1097,8 @@ async fn pr13_peer_to_controller_cap_bound_at_canonical_path() {
 
     let q_hash = h.add_quorum(&["k1", "k2", "k3"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32]));
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32]));
     let _ctrl_cert = h.add_identity_cert(
         "quorum",
         "ctrl",
@@ -1057,8 +1128,14 @@ async fn pr13_peer_to_controller_cap_bound_at_canonical_path() {
     ]);
     let params = to_ecf(&Value::Map(vec![
         (text("bindings"), Value::Array(vec![])),
-        (text("controller_grants"), Value::Array(vec![wildcard_grant])),
-        (text("trusts_quorum"), Value::Bytes(q_hash.to_bytes().to_vec())),
+        (
+            text("controller_grants"),
+            Value::Array(vec![wildcard_grant]),
+        ),
+        (
+            text("trusts_quorum"),
+            Value::Bytes(q_hash.to_bytes().to_vec()),
+        ),
     ]));
     let ctx = build_ctx(&handler, "configure", Some(&pc_path), params);
     let result = handler.handle(&ctx).await.expect("handle ok");
@@ -1080,7 +1157,13 @@ async fn pr13_peer_to_controller_cap_bound_at_canonical_path() {
     let result_map = result_value.as_map().expect("map");
     let result_caps = result_map
         .iter()
-        .find_map(|(k, v)| if k.as_text() == Some("local_peer_to_controller_caps") { v.as_array() } else { None })
+        .find_map(|(k, v)| {
+            if k.as_text() == Some("local_peer_to_controller_caps") {
+                v.as_array()
+            } else {
+                None
+            }
+        })
         .expect("local_peer_to_controller_caps");
     assert_eq!(result_caps.len(), 1);
     let returned_hash = Hash::from_bytes(result_caps[0].as_bytes().unwrap()).unwrap();
@@ -1146,7 +1229,8 @@ async fn pr12_revoke_attestation_creates_revocation_entity() {
     h.add_peer("ctrl", 20);
     let q_hash = h.add_quorum(&["k1", "k2", "k3"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32]));
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32]));
     let target_cert = h.add_identity_cert(
         "quorum",
         "ctrl",
@@ -1168,7 +1252,8 @@ async fn pr12_revoke_attestation_creates_revocation_entity() {
     let ctx = build_ctx(&handler, "revoke_attestation", None, params);
     let result = handler.handle(&ctx).await.expect("handle ok");
     assert_eq!(
-        result.status, STATUS_OK,
+        result.status,
+        STATUS_OK,
         "R-12: revoke_attestation must succeed with target_hash + reason; got {}: {}",
         result.status,
         String::from_utf8_lossy(&result.result.data)
@@ -1188,8 +1273,14 @@ async fn pr12_revoke_attestation_creates_revocation_entity() {
             }
         })
         .expect("R-12: revocation attestation MUST exist in the index");
-    assert_eq!(rev.attesting, q_hash, "R-12: revocation.attesting MUST be quorum_id");
-    assert_eq!(rev.attested, target_cert, "R-12: revocation.attested MUST be target_hash");
+    assert_eq!(
+        rev.attesting, q_hash,
+        "R-12: revocation.attesting MUST be quorum_id"
+    );
+    assert_eq!(
+        rev.attested, target_cert,
+        "R-12: revocation.attested MUST be target_hash"
+    );
 
     // R-12' (cross-impl spec, Round 8): the result entity
     // MUST carry a non-zero `revocation_hash` field equal to the minted
@@ -1200,10 +1291,15 @@ async fn pr12_revoke_attestation_creates_revocation_entity() {
     let result_map = result_value.as_map().expect("result is a map");
     let result_rev_hash_bytes = result_map
         .iter()
-        .find_map(|(k, v)| if k.as_text() == Some("revocation_hash") { v.as_bytes() } else { None })
+        .find_map(|(k, v)| {
+            if k.as_text() == Some("revocation_hash") {
+                v.as_bytes()
+            } else {
+                None
+            }
+        })
         .expect("R-12': result MUST carry `revocation_hash` field");
-    let result_rev_hash =
-        Hash::from_bytes(result_rev_hash_bytes).expect("decode revocation_hash");
+    let result_rev_hash = Hash::from_bytes(result_rev_hash_bytes).expect("decode revocation_hash");
     assert_eq!(
         result_rev_hash, rev_hash_in_index,
         "R-12': result.revocation_hash MUST equal the indexed revocation entity's hash"
@@ -1218,9 +1314,10 @@ async fn pr12_revoke_attestation_404_when_target_missing() {
     h.add_peer("ctrl", 20);
     let phantom = Hash::compute("test", b"phantom-target");
     let handler = h.handler();
-    let params = to_ecf(&Value::Map(vec![
-        (text("target_hash"), Value::Bytes(phantom.to_bytes().to_vec())),
-    ]));
+    let params = to_ecf(&Value::Map(vec![(
+        text("target_hash"),
+        Value::Bytes(phantom.to_bytes().to_vec()),
+    )]));
     let ctx = build_ctx(&handler, "revoke_attestation", None, params);
     let result = handler.handle(&ctx).await.expect("handle ok");
     assert_eq!(
@@ -1247,7 +1344,10 @@ async fn pr7_configure_404_when_no_live_controller_under_quorum() {
     let params = to_ecf(&Value::Map(vec![
         (text("bindings"), Value::Array(vec![])),
         (text("controller_grants"), Value::Array(vec![])),
-        (text("trusts_quorum"), Value::Bytes(q_hash.to_bytes().to_vec())),
+        (
+            text("trusts_quorum"),
+            Value::Bytes(q_hash.to_bytes().to_vec()),
+        ),
     ]));
     let ctx = build_ctx(&handler, "configure", Some(&pc_path), params);
     let result = handler.handle(&ctx).await.expect("handle ok");
@@ -1275,20 +1375,37 @@ async fn pr10_configure_with_bindings_happy_path() {
 
     let q_hash = h.add_quorum(&["k1", "k2", "k3"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32]));
-    let ctrl_cert = h.add_identity_cert("quorum", "ctrl", "controller", "public", &["k1", "k2"], None);
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32]));
+    let ctrl_cert = h.add_identity_cert(
+        "quorum",
+        "ctrl",
+        "controller",
+        "public",
+        &["k1", "k2"],
+        None,
+    );
     let agent_cert = h.add_identity_cert("ctrl", "agent", "agent", "internal", &["ctrl"], None);
 
     let handler = h.handler();
     let pc_path = h.qualify(crate::paths::PATH_PEER_CONFIG);
     let binding = Value::Map(vec![
-        (text("agent_cert"), Value::Bytes(agent_cert.to_bytes().to_vec())),
-        (text("handle_cert"), Value::Bytes(ctrl_cert.to_bytes().to_vec())),
+        (
+            text("agent_cert"),
+            Value::Bytes(agent_cert.to_bytes().to_vec()),
+        ),
+        (
+            text("handle_cert"),
+            Value::Bytes(ctrl_cert.to_bytes().to_vec()),
+        ),
     ]);
     let params = to_ecf(&Value::Map(vec![
         (text("bindings"), Value::Array(vec![binding])),
         (text("controller_grants"), Value::Array(vec![])),
-        (text("trusts_quorum"), Value::Bytes(q_hash.to_bytes().to_vec())),
+        (
+            text("trusts_quorum"),
+            Value::Bytes(q_hash.to_bytes().to_vec()),
+        ),
     ]));
     let ctx = build_ctx(&handler, "configure", Some(&pc_path), params);
     let result = handler.handle(&ctx).await.expect("handle ok");
@@ -1316,10 +1433,18 @@ async fn pi2_binding_controller_not_live_returns_400() {
 
     let q_hash = h.add_quorum(&["k1", "k2"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32]));
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32]));
 
     // Live controller cert under the trusted quorum.
-    let ctrl_cert = h.add_identity_cert("quorum", "ctrl", "controller", "public", &["k1", "k2"], None);
+    let ctrl_cert = h.add_identity_cert(
+        "quorum",
+        "ctrl",
+        "controller",
+        "public",
+        &["k1", "k2"],
+        None,
+    );
     // Agent cert chains under a DIFFERENT (non-live) identity — `orphan`
     // is a peer with no controller cert under the trusted quorum.
     // Manually-constructed AttestationData since add_identity_cert would
@@ -1349,17 +1474,29 @@ async fn pi2_binding_controller_not_live_returns_400() {
     let handler = h.handler();
     let pc_path = h.qualify(crate::paths::PATH_PEER_CONFIG);
     let binding = Value::Map(vec![
-        (text("agent_cert"), Value::Bytes(agent_cert.to_bytes().to_vec())),
-        (text("handle_cert"), Value::Bytes(ctrl_cert.to_bytes().to_vec())),
+        (
+            text("agent_cert"),
+            Value::Bytes(agent_cert.to_bytes().to_vec()),
+        ),
+        (
+            text("handle_cert"),
+            Value::Bytes(ctrl_cert.to_bytes().to_vec()),
+        ),
     ]);
     let params = to_ecf(&Value::Map(vec![
         (text("bindings"), Value::Array(vec![binding])),
         (text("controller_grants"), Value::Array(vec![])),
-        (text("trusts_quorum"), Value::Bytes(q_hash.to_bytes().to_vec())),
+        (
+            text("trusts_quorum"),
+            Value::Bytes(q_hash.to_bytes().to_vec()),
+        ),
     ]));
     let ctx = build_ctx(&handler, "configure", Some(&pc_path), params);
     let result = handler.handle(&ctx).await.expect("handle ok");
-    assert_eq!(result.status, 400, "PI-2: non-live controller binding MUST 400");
+    assert_eq!(
+        result.status, 400,
+        "PI-2: non-live controller binding MUST 400"
+    );
 
     // Verify the error code is `binding_controller_not_live`.
     let result_value: ciborium::Value =
@@ -1367,7 +1504,13 @@ async fn pi2_binding_controller_not_live_returns_400() {
     let result_map = result_value.as_map().expect("error map");
     let code = result_map
         .iter()
-        .find_map(|(k, v)| if k.as_text() == Some("code") { v.as_text() } else { None })
+        .find_map(|(k, v)| {
+            if k.as_text() == Some("code") {
+                v.as_text()
+            } else {
+                None
+            }
+        })
         .unwrap_or("");
     assert_eq!(
         code, "binding_controller_not_live",
@@ -1385,14 +1528,25 @@ async fn pr10_binding_zero_handle_cert_returns_400_missing() {
     h.add_peer("agent", 30);
     let q_hash = h.add_quorum(&["k1", "k2"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32]));
-    let _ = h.add_identity_cert("quorum", "ctrl", "controller", "public", &["k1", "k2"], None);
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32]));
+    let _ = h.add_identity_cert(
+        "quorum",
+        "ctrl",
+        "controller",
+        "public",
+        &["k1", "k2"],
+        None,
+    );
     let agent_cert = h.add_identity_cert("ctrl", "agent", "agent", "internal", &["ctrl"], None);
 
     let handler = h.handler();
     let pc_path = h.qualify(crate::paths::PATH_PEER_CONFIG);
     let binding = Value::Map(vec![
-        (text("agent_cert"), Value::Bytes(agent_cert.to_bytes().to_vec())),
+        (
+            text("agent_cert"),
+            Value::Bytes(agent_cert.to_bytes().to_vec()),
+        ),
         (
             text("handle_cert"),
             Value::Bytes(Hash::zero().to_bytes().to_vec()),
@@ -1401,7 +1555,10 @@ async fn pr10_binding_zero_handle_cert_returns_400_missing() {
     let params = to_ecf(&Value::Map(vec![
         (text("bindings"), Value::Array(vec![binding])),
         (text("controller_grants"), Value::Array(vec![])),
-        (text("trusts_quorum"), Value::Bytes(q_hash.to_bytes().to_vec())),
+        (
+            text("trusts_quorum"),
+            Value::Bytes(q_hash.to_bytes().to_vec()),
+        ),
     ]));
     let ctx = build_ctx(&handler, "configure", Some(&pc_path), params);
     let result = handler.handle(&ctx).await.expect("handle ok");
@@ -1418,21 +1575,38 @@ async fn pr10_binding_unresolvable_handle_cert_returns_404() {
     h.add_peer("agent", 30);
     let q_hash = h.add_quorum(&["k1", "k2"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32]));
-    let _ = h.add_identity_cert("quorum", "ctrl", "controller", "public", &["k1", "k2"], None);
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32]));
+    let _ = h.add_identity_cert(
+        "quorum",
+        "ctrl",
+        "controller",
+        "public",
+        &["k1", "k2"],
+        None,
+    );
     let agent_cert = h.add_identity_cert("ctrl", "agent", "agent", "internal", &["ctrl"], None);
 
     let phantom = Hash::compute("test", b"phantom-handle-cert-not-in-store");
     let handler = h.handler();
     let pc_path = h.qualify(crate::paths::PATH_PEER_CONFIG);
     let binding = Value::Map(vec![
-        (text("agent_cert"), Value::Bytes(agent_cert.to_bytes().to_vec())),
-        (text("handle_cert"), Value::Bytes(phantom.to_bytes().to_vec())),
+        (
+            text("agent_cert"),
+            Value::Bytes(agent_cert.to_bytes().to_vec()),
+        ),
+        (
+            text("handle_cert"),
+            Value::Bytes(phantom.to_bytes().to_vec()),
+        ),
     ]);
     let params = to_ecf(&Value::Map(vec![
         (text("bindings"), Value::Array(vec![binding])),
         (text("controller_grants"), Value::Array(vec![])),
-        (text("trusts_quorum"), Value::Bytes(q_hash.to_bytes().to_vec())),
+        (
+            text("trusts_quorum"),
+            Value::Bytes(q_hash.to_bytes().to_vec()),
+        ),
     ]));
     let ctx = build_ctx(&handler, "configure", Some(&pc_path), params);
     let result = handler.handle(&ctx).await.expect("handle ok");
@@ -1454,8 +1628,16 @@ async fn pr10_binding_wrong_function_returns_400_wrong_kind() {
     h.add_peer("agent2", 31);
     let q_hash = h.add_quorum(&["k1", "k2"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32]));
-    let _ = h.add_identity_cert("quorum", "ctrl", "controller", "public", &["k1", "k2"], None);
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32]));
+    let _ = h.add_identity_cert(
+        "quorum",
+        "ctrl",
+        "controller",
+        "public",
+        &["k1", "k2"],
+        None,
+    );
     // Two agent certs; we'll put an agent cert in the handle_cert slot
     // (wrong function — handle_cert should be controller or identifier).
     let agent_cert_a = h.add_identity_cert("ctrl", "agent", "agent", "internal", &["ctrl"], None);
@@ -1464,13 +1646,22 @@ async fn pr10_binding_wrong_function_returns_400_wrong_kind() {
     let handler = h.handler();
     let pc_path = h.qualify(crate::paths::PATH_PEER_CONFIG);
     let binding = Value::Map(vec![
-        (text("agent_cert"), Value::Bytes(agent_cert_a.to_bytes().to_vec())),
-        (text("handle_cert"), Value::Bytes(agent_cert_b.to_bytes().to_vec())),
+        (
+            text("agent_cert"),
+            Value::Bytes(agent_cert_a.to_bytes().to_vec()),
+        ),
+        (
+            text("handle_cert"),
+            Value::Bytes(agent_cert_b.to_bytes().to_vec()),
+        ),
     ]);
     let params = to_ecf(&Value::Map(vec![
         (text("bindings"), Value::Array(vec![binding])),
         (text("controller_grants"), Value::Array(vec![])),
-        (text("trusts_quorum"), Value::Bytes(q_hash.to_bytes().to_vec())),
+        (
+            text("trusts_quorum"),
+            Value::Bytes(q_hash.to_bytes().to_vec()),
+        ),
     ]));
     let ctx = build_ctx(&handler, "configure", Some(&pc_path), params);
     let result = handler.handle(&ctx).await.expect("handle ok");
@@ -1495,15 +1686,32 @@ async fn pr8_supersede_attestation_succeeds_with_attestation_data_shape() {
     h.add_peer("ctrl", 20);
     let q_hash = h.add_quorum(&["k1", "k2", "k3"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32]));
-    let ctrl_cert = h.add_identity_cert("quorum", "ctrl", "controller", "public", &["k1", "k2"], None);
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32]));
+    let ctrl_cert = h.add_identity_cert(
+        "quorum",
+        "ctrl",
+        "controller",
+        "public",
+        &["k1", "k2"],
+        None,
+    );
     let predecessor = h.attestation_index.get(&ctrl_cert).unwrap();
 
     let handler = h.handler();
     let params = to_ecf(&Value::Map(vec![
-        (text("attested"), Value::Bytes(predecessor.attested.to_bytes().to_vec())),
-        (text("attesting"), Value::Bytes(predecessor.attesting.to_bytes().to_vec())),
-        (text("supersedes"), Value::Bytes(ctrl_cert.to_bytes().to_vec())),
+        (
+            text("attested"),
+            Value::Bytes(predecessor.attested.to_bytes().to_vec()),
+        ),
+        (
+            text("attesting"),
+            Value::Bytes(predecessor.attesting.to_bytes().to_vec()),
+        ),
+        (
+            text("supersedes"),
+            Value::Bytes(ctrl_cert.to_bytes().to_vec()),
+        ),
     ]));
     let ctx = build_ctx(&handler, "supersede_attestation", None, params);
     let result = handler.handle(&ctx).await.expect("handle ok");
@@ -1533,7 +1741,8 @@ async fn pr8_prime_supersede_allows_attested_change_for_rotation() {
     h.add_peer("ctrl_new", 21);
     let q_hash = h.add_quorum(&["k1", "k2", "k3"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32]));
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32]));
 
     // OLD controller cert, K-of-N signed.
     let old_cert = h.add_identity_cert(
@@ -1557,14 +1766,21 @@ async fn pr8_prime_supersede_allows_attested_change_for_rotation() {
     ]);
     let params = to_ecf(&Value::Map(vec![
         (text("attested"), Value::Bytes(new_ctrl.to_bytes().to_vec())),
-        (text("attesting"), Value::Bytes(predecessor.attesting.to_bytes().to_vec())),
+        (
+            text("attesting"),
+            Value::Bytes(predecessor.attesting.to_bytes().to_vec()),
+        ),
         (text("properties"), new_props),
-        (text("supersedes"), Value::Bytes(old_cert.to_bytes().to_vec())),
+        (
+            text("supersedes"),
+            Value::Bytes(old_cert.to_bytes().to_vec()),
+        ),
     ]));
     let ctx = build_ctx(&handler, "supersede_attestation", None, params);
     let result = handler.handle(&ctx).await.expect("handle ok");
     assert_eq!(
-        result.status, STATUS_OK,
+        result.status,
+        STATUS_OK,
         "R-8': supersede MUST allow attested-change for controller rotation; got {}: {}",
         result.status,
         String::from_utf8_lossy(&result.result.data)
@@ -1582,20 +1798,38 @@ async fn pr8_prime_supersede_rejects_kind_mismatch() {
     h.add_peer("ctrl", 20);
     let q_hash = h.add_quorum(&["k1", "k2"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32]));
-    let ctrl_cert = h.add_identity_cert("quorum", "ctrl", "controller", "public", &["k1", "k2"], None);
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32]));
+    let ctrl_cert = h.add_identity_cert(
+        "quorum",
+        "ctrl",
+        "controller",
+        "public",
+        &["k1", "k2"],
+        None,
+    );
     let predecessor = h.attestation_index.get(&ctrl_cert).unwrap();
 
     let handler = h.handler();
     // Supersede with a different kind (rotation-recovery) — should reject.
-    let bad_props = Value::Map(vec![
-        (text("kind"), text(crate::kinds::KIND_IDENTITY_ROTATION_RECOVERY)),
-    ]);
+    let bad_props = Value::Map(vec![(
+        text("kind"),
+        text(crate::kinds::KIND_IDENTITY_ROTATION_RECOVERY),
+    )]);
     let params = to_ecf(&Value::Map(vec![
-        (text("attested"), Value::Bytes(predecessor.attested.to_bytes().to_vec())),
-        (text("attesting"), Value::Bytes(predecessor.attesting.to_bytes().to_vec())),
+        (
+            text("attested"),
+            Value::Bytes(predecessor.attested.to_bytes().to_vec()),
+        ),
+        (
+            text("attesting"),
+            Value::Bytes(predecessor.attesting.to_bytes().to_vec()),
+        ),
         (text("properties"), bad_props),
-        (text("supersedes"), Value::Bytes(ctrl_cert.to_bytes().to_vec())),
+        (
+            text("supersedes"),
+            Value::Bytes(ctrl_cert.to_bytes().to_vec()),
+        ),
     ]));
     let ctx = build_ctx(&handler, "supersede_attestation", None, params);
     let result = handler.handle(&ctx).await.expect("handle ok");
@@ -1621,18 +1855,23 @@ async fn pi1_supersede_non_rebind_kind_preserves_attesting_attested() {
     h.add_peer("other", 30);
     let q_hash = h.add_quorum(&["k1", "k2"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32]));
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32]));
 
     // Pre-build a controller cert (target of the rotation) and a
     // rotation-recovery predecessor pointing to it.
     let target_cert = h.add_identity_cert(
-        "quorum", "ctrl", "controller", "public", &["k1", "k2"], None,
+        "quorum",
+        "ctrl",
+        "controller",
+        "public",
+        &["k1", "k2"],
+        None,
     );
     let new_ctrl = h.peer("new_ctrl");
     let old_handle = h.peer("ctrl");
-    let (prev_hash, prev_data) = h.add_rotation_recovery(
-        q_hash, new_ctrl, target_cert, old_handle, &["k1", "k2"],
-    );
+    let (prev_hash, prev_data) =
+        h.add_rotation_recovery(q_hash, new_ctrl, target_cert, old_handle, &["k1", "k2"]);
 
     let handler = h.handler();
 
@@ -1640,15 +1879,27 @@ async fn pi1_supersede_non_rebind_kind_preserves_attesting_attested() {
     // these caller-supplied values MUST be ignored.
     let bogus = h.peer("other");
     let new_props = Value::Map(vec![
-        (text("kind"), text(crate::kinds::KIND_IDENTITY_ROTATION_RECOVERY)),
-        (text("old_handle"), Value::Bytes(old_handle.to_bytes().to_vec())),
-        (text("target_cert"), Value::Bytes(target_cert.to_bytes().to_vec())),
+        (
+            text("kind"),
+            text(crate::kinds::KIND_IDENTITY_ROTATION_RECOVERY),
+        ),
+        (
+            text("old_handle"),
+            Value::Bytes(old_handle.to_bytes().to_vec()),
+        ),
+        (
+            text("target_cert"),
+            Value::Bytes(target_cert.to_bytes().to_vec()),
+        ),
     ]);
     let params = to_ecf(&Value::Map(vec![
         (text("attested"), Value::Bytes(bogus.to_bytes().to_vec())),
         (text("attesting"), Value::Bytes(bogus.to_bytes().to_vec())),
         (text("properties"), new_props),
-        (text("supersedes"), Value::Bytes(prev_hash.to_bytes().to_vec())),
+        (
+            text("supersedes"),
+            Value::Bytes(prev_hash.to_bytes().to_vec()),
+        ),
     ]));
     let ctx = build_ctx(&handler, "supersede_attestation", None, params);
     let result = handler.handle(&ctx).await.expect("handle ok");
@@ -1665,7 +1916,13 @@ async fn pi1_supersede_non_rebind_kind_preserves_attesting_attested() {
     let result_map = result_value.as_map().expect("result map");
     let new_hash_bytes = result_map
         .iter()
-        .find_map(|(k, v)| if k.as_text() == Some("attestation_hash") { v.as_bytes() } else { None })
+        .find_map(|(k, v)| {
+            if k.as_text() == Some("attestation_hash") {
+                v.as_bytes()
+            } else {
+                None
+            }
+        })
         .expect("attestation_hash");
     let new_hash = Hash::from_bytes(new_hash_bytes).expect("hash bytes");
     let new_att = h.attestation_index.get(&new_hash).expect("new attestation");
@@ -1772,7 +2029,13 @@ async fn publish_attestation_result_uses_new_path_field() {
     let result_map = result_value.as_map().expect("result map");
     let new_path = result_map
         .iter()
-        .find_map(|(k, v)| if k.as_text() == Some("new_path") { v.as_text() } else { None })
+        .find_map(|(k, v)| {
+            if k.as_text() == Some("new_path") {
+                v.as_text()
+            } else {
+                None
+            }
+        })
         .expect("R-9: result MUST carry `new_path` field");
     assert!(
         new_path.contains("system/identity/public/cert/"),
@@ -1780,7 +2043,9 @@ async fn publish_attestation_result_uses_new_path_field() {
         new_path
     );
     assert!(
-        result_map.iter().all(|(k, _)| k.as_text() != Some("storage_path")),
+        result_map
+            .iter()
+            .all(|(k, _)| k.as_text() != Some("storage_path")),
         "R-9: result MUST NOT carry `storage_path` (renamed to `new_path`)"
     );
 }
@@ -1821,7 +2086,8 @@ async fn process_attestation_validates_then_succeeds() {
     h.add_peer("ctrl", 20);
     let q_hash = h.add_quorum(&["k1", "k2", "k3"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32]));
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32]));
     let cert_hash = h.add_identity_cert(
         "quorum",
         "ctrl",
@@ -1837,7 +2103,10 @@ async fn process_attestation_validates_then_succeeds() {
     )]));
     let ctx = build_ctx(&handler, "process_attestation", None, params);
     let result = handler.handle(&ctx).await.expect("handle ok");
-    assert_eq!(result.status, STATUS_OK, "process_attestation should succeed");
+    assert_eq!(
+        result.status, STATUS_OK,
+        "process_attestation should succeed"
+    );
 }
 
 // ===========================================================================
@@ -1854,7 +2123,8 @@ async fn rotation_recovery_fails_closed_without_cached_quorum_publish() {
     h.add_peer("ctrl_new", 21);
     let q_hash = h.add_quorum(&["k1", "k2", "k3"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32]));
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32]));
     let target_cert = h.add_identity_cert(
         "quorum",
         "ctrl_old",
@@ -1890,7 +2160,8 @@ async fn rotation_recovery_succeeds_with_cached_quorum_publish() {
     h.add_peer("ctrl_new", 21);
     let q_hash = h.add_quorum(&["k1", "k2", "k3"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32]));
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32]));
     let target_cert = h.add_identity_cert(
         "quorum",
         "ctrl_old",
@@ -1936,13 +2207,21 @@ async fn pi5_process_attestation_emits_failure_observation_on_handler_failure() 
     h.add_peer("retired", 21);
     let q_hash = h.add_quorum(&["k1", "k2"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32]));
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32]));
 
     // Build a retirement attestation pointing at a target_cert hash that
     // is NOT in the attestation index — handler will emit a
     // failure-observation event.
     let bogus_target = Hash::compute("test/missing", b"target");
-    let _ctrl_cert = h.add_identity_cert("quorum", "ctrl", "controller", "public", &["k1", "k2"], None);
+    let _ctrl_cert = h.add_identity_cert(
+        "quorum",
+        "ctrl",
+        "controller",
+        "public",
+        &["k1", "k2"],
+        None,
+    );
 
     let retirement = AttestationData {
         attesting: q_hash,
@@ -1950,7 +2229,10 @@ async fn pi5_process_attestation_emits_failure_observation_on_handler_failure() 
         properties: {
             let mut p: Vec<(Value, Value)> = vec![
                 (text("kind"), text(crate::kinds::KIND_IDENTITY_RETIREMENT)),
-                (text("target_cert"), Value::Bytes(bogus_target.to_bytes().to_vec())),
+                (
+                    text("target_cert"),
+                    Value::Bytes(bogus_target.to_bytes().to_vec()),
+                ),
             ];
             p.sort_by(|a, b| a.0.as_text().unwrap_or("").cmp(b.0.as_text().unwrap_or("")));
             p
@@ -1967,7 +2249,8 @@ async fn pi5_process_attestation_emits_failure_observation_on_handler_failure() 
 
     // Snapshot event-stream count before dispatch.
     let events_prefix = h.qualify("system/identity/events/");
-    let before: Vec<String> = h.location_index
+    let before: Vec<String> = h
+        .location_index
         .list(&events_prefix)
         .into_iter()
         .map(|e| e.path)
@@ -1984,34 +2267,46 @@ async fn pi5_process_attestation_emits_failure_observation_on_handler_failure() 
     // failure happens in Phase 2 (target_cert lookup), which doesn't
     // propagate to the response status. v2 scope: phase-2 failures emit
     // events, return ok at the dispatch level.
-    assert_eq!(result.status, STATUS_OK, "process_attestation phase-2 failures emit events; status stays OK");
+    assert_eq!(
+        result.status, STATUS_OK,
+        "process_attestation phase-2 failures emit events; status stays OK"
+    );
 
     // Check the events stream picked up an entry for this retirement.
     let after = h.location_index.list(&events_prefix);
-    let new_entries: Vec<&entity_store::LocationEntry> = after
-        .iter()
-        .filter(|e| !before.contains(&e.path))
-        .collect();
+    let new_entries: Vec<&entity_store::LocationEntry> =
+        after.iter().filter(|e| !before.contains(&e.path)).collect();
     assert!(
         !new_entries.is_empty(),
         "PI-5: phase-2 handler failure MUST emit a controller-event"
     );
     let event_entry = new_entries[0];
     assert!(
-        event_entry.path.contains("/revoke_local_caps_for_attested/"),
+        event_entry
+            .path
+            .contains("/revoke_local_caps_for_attested/"),
         "PI-5: event path should embed the handler_id; got {}",
         event_entry.path
     );
 
     // Read the event entity and check event_subkind = "failure_observation".
-    let event_entity = h.content_store.get(&event_entry.hash).expect("event entity in store");
+    let event_entity = h
+        .content_store
+        .get(&event_entry.hash)
+        .expect("event entity in store");
     assert_eq!(event_entity.entity_type, entity_types::TYPE_IDENTITY_EVENT);
     let value: ciborium::Value =
         ciborium::from_reader(event_entity.data.as_slice()).expect("decode event");
     let event_map = value.as_map().expect("event is map");
     let subkind = event_map
         .iter()
-        .find_map(|(k, v)| if k.as_text() == Some("event_subkind") { v.as_text() } else { None })
+        .find_map(|(k, v)| {
+            if k.as_text() == Some("event_subkind") {
+                v.as_text()
+            } else {
+                None
+            }
+        })
         .unwrap_or("");
     assert_eq!(
         subkind, "failure_observation",
@@ -2037,18 +2332,27 @@ async fn pi13_revoke_attestation_cascades_cap_and_signature() {
     h.add_peer("ctrl", 20);
     let q_hash = h.add_quorum(&["k1", "k2"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32]));
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32]));
 
     // Build live controller cert + run :configure to issue + bind cap.
     let _ctrl_cert = h.add_identity_cert(
-        "quorum", "ctrl", "controller", "public", &["k1", "k2"], None,
+        "quorum",
+        "ctrl",
+        "controller",
+        "public",
+        &["k1", "k2"],
+        None,
     );
     let handler = h.handler();
     let pc_path = h.qualify(crate::paths::PATH_PEER_CONFIG);
     let configure_params = to_ecf(&Value::Map(vec![
         (text("bindings"), Value::Array(vec![])),
         (text("controller_grants"), Value::Array(vec![])),
-        (text("trusts_quorum"), Value::Bytes(q_hash.to_bytes().to_vec())),
+        (
+            text("trusts_quorum"),
+            Value::Bytes(q_hash.to_bytes().to_vec()),
+        ),
     ]));
     let configure_ctx = build_ctx(&handler, "configure", Some(&pc_path), configure_params);
     let configure_result = handler.handle(&configure_ctx).await.expect("configure ok");
@@ -2060,21 +2364,30 @@ async fn pi13_revoke_attestation_cascades_cap_and_signature() {
         "system/capability/grants/identity/peer-to-controller/{}",
         entity_attestation::hex_segment(&ctrl_peer)
     ));
-    let cap_hash = h.location_index.get(&cap_path).expect("cap bound pre-revoke");
+    let cap_hash = h
+        .location_index
+        .get(&cap_path)
+        .expect("cap bound pre-revoke");
     // v3.6 I-7: signature at invariant pointer path, not sibling.
     let sig_path = format!(
         "/{}/system/signature/{}",
         h.local_peer_id,
         entity_attestation::hex_segment(&cap_hash)
     );
-    assert!(h.location_index.get(&sig_path).is_some(), "signature bound at invariant pointer pre-revoke");
+    assert!(
+        h.location_index.get(&sig_path).is_some(),
+        "signature bound at invariant pointer pre-revoke"
+    );
 
     // Locate the controller cert hash for revoke.
     let ctrl_cert = _ctrl_cert;
     // Revoke the controller cert.
     let revoke_params = to_ecf(&Value::Map(vec![
         (text("reason"), text("PI-13 cascade test")),
-        (text("target_hash"), Value::Bytes(ctrl_cert.to_bytes().to_vec())),
+        (
+            text("target_hash"),
+            Value::Bytes(ctrl_cert.to_bytes().to_vec()),
+        ),
     ]));
     let revoke_ctx = build_ctx(&handler, "revoke_attestation", None, revoke_params);
     let revoke_result = handler.handle(&revoke_ctx).await.expect("revoke ok");
@@ -2108,7 +2421,8 @@ async fn pi11_create_attestation_rejects_identifier_public() {
     h.add_peer("ident", 20);
     let q_hash = h.add_quorum(&["k1", "k2"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32]));
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32]));
     let ident_peer = h.peer("ident");
 
     let handler = h.handler();
@@ -2118,7 +2432,10 @@ async fn pi11_create_attestation_rejects_identifier_public() {
         (text("mode"), text("public")),
     ]);
     let params = to_ecf(&Value::Map(vec![
-        (text("attested"), Value::Bytes(ident_peer.to_bytes().to_vec())),
+        (
+            text("attested"),
+            Value::Bytes(ident_peer.to_bytes().to_vec()),
+        ),
         (text("attesting"), Value::Bytes(q_hash.to_bytes().to_vec())),
         (text("properties"), props),
     ]));
@@ -2137,21 +2454,45 @@ async fn pi11_create_attestation_rejects_identifier_public() {
     let map = value.as_map().expect("error map");
     let code = map
         .iter()
-        .find_map(|(k, v)| if k.as_text() == Some("code") { v.as_text() } else { None })
+        .find_map(|(k, v)| {
+            if k.as_text() == Some("code") {
+                v.as_text()
+            } else {
+                None
+            }
+        })
         .unwrap_or("");
     assert_eq!(code, "invalid_mode_for_function", "PI-11: error code");
 
     let function_field = map
         .iter()
-        .find_map(|(k, v)| if k.as_text() == Some("function") { v.as_text() } else { None })
+        .find_map(|(k, v)| {
+            if k.as_text() == Some("function") {
+                v.as_text()
+            } else {
+                None
+            }
+        })
         .unwrap_or("");
-    assert_eq!(function_field, "identifier", "PI-11: error MUST carry function");
+    assert_eq!(
+        function_field, "identifier",
+        "PI-11: error MUST carry function"
+    );
 
     let attempted = map
         .iter()
-        .find_map(|(k, v)| if k.as_text() == Some("attempted_mode") { v.as_text() } else { None })
+        .find_map(|(k, v)| {
+            if k.as_text() == Some("attempted_mode") {
+                v.as_text()
+            } else {
+                None
+            }
+        })
         .unwrap_or("");
-    assert_eq!(attempted, "public", "PI-11: error MUST carry attempted_mode");
+    assert_eq!(
+        attempted, "public",
+        "PI-11: error MUST carry attempted_mode"
+    );
 
     let valid = map
         .iter()
@@ -2176,11 +2517,19 @@ async fn pi11_create_attestation_accepts_valid_combinations() {
     h.add_peer("ctrl", 20);
     let q_hash = h.add_quorum(&["k1", "k2"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32]));
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32]));
 
     // add_identity_cert internally calls :create_attestation; if PI-11
     // were over-aggressive this would fail.
-    let cert_hash = h.add_identity_cert("quorum", "ctrl", "controller", "public", &["k1", "k2"], None);
+    let cert_hash = h.add_identity_cert(
+        "quorum",
+        "ctrl",
+        "controller",
+        "public",
+        &["k1", "k2"],
+        None,
+    );
     assert!(
         h.attestation_index.get(&cert_hash).is_some(),
         "PI-11: controller+public MUST be accepted"
@@ -2312,7 +2661,8 @@ fn tv_i_v23_top_level_controller_cert_validates_via_k_of_n() {
     h.add_peer("ctrl", 20);
     let q_hash = h.add_quorum(&["k1", "k2", "k3"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32]));
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32]));
     let cert_hash = h.add_identity_cert(
         "quorum",
         "ctrl",
@@ -2354,7 +2704,8 @@ fn tv_i_v13a_identity_confers_function_via_handoff() {
     h.add_peer("ctrl_new", 21);
     let q_hash = h.add_quorum(&["k1", "k2", "k3"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32]));
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32]));
     let ctrl_cert = h.add_identity_cert(
         "quorum",
         "ctrl_old",
@@ -2367,7 +2718,10 @@ fn tv_i_v13a_identity_confers_function_via_handoff() {
     let ctrl_old = h.peer("ctrl_old");
     let ctrl_new = h.peer("ctrl_new");
     let mut handoff_props: Vec<(ciborium::Value, ciborium::Value)> = vec![
-        (text("kind"), text(crate::kinds::KIND_IDENTITY_ROTATION_HANDOFF)),
+        (
+            text("kind"),
+            text(crate::kinds::KIND_IDENTITY_ROTATION_HANDOFF),
+        ),
         (
             text("target_cert"),
             ciborium::Value::Bytes(ctrl_cert.to_bytes().to_vec()),
@@ -2411,7 +2765,8 @@ fn tv_i_v13b_identity_retirement_does_not_confer_function() {
     h.add_peer("ctrl", 20);
     let q_hash = h.add_quorum(&["k1", "k2"], 2);
     h.identity_hashes.insert("quorum".into(), q_hash);
-    h.keypairs.insert("quorum".into(), Keypair::from_seed([99u8; 32]));
+    h.keypairs
+        .insert("quorum".into(), Keypair::from_seed([99u8; 32]));
     let ctrl_cert = h.add_identity_cert(
         "quorum",
         "ctrl",

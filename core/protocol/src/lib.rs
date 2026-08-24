@@ -5,19 +5,13 @@
 //! - Auth: every non-connect EXECUTE requires author + capability + signature
 //! - Dispatch: verify → resolve handler → check permission → dispatch
 
-mod verify;
 mod connect;
 mod response;
+mod verify;
 
 use thiserror::Error;
 
 // Re-export public API
-pub use verify::{
-    capability_path_for_scan, check_creator_authority, collect_authority_chain,
-    collect_chain_bundle, is_operator_class_for, is_revoked, verify_capability_chain,
-    verify_request, verify_request_with_ctx, ChainWalkError, CreatorAuthorityResult,
-    VerifiedRequest, VerifyContext, MAX_CHAIN_DEPTH,
-};
 pub use connect::{
     build_authenticate_envelope, build_connect_execute, default_advertised_hash_formats,
     default_advertised_key_types, negotiate_active_format, AuthenticateData, Connection,
@@ -27,6 +21,12 @@ pub use response::{
     build_error_response, build_error_response_with_marker, build_execute_response,
     build_execute_response_full, build_execute_response_with_included, extract_rejected_marker,
     parse_execute_response, ParsedResponse,
+};
+pub use verify::{
+    capability_path_for_scan, check_creator_authority, collect_authority_chain,
+    collect_chain_bundle, is_operator_class_for, is_revoked, verify_capability_chain,
+    verify_request, verify_request_with_ctx, ChainWalkError, CreatorAuthorityResult,
+    VerifiedRequest, VerifyContext, MAX_CHAIN_DEPTH,
 };
 
 #[derive(Debug, Error)]
@@ -289,10 +289,7 @@ mod tests {
 
         // Build capability token
         let cap_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-            (
-                entity_ecf::text("created_at"),
-                entity_ecf::integer(0),
-            ),
+            (entity_ecf::text("created_at"), entity_ecf::integer(0)),
             (
                 entity_ecf::text("grantee"),
                 entity_ecf::Value::Bytes(identity_hash.to_bytes().to_vec()),
@@ -328,8 +325,7 @@ mod tests {
                 ])]),
             ),
         ]));
-        let cap_entity =
-            Entity::new(entity_types::TYPE_CAP_TOKEN, cap_data).unwrap();
+        let cap_entity = Entity::new(entity_types::TYPE_CAP_TOKEN, cap_data).unwrap();
         let cap_hash = cap_entity.content_hash;
 
         // Sign capability with local keypair (granter)
@@ -361,22 +357,15 @@ mod tests {
                 entity_ecf::text("capability"),
                 entity_ecf::Value::Bytes(cap_hash.to_bytes().to_vec()),
             ),
-            (
-                entity_ecf::text("operation"),
-                entity_ecf::text(operation),
-            ),
-            (
-                entity_ecf::text("params"),
-                entity_ecf::Value::Map(vec![]),
-            ),
+            (entity_ecf::text("operation"), entity_ecf::text(operation)),
+            (entity_ecf::text("params"), entity_ecf::Value::Map(vec![])),
             (
                 entity_ecf::text("request_id"),
                 entity_ecf::text("test-req-1"),
             ),
             (entity_ecf::text("uri"), entity_ecf::text(uri)),
         ]));
-        let exec_entity =
-            Entity::new(entity_types::TYPE_EXECUTE, exec_data).unwrap();
+        let exec_entity = Entity::new(entity_types::TYPE_EXECUTE, exec_data).unwrap();
 
         // Sign EXECUTE with author keypair
         let exec_sig_bytes = keypair.sign(&exec_entity.content_hash.to_bytes());
@@ -414,12 +403,7 @@ mod tests {
         let local_kp = Keypair::from_seed([99u8; 32]);
         let local_peer_id = local_kp.peer_id();
 
-        let envelope = build_test_execute(
-            &author_kp,
-            &local_kp,
-            "system/tree",
-            "get",
-        );
+        let envelope = build_test_execute(&author_kp, &local_kp, "system/tree", "get");
 
         let result = verify_request(&envelope, local_peer_id.as_str());
         assert!(result.is_ok(), "verify_request failed: {:?}", result.err());
@@ -465,12 +449,7 @@ mod tests {
         let local_kp = Keypair::from_seed([99u8; 32]);
         let local_peer_id = local_kp.peer_id();
 
-        let mut envelope = build_test_execute(
-            &author_kp,
-            &local_kp,
-            "system/tree",
-            "get",
-        );
+        let mut envelope = build_test_execute(&author_kp, &local_kp, "system/tree", "get");
 
         envelope.root.data = entity_ecf::to_ecf(&entity_ecf::text("tampered"));
 
@@ -484,12 +463,7 @@ mod tests {
         let local_kp = Keypair::from_seed([99u8; 32]);
         let local_peer_id = local_kp.peer_id();
 
-        let mut envelope = build_test_execute(
-            &author_kp,
-            &local_kp,
-            "system/tree",
-            "get",
-        );
+        let mut envelope = build_test_execute(&author_kp, &local_kp, "system/tree", "get");
 
         let wrong_sig_bytes = wrong_kp.sign(&envelope.root.content_hash.to_bytes());
         let wrong_sig_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
@@ -511,9 +485,7 @@ mod tests {
             ),
             (
                 entity_ecf::text("target"),
-                entity_ecf::Value::Bytes(
-                    envelope.root.content_hash.to_bytes().to_vec(),
-                ),
+                entity_ecf::Value::Bytes(envelope.root.content_hash.to_bytes().to_vec()),
             ),
         ]));
         let wrong_sig = Entity::new(TYPE_SIGNATURE, wrong_sig_data).unwrap();
@@ -582,19 +554,31 @@ mod tests {
     fn test_build_authenticate_envelope() {
         let kp = test_keypair();
         let nonce = vec![1u8; 32];
-        let envelope = build_authenticate_envelope(&IdentityKeypair::Ed25519(kp.clone_inner()), &nonce, entity_hash::HASH_ALGORITHM_SHA256).unwrap();
+        let envelope = build_authenticate_envelope(
+            &IdentityKeypair::Ed25519(kp.clone_inner()),
+            &nonce,
+            entity_hash::HASH_ALGORITHM_SHA256,
+        )
+        .unwrap();
         assert!(envelope.validate_all().is_ok());
         // Root is now EXECUTE; signature targets the authenticate entity (in included)
         assert_eq!(envelope.root.entity_type, entity_types::TYPE_EXECUTE);
         let auth_entity = find_auth_entity(&envelope);
-        assert!(envelope.find_signature_for(&auth_entity.content_hash).is_some());
+        assert!(envelope
+            .find_signature_for(&auth_entity.content_hash)
+            .is_some());
     }
 
     #[test]
     fn test_authenticate_signature_verifiable() {
         let kp = test_keypair();
         let nonce = vec![2u8; 32];
-        let envelope = build_authenticate_envelope(&IdentityKeypair::Ed25519(kp.clone_inner()), &nonce, entity_hash::HASH_ALGORITHM_SHA256).unwrap();
+        let envelope = build_authenticate_envelope(
+            &IdentityKeypair::Ed25519(kp.clone_inner()),
+            &nonce,
+            entity_hash::HASH_ALGORITHM_SHA256,
+        )
+        .unwrap();
 
         let auth_entity = find_auth_entity(&envelope);
         let sig_entity = envelope
@@ -649,8 +633,7 @@ mod tests {
 
     /// Helper: wrap a hello entity in an EXECUTE envelope for testing.
     fn wrap_hello_in_execute(hello_entity: &Entity) -> Envelope {
-        let exec_entity =
-            build_connect_execute("test-hello", "hello", hello_entity).unwrap();
+        let exec_entity = build_connect_execute("test-hello", "hello", hello_entity).unwrap();
         Envelope::new(exec_entity)
     }
 
@@ -700,8 +683,12 @@ mod tests {
             .unwrap();
 
         // Build authenticate with our nonce (now wrapped in EXECUTE)
-        let auth_envelope =
-            build_authenticate_envelope(&IdentityKeypair::Ed25519(remote_kp.clone_inner()), &conn.local_nonce, entity_hash::HASH_ALGORITHM_SHA256).unwrap();
+        let auth_envelope = build_authenticate_envelope(
+            &IdentityKeypair::Ed25519(remote_kp.clone_inner()),
+            &conn.local_nonce,
+            entity_hash::HASH_ALGORITHM_SHA256,
+        )
+        .unwrap();
 
         let (remote_pid, _request_id) = conn.process_authenticate(&auth_envelope).unwrap();
         assert_eq!(remote_pid, remote_kp.peer_id());
@@ -725,8 +712,7 @@ mod tests {
 
     #[test]
     fn test_build_error_response() {
-        let envelope =
-            build_error_response("req-2", 404, "not_found", "path not found").unwrap();
+        let envelope = build_error_response("req-2", 404, "not_found", "path not found").unwrap();
         let parsed = parse_execute_response(&envelope).unwrap();
         assert_eq!(parsed.request_id, "req-2");
         assert_eq!(parsed.status, 404);
@@ -795,8 +781,7 @@ mod tests {
     /// `build_error_response` (additive-optional contract).
     #[test]
     fn test_error_response_without_rejected_marker_unchanged() {
-        let plain =
-            build_error_response("r", 404, "not_found", "missing").unwrap();
+        let plain = build_error_response("r", 404, "not_found", "missing").unwrap();
         let with_none =
             build_error_response_with_marker("r", 404, "not_found", "missing", None).unwrap();
         assert_eq!(
@@ -810,9 +795,12 @@ mod tests {
     /// error entities without the field (defensive).
     #[test]
     fn test_extract_rejected_marker_negative() {
-        let result = Entity::new("test/result", entity_ecf::to_ecf(&entity_ecf::text("x")))
-            .unwrap();
-        assert!(extract_rejected_marker(&result).is_none(), "non-error entity");
+        let result =
+            Entity::new("test/result", entity_ecf::to_ecf(&entity_ecf::text("x"))).unwrap();
+        assert!(
+            extract_rejected_marker(&result).is_none(),
+            "non-error entity"
+        );
         let plain_err = build_error_response("r", 404, "not_found", "missing").unwrap();
         let parsed = parse_execute_response(&plain_err).unwrap();
         assert!(
@@ -825,17 +813,12 @@ mod tests {
     /// (durability-unaware consumers unaffected; EXTENSION-DURABILITY §5).
     #[test]
     fn test_response_without_durability_unchanged() {
-        let result = Entity::new("test/result", entity_ecf::to_ecf(&entity_ecf::text("x")))
-            .unwrap();
+        let result =
+            Entity::new("test/result", entity_ecf::to_ecf(&entity_ecf::text("x"))).unwrap();
         let plain = build_execute_response("r", 200, result.clone()).unwrap();
-        let full_none = build_execute_response_full(
-            "r",
-            200,
-            result,
-            std::collections::HashMap::new(),
-            None,
-        )
-        .unwrap();
+        let full_none =
+            build_execute_response_full("r", 200, result, std::collections::HashMap::new(), None)
+                .unwrap();
         assert_eq!(
             entity_wire::encode_envelope(&plain),
             entity_wire::encode_envelope(&full_none),
@@ -852,7 +835,10 @@ mod tests {
     #[test]
     fn test_durability_field_wire_roundtrip() {
         let dur_cbor = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-            (entity_ecf::text("requested"), entity_ecf::text("replicated")),
+            (
+                entity_ecf::text("requested"),
+                entity_ecf::text("replicated"),
+            ),
             (entity_ecf::text("applied"), entity_ecf::text("none")),
             (entity_ecf::text("committed"), entity_ecf::text("stored")),
         ]));
@@ -904,11 +890,7 @@ mod tests {
 
     /// Build a capability entity with the given granter, grantee, and optional parent.
     /// Only the fields the chain-walk reads are populated; signatures are not constructed.
-    fn make_cap_entity(
-        granter: Hash,
-        grantee: Hash,
-        parent: Option<Hash>,
-    ) -> Entity {
+    fn make_cap_entity(granter: Hash, grantee: Hash, parent: Option<Hash>) -> Entity {
         let mut fields = vec![
             (entity_ecf::text("created_at"), entity_ecf::integer(0)),
             (
@@ -919,10 +901,7 @@ mod tests {
                 entity_ecf::text("granter"),
                 entity_ecf::Value::Bytes(granter.to_bytes().to_vec()),
             ),
-            (
-                entity_ecf::text("grants"),
-                entity_ecf::Value::Array(vec![]),
-            ),
+            (entity_ecf::text("grants"), entity_ecf::Value::Array(vec![])),
         ];
         if let Some(p) = parent {
             fields.push((
@@ -945,8 +924,7 @@ mod tests {
         let root = make_cap_entity(local, grantee, None);
         let store: std::collections::HashMap<Hash, Entity> =
             [(root.content_hash, root.clone())].into();
-        let chain =
-            collect_authority_chain(&root.content_hash, |h| store.get(h).cloned()).unwrap();
+        let chain = collect_authority_chain(&root.content_hash, |h| store.get(h).cloned()).unwrap();
         assert_eq!(chain.len(), 1);
         assert_eq!(chain[0].0.content_hash, root.content_hash);
     }
@@ -968,8 +946,7 @@ mod tests {
             (leaf.content_hash, leaf.clone()),
         ]
         .into();
-        let chain =
-            collect_authority_chain(&leaf.content_hash, |h| store.get(h).cloned()).unwrap();
+        let chain = collect_authority_chain(&leaf.content_hash, |h| store.get(h).cloned()).unwrap();
         assert_eq!(chain.len(), 3);
         assert_eq!(chain[0].0.content_hash, leaf.content_hash);
         assert_eq!(chain[1].0.content_hash, mid.content_hash);
@@ -1000,8 +977,7 @@ mod tests {
         // Leaf hash isn't even in the resolver.
         let store: std::collections::HashMap<Hash, Entity> = std::collections::HashMap::new();
         let missing = Hash::compute("test", b"missing");
-        let err =
-            collect_authority_chain(&missing, |h| store.get(h).cloned()).unwrap_err();
+        let err = collect_authority_chain(&missing, |h| store.get(h).cloned()).unwrap_err();
         assert_eq!(err, ChainWalkError::Unreachable);
     }
 
@@ -1013,8 +989,8 @@ mod tests {
         let leaf = make_cap_entity(writer, writer, Some(phantom));
         let store: std::collections::HashMap<Hash, Entity> =
             [(leaf.content_hash, leaf.clone())].into();
-        let err = collect_authority_chain(&leaf.content_hash, |h| store.get(h).cloned())
-            .unwrap_err();
+        let err =
+            collect_authority_chain(&leaf.content_hash, |h| store.get(h).cloned()).unwrap_err();
         assert_eq!(err, ChainWalkError::Unreachable);
     }
 
@@ -1092,12 +1068,7 @@ mod tests {
         // Root's granter matches the supplied identity hash → operator-class.
         let identity = Hash::compute("test", b"L0-bootstrap-identity");
         let grantee = Hash::compute("test", b"app-handler");
-        let root = make_cap_with_resources(
-            identity,
-            grantee,
-            None,
-            &["system/capability"],
-        );
+        let root = make_cap_with_resources(identity, grantee, None, &["system/capability"]);
         let store: std::collections::HashMap<Hash, Entity> =
             [(root.content_hash, root.clone())].into();
         let ok = is_operator_class_for(
@@ -1106,7 +1077,10 @@ mod tests {
             &identity,
             |h| store.get(h).cloned(),
         );
-        assert!(ok, "single-hop explicit-prefix root grant is operator-class");
+        assert!(
+            ok,
+            "single-hop explicit-prefix root grant is operator-class"
+        );
     }
 
     #[test]
@@ -1117,18 +1091,9 @@ mod tests {
         let identity = Hash::compute("test", b"L0-identity");
         let mid_grantee = Hash::compute("test", b"middle-actor");
         let leaf_grantee = Hash::compute("test", b"leaf-actor");
-        let root = make_cap_with_resources(
-            identity,
-            mid_grantee,
-            None,
-            &["system/capability"],
-        );
-        let leaf = make_cap_with_resources(
-            mid_grantee,
-            leaf_grantee,
-            Some(root.content_hash),
-            &["*"],
-        );
+        let root = make_cap_with_resources(identity, mid_grantee, None, &["system/capability"]);
+        let leaf =
+            make_cap_with_resources(mid_grantee, leaf_grantee, Some(root.content_hash), &["*"]);
         let store: std::collections::HashMap<Hash, Entity> = [
             (root.content_hash, root.clone()),
             (leaf.content_hash, leaf.clone()),
@@ -1153,12 +1118,8 @@ mod tests {
         let claimed_identity = Hash::compute("test", b"local-peer");
         let actual_root_granter = Hash::compute("test", b"some-other-peer");
         let grantee = Hash::compute("test", b"grantee");
-        let root = make_cap_with_resources(
-            actual_root_granter,
-            grantee,
-            None,
-            &["system/capability"],
-        );
+        let root =
+            make_cap_with_resources(actual_root_granter, grantee, None, &["system/capability"]);
         let store: std::collections::HashMap<Hash, Entity> =
             [(root.content_hash, root.clone())].into();
         let ok = is_operator_class_for(
@@ -1177,12 +1138,8 @@ mod tests {
         let identity = Hash::compute("test", b"identity");
         let grantee = Hash::compute("test", b"grantee");
         let phantom = Hash::compute("test", b"phantom-parent");
-        let leaf = make_cap_with_resources(
-            identity,
-            grantee,
-            Some(phantom),
-            &["system/capability"],
-        );
+        let leaf =
+            make_cap_with_resources(identity, grantee, Some(phantom), &["system/capability"]);
         let store: std::collections::HashMap<Hash, Entity> =
             [(leaf.content_hash, leaf.clone())].into();
         let ok = is_operator_class_for(
@@ -1199,12 +1156,7 @@ mod tests {
         // Edge: resources.include entry equal to target (not a prefix).
         let identity = Hash::compute("test", b"identity");
         let grantee = Hash::compute("test", b"grantee");
-        let root = make_cap_with_resources(
-            identity,
-            grantee,
-            None,
-            &["system/capability/grants"],
-        );
+        let root = make_cap_with_resources(identity, grantee, None, &["system/capability/grants"]);
         let store: std::collections::HashMap<Hash, Entity> =
             [(root.content_hash, root.clone())].into();
         let ok = is_operator_class_for(
@@ -1222,12 +1174,7 @@ mod tests {
         // (e.g., `system/capability-other` vs target `system/capability/...`).
         let identity = Hash::compute("test", b"identity");
         let grantee = Hash::compute("test", b"grantee");
-        let root = make_cap_with_resources(
-            identity,
-            grantee,
-            None,
-            &["system/capability-other"],
-        );
+        let root = make_cap_with_resources(identity, grantee, None, &["system/capability-other"]);
         let store: std::collections::HashMap<Hash, Entity> =
             [(root.content_hash, root.clone())].into();
         let ok = is_operator_class_for(
@@ -1276,11 +1223,7 @@ mod tests {
             .iter()
             .map(|b| format!("{:02x}", b))
             .collect();
-        let path = format!(
-            "/{}/system/signature/{}",
-            signer_kp.peer_id().as_str(),
-            hex
-        );
+        let path = format!("/{}/system/signature/{}", signer_kp.peer_id().as_str(), hex);
         li.insert(path, sig.content_hash);
         cap
     }
@@ -1300,8 +1243,7 @@ mod tests {
             (inst_id.content_hash, inst_id.clone()),
         ]
         .into();
-        let mut li: std::collections::HashMap<String, Hash> =
-            std::collections::HashMap::new();
+        let mut li: std::collections::HashMap<String, Hash> = std::collections::HashMap::new();
 
         // root: B -> installer (B-rooted). leaf: installer -> installer, parent=root.
         let root = put_signed_cap(
@@ -1331,7 +1273,10 @@ mod tests {
         assert!(bundle.contains_key(&leaf.content_hash), "leaf cap");
         assert!(bundle.contains_key(&root.content_hash), "root cap");
         assert!(bundle.contains_key(&b_id.content_hash), "B identity");
-        assert!(bundle.contains_key(&inst_id.content_hash), "installer identity");
+        assert!(
+            bundle.contains_key(&inst_id.content_hash),
+            "installer identity"
+        );
         let sig_count = bundle
             .values()
             .filter(|e| e.entity_type == TYPE_SIGNATURE)
@@ -1340,13 +1285,11 @@ mod tests {
 
         // A verifier reconstructing the chain from ONLY the bundle must find
         // the installer in-chain (single-sig granter of the leaf).
-        let result = check_creator_authority(
-            &leaf.content_hash,
-            &inst_id.content_hash,
-            &bundle,
-            |h| bundle.get(h).cloned(),
-        )
-        .unwrap();
+        let result =
+            check_creator_authority(&leaf.content_hash, &inst_id.content_hash, &bundle, |h| {
+                bundle.get(h).cloned()
+            })
+            .unwrap();
         assert!(
             result.found,
             "installer must be in-chain when verifying from the bundle alone"
@@ -1363,8 +1306,7 @@ mod tests {
         let cap = make_cap_entity(id.content_hash, id.content_hash, None);
         let store: std::collections::HashMap<Hash, Entity> =
             [(cap.content_hash, cap.clone())].into();
-        let li: std::collections::HashMap<String, Hash> =
-            std::collections::HashMap::new();
+        let li: std::collections::HashMap<String, Hash> = std::collections::HashMap::new();
 
         let bundle = collect_chain_bundle(
             &cap.content_hash,
@@ -1373,7 +1315,10 @@ mod tests {
         )
         .unwrap();
 
-        assert!(bundle.contains_key(&cap.content_hash), "resolvable cap still bundled");
+        assert!(
+            bundle.contains_key(&cap.content_hash),
+            "resolvable cap still bundled"
+        );
         assert!(
             !bundle.values().any(|e| e.entity_type == TYPE_SIGNATURE),
             "no signature should be present (none was resolvable)"
@@ -1394,8 +1339,7 @@ mod tests {
         let store: std::collections::HashMap<Hash, Entity> =
             [(cap.content_hash, cap.clone())].into();
         let marker_hash = Hash::compute("test", b"marker");
-        let mut li: std::collections::HashMap<String, Hash> =
-            std::collections::HashMap::new();
+        let mut li: std::collections::HashMap<String, Hash> = std::collections::HashMap::new();
         li.insert(
             format!(
                 "/peer-x/system/capability/revocations/{}",
@@ -1422,8 +1366,7 @@ mod tests {
         let cap = make_cap_entity(local, grantee, None);
         let store: std::collections::HashMap<Hash, Entity> =
             [(cap.content_hash, cap.clone())].into();
-        let li: std::collections::HashMap<String, Hash> =
-            std::collections::HashMap::new();
+        let li: std::collections::HashMap<String, Hash> = std::collections::HashMap::new();
 
         let revoked = crate::verify::is_revoked(
             &cap.content_hash,
@@ -1444,8 +1387,7 @@ mod tests {
         let cap = make_cap_entity(local, grantee, None);
         let store: std::collections::HashMap<Hash, Entity> =
             [(cap.content_hash, cap.clone())].into();
-        let li: std::collections::HashMap<String, Hash> =
-            std::collections::HashMap::new(); // path NOT bound
+        let li: std::collections::HashMap<String, Hash> = std::collections::HashMap::new(); // path NOT bound
         let cap_path = "/peer-x/system/capability/grants/local/handler".to_string();
 
         let revoked = crate::verify::is_revoked(
@@ -1455,7 +1397,10 @@ mod tests {
             |p| li.get(p).cloned(),
             |_| Some(cap_path.clone()),
         );
-        assert!(revoked, "path-bound cap whose tree entry vanished ⇒ revoked");
+        assert!(
+            revoked,
+            "path-bound cap whose tree entry vanished ⇒ revoked"
+        );
     }
 
     #[test]
@@ -1469,8 +1414,7 @@ mod tests {
             [(cap.content_hash, cap.clone())].into();
         let other_hash = Hash::compute("test", b"other");
         let cap_path = "/peer-x/system/capability/grants/local/handler".to_string();
-        let mut li: std::collections::HashMap<String, Hash> =
-            std::collections::HashMap::new();
+        let mut li: std::collections::HashMap<String, Hash> = std::collections::HashMap::new();
         li.insert(cap_path.clone(), other_hash); // different entity bound
 
         let revoked = crate::verify::is_revoked(
@@ -1488,10 +1432,8 @@ mod tests {
         // Leaf isn't in the store at all — the chain walk fails, and §5.1
         // requires fail-closed (treat as revoked).
         let phantom = Hash::compute("test", b"phantom");
-        let store: std::collections::HashMap<Hash, Entity> =
-            std::collections::HashMap::new();
-        let li: std::collections::HashMap<String, Hash> =
-            std::collections::HashMap::new();
+        let store: std::collections::HashMap<Hash, Entity> = std::collections::HashMap::new();
+        let li: std::collections::HashMap<String, Hash> = std::collections::HashMap::new();
         let revoked = crate::verify::is_revoked(
             &phantom,
             "peer-x",
@@ -1516,8 +1458,7 @@ mod tests {
             (leaf.content_hash, leaf.clone()),
         ]
         .into();
-        let mut li: std::collections::HashMap<String, Hash> =
-            std::collections::HashMap::new();
+        let mut li: std::collections::HashMap<String, Hash> = std::collections::HashMap::new();
         li.insert(
             format!(
                 "/peer-x/system/capability/revocations/{}",
@@ -1541,11 +1482,8 @@ mod tests {
         let cap_hash = Hash::compute("test", b"cap");
         let path = "/peer-x/system/capability/grants/local/files".to_string();
         let entries = vec![(path.clone(), cap_hash)];
-        let result = crate::verify::capability_path_for_scan(
-            &cap_hash,
-            "peer-x",
-            |_prefix| entries.clone(),
-        );
+        let result =
+            crate::verify::capability_path_for_scan(&cap_hash, "peer-x", |_prefix| entries.clone());
         assert_eq!(result, Some(path));
     }
 
@@ -1557,11 +1495,8 @@ mod tests {
             "/peer-x/system/capability/grants/local/files".to_string(),
             other_hash,
         )];
-        let result = crate::verify::capability_path_for_scan(
-            &cap_hash,
-            "peer-x",
-            |_prefix| entries.clone(),
-        );
+        let result =
+            crate::verify::capability_path_for_scan(&cap_hash, "peer-x", |_prefix| entries.clone());
         assert_eq!(result, None);
     }
 
@@ -1670,8 +1605,7 @@ mod tests {
     /// expected `{code, message}` shape.
     #[test]
     fn test_error_entity_body_is_well_formed() {
-        let envelope =
-            build_error_response("r", 404, "not_found", "path not found: abc").unwrap();
+        let envelope = build_error_response("r", 404, "not_found", "path not found: abc").unwrap();
         // The inline error entity travels on the wire both as `root.data.result`
         // and as an included entity — both surfaces must decode cleanly.
         for (_, inc) in envelope.included.iter() {
@@ -1762,8 +1696,8 @@ mod tests {
         let local_kp = Keypair::from_seed([99u8; 32]);
         let local_peer_id = local_kp.peer_id();
         let (cap_hash, included) = build_zero_grantee_chain(&local_kp, Hash::zero());
-        let err = verify_capability_chain(&cap_hash, &included, local_peer_id.as_str())
-            .unwrap_err();
+        let err =
+            verify_capability_chain(&cap_hash, &included, local_peer_id.as_str()).unwrap_err();
         assert!(
             matches!(err, ProtocolError::UnresolvableGrantee),
             "expected UnresolvableGrantee, got {err:?}"
@@ -1781,8 +1715,8 @@ mod tests {
         let local_peer_id = local_kp.peer_id();
         let phantom = Hash::compute("test", b"identity-not-in-included");
         let (cap_hash, included) = build_zero_grantee_chain(&local_kp, phantom);
-        let err = verify_capability_chain(&cap_hash, &included, local_peer_id.as_str())
-            .unwrap_err();
+        let err =
+            verify_capability_chain(&cap_hash, &included, local_peer_id.as_str()).unwrap_err();
         assert!(matches!(err, ProtocolError::UnresolvableGrantee));
     }
 
@@ -1807,8 +1741,8 @@ mod tests {
         let (cap_hash, mut included) = build_zero_grantee_chain(&local_kp, bogus_hash);
         included.insert(bogus_hash, bogus);
 
-        let err = verify_capability_chain(&cap_hash, &included, local_peer_id.as_str())
-            .unwrap_err();
+        let err =
+            verify_capability_chain(&cap_hash, &included, local_peer_id.as_str()).unwrap_err();
         assert!(matches!(err, ProtocolError::UnresolvableGrantee));
     }
 
@@ -1827,13 +1761,7 @@ mod tests {
         let envelope = build_test_execute(&author_kp, &local_kp, "system/tree", "get");
 
         let ctx = VerifyContext::new(local_peer_id.as_str()).with_revocation(false);
-        let res = verify_request_with_ctx(
-            &envelope,
-            &ctx,
-            |_| None,
-            |_| None,
-            |_| None,
-        );
+        let res = verify_request_with_ctx(&envelope, &ctx, |_| None, |_| None, |_| None);
         assert!(res.is_ok());
     }
 
@@ -1849,8 +1777,7 @@ mod tests {
         let envelope = build_test_execute(&author_kp, &local_kp, "system/tree", "get");
 
         let cap_hash = decode_execute_capability(&envelope.root.data);
-        let mut li: std::collections::HashMap<String, Hash> =
-            std::collections::HashMap::new();
+        let mut li: std::collections::HashMap<String, Hash> = std::collections::HashMap::new();
         li.insert(
             format!(
                 "/{}/system/capability/revocations/{}",

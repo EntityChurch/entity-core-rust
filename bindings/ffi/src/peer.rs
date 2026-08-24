@@ -31,18 +31,21 @@ static RUNTIME: LazyLock<std::sync::Mutex<Option<tokio::runtime::Runtime>>> =
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
 pub extern "C" fn entity_core_init() -> i32 {
-    ffi_fn!({
-        match tokio::runtime::Runtime::new() {
-            Ok(rt) => {
-                *RUNTIME.lock().unwrap() = Some(rt);
-                0
+    ffi_fn!(
+        {
+            match tokio::runtime::Runtime::new() {
+                Ok(rt) => {
+                    *RUNTIME.lock().unwrap() = Some(rt);
+                    0
+                }
+                Err(e) => {
+                    set_last_error(&format!("runtime init failed: {}", e));
+                    -1
+                }
             }
-            Err(e) => {
-                set_last_error(&format!("runtime init failed: {}", e));
-                -1
-            }
-        }
-    }, -1)
+        },
+        -1
+    )
 }
 
 /// Shutdown the FFI runtime. Call when done with the library.
@@ -54,9 +57,7 @@ pub extern "C" fn entity_core_shutdown() {
 /// Get the library version string.
 #[no_mangle]
 pub extern "C" fn entity_core_version() -> EntityCoreBuffer {
-    ffi_fn!({
-        EntityCoreBuffer::from_vec(b"entity-core-ffi/0.1.0".to_vec())
-    })
+    ffi_fn!({ EntityCoreBuffer::from_vec(b"entity-core-ffi/0.1.0".to_vec()) })
 }
 
 /// Create a new peer from a 32-byte seed. Returns a handle, or 0 on error.
@@ -76,15 +77,14 @@ pub unsafe extern "C" fn entity_core_peer_create(
         let mut seed_arr = [0u8; 32];
         seed_arr.copy_from_slice(seed);
 
-        let addr = match unsafe {
-            std::str::from_utf8(std::slice::from_raw_parts(addr_ptr, addr_len))
-        } {
-            Ok(s) => s,
-            Err(e) => {
-                set_last_error(&format!("invalid UTF-8 address: {}", e));
-                return 0;
-            }
-        };
+        let addr =
+            match unsafe { std::str::from_utf8(std::slice::from_raw_parts(addr_ptr, addr_len)) } {
+                Ok(s) => s,
+                Err(e) => {
+                    set_last_error(&format!("invalid UTF-8 address: {}", e));
+                    return 0;
+                }
+            };
 
         let runtime = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
@@ -135,32 +135,35 @@ pub extern "C" fn entity_core_peer_id(handle: Handle) -> EntityCoreBuffer {
 /// Returns 0 on success.
 #[no_mangle]
 pub extern "C" fn entity_core_peer_start(handle: Handle) -> EntityCoreError {
-    ffi_fn!({
-        match PEERS.with(handle, |p| {
-            let listener = p.runtime.block_on(p.peer.listen());
-            match listener {
-                Ok(listener) => {
-                    let shared = p.peer.shared();
-                    let _guard = p.runtime.enter();
-                    p.peer.start_engines(&shared);
-                    p.runtime.spawn(async move {
-                        let _ = entity_peer::server::run(listener, shared).await;
-                    });
-                    EntityCoreError::Ok
+    ffi_fn!(
+        {
+            match PEERS.with(handle, |p| {
+                let listener = p.runtime.block_on(p.peer.listen());
+                match listener {
+                    Ok(listener) => {
+                        let shared = p.peer.shared();
+                        let _guard = p.runtime.enter();
+                        p.peer.start_engines(&shared);
+                        p.runtime.spawn(async move {
+                            let _ = entity_peer::server::run(listener, shared).await;
+                        });
+                        EntityCoreError::Ok
+                    }
+                    Err(e) => {
+                        set_last_error(&format!("listen failed: {}", e));
+                        EntityCoreError::NetworkError
+                    }
                 }
-                Err(e) => {
-                    set_last_error(&format!("listen failed: {}", e));
-                    EntityCoreError::NetworkError
+            }) {
+                Some(e) => e,
+                None => {
+                    set_last_error("invalid peer handle");
+                    EntityCoreError::InvalidArgument
                 }
             }
-        }) {
-            Some(e) => e,
-            None => {
-                set_last_error("invalid peer handle");
-                EntityCoreError::InvalidArgument
-            }
-        }
-    }, EntityCoreError::InternalError)
+        },
+        EntityCoreError::InternalError
+    )
 }
 
 /// Execute a local handler operation. Returns an entity handle for the result, or 0 on error.
@@ -207,7 +210,8 @@ pub unsafe extern "C" fn entity_core_execute(
         };
 
         match PEERS.with(peer_handle, |p| {
-            p.runtime.block_on(p.peer.execute(handler, operation, params))
+            p.runtime
+                .block_on(p.peer.execute(handler, operation, params))
         }) {
             Some(Ok(result)) => ENTITIES.insert(result.result),
             Some(Err(e)) => {
@@ -241,7 +245,9 @@ pub extern "C" fn entity_core_subscribe(peer_handle: Handle) -> Handle {
                     }
                 }
             });
-            SUBSCRIPTIONS.insert(FfiSubscription { rx: std::sync::Mutex::new(rx) })
+            SUBSCRIPTIONS.insert(FfiSubscription {
+                rx: std::sync::Mutex::new(rx),
+            })
         }) {
             Some(handle) => handle,
             None => {
@@ -288,15 +294,14 @@ pub unsafe extern "C" fn entity_core_tree_get(
     path_len: usize,
 ) -> Handle {
     ffi_fn!({
-        let path = match unsafe {
-            std::str::from_utf8(std::slice::from_raw_parts(path_ptr, path_len))
-        } {
-            Ok(s) => s,
-            Err(e) => {
-                set_last_error(&format!("invalid UTF-8 path: {}", e));
-                return 0;
-            }
-        };
+        let path =
+            match unsafe { std::str::from_utf8(std::slice::from_raw_parts(path_ptr, path_len)) } {
+                Ok(s) => s,
+                Err(e) => {
+                    set_last_error(&format!("invalid UTF-8 path: {}", e));
+                    return 0;
+                }
+            };
         match PEERS.with(handle, |p| p.peer.tree().get(path)) {
             Some(Some(entity)) => ENTITIES.insert(entity),
             Some(None) => {
@@ -323,15 +328,14 @@ pub unsafe extern "C" fn entity_core_tree_put(
     entity_handle: Handle,
 ) -> EntityCoreBuffer {
     ffi_fn!({
-        let path = match unsafe {
-            std::str::from_utf8(std::slice::from_raw_parts(path_ptr, path_len))
-        } {
-            Ok(s) => s,
-            Err(e) => {
-                set_last_error(&format!("invalid UTF-8 path: {}", e));
-                return EntityCoreBuffer::null();
-            }
-        };
+        let path =
+            match unsafe { std::str::from_utf8(std::slice::from_raw_parts(path_ptr, path_len)) } {
+                Ok(s) => s,
+                Err(e) => {
+                    set_last_error(&format!("invalid UTF-8 path: {}", e));
+                    return EntityCoreBuffer::null();
+                }
+            };
 
         let entity = match ENTITIES.remove(entity_handle) {
             Some(e) => e,

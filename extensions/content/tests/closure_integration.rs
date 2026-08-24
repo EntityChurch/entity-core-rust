@@ -12,8 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use ciborium::Value;
 use entity_content::{
-    create_blob_fastcdc, create_blob_fixed, ensure_closure, EnsureClosureError,
-    GET_BATCH_SIZE,
+    create_blob_fastcdc, create_blob_fixed, ensure_closure, EnsureClosureError, GET_BATCH_SIZE,
 };
 use entity_ecf::ValueExt;
 use entity_entity::Entity;
@@ -202,10 +201,7 @@ async fn ensure_closure_skips_already_local_blob() {
     let batches = dispatcher.last_batch_sizes.lock().unwrap().clone();
     // No call asked for the blob hash itself; first dispatch is the
     // chunk batch.
-    assert!(
-        calls >= 1,
-        "must have dispatched at least one chunk batch"
-    );
+    assert!(calls >= 1, "must have dispatched at least one chunk batch");
     // None of the dispatched batches contained the blob hash.
     for size in &batches {
         assert!(*size <= GET_BATCH_SIZE, "batch <= GET_BATCH_SIZE");

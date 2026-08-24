@@ -38,16 +38,13 @@ pub(super) fn eval_apply(
 
     if has_path && has_fn {
         return EvalResult::Value(
-            ComputeError::InvalidExpression(
-                "compute/apply has both 'path' and 'fn'".into(),
-            )
-            .to_value(),
+            ComputeError::InvalidExpression("compute/apply has both 'path' and 'fn'".into())
+                .to_value(),
         );
     }
     if !has_path && !has_fn {
         return EvalResult::Value(
-            ComputeError::InvalidExpression("compute/apply requires path or fn".into())
-                .to_value(),
+            ComputeError::InvalidExpression("compute/apply requires path or fn".into()).to_value(),
         );
     }
 
@@ -86,19 +83,15 @@ fn eval_apply_closure(
 
     let closure = match &fn_value {
         ComputeValue::Closure(c) => c.clone(),
-        ComputeValue::Entity(e) if e.entity_type == TYPE_CLOSURE => {
-            match parse_closure_entity(e) {
-                Some(c) => c,
-                None => {
-                    return EvalResult::Value(
-                        ComputeError::InvalidExpression(
-                            "Failed to parse closure entity".into(),
-                        )
+        ComputeValue::Entity(e) if e.entity_type == TYPE_CLOSURE => match parse_closure_entity(e) {
+            Some(c) => c,
+            None => {
+                return EvalResult::Value(
+                    ComputeError::InvalidExpression("Failed to parse closure entity".into())
                         .to_value(),
-                    )
-                }
+                )
             }
-        }
+        },
         _ => {
             return EvalResult::Value(
                 ComputeError::TypeMismatch("Apply target is not a closure".into()).to_value(),
@@ -165,10 +158,8 @@ fn eval_apply_handler(
         Some(p) => p,
         None => {
             return EvalResult::Value(
-                ComputeError::InvalidExpression(
-                    "compute/apply handler mode missing 'path'".into(),
-                )
-                .to_value(),
+                ComputeError::InvalidExpression("compute/apply handler mode missing 'path'".into())
+                    .to_value(),
             )
         }
     };
@@ -244,8 +235,7 @@ fn eval_apply_handler(
             if !has_resource_field {
                 return EvalResult::Value(
                     ComputeError::InvalidExpression(
-                        "compute/apply with capability field MUST also have resource field"
-                            .into(),
+                        "compute/apply with capability field MUST also have resource field".into(),
                     )
                     .to_value(),
                 );
@@ -272,22 +262,21 @@ fn eval_apply_handler(
     // entity carry the handler's declared input type, not a generic primitive/map.
     // When the type definition is unavailable, fall back to primitive/map (the
     // spec's fall-back path when type extension isn't present).
-    let params_type =
-        resolve_operation_input_type(ctx, &path, &operation).unwrap_or_else(|| {
-            // Builtins are not user-registered tree handlers — their input_type
-            // comes from the spec (§3.5 §912 table). Fall back to the canonical
-            // type before resorting to primitive/map so cross-impl hashing of
-            // the params entity stays stable.
-            if let Some(t) = crate::builtins::builtin_input_type(&path, &operation) {
-                return t.to_string();
-            }
-            tracing::debug!(
-                handler = %path,
-                operation = %operation,
-                "compute/apply: input_type lookup failed, falling back to primitive/map"
-            );
-            "primitive/map".to_string()
-        });
+    let params_type = resolve_operation_input_type(ctx, &path, &operation).unwrap_or_else(|| {
+        // Builtins are not user-registered tree handlers — their input_type
+        // comes from the spec (§3.5 §912 table). Fall back to the canonical
+        // type before resorting to primitive/map so cross-impl hashing of
+        // the params entity stays stable.
+        if let Some(t) = crate::builtins::builtin_input_type(&path, &operation) {
+            return t.to_string();
+        }
+        tracing::debug!(
+            handler = %path,
+            operation = %operation,
+            "compute/apply: input_type lookup failed, falling back to primitive/map"
+        );
+        "primitive/map".to_string()
+    });
 
     let params_data = Value::Map(resolved);
     let params_bytes = entity_ecf::to_ecf(&params_data);
@@ -324,10 +313,7 @@ fn eval_apply_handler(
 /// Walk the tree backward from `path` to find the longest-prefix `system/handler`
 /// entity (V7 §6.6). Returns the matched handler entity, or None if no handler
 /// exists along the path. Pure tree-only resolution — no registry consulted.
-fn resolve_handler_entity_in_tree(
-    ctx: &EvalContext<'_>,
-    path: &str,
-) -> Option<Entity> {
+fn resolve_handler_entity_in_tree(ctx: &EvalContext<'_>, path: &str) -> Option<Entity> {
     let qualified = qualify_path(path, ctx.local_peer_id);
     let segments: Vec<&str> = qualified.split('/').filter(|s| !s.is_empty()).collect();
     for i in (1..=segments.len()).rev() {

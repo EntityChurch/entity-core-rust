@@ -11,15 +11,17 @@
 
 use entity_hash::Hash;
 
+use crate::aad;
 use crate::aead::{random_nonce, xchacha_decrypt, xchacha_encrypt, AEAD_KEY_SIZE, AEAD_NONCE_SIZE};
-use crate::ecdh::{generate_or_load_x25519, x25519_shared, X25519_PRIVATE_SIZE, X25519_PUBLIC_SIZE};
+use crate::ecdh::{
+    generate_or_load_x25519, x25519_shared, X25519_PRIVATE_SIZE, X25519_PUBLIC_SIZE,
+};
 use crate::kdf::hkdf_sha256;
 use crate::registry::{
     peer_mode_suite_allowed, AEAD_ID_XCHACHA20_POLY1305, ENC_KEY_TYPE_X25519, KDF_ID_HKDF_SHA256,
 };
 use crate::types::{EncryptionError, MODE_PEER};
 use crate::wrapper::EncryptedData;
-use crate::aad;
 
 /// §7.3 step-4 ASCII HKDF-info prefix. The bound context is the F-GO-1
 /// uniform-across-tiers `recipient_pubkey_hash` wire bytes (33 bytes for
@@ -51,9 +53,9 @@ pub fn peer_encrypt(input: PeerEncryptInput) -> Result<EncryptedData, Encryption
             input.recipient_pubkey.len()
         )));
     }
-    let recipient_hash = input.recipient_pubkey_hash.ok_or_else(|| {
-        EncryptionError::InvalidWrapper("recipient_key hash required".into())
-    })?;
+    let recipient_hash = input
+        .recipient_pubkey_hash
+        .ok_or_else(|| EncryptionError::InvalidWrapper("recipient_key hash required".into()))?;
 
     let enc_key_type = ENC_KEY_TYPE_X25519;
     let aead_id = AEAD_ID_XCHACHA20_POLY1305;
@@ -76,7 +78,14 @@ pub fn peer_encrypt(input: PeerEncryptInput) -> Result<EncryptedData, Encryption
     let shared = x25519_shared(&eph_seed, &input.recipient_pubkey)?;
 
     let aead_key = derive_aead_key(&shared, &nonce, &recipient_hash)?;
-    let aad = aad::peer_aad(enc_key_type, aead_id, kdf_id, &nonce, &recipient_hash, &eph_pub);
+    let aad = aad::peer_aad(
+        enc_key_type,
+        aead_id,
+        kdf_id,
+        &nonce,
+        &recipient_hash,
+        &eph_pub,
+    );
     let ct = xchacha_encrypt(&aead_key, &nonce, &aad, &input.plaintext)?;
 
     let mut ed = EncryptedData::common(MODE_PEER, enc_key_type, aead_id, kdf_id, nonce, ct);
@@ -111,7 +120,14 @@ pub fn peer_decrypt(ed: &EncryptedData, recipient_priv: &[u8]) -> Result<Vec<u8>
 
     let shared = x25519_shared(recipient_priv, eph_pub)?;
     let aead_key = derive_aead_key(&shared, &ed.nonce, &recipient_hash)?;
-    let aad = aad::peer_aad(ed.enc_key_type, ed.aead_id, ed.kdf_id, &ed.nonce, &recipient_hash, eph_pub);
+    let aad = aad::peer_aad(
+        ed.enc_key_type,
+        ed.aead_id,
+        ed.kdf_id,
+        &ed.nonce,
+        &recipient_hash,
+        eph_pub,
+    );
     xchacha_decrypt(&aead_key, &ed.nonce, &aad, &ed.ciphertext)
 }
 

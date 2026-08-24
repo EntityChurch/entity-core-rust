@@ -37,11 +37,7 @@ pub fn is_excluded(
 /// Resolve `{context}` and `{peer_id}` template variables in every path
 /// string of a grant entry per §5.2. Pure textual substitution — no path
 /// canonicalization or validation.
-pub fn resolve_grant_templates(
-    grant: &GrantEntry,
-    context: &str,
-    peer_id: &str,
-) -> GrantEntry {
+pub fn resolve_grant_templates(grant: &GrantEntry, context: &str, peer_id: &str) -> GrantEntry {
     GrantEntry {
         handlers: resolve_path_scope(&grant.handlers, context, peer_id),
         resources: resolve_path_scope(&grant.resources, context, peer_id),
@@ -107,10 +103,7 @@ mod tests {
     fn template_resolution_substitutes_path_scopes() {
         let grant = GrantEntry {
             handlers: PathScope::new(vec!["system/tree".into()]),
-            resources: PathScope::new(vec![
-                "shared/{context}/*".into(),
-                "by/{peer_id}/*".into(),
-            ]),
+            resources: PathScope::new(vec!["shared/{context}/*".into(), "by/{peer_id}/*".into()]),
             operations: IdScope::new(vec!["get".into(), "put".into()]),
             peers: None,
             constraints: None,

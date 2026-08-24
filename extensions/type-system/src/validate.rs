@@ -79,10 +79,7 @@ impl TypeHandler {
         let (entity_value, type_path_override) = match parse_validate_request(&params_value) {
             Ok(t) => t,
             Err(e) => {
-                return HandlerResult::error(
-                    STATUS_BAD_REQUEST,
-                    error_entity("bad_request", &e),
-                );
+                return HandlerResult::error(STATUS_BAD_REQUEST, error_entity("bad_request", &e));
             }
         };
 
@@ -137,10 +134,7 @@ impl TypeHandler {
             .unwrap_or_default();
 
         // The entity's data should be a map for fielded types.
-        let entity_fields = entity_data
-            .as_map()
-            .map(|m| m.to_vec())
-            .unwrap_or_default();
+        let entity_fields = entity_data.as_map().map(|m| m.to_vec()).unwrap_or_default();
         let present_keys: Vec<String> = entity_fields
             .iter()
             .filter_map(|(k, _)| k.as_text().map(String::from))
@@ -272,10 +266,7 @@ impl TypeHandler {
                 entity_ecf::text("constraint_type"),
                 entity_ecf::text(constraint_type),
             ),
-            (
-                entity_ecf::text("constraint_data"),
-                constraint_data.clone(),
-            ),
+            (entity_ecf::text("constraint_data"), constraint_data.clone()),
         ]));
         let req = match Entity::new("system/type/constraint/validate-request", req_data) {
             Ok(e) => e,
@@ -451,18 +442,15 @@ pub struct ValidateResult {
 
 impl ValidateResult {
     pub fn to_entity(&self) -> Entity {
-        let mut entries = vec![(
-            entity_ecf::text("valid"),
-            entity_ecf::bool_val(self.valid),
-        )];
+        let mut entries = vec![(entity_ecf::text("valid"), entity_ecf::bool_val(self.valid))];
         if !self.violations.is_empty() {
             let arr: Vec<Value> = self
                 .violations
                 .iter()
                 .map(|v| {
                     let e = v.to_entity();
-                    let inner: Value = ciborium::from_reader(e.data.as_slice())
-                        .unwrap_or(Value::Map(vec![]));
+                    let inner: Value =
+                        ciborium::from_reader(e.data.as_slice()).unwrap_or(Value::Map(vec![]));
                     inner
                 })
                 .collect();
@@ -474,7 +462,10 @@ impl ValidateResult {
                 .iter()
                 .map(|s| entity_ecf::text(s.as_str()))
                 .collect();
-            entries.push((entity_ecf::text("unevaluated_fields"), entity_ecf::array(arr)));
+            entries.push((
+                entity_ecf::text("unevaluated_fields"),
+                entity_ecf::array(arr),
+            ));
         }
         let data = entity_ecf::to_ecf(&Value::Map(entries));
         Entity::new(TYPE_VALIDATE_RES, data).expect("validate-result entity")

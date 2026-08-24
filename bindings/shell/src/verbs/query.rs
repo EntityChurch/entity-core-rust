@@ -52,7 +52,10 @@ where
             Ok(results) => {
                 for m in &results.matches {
                     let _ = tx
-                        .send(StreamChunk::Line(format!("  {}  {}", m.path, m.entity_type)))
+                        .send(StreamChunk::Line(format!(
+                            "  {}  {}",
+                            m.path, m.entity_type
+                        )))
                         .await;
                 }
                 let _ = tx
@@ -109,15 +112,27 @@ mod tests {
     }
 
     impl PeerBinding for StubBinding {
-        fn peer_id(&self) -> &str { "alice" }
-        fn primary_peer_id(&self) -> String { "alice".into() }
-        fn peer_ids(&self) -> Vec<String> { vec!["alice".into()] }
-        fn connected_peers(&self) -> Vec<String> { Vec::new() }
-        fn peer_label(&self, _pid: &str) -> Option<String> { None }
+        fn peer_id(&self) -> &str {
+            "alice"
+        }
+        fn primary_peer_id(&self) -> String {
+            "alice".into()
+        }
+        fn peer_ids(&self) -> Vec<String> {
+            vec!["alice".into()]
+        }
+        fn connected_peers(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn peer_label(&self, _pid: &str) -> Option<String> {
+            None
+        }
         fn tree_listing(&self, _pid: &str, _prefix: &str) -> Vec<TreeListingEntry> {
             Vec::new()
         }
-        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> { None }
+        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> {
+            None
+        }
         fn query(
             &self,
             _pid: &str,
@@ -148,7 +163,11 @@ mod tests {
     #[test]
     fn empty_filter_returns_usage() {
         let b = StubBinding {
-            result: Ok(QueryResults { matches: Vec::new(), total: 0, has_more: false }),
+            result: Ok(QueryResults {
+                matches: Vec::new(),
+                total: 0,
+                has_more: false,
+            }),
         };
         let err = query(&[], &b, |_| {}).unwrap_err();
         assert_eq!(err.code, crate::result::ErrorCode::Usage);
@@ -159,8 +178,14 @@ mod tests {
         let b = StubBinding {
             result: Ok(QueryResults {
                 matches: vec![
-                    QueryMatch { path: "/alice/a".into(), entity_type: "app/x".into() },
-                    QueryMatch { path: "/alice/b".into(), entity_type: "app/x".into() },
+                    QueryMatch {
+                        path: "/alice/a".into(),
+                        entity_type: "app/x".into(),
+                    },
+                    QueryMatch {
+                        path: "/alice/b".into(),
+                        entity_type: "app/x".into(),
+                    },
                 ],
                 total: 2,
                 has_more: false,
@@ -183,7 +208,9 @@ mod tests {
 
     #[test]
     fn failure_emits_failed_chunk() {
-        let b = StubBinding { result: Err("backend down".into()) };
+        let b = StubBinding {
+            result: Err("backend down".into()),
+        };
         let result = query(&["x"], &b, drive).unwrap();
         let mut rx = match result {
             VerbOutput::Lines(rx) => rx,
@@ -204,7 +231,10 @@ mod tests {
     fn query_op_streams_directly() {
         let b = StubBinding {
             result: Ok(QueryResults {
-                matches: vec![QueryMatch { path: "/alice/x".into(), entity_type: "t".into() }],
+                matches: vec![QueryMatch {
+                    path: "/alice/x".into(),
+                    entity_type: "t".into(),
+                }],
                 total: 1,
                 has_more: false,
             }),

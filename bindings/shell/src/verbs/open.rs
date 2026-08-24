@@ -47,11 +47,7 @@ pub fn open_list_op(action_sink: &dyn AppActionSink) -> VerbOutput {
 
 /// Verb-op (§8.1). Submit a `SpawnWindow` request for an already-
 /// resolved window `type_name` and `peer_id`.
-pub fn open_op(
-    action_sink: &dyn AppActionSink,
-    type_name: String,
-    peer_id: String,
-) -> VerbOutput {
+pub fn open_op(action_sink: &dyn AppActionSink, type_name: String, peer_id: String) -> VerbOutput {
     let short = display::short_pid(&peer_id);
     let type_name_clone = type_name.clone();
     action_sink.submit(ShellRequest::SpawnWindow {
@@ -115,15 +111,27 @@ mod tests {
 
     struct StubBinding;
     impl PeerBinding for StubBinding {
-        fn peer_id(&self) -> &str { "alice" }
-        fn primary_peer_id(&self) -> String { "alice".into() }
-        fn peer_ids(&self) -> Vec<String> { vec!["alice".into()] }
-        fn connected_peers(&self) -> Vec<String> { Vec::new() }
-        fn peer_label(&self, _pid: &str) -> Option<String> { None }
+        fn peer_id(&self) -> &str {
+            "alice"
+        }
+        fn primary_peer_id(&self) -> String {
+            "alice".into()
+        }
+        fn peer_ids(&self) -> Vec<String> {
+            vec!["alice".into()]
+        }
+        fn connected_peers(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn peer_label(&self, _pid: &str) -> Option<String> {
+            None
+        }
         fn tree_listing(&self, _pid: &str, _prefix: &str) -> Vec<TreeListingEntry> {
             Vec::new()
         }
-        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> { None }
+        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> {
+            None
+        }
     }
 
     struct StubSink {
@@ -167,7 +175,11 @@ mod tests {
         }
         match open(&[], &StubBinding, &Empty).unwrap() {
             VerbOutput::Listing { sections } => {
-                assert!(sections[0].header.as_ref().unwrap().contains("no window types"));
+                assert!(sections[0]
+                    .header
+                    .as_ref()
+                    .unwrap()
+                    .contains("no window types"));
             }
             other => panic!("unexpected variant: {:?}", other),
         }

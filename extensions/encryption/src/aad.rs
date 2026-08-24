@@ -35,16 +35,28 @@ fn uint(v: u8) -> Value {
 /// `kdf_params` (mirroring the §9.2 backup path); Go's v2.3 6-key prototype hex
 /// is superseded. `enc_key_type` is always 0; `recipient_key` is empty bytes
 /// (no recipient in self mode). `kdf_params` is the nested §6.1 sub-map.
-pub fn self_aad(aead_id: u8, kdf_id: u8, nonce: &[u8], kdf_salt: &[u8], kdf_params: Value) -> Vec<u8> {
+pub fn self_aad(
+    aead_id: u8,
+    kdf_id: u8,
+    nonce: &[u8],
+    kdf_salt: &[u8],
+    kdf_params: Value,
+) -> Vec<u8> {
     let m = Value::Map(vec![
         (Value::Text("mode".into()), Value::Text(MODE_SELF.into())),
         (Value::Text("enc_key_type".into()), uint(0)),
         (Value::Text("aead_id".into()), uint(aead_id)),
         (Value::Text("kdf_id".into()), uint(kdf_id)),
         (Value::Text("nonce".into()), Value::Bytes(nonce.to_vec())),
-        (Value::Text("kdf_salt".into()), Value::Bytes(kdf_salt.to_vec())),
+        (
+            Value::Text("kdf_salt".into()),
+            Value::Bytes(kdf_salt.to_vec()),
+        ),
         (Value::Text("kdf_params".into()), kdf_params),
-        (Value::Text("recipient_key".into()), Value::Bytes(Vec::new())),
+        (
+            Value::Text("recipient_key".into()),
+            Value::Bytes(Vec::new()),
+        ),
     ]);
     to_ecf(&m)
 }
@@ -68,8 +80,14 @@ pub fn peer_aad(
         (Value::Text("aead_id".into()), uint(aead_id)),
         (Value::Text("kdf_id".into()), uint(kdf_id)),
         (Value::Text("nonce".into()), Value::Bytes(nonce.to_vec())),
-        (Value::Text("recipient_key".into()), hash_value(recipient_key)),
-        (Value::Text("ephemeral_key".into()), Value::Bytes(ephemeral_key.to_vec())),
+        (
+            Value::Text("recipient_key".into()),
+            hash_value(recipient_key),
+        ),
+        (
+            Value::Text("ephemeral_key".into()),
+            Value::Bytes(ephemeral_key.to_vec()),
+        ),
     ]);
     to_ecf(&m)
 }
@@ -90,8 +108,14 @@ pub fn group_outer_aad(aead_id: u8, kdf_id: u8, nonce: &[u8], commitment: &[u8])
         (Value::Text("aead_id".into()), uint(aead_id)),
         (Value::Text("kdf_id".into()), uint(kdf_id)),
         (Value::Text("nonce".into()), Value::Bytes(nonce.to_vec())),
-        (Value::Text("commitment".into()), Value::Bytes(commitment.to_vec())),
-        (Value::Text("recipient_key".into()), Value::Bytes(Vec::new())),
+        (
+            Value::Text("commitment".into()),
+            Value::Bytes(commitment.to_vec()),
+        ),
+        (
+            Value::Text("recipient_key".into()),
+            Value::Bytes(Vec::new()),
+        ),
     ]);
     to_ecf(&m)
 }
@@ -113,13 +137,22 @@ pub fn group_wrap_aad(
     ephemeral_key: &[u8],
 ) -> Vec<u8> {
     let m = Value::Map(vec![
-        (Value::Text("mode".into()), Value::Text(AAD_MODE_GROUP_WRAP.into())),
+        (
+            Value::Text("mode".into()),
+            Value::Text(AAD_MODE_GROUP_WRAP.into()),
+        ),
         (Value::Text("enc_key_type".into()), uint(enc_key_type)),
         (Value::Text("aead_id".into()), uint(aead_id)),
         (Value::Text("kdf_id".into()), uint(kdf_id)),
-        (Value::Text("nonce".into()), Value::Bytes(wrap_nonce.to_vec())),
+        (
+            Value::Text("nonce".into()),
+            Value::Bytes(wrap_nonce.to_vec()),
+        ),
         (Value::Text("recipient_key".into()), hash_value(member_key)),
-        (Value::Text("ephemeral_key".into()), Value::Bytes(ephemeral_key.to_vec())),
+        (
+            Value::Text("ephemeral_key".into()),
+            Value::Bytes(ephemeral_key.to_vec()),
+        ),
     ]);
     to_ecf(&m)
 }

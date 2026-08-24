@@ -143,7 +143,11 @@ pub(crate) fn read_config(
 impl ClockHandler {
     async fn handle_now(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         tracing::debug!(request_id = %ctx.request_id, "clock: now");
-        let config = read_config(self.content_store.as_ref(), self.location_index.as_ref(), &self.local_peer_id);
+        let config = read_config(
+            self.content_store.as_ref(),
+            self.location_index.as_ref(),
+            &self.local_peer_id,
+        );
         let state = read_clock_state(
             self.content_store.as_ref(),
             self.location_index.as_ref(),
@@ -151,10 +155,7 @@ impl ClockHandler {
             &self.local_peer_id,
         );
 
-        let mut fields = vec![(
-            entity_ecf::text("mode"),
-            entity_ecf::text(&config.mode),
-        )];
+        let mut fields = vec![(entity_ecf::text("mode"), entity_ecf::text(&config.mode))];
 
         if let Some(ts) = state.timestamp {
             fields.push((
@@ -216,7 +217,7 @@ impl ClockHandler {
         Ok(HandlerResult {
             status: STATUS_OK,
             result,
-        included: std::collections::HashMap::new(),
+            included: std::collections::HashMap::new(),
         })
     }
 }
@@ -257,11 +258,19 @@ fn read_clock_state(
     }
 
     if config.mode == "logical" || config.mode == "vector" || config.mode == "hlc" {
-        state.logical = Some(read_logical_counter(content_store, location_index, local_peer_id));
+        state.logical = Some(read_logical_counter(
+            content_store,
+            location_index,
+            local_peer_id,
+        ));
     }
 
     if config.mode == "vector" {
-        state.vector = Some(read_vector_entries(content_store, location_index, local_peer_id));
+        state.vector = Some(read_vector_entries(
+            content_store,
+            location_index,
+            local_peer_id,
+        ));
     }
 
     if config.mode == "hlc" {
@@ -357,7 +366,7 @@ impl ClockHandler {
         Ok(HandlerResult {
             status: STATUS_OK,
             result,
-        included: std::collections::HashMap::new(),
+            included: std::collections::HashMap::new(),
         })
     }
 }
@@ -368,10 +377,20 @@ impl ClockHandler {
 
 #[derive(Debug)]
 enum ClockValue {
-    Timestamp { ms: u64 },
-    Logical { counter: u64 },
-    Vector { entries: HashMap<String, u64> },
-    Hlc { physical: u64, logical: u64, peer: Hash },
+    Timestamp {
+        ms: u64,
+    },
+    Logical {
+        counter: u64,
+    },
+    Vector {
+        entries: HashMap<String, u64>,
+    },
+    Hlc {
+        physical: u64,
+        logical: u64,
+        peer: Hash,
+    },
 }
 
 fn detect_clock_type(val: &ciborium::Value) -> Result<ClockValue, HandlerError> {
@@ -395,27 +414,18 @@ fn detect_clock_type(val: &ciborium::Value) -> Result<ClockValue, HandlerError> 
         match k.as_text() {
             Some("ms") => {
                 has_ms = true;
-                ms = v
-                    .as_integer()
-                    .map(|i| i128::from(i) as u64)
-                    .unwrap_or(0);
+                ms = v.as_integer().map(|i| i128::from(i) as u64).unwrap_or(0);
             }
             Some("counter") => {
                 has_counter = true;
-                counter = v
-                    .as_integer()
-                    .map(|i| i128::from(i) as u64)
-                    .unwrap_or(0);
+                counter = v.as_integer().map(|i| i128::from(i) as u64).unwrap_or(0);
             }
             Some("entries") => {
                 has_entries = true;
                 if let Some(m) = v.as_map() {
                     for (ek, ev) in m {
                         if let Some(key) = ek.as_text() {
-                            let val = ev
-                                .as_integer()
-                                .map(|i| i128::from(i) as u64)
-                                .unwrap_or(0);
+                            let val = ev.as_integer().map(|i| i128::from(i) as u64).unwrap_or(0);
                             entries.insert(key.to_string(), val);
                         }
                     }
@@ -423,16 +433,10 @@ fn detect_clock_type(val: &ciborium::Value) -> Result<ClockValue, HandlerError> 
             }
             Some("physical") => {
                 has_physical = true;
-                physical = v
-                    .as_integer()
-                    .map(|i| i128::from(i) as u64)
-                    .unwrap_or(0);
+                physical = v.as_integer().map(|i| i128::from(i) as u64).unwrap_or(0);
             }
             Some("logical") => {
-                logical = v
-                    .as_integer()
-                    .map(|i| i128::from(i) as u64)
-                    .unwrap_or(0);
+                logical = v.as_integer().map(|i| i128::from(i) as u64).unwrap_or(0);
             }
             Some("peer") => {
                 if let ciborium::Value::Bytes(b) = v {
@@ -587,9 +591,7 @@ fn compare_hlc(
 // Decode helpers
 // ---------------------------------------------------------------------------
 
-fn decode_compare_params(
-    params_data: &[u8],
-) -> Result<(ClockValue, ClockValue), HandlerError> {
+fn decode_compare_params(params_data: &[u8]) -> Result<(ClockValue, ClockValue), HandlerError> {
     let val: ciborium::Value = ciborium::from_reader(params_data)
         .map_err(|e| HandlerError::InvalidParams(format!("decode params: {}", e)))?;
     let map = val
@@ -698,7 +700,11 @@ fn error_result(status: u32, code: &str, message: &str) -> HandlerResult {
     // TypeError so cross-impl SDKs read {code,message} from the entity
     // instead of falling back to status-default codes.
     let result = Entity::new("system/protocol/error", data).unwrap();
-    HandlerResult { status, result, included: std::collections::HashMap::new() }
+    HandlerResult {
+        status,
+        result,
+        included: std::collections::HashMap::new(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -783,11 +789,7 @@ mod tests {
         index.set(&path, hash);
     }
 
-    fn store_logical(
-        store: &Arc<dyn ContentStore>,
-        index: &Arc<dyn LocationIndex>,
-        counter: u64,
-    ) {
+    fn store_logical(store: &Arc<dyn ContentStore>, index: &Arc<dyn LocationIndex>, counter: u64) {
         let peer_id = test_peer_id();
         let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
             entity_ecf::text("counter"),
@@ -852,7 +854,10 @@ mod tests {
     #[test]
     fn test_pattern() {
         let handler = make_handler();
-        assert_eq!(handler.pattern(), format!("/{}/system/clock", test_peer_id()));
+        assert_eq!(
+            handler.pattern(),
+            format!("/{}/system/clock", test_peer_id())
+        );
         assert_eq!(handler.name(), "clock");
         assert_eq!(handler.operations(), &["now", "compare", "tick"]);
     }
@@ -868,8 +873,7 @@ mod tests {
         assert_eq!(result.result.entity_type, "system/clock/state");
 
         // Decode and check fields
-        let val: ciborium::Value =
-            ciborium::from_reader(result.result.data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
         let mode = map
             .iter()
@@ -905,8 +909,7 @@ mod tests {
         let result = handler.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
 
-        let val: ciborium::Value =
-            ciborium::from_reader(result.result.data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
 
         // Should have logical
@@ -939,8 +942,7 @@ mod tests {
         let result = handler.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
 
-        let val: ciborium::Value =
-            ciborium::from_reader(result.result.data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
 
         // Should have vector
@@ -972,8 +974,7 @@ mod tests {
         let result = handler.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
 
-        let val: ciborium::Value =
-            ciborium::from_reader(result.result.data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
 
         // Should have hlc
@@ -1003,17 +1004,11 @@ mod tests {
         let params = entity_ecf::Value::Map(vec![
             (
                 entity_ecf::text("a"),
-                entity_ecf::Value::Map(vec![(
-                    entity_ecf::text("ms"),
-                    entity_ecf::integer(1000),
-                )]),
+                entity_ecf::Value::Map(vec![(entity_ecf::text("ms"), entity_ecf::integer(1000))]),
             ),
             (
                 entity_ecf::text("b"),
-                entity_ecf::Value::Map(vec![(
-                    entity_ecf::text("ms"),
-                    entity_ecf::integer(2000),
-                )]),
+                entity_ecf::Value::Map(vec![(entity_ecf::text("ms"), entity_ecf::integer(2000))]),
             ),
         ]);
         let ctx = make_ctx("compare", params);
@@ -1026,17 +1021,11 @@ mod tests {
         let params_eq = entity_ecf::Value::Map(vec![
             (
                 entity_ecf::text("a"),
-                entity_ecf::Value::Map(vec![(
-                    entity_ecf::text("ms"),
-                    entity_ecf::integer(5000),
-                )]),
+                entity_ecf::Value::Map(vec![(entity_ecf::text("ms"), entity_ecf::integer(5000))]),
             ),
             (
                 entity_ecf::text("b"),
-                entity_ecf::Value::Map(vec![(
-                    entity_ecf::text("ms"),
-                    entity_ecf::integer(5000),
-                )]),
+                entity_ecf::Value::Map(vec![(entity_ecf::text("ms"), entity_ecf::integer(5000))]),
             ),
         ]);
         let ctx_eq = make_ctx("compare", params_eq);
@@ -1047,17 +1036,11 @@ mod tests {
         let params_after = entity_ecf::Value::Map(vec![
             (
                 entity_ecf::text("a"),
-                entity_ecf::Value::Map(vec![(
-                    entity_ecf::text("ms"),
-                    entity_ecf::integer(3000),
-                )]),
+                entity_ecf::Value::Map(vec![(entity_ecf::text("ms"), entity_ecf::integer(3000))]),
             ),
             (
                 entity_ecf::text("b"),
-                entity_ecf::Value::Map(vec![(
-                    entity_ecf::text("ms"),
-                    entity_ecf::integer(1000),
-                )]),
+                entity_ecf::Value::Map(vec![(entity_ecf::text("ms"), entity_ecf::integer(1000))]),
             ),
         ]);
         let ctx_after = make_ctx("compare", params_after);
@@ -1071,10 +1054,7 @@ mod tests {
         let params = entity_ecf::Value::Map(vec![
             (
                 entity_ecf::text("a"),
-                entity_ecf::Value::Map(vec![(
-                    entity_ecf::text("counter"),
-                    entity_ecf::integer(5),
-                )]),
+                entity_ecf::Value::Map(vec![(entity_ecf::text("counter"), entity_ecf::integer(5))]),
             ),
             (
                 entity_ecf::text("b"),
@@ -1153,18 +1133,14 @@ mod tests {
                 entity_ecf::text("a"),
                 entity_ecf::Value::Map(vec![(
                     entity_ecf::text("entries"),
-                    entity_ecf::Value::Map(vec![
-                        (entity_ecf::text("p1"), entity_ecf::integer(2)),
-                    ]),
+                    entity_ecf::Value::Map(vec![(entity_ecf::text("p1"), entity_ecf::integer(2))]),
                 )]),
             ),
             (
                 entity_ecf::text("b"),
                 entity_ecf::Value::Map(vec![(
                     entity_ecf::text("entries"),
-                    entity_ecf::Value::Map(vec![
-                        (entity_ecf::text("p1"), entity_ecf::integer(2)),
-                    ]),
+                    entity_ecf::Value::Map(vec![(entity_ecf::text("p1"), entity_ecf::integer(2))]),
                 )]),
             ),
         ]);
@@ -1293,17 +1269,11 @@ mod tests {
         let params = entity_ecf::Value::Map(vec![
             (
                 entity_ecf::text("a"),
-                entity_ecf::Value::Map(vec![(
-                    entity_ecf::text("ms"),
-                    entity_ecf::integer(1000),
-                )]),
+                entity_ecf::Value::Map(vec![(entity_ecf::text("ms"), entity_ecf::integer(1000))]),
             ),
             (
                 entity_ecf::text("b"),
-                entity_ecf::Value::Map(vec![(
-                    entity_ecf::text("counter"),
-                    entity_ecf::integer(5),
-                )]),
+                entity_ecf::Value::Map(vec![(entity_ecf::text("counter"), entity_ecf::integer(5))]),
             ),
         ]);
         let ctx = make_ctx("compare", params);
@@ -1314,8 +1284,7 @@ mod tests {
     // --- Helpers ---
 
     fn extract_order(entity: &Entity) -> String {
-        let val: ciborium::Value =
-            ciborium::from_reader(entity.data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(entity.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
         for (k, v) in map {
             if k.as_text() == Some("order") {

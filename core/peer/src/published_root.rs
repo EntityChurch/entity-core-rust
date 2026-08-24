@@ -140,7 +140,9 @@ impl PublishRootEngine {
             published_at: now_ms(),
             predecessor,
         };
-        let entity = pr.to_entity().map_err(|e| PublishedRootError::Encode(e.to_string()))?;
+        let entity = pr
+            .to_entity()
+            .map_err(|e| PublishedRootError::Encode(e.to_string()))?;
         let hash = entity.content_hash;
         self.content_store.put(entity)?;
 
@@ -253,8 +255,13 @@ pub fn verify_signed_root(
     if sig.target != root_hash {
         return Err(PublishedRootError::SignatureInvalid);
     }
-    verify_for_key_type(pinned_key_type, pinned_pubkey, &root_hash.to_bytes(), &sig.signature)
-        .map_err(|_| PublishedRootError::SignatureInvalid)?;
+    verify_for_key_type(
+        pinned_key_type,
+        pinned_pubkey,
+        &root_hash.to_bytes(),
+        &sig.signature,
+    )
+    .map_err(|_| PublishedRootError::SignatureInvalid)?;
 
     Ok((root_hash, data))
 }
@@ -371,7 +378,10 @@ impl<F: ContentFetcher> PublishedRootClient<F> {
             Some(h) => h,
             None => return Ok(None),
         };
-        let bytes = self.fetcher.content(&leaf).map_err(PublishedRootError::Fetch)?;
+        let bytes = self
+            .fetcher
+            .content(&leaf)
+            .map_err(PublishedRootError::Fetch)?;
         Ok(Some(verify_content(&bytes, &leaf)?))
     }
 }
@@ -424,7 +434,11 @@ impl HttpPollFetcher {
     /// `base` is the poll route root (e.g. `http://host:port` or
     /// `http://host:port/poll`); `peer_id` is the publisher's Base58 id;
     /// `tree_leaf_suffix` is the publisher's leaf suffix (default `.bin`).
-    pub fn new(base: impl Into<String>, peer_id: impl Into<String>, tree_leaf_suffix: impl Into<String>) -> Self {
+    pub fn new(
+        base: impl Into<String>,
+        peer_id: impl Into<String>,
+        tree_leaf_suffix: impl Into<String>,
+    ) -> Self {
         Self {
             client: reqwest::blocking::Client::new(),
             base: base.into(),
@@ -457,7 +471,12 @@ impl ContentFetcher for HttpPollFetcher {
             .ok_or_else(|| "content not found".to_string())
     }
     fn signature_for(&self, target: &Hash) -> Result<Option<Vec<u8>>, String> {
-        self.get(&signature_url(&self.base, &self.peer_id, target, &self.tree_leaf_suffix))
+        self.get(&signature_url(
+            &self.base,
+            &self.peer_id,
+            target,
+            &self.tree_leaf_suffix,
+        ))
     }
 }
 
@@ -543,7 +562,13 @@ mod tests {
 
     fn build_published(
         bindings: BTreeMap<String, Hash>,
-    ) -> (Arc<dyn ContentStore>, Arc<dyn LocationIndex>, IdentityKeypair, String, Hash) {
+    ) -> (
+        Arc<dyn ContentStore>,
+        Arc<dyn LocationIndex>,
+        IdentityKeypair,
+        String,
+        Hash,
+    ) {
         let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
         let li: Arc<dyn LocationIndex> = Arc::new(MemoryLocationIndex::new());
         let root_hash = build_trie(store.as_ref(), &bindings).unwrap();
@@ -566,9 +591,18 @@ mod tests {
     fn url_construction_matches_http_live_routes() {
         let h = Hash::compute("t", b"x");
         let hex = h.to_hex();
-        assert_eq!(manifest_url("http://host:9/poll"), "http://host:9/poll/manifest");
-        assert_eq!(manifest_url("http://host:9/poll/"), "http://host:9/poll/manifest");
-        assert_eq!(content_url("http://host:9", &h), format!("http://host:9/content/{}", hex));
+        assert_eq!(
+            manifest_url("http://host:9/poll"),
+            "http://host:9/poll/manifest"
+        );
+        assert_eq!(
+            manifest_url("http://host:9/poll/"),
+            "http://host:9/poll/manifest"
+        );
+        assert_eq!(
+            content_url("http://host:9", &h),
+            format!("http://host:9/content/{}", hex)
+        );
         assert_eq!(
             signature_url("http://host:9", "z6Mk", &h, ".bin"),
             format!("http://host:9/z6Mk/system/signature/{}.bin", hex)
@@ -656,8 +690,9 @@ mod tests {
             algorithm: "ed25519".into(),
             signature: vec![0u8; 64],
         };
-        *client.fetcher.forced_sig.lock().unwrap() =
-            Some(Some(entity_wire::encode_entity(&bad_sig.to_entity().unwrap())));
+        *client.fetcher.forced_sig.lock().unwrap() = Some(Some(entity_wire::encode_entity(
+            &bad_sig.to_entity().unwrap(),
+        )));
         match client.fetch_root() {
             Err(PublishedRootError::SignatureInvalid) => {}
             other => panic!("expected SignatureInvalid, got {:?}", other),
@@ -698,7 +733,10 @@ mod tests {
         // Now serve the older (seq 0) → rollback rejected.
         *client.fetcher.manifest_hash.lock().unwrap() = h0;
         match client.fetch_root() {
-            Err(PublishedRootError::SeqRollback { cached: 1, received: 0 }) => {}
+            Err(PublishedRootError::SeqRollback {
+                cached: 1,
+                received: 0,
+            }) => {}
             other => panic!("expected SeqRollback, got {:?}", other),
         }
     }

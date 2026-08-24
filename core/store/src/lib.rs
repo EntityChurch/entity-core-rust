@@ -138,8 +138,11 @@ pub trait SyncTreeHook: Send + Sync {
     /// contributed fields (e.g., clock updates `ctx.clock`). The per-write
     /// fields (capability, handler_grant, handler_pattern, operation) are
     /// set by the dispatcher to this hook's values before invocation.
-    fn on_tree_change(&self, event: &TreeChangeEvent, ctx: &mut ExecutionContext)
-        -> Result<(), CascadeHalt>;
+    fn on_tree_change(
+        &self,
+        event: &TreeChangeEvent,
+        ctx: &mut ExecutionContext,
+    ) -> Result<(), CascadeHalt>;
 
     /// Stable consumer name for cascade-halt reporting (§4.4).
     /// SHOULD be prefixed with the owning extension's handler pattern
@@ -197,7 +200,9 @@ pub struct CascadeResult {
 impl CascadeResult {
     /// True when no consumer halted or errored — the cascade completed fully.
     pub fn is_complete(&self) -> bool {
-        self.consumers_halted.is_empty() && self.consumers_errored.is_empty() && self.binding_committed
+        self.consumers_halted.is_empty()
+            && self.consumers_errored.is_empty()
+            && self.binding_committed
     }
 
     /// Convenience: a fully-successful cascade with no consumers (non-notifying impls).
@@ -355,7 +360,9 @@ impl NotifyingLocationIndex {
         {
             *self.cascade_depth.lock().unwrap() += 1;
         }
-        let _guard = CascadeGuard { depth: &self.cascade_depth };
+        let _guard = CascadeGuard {
+            depth: &self.cascade_depth,
+        };
 
         let mut ctx = context.unwrap_or_default();
         ctx.cascade_depth = *self.cascade_depth.lock().unwrap();
@@ -376,12 +383,15 @@ impl NotifyingLocationIndex {
                     total,
                     "cross-peer cascade depth limit exceeded"
                 );
-                return CascadeResult::rejected(CascadeHalt {
-                    consumer_name: "system".to_string(),
-                    error_code: 500,
-                    error_message: "cross_peer_cascade_depth_exceeded".to_string(),
-                    is_error: false,
-                }, ctx.cascade_depth);
+                return CascadeResult::rejected(
+                    CascadeHalt {
+                        consumer_name: "system".to_string(),
+                        error_code: 500,
+                        error_message: "cross_peer_cascade_depth_exceeded".to_string(),
+                        is_error: false,
+                    },
+                    ctx.cascade_depth,
+                );
             }
             *accumulated = total;
         }
@@ -398,8 +408,7 @@ impl NotifyingLocationIndex {
         // Phase 1: synchronous hooks (in registration order).
         // Clone the hook list to avoid holding RwLock during dispatch
         // (hooks may write to tree, triggering nested dispatch calls).
-        let hooks: Vec<Arc<dyn SyncTreeHook>> =
-            self.sync_hooks.read().unwrap().clone();
+        let hooks: Vec<Arc<dyn SyncTreeHook>> = self.sync_hooks.read().unwrap().clone();
         let hook_names: Vec<String> = hooks.iter().map(|h| h.name().to_string()).collect();
         tracing::Span::current().record("hooks", hooks.len());
         let mut completed: Vec<String> = Vec::new();
@@ -479,12 +488,15 @@ impl NotifyingLocationIndex {
                 error = %e,
                 "invalid path — refusing write (§5.4 validate_absolute_path)"
             );
-            return CascadeResult::rejected(CascadeHalt {
-                consumer_name: "system".to_string(),
-                error_code: 400,
-                error_message: format!("invalid path: {}", e),
-                is_error: false,
-            }, 0);
+            return CascadeResult::rejected(
+                CascadeHalt {
+                    consumer_name: "system".to_string(),
+                    error_code: 400,
+                    error_message: format!("invalid path: {}", e),
+                    is_error: false,
+                },
+                0,
+            );
         }
 
         // Cascade depth check — refuse write at threshold (§4.7 pre-write rejection).
@@ -496,12 +508,15 @@ impl NotifyingLocationIndex {
                     depth = *depth,
                     "cascade depth limit reached, refusing write"
                 );
-                return CascadeResult::rejected(CascadeHalt {
-                    consumer_name: "system".to_string(),
-                    error_code: 500,
-                    error_message: "cascade_depth_exceeded".to_string(),
-                    is_error: false,
-                }, *depth);
+                return CascadeResult::rejected(
+                    CascadeHalt {
+                        consumer_name: "system".to_string(),
+                        error_code: 500,
+                        error_message: "cascade_depth_exceeded".to_string(),
+                        is_error: false,
+                    },
+                    *depth,
+                );
             }
         }
 
@@ -640,19 +655,29 @@ impl NotifyingLocationIndex {
         ))
     }
 
-    fn remove_impl(&self, path: &str, context: Option<ExecutionContext>) -> (Option<Hash>, CascadeResult) {
+    fn remove_impl(
+        &self,
+        path: &str,
+        context: Option<ExecutionContext>,
+    ) -> (Option<Hash>, CascadeResult) {
         if let Err(e) = entity_entity::EntityUri::validate_absolute_path(path) {
             tracing::error!(
                 path = %path,
                 error = %e,
                 "invalid path — refusing remove (§5.4 validate_absolute_path)"
             );
-            return (None, CascadeResult::rejected(CascadeHalt {
-                consumer_name: "system".to_string(),
-                error_code: 400,
-                error_message: format!("invalid path: {}", e),
-                is_error: false,
-            }, 0));
+            return (
+                None,
+                CascadeResult::rejected(
+                    CascadeHalt {
+                        consumer_name: "system".to_string(),
+                        error_code: 400,
+                        error_message: format!("invalid path: {}", e),
+                        is_error: false,
+                    },
+                    0,
+                ),
+            );
         }
 
         {
@@ -663,18 +688,25 @@ impl NotifyingLocationIndex {
                     depth = *depth,
                     "cascade depth limit reached, refusing remove"
                 );
-                return (None, CascadeResult::rejected(CascadeHalt {
-                    consumer_name: "system".to_string(),
-                    error_code: 500,
-                    error_message: "cascade_depth_exceeded".to_string(),
-                    is_error: false,
-                }, *depth));
+                return (
+                    None,
+                    CascadeResult::rejected(
+                        CascadeHalt {
+                            consumer_name: "system".to_string(),
+                            error_code: 500,
+                            error_message: "cascade_depth_exceeded".to_string(),
+                            is_error: false,
+                        },
+                        *depth,
+                    ),
+                );
             }
         }
 
         let removed = self.inner.remove(path);
         if let Some(prev) = removed {
-            let cascade = self.dispatch_event(path, prev, Some(prev), None, ChangeType::Deleted, context);
+            let cascade =
+                self.dispatch_event(path, prev, Some(prev), None, ChangeType::Deleted, context);
             (Some(prev), cascade)
         } else {
             (None, CascadeResult::empty_success())
@@ -711,17 +743,17 @@ impl LocationIndex for NotifyingLocationIndex {
         self.set_impl(path, hash, Some(ctx))
     }
 
-    fn remove_with_context(&self, path: &str, ctx: ExecutionContext) -> (Option<Hash>, CascadeResult) {
+    fn remove_with_context(
+        &self,
+        path: &str,
+        ctx: ExecutionContext,
+    ) -> (Option<Hash>, CascadeResult) {
         self.remove_impl(path, Some(ctx))
     }
 
-    fn compare_and_swap(
-        &self,
-        path: &str,
-        expected: Hash,
-        new_hash: Hash,
-    ) -> Result<(), CasError> {
-        self.cas_swap_impl(path, expected, new_hash, None).map(|_| ())
+    fn compare_and_swap(&self, path: &str, expected: Hash, new_hash: Hash) -> Result<(), CasError> {
+        self.cas_swap_impl(path, expected, new_hash, None)
+            .map(|_| ())
     }
 
     fn compare_and_remove(&self, path: &str, expected: Hash) -> Result<Hash, CasError> {
@@ -855,8 +887,7 @@ impl ContentStore for NotifyingContentStore {
         };
 
         // Phase 1: synchronous hooks in registration order.
-        let hooks: Vec<Arc<dyn SyncContentHook>> =
-            self.sync_hooks.read().unwrap().clone();
+        let hooks: Vec<Arc<dyn SyncContentHook>> = self.sync_hooks.read().unwrap().clone();
         for hook in &hooks {
             if let Err(halt) = hook.on_content_stored(&event) {
                 tracing::warn!(
@@ -986,12 +1017,7 @@ pub trait LocationIndex: Send + Sync {
     /// The default implementation is a non-atomic `get`+`set` and is
     /// acceptable only for single-threaded or deprecated backends. Real
     /// backends MUST override this with an atomic implementation.
-    fn compare_and_swap(
-        &self,
-        path: &str,
-        expected: Hash,
-        new_hash: Hash,
-    ) -> Result<(), CasError> {
+    fn compare_and_swap(&self, path: &str, expected: Hash, new_hash: Hash) -> Result<(), CasError> {
         match self.get(path) {
             Some(current) if current == expected => {
                 self.set(path, new_hash);
@@ -1204,12 +1230,7 @@ impl LocationIndex for MemoryLocationIndex {
             .count()
     }
 
-    fn compare_and_swap(
-        &self,
-        path: &str,
-        expected: Hash,
-        new_hash: Hash,
-    ) -> Result<(), CasError> {
+    fn compare_and_swap(&self, path: &str, expected: Hash, new_hash: Hash) -> Result<(), CasError> {
         let mut paths = self.paths.write().unwrap();
         match paths.get(path) {
             Some(current) if *current == expected => {
@@ -1270,36 +1291,64 @@ mod tests {
     // --- ContentStore tests (via shared suite) ---
 
     #[test]
-    fn test_content_store_put_get() { test_suite::test_content_store_put_get(&MemoryContentStore::new()); }
+    fn test_content_store_put_get() {
+        test_suite::test_content_store_put_get(&MemoryContentStore::new());
+    }
     #[test]
-    fn test_content_store_has() { test_suite::test_content_store_has(&MemoryContentStore::new()); }
+    fn test_content_store_has() {
+        test_suite::test_content_store_has(&MemoryContentStore::new());
+    }
     #[test]
-    fn test_content_store_remove() { test_suite::test_content_store_remove(&MemoryContentStore::new()); }
+    fn test_content_store_remove() {
+        test_suite::test_content_store_remove(&MemoryContentStore::new());
+    }
     #[test]
-    fn test_content_store_len() { test_suite::test_content_store_len(&MemoryContentStore::new()); }
+    fn test_content_store_len() {
+        test_suite::test_content_store_len(&MemoryContentStore::new());
+    }
     #[test]
-    fn test_content_store_get_missing() { test_suite::test_content_store_get_missing(&MemoryContentStore::new()); }
+    fn test_content_store_get_missing() {
+        test_suite::test_content_store_get_missing(&MemoryContentStore::new());
+    }
     #[test]
-    fn test_content_store_put_overwrite() { test_suite::test_content_store_put_overwrite(&MemoryContentStore::new()); }
+    fn test_content_store_put_overwrite() {
+        test_suite::test_content_store_put_overwrite(&MemoryContentStore::new());
+    }
     #[test]
-    fn test_content_store_multiple_entities() { test_suite::test_content_store_multiple_entities(&MemoryContentStore::new()); }
+    fn test_content_store_multiple_entities() {
+        test_suite::test_content_store_multiple_entities(&MemoryContentStore::new());
+    }
 
     // --- LocationIndex tests (via shared suite) ---
 
     #[test]
-    fn test_location_index_set_get() { test_suite::test_location_index_set_get(&MemoryLocationIndex::new()); }
+    fn test_location_index_set_get() {
+        test_suite::test_location_index_set_get(&MemoryLocationIndex::new());
+    }
     #[test]
-    fn test_location_index_has() { test_suite::test_location_index_has(&MemoryLocationIndex::new()); }
+    fn test_location_index_has() {
+        test_suite::test_location_index_has(&MemoryLocationIndex::new());
+    }
     #[test]
-    fn test_location_index_remove() { test_suite::test_location_index_remove(&MemoryLocationIndex::new()); }
+    fn test_location_index_remove() {
+        test_suite::test_location_index_remove(&MemoryLocationIndex::new());
+    }
     #[test]
-    fn test_location_index_get_missing() { test_suite::test_location_index_get_missing(&MemoryLocationIndex::new()); }
+    fn test_location_index_get_missing() {
+        test_suite::test_location_index_get_missing(&MemoryLocationIndex::new());
+    }
     #[test]
-    fn test_location_index_overwrite() { test_suite::test_location_index_overwrite(&MemoryLocationIndex::new()); }
+    fn test_location_index_overwrite() {
+        test_suite::test_location_index_overwrite(&MemoryLocationIndex::new());
+    }
     #[test]
-    fn test_location_index_list_prefix() { test_suite::test_location_index_list_prefix(&MemoryLocationIndex::new()); }
+    fn test_location_index_list_prefix() {
+        test_suite::test_location_index_list_prefix(&MemoryLocationIndex::new());
+    }
     #[test]
-    fn test_location_index_list_all() { test_suite::test_location_index_list_all(&MemoryLocationIndex::new()); }
+    fn test_location_index_list_all() {
+        test_suite::test_location_index_list_all(&MemoryLocationIndex::new());
+    }
 
     #[test]
     fn test_location_index_list_empty() {
@@ -1325,17 +1374,29 @@ mod tests {
     // --- CAS tests (memory) ---
 
     #[test]
-    fn test_cas_swap_match_succeeds() { test_suite::test_cas_swap_match_succeeds(&MemoryLocationIndex::new()); }
+    fn test_cas_swap_match_succeeds() {
+        test_suite::test_cas_swap_match_succeeds(&MemoryLocationIndex::new());
+    }
     #[test]
-    fn test_cas_swap_mismatch_returns_actual() { test_suite::test_cas_swap_mismatch_returns_actual(&MemoryLocationIndex::new()); }
+    fn test_cas_swap_mismatch_returns_actual() {
+        test_suite::test_cas_swap_mismatch_returns_actual(&MemoryLocationIndex::new());
+    }
     #[test]
-    fn test_cas_swap_missing_returns_not_found() { test_suite::test_cas_swap_missing_returns_not_found(&MemoryLocationIndex::new()); }
+    fn test_cas_swap_missing_returns_not_found() {
+        test_suite::test_cas_swap_missing_returns_not_found(&MemoryLocationIndex::new());
+    }
     #[test]
-    fn test_cas_remove_match_succeeds() { test_suite::test_cas_remove_match_succeeds(&MemoryLocationIndex::new()); }
+    fn test_cas_remove_match_succeeds() {
+        test_suite::test_cas_remove_match_succeeds(&MemoryLocationIndex::new());
+    }
     #[test]
-    fn test_cas_remove_mismatch_returns_actual() { test_suite::test_cas_remove_mismatch_returns_actual(&MemoryLocationIndex::new()); }
+    fn test_cas_remove_mismatch_returns_actual() {
+        test_suite::test_cas_remove_mismatch_returns_actual(&MemoryLocationIndex::new());
+    }
     #[test]
-    fn test_cas_remove_missing_returns_not_found() { test_suite::test_cas_remove_missing_returns_not_found(&MemoryLocationIndex::new()); }
+    fn test_cas_remove_missing_returns_not_found() {
+        test_suite::test_cas_remove_missing_returns_not_found(&MemoryLocationIndex::new());
+    }
 
     // --- NotifyingLocationIndex tests ---
 
@@ -1456,9 +1517,11 @@ mod tests {
     }
 
     impl SyncTreeHook for HaltingHook {
-        fn on_tree_change(&self, _event: &TreeChangeEvent, _ctx: &mut ExecutionContext)
-            -> Result<(), CascadeHalt>
-        {
+        fn on_tree_change(
+            &self,
+            _event: &TreeChangeEvent,
+            _ctx: &mut ExecutionContext,
+        ) -> Result<(), CascadeHalt> {
             Err(CascadeHalt {
                 consumer_name: self.hook_name.clone(),
                 error_code: 500,
@@ -1466,8 +1529,12 @@ mod tests {
                 is_error: false,
             })
         }
-        fn name(&self) -> &str { &self.hook_name }
-        fn handler_pattern(&self) -> &str { "test" }
+        fn name(&self) -> &str {
+            &self.hook_name
+        }
+        fn handler_pattern(&self) -> &str {
+            "test"
+        }
     }
 
     struct PassingHook {
@@ -1475,21 +1542,33 @@ mod tests {
     }
 
     impl SyncTreeHook for PassingHook {
-        fn on_tree_change(&self, _event: &TreeChangeEvent, _ctx: &mut ExecutionContext)
-            -> Result<(), CascadeHalt>
-        {
+        fn on_tree_change(
+            &self,
+            _event: &TreeChangeEvent,
+            _ctx: &mut ExecutionContext,
+        ) -> Result<(), CascadeHalt> {
             Ok(())
         }
-        fn name(&self) -> &str { &self.hook_name }
-        fn handler_pattern(&self) -> &str { "test" }
+        fn name(&self) -> &str {
+            &self.hook_name
+        }
+        fn handler_pattern(&self) -> &str {
+            "test"
+        }
     }
 
     #[test]
     fn test_cascade_halt_short_circuits_subsequent_hooks() {
         let (index, events) = notifying_index();
-        index.register_hook(Arc::new(PassingHook { hook_name: "hook-a".into() }));
-        index.register_hook(Arc::new(HaltingHook { hook_name: "hook-b".into() }));
-        index.register_hook(Arc::new(PassingHook { hook_name: "hook-c".into() }));
+        index.register_hook(Arc::new(PassingHook {
+            hook_name: "hook-a".into(),
+        }));
+        index.register_hook(Arc::new(HaltingHook {
+            hook_name: "hook-b".into(),
+        }));
+        index.register_hook(Arc::new(PassingHook {
+            hook_name: "hook-c".into(),
+        }));
 
         let hash = Hash::compute("t", &entity_ecf::to_ecf(&entity_ecf::text("v")));
         let path = format!("/{}/test/path", TEST_PEER);
@@ -1509,8 +1588,12 @@ mod tests {
     #[test]
     fn test_cascade_success_fires_broadcast() {
         let (index, events) = notifying_index();
-        index.register_hook(Arc::new(PassingHook { hook_name: "hook-a".into() }));
-        index.register_hook(Arc::new(PassingHook { hook_name: "hook-b".into() }));
+        index.register_hook(Arc::new(PassingHook {
+            hook_name: "hook-a".into(),
+        }));
+        index.register_hook(Arc::new(PassingHook {
+            hook_name: "hook-b".into(),
+        }));
 
         let hash = Hash::compute("t", &entity_ecf::to_ecf(&entity_ecf::text("v")));
         let path = format!("/{}/test/path", TEST_PEER);
@@ -1537,8 +1620,14 @@ mod tests {
 
         assert!(!cr.binding_committed);
         assert!(!cr.is_complete());
-        assert_eq!(cr.consumers_halted[0].error_message, "cascade_depth_exceeded");
-        assert!(index.get(&path).is_none(), "write should not have committed");
+        assert_eq!(
+            cr.consumers_halted[0].error_message,
+            "cascade_depth_exceeded"
+        );
+        assert!(
+            index.get(&path).is_none(),
+            "write should not have committed"
+        );
 
         // Reset depth for cleanup
         *index.cascade_depth.lock().unwrap() = 0;
@@ -1580,7 +1669,11 @@ mod tests {
         store.put(entity.clone()).unwrap(); // duplicate — should not fire
 
         let evts = events.lock().unwrap();
-        assert_eq!(evts.len(), 1, "duplicate put should not fire a second event");
+        assert_eq!(
+            evts.len(),
+            1,
+            "duplicate put should not fire a second event"
+        );
     }
 
     #[test]
@@ -1650,11 +1743,15 @@ mod tests {
                 *self.count.lock().unwrap() += 1;
                 Ok(())
             }
-            fn name(&self) -> &str { "counting-hook" }
+            fn name(&self) -> &str {
+                "counting-hook"
+            }
         }
 
         let (store, _events) = notifying_store();
-        let hook = Arc::new(CountingHook { count: Mutex::new(0) });
+        let hook = Arc::new(CountingHook {
+            count: Mutex::new(0),
+        });
         store.register_hook(hook.clone());
 
         store.put(test_entity("x")).unwrap();
@@ -1676,7 +1773,9 @@ mod tests {
                     is_error: false,
                 })
             }
-            fn name(&self) -> &str { "halt-hook" }
+            fn name(&self) -> &str {
+                "halt-hook"
+            }
         }
 
         let (store, events) = notifying_store();

@@ -28,10 +28,7 @@ use crate::shell::Shell;
 /// subscription matches descendants only — `/p/foo/` not
 /// `/p/foobar`). Caller (verb-parser or non-shell consumer) is
 /// responsible for the trailing-slash and peer-id validation.
-pub fn tail_op(
-    action_sink: &dyn AppActionSink,
-    prefix: &str,
-) -> VerbOutput {
+pub fn tail_op(action_sink: &dyn AppActionSink, prefix: &str) -> VerbOutput {
     action_sink.submit(ShellRequest::InstallTail {
         prefix: prefix.to_string(),
     });
@@ -75,10 +72,7 @@ pub fn tails(action_sink: &dyn AppActionSink) -> Result<VerbOutput, ShellError> 
     let entries = action_sink.list_tails();
     if entries.is_empty() {
         return Ok(VerbOutput::Listing {
-            sections: vec![ListingSection::with_header(
-                "(no active tails)",
-                Vec::new(),
-            )],
+            sections: vec![ListingSection::with_header("(no active tails)", Vec::new())],
         });
     }
     let active_count = entries.iter().filter(|t| t.active).count();
@@ -101,10 +95,7 @@ pub fn tails(action_sink: &dyn AppActionSink) -> Result<VerbOutput, ShellError> 
 /// validated target (literal prefix string or `"all"`). Caller is
 /// responsible for arg-validation. Reusable from non-shell consumers
 /// driving subscription teardown (e.g., a tails-management panel).
-pub fn untail_op(
-    action_sink: &dyn AppActionSink,
-    target: &str,
-) -> VerbOutput {
+pub fn untail_op(action_sink: &dyn AppActionSink, target: &str) -> VerbOutput {
     action_sink.submit(ShellRequest::UninstallTail {
         target: target.to_string(),
     });
@@ -115,10 +106,7 @@ pub fn untail_op(
 /// The target is treated opaquely (the embedding's action-sink
 /// resolves prefix vs `"all"` semantics); no path resolution or alias
 /// expansion happens at the shell layer for `untail`.
-pub fn untail(
-    args: &[&str],
-    action_sink: &dyn AppActionSink,
-) -> Result<VerbOutput, ShellError> {
+pub fn untail(args: &[&str], action_sink: &dyn AppActionSink) -> Result<VerbOutput, ShellError> {
     let target = args
         .first()
         .copied()
@@ -135,15 +123,27 @@ mod tests {
 
     struct StubBinding;
     impl PeerBinding for StubBinding {
-        fn peer_id(&self) -> &str { "alice" }
-        fn primary_peer_id(&self) -> String { "alice".into() }
-        fn peer_ids(&self) -> Vec<String> { vec!["alice".into()] }
-        fn connected_peers(&self) -> Vec<String> { Vec::new() }
-        fn peer_label(&self, _pid: &str) -> Option<String> { None }
+        fn peer_id(&self) -> &str {
+            "alice"
+        }
+        fn primary_peer_id(&self) -> String {
+            "alice".into()
+        }
+        fn peer_ids(&self) -> Vec<String> {
+            vec!["alice".into()]
+        }
+        fn connected_peers(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn peer_label(&self, _pid: &str) -> Option<String> {
+            None
+        }
         fn tree_listing(&self, _pid: &str, _prefix: &str) -> Vec<TreeListingEntry> {
             Vec::new()
         }
-        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> { None }
+        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> {
+            None
+        }
     }
 
     struct StubSink {
@@ -161,7 +161,10 @@ mod tests {
     }
 
     fn sink() -> StubSink {
-        StubSink { tails: Vec::new(), requests: RefCell::new(Vec::new()) }
+        StubSink {
+            tails: Vec::new(),
+            requests: RefCell::new(Vec::new()),
+        }
     }
 
     #[test]
@@ -199,14 +202,24 @@ mod tests {
     fn tails_lists_active_and_stopped_subscriptions() {
         let s = StubSink {
             tails: vec![
-                TailInfo { prefix: "/alice/foo/".into(), active: true },
-                TailInfo { prefix: "/alice/bar/".into(), active: false },
+                TailInfo {
+                    prefix: "/alice/foo/".into(),
+                    active: true,
+                },
+                TailInfo {
+                    prefix: "/alice/bar/".into(),
+                    active: false,
+                },
             ],
             requests: RefCell::new(Vec::new()),
         };
         match tails(&s).unwrap() {
             VerbOutput::Listing { sections } => {
-                assert!(sections[0].header.as_ref().unwrap().contains("active tails (1)"));
+                assert!(sections[0]
+                    .header
+                    .as_ref()
+                    .unwrap()
+                    .contains("active tails (1)"));
                 assert!(sections[0].entries[0].contains("[active]"));
                 assert!(sections[0].entries[1].contains("[stopped]"));
             }

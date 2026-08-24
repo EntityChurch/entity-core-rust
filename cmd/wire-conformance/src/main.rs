@@ -73,8 +73,13 @@ enum Cmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::EmitCanonical { input, out, impl_version } => {
-            let impl_version = impl_version.unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+        Cmd::EmitCanonical {
+            input,
+            out,
+            impl_version,
+        } => {
+            let impl_version =
+                impl_version.unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
             emit_canonical(&input, &out, &impl_version)
         }
     }
@@ -105,9 +110,8 @@ fn emit_canonical(input: &PathBuf, out: &PathBuf, impl_version: &str) -> Result<
 
         match kind.as_str() {
             "encode_equal" => {
-                let input = field(vec_map, "input").ok_or_else(|| {
-                    anyhow!("vector {id}: encode_equal missing 'input' field")
-                })?;
+                let input = field(vec_map, "input")
+                    .ok_or_else(|| anyhow!("vector {id}: encode_equal missing 'input' field"))?;
                 match encode_vector(&id, input) {
                     Ok(bytes) => {
                         encode_results.insert(id, bytes);
@@ -152,9 +156,7 @@ fn encode_vector(id: &str, input: &Value) -> Result<Vec<u8>, EmitError> {
         .split_once('.')
         .ok_or_else(|| EmitError::Other(format!("malformed vector id: {id}")))?;
     match category {
-        "float" | "int" | "map_keys" | "length" | "primitive" | "nested" => {
-            Ok(to_ecf(input))
-        }
+        "float" | "int" | "map_keys" | "length" | "primitive" | "nested" => Ok(to_ecf(input)),
         "content_hash" => encode_content_hash(input),
         "peer_id" => encode_peer_id(input),
         "signature" => encode_signature(input),
@@ -317,9 +319,7 @@ fn walk_canonical(data: &[u8], offset: usize) -> Result<usize, CanonicalErr> {
     match major {
         0 | 1 => Ok(after_head),
         2 | 3 => {
-            let end = after_head
-                .checked_add(arg as usize)
-                .ok_or(CanonicalErr)?;
+            let end = after_head.checked_add(arg as usize).ok_or(CanonicalErr)?;
             if end > data.len() {
                 return Err(CanonicalErr);
             }
@@ -422,7 +422,10 @@ fn build_emission(
     );
 
     EcfValue::Map(vec![
-        (EcfValue::Text("impl".into()), EcfValue::Text(IMPL_NAME.into())),
+        (
+            EcfValue::Text("impl".into()),
+            EcfValue::Text(IMPL_NAME.into()),
+        ),
         (
             EcfValue::Text("impl_version".into()),
             EcfValue::Text(impl_version.into()),
@@ -476,20 +479,38 @@ mod tests {
             // encode_equal — float
             Value::Map(vec![
                 (Value::Text("id".into()), Value::Text("float.3".into())),
-                (Value::Text("description".into()), Value::Text("f16: 1.0".into())),
-                (Value::Text("kind".into()), Value::Text("encode_equal".into())),
+                (
+                    Value::Text("description".into()),
+                    Value::Text("f16: 1.0".into()),
+                ),
+                (
+                    Value::Text("kind".into()),
+                    Value::Text("encode_equal".into()),
+                ),
                 (Value::Text("input".into()), Value::Float(1.0)),
                 (Value::Text("canonical".into()), Value::Bytes(vec![])),
             ]),
             // encode_equal — content_hash on empty entity (F5 vector)
             Value::Map(vec![
-                (Value::Text("id".into()), Value::Text("content_hash.1".into())),
-                (Value::Text("description".into()), Value::Text("empty entity".into())),
-                (Value::Text("kind".into()), Value::Text("encode_equal".into())),
+                (
+                    Value::Text("id".into()),
+                    Value::Text("content_hash.1".into()),
+                ),
+                (
+                    Value::Text("description".into()),
+                    Value::Text("empty entity".into()),
+                ),
+                (
+                    Value::Text("kind".into()),
+                    Value::Text("encode_equal".into()),
+                ),
                 (
                     Value::Text("input".into()),
                     Value::Map(vec![
-                        (Value::Text("type".into()), Value::Text("system/empty".into())),
+                        (
+                            Value::Text("type".into()),
+                            Value::Text("system/empty".into()),
+                        ),
                         (Value::Text("data".into()), Value::Map(vec![])),
                     ]),
                 ),
@@ -498,8 +519,14 @@ mod tests {
             // encode_equal — signature with deterministic seed
             Value::Map(vec![
                 (Value::Text("id".into()), Value::Text("signature.1".into())),
-                (Value::Text("description".into()), Value::Text("deterministic".into())),
-                (Value::Text("kind".into()), Value::Text("encode_equal".into())),
+                (
+                    Value::Text("description".into()),
+                    Value::Text("deterministic".into()),
+                ),
+                (
+                    Value::Text("kind".into()),
+                    Value::Text("encode_equal".into()),
+                ),
                 (
                     Value::Text("input".into()),
                     Value::Map(vec![
@@ -510,7 +537,10 @@ mod tests {
                                 (Value::Text("type".into()), Value::Text("test/v1".into())),
                                 (
                                     Value::Text("data".into()),
-                                    Value::Map(vec![(Value::Text("x".into()), Value::Integer(1.into()))]),
+                                    Value::Map(vec![(
+                                        Value::Text("x".into()),
+                                        Value::Integer(1.into()),
+                                    )]),
                                 ),
                             ]),
                         ),
@@ -525,16 +555,17 @@ mod tests {
                     Value::Text("description".into()),
                     Value::Text("tag 0 in data".into()),
                 ),
-                (Value::Text("kind".into()), Value::Text("decode_reject".into())),
+                (
+                    Value::Text("kind".into()),
+                    Value::Text("decode_reject".into()),
+                ),
                 (
                     Value::Text("canonical".into()),
                     // From conformance-vectors-v1.diag.
-                    Value::Bytes(
-                        hex_to_bytes(
-                            "a2647479706567746573742f7631646461746161316274736374\
+                    Value::Bytes(hex_to_bytes(
+                        "a2647479706567746573742f7631646461746161316274736374\
                              323032362d30362d30365431323a30303a30305a",
-                        ),
-                    ),
+                    )),
                 ),
             ]),
             // decode_reject — empty map (CANONICAL — must NOT be rejected)
@@ -573,7 +604,10 @@ mod tests {
         assert_eq!(field_text(map, "spec_version").unwrap(), "1.5");
 
         let encode_results = field(map, "encode_results").unwrap().as_map().unwrap();
-        let float_bytes = field(encode_results, "float.3").unwrap().as_bytes().unwrap();
+        let float_bytes = field(encode_results, "float.3")
+            .unwrap()
+            .as_bytes()
+            .unwrap();
         assert_eq!(float_bytes, &[0xF9, 0x3C, 0x00], "f16 1.0 = F9 3C 00");
 
         let hash_bytes = field(encode_results, "content_hash.1")
@@ -592,11 +626,17 @@ mod tests {
         };
         assert_eq!(hash_bytes, expected.as_slice());
 
-        let sig_bytes = field(encode_results, "signature.1").unwrap().as_bytes().unwrap();
+        let sig_bytes = field(encode_results, "signature.1")
+            .unwrap()
+            .as_bytes()
+            .unwrap();
         assert_eq!(sig_bytes.len(), 64, "Ed25519 sig is 64 bytes");
 
         let decode_results = field(map, "decode_results").unwrap().as_map().unwrap();
-        let rejected = matches!(field(decode_results, "tag_reject.1"), Some(Value::Bool(true)));
+        let rejected = matches!(
+            field(decode_results, "tag_reject.1"),
+            Some(Value::Bool(true))
+        );
         assert!(rejected, "tag_reject.1 must be rejected");
     }
 
@@ -696,7 +736,11 @@ mod tests {
         for (id, input, expected_hex) in cases {
             let got = to_ecf(&input);
             println!("F30 stripped{id}: {}", bytes_to_hex(&got));
-            assert_eq!(bytes_to_hex(&got), expected_hex, "stripped{id} must reproduce canonical bytes");
+            assert_eq!(
+                bytes_to_hex(&got),
+                expected_hex,
+                "stripped{id} must reproduce canonical bytes"
+            );
         }
     }
 
@@ -718,9 +762,10 @@ mod tests {
         assert_eq!(got5, exp5, "nested.5 must match Go candidate");
 
         // nested.6 — [{"k": 256×'c'}] : inner head 0x79 0x0100
-        let n6 = Value::Array(vec![
-            Value::Map(vec![(Value::Text("k".into()), Value::Text("c".repeat(256)))]),
-        ]);
+        let n6 = Value::Array(vec![Value::Map(vec![(
+            Value::Text("k".into()),
+            Value::Text("c".repeat(256)),
+        )])]);
         let mut exp6 = hex_to_bytes("81a1616b790100");
         exp6.extend(std::iter::repeat(0x63).take(256));
         let got6 = to_ecf(&n6);

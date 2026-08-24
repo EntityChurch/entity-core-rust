@@ -5,8 +5,12 @@ edition.workspace = true
 description = "Peer, PeerBuilder, and connection management"
 
 [features]
-default = ["inbox", "continuation", "subscription", "clock", "revision", "query", "history", "compute", "handlers", "capability-handler", "identity", "role", "registry", "discovery", "relay", "conformance", "type-system", "content", "local-files", "websocket", "http-live"]
+default = ["inbox", "continuation", "subscription", "clock", "revision", "query", "history", "compute", "handlers", "capability-handler", "identity", "role", "registry", "discovery", "relay", "network", "conformance", "type-system", "content", "local-files", "websocket", "http-live"]
 inbox = ["dep:entity-inbox"]
+# EXTENSION-NETWORK rung 3: the system/network handler composes the §4.1
+# reconnect graph out of inbox-resident continuations advanced by
+# subscription deliveries — the reactive stack is a functional dependency.
+network = ["dep:entity-network", "inbox", "continuation", "subscription"]
 continuation = ["dep:entity-continuation"]
 subscription = ["dep:entity-subscription"]
 clock = ["dep:entity-clock"]
@@ -63,6 +67,7 @@ entity-role = { workspace = true, optional = true }
 entity-registry = { workspace = true, optional = true }
 entity-discovery = { workspace = true, optional = true }
 entity-relay = { workspace = true, optional = true }
+entity-network = { workspace = true, optional = true }
 entity-conformance = { workspace = true, optional = true }
 entity-type-system = { workspace = true, optional = true }
 entity-content = { workspace = true, optional = true }

@@ -23,3 +23,15 @@ where
 {
     wasm_bindgen_futures::spawn_local(future);
 }
+
+/// Cross-platform sleep (native tokio timer / WASM gloo timer). Used by the
+/// network handler's §2.2 backoff pacing (via the injected `PeerLink`).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn sleep_ms(ms: u64) {
+    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn sleep_ms(ms: u64) {
+    gloo_timers::future::TimeoutFuture::new(ms as u32).await;
+}

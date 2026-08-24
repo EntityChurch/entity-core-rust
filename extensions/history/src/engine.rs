@@ -7,7 +7,10 @@ use std::sync::{Arc, RwLock};
 
 use entity_entity::Entity;
 use entity_hash::Hash;
-use entity_store::{ChangeType, ClockState, ContentStore, ExecutionContext, LocationIndex, SyncTreeHook, TreeChangeEvent};
+use entity_store::{
+    ChangeType, ClockState, ContentStore, ExecutionContext, LocationIndex, SyncTreeHook,
+    TreeChangeEvent,
+};
 
 // ---------------------------------------------------------------------------
 // HistoryEngine
@@ -80,7 +83,10 @@ impl HistoryEngine {
 
     /// Start the engine: spawn a background task that processes tree change events.
     #[cfg(not(target_arch = "wasm32"))]
-    pub fn start(self: &Arc<Self>, mut events_rx: tokio::sync::broadcast::Receiver<TreeChangeEvent>) {
+    pub fn start(
+        self: &Arc<Self>,
+        mut events_rx: tokio::sync::broadcast::Receiver<TreeChangeEvent>,
+    ) {
         let engine = Arc::clone(self);
         tokio::spawn(async move {
             loop {
@@ -99,7 +105,10 @@ impl HistoryEngine {
     }
 
     #[cfg(target_arch = "wasm32")]
-    pub fn start(self: &Arc<Self>, mut events_rx: tokio::sync::broadcast::Receiver<TreeChangeEvent>) {
+    pub fn start(
+        self: &Arc<Self>,
+        mut events_rx: tokio::sync::broadcast::Receiver<TreeChangeEvent>,
+    ) {
         let engine = Arc::clone(self);
         wasm_bindgen_futures::spawn_local(async move {
             loop {
@@ -116,7 +125,6 @@ impl HistoryEngine {
             }
         });
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -124,9 +132,11 @@ impl HistoryEngine {
 // ---------------------------------------------------------------------------
 
 impl SyncTreeHook for HistoryEngine {
-    fn on_tree_change(&self, event: &TreeChangeEvent, ctx: &mut ExecutionContext)
-        -> Result<(), entity_store::CascadeHalt>
-    {
+    fn on_tree_change(
+        &self,
+        event: &TreeChangeEvent,
+        ctx: &mut ExecutionContext,
+    ) -> Result<(), entity_store::CascadeHalt> {
         if event.path.starts_with(&self.history_path_prefix) {
             return Ok(());
         }
@@ -217,7 +227,9 @@ impl HistoryEngine {
             event: event_name,
             hash: event.new_hash,
             previous_hash: event.previous_hash,
-            author: ectx.and_then(|c| c.author).or(Some(self.local_identity_hash)),
+            author: ectx
+                .and_then(|c| c.author)
+                .or(Some(self.local_identity_hash)),
             capability: cap,
             caller_capability,
             handler: ectx.and_then(|c| c.handler_pattern.as_deref()),
@@ -348,43 +360,54 @@ fn build_transition_entity(f: &TransitionFields<'_>) -> Entity {
 
     // F7: structured clock state (system/clock/state)
     if let Some(clock) = &f.clock {
-        let mut clock_fields = vec![
-            (entity_ecf::text("mode"), entity_ecf::text(&clock.mode)),
-        ];
+        let mut clock_fields = vec![(entity_ecf::text("mode"), entity_ecf::text(&clock.mode))];
         if let Some(ts) = clock.timestamp {
             clock_fields.push((
                 entity_ecf::text("timestamp"),
-                entity_ecf::Value::Map(vec![
-                    (entity_ecf::text("ms"), entity_ecf::integer(ts as i64)),
-                ]),
+                entity_ecf::Value::Map(vec![(
+                    entity_ecf::text("ms"),
+                    entity_ecf::integer(ts as i64),
+                )]),
             ));
         }
         if let Some(ref logical) = clock.logical {
             clock_fields.push((
                 entity_ecf::text("logical"),
-                entity_ecf::Value::Map(vec![
-                    (entity_ecf::text("counter"), entity_ecf::integer(logical.counter as i64)),
-                ]),
+                entity_ecf::Value::Map(vec![(
+                    entity_ecf::text("counter"),
+                    entity_ecf::integer(logical.counter as i64),
+                )]),
             ));
         }
         if let Some(ref vector) = clock.vector {
-            let entries: Vec<_> = vector.iter()
+            let entries: Vec<_> = vector
+                .iter()
                 .map(|(k, v)| (entity_ecf::text(k), entity_ecf::integer(*v as i64)))
                 .collect();
             clock_fields.push((
                 entity_ecf::text("vector"),
-                entity_ecf::Value::Map(vec![
-                    (entity_ecf::text("entries"), entity_ecf::Value::Map(entries)),
-                ]),
+                entity_ecf::Value::Map(vec![(
+                    entity_ecf::text("entries"),
+                    entity_ecf::Value::Map(entries),
+                )]),
             ));
         }
         if let Some(ref hlc) = clock.hlc {
             clock_fields.push((
                 entity_ecf::text("hlc"),
                 entity_ecf::Value::Map(vec![
-                    (entity_ecf::text("logical"), entity_ecf::integer(hlc.logical as i64)),
-                    (entity_ecf::text("peer"), entity_ecf::Value::Bytes(hlc.peer.to_bytes().to_vec())),
-                    (entity_ecf::text("physical"), entity_ecf::integer(hlc.physical as i64)),
+                    (
+                        entity_ecf::text("logical"),
+                        entity_ecf::integer(hlc.logical as i64),
+                    ),
+                    (
+                        entity_ecf::text("peer"),
+                        entity_ecf::Value::Bytes(hlc.peer.to_bytes().to_vec()),
+                    ),
+                    (
+                        entity_ecf::text("physical"),
+                        entity_ecf::integer(hlc.physical as i64),
+                    ),
                 ]),
             ));
         }
@@ -656,10 +679,7 @@ mod tests {
         let peer_id = test_peer_id();
         let mut fields = vec![
             (entity_ecf::text("pattern"), entity_ecf::text(pattern)),
-            (
-                entity_ecf::text("enabled"),
-                entity_ecf::bool_val(enabled),
-            ),
+            (entity_ecf::text("enabled"), entity_ecf::bool_val(enabled)),
         ];
         // Default events
         fields.push((
@@ -772,10 +792,7 @@ mod tests {
     #[test]
     fn test_canonicalize_peer_wildcard() {
         let pid = test_peer_id();
-        assert_eq!(
-            canonicalize_pattern("*/project/*", &pid),
-            "*/project/*"
-        );
+        assert_eq!(canonicalize_pattern("*/project/*", &pid), "*/project/*");
     }
 
     // --- pattern_specificity ---
@@ -783,7 +800,9 @@ mod tests {
     #[test]
     fn test_specificity_ordering() {
         // More literal segments = more specific
-        assert!(pattern_specificity("/peer/project/readme") > pattern_specificity("/peer/project/*"));
+        assert!(
+            pattern_specificity("/peer/project/readme") > pattern_specificity("/peer/project/*")
+        );
         assert!(pattern_specificity("/peer/project/*") > pattern_specificity("*/project/*"));
         assert!(pattern_specificity("/peer/*") > pattern_specificity("*"));
     }
@@ -861,11 +880,13 @@ mod tests {
         // Verify transition entity
         let head_hash = li.get(&head_path).unwrap();
         let transition = store.get(&head_hash).unwrap();
-        assert_eq!(transition.entity_type, entity_types::TYPE_HISTORY_TRANSITION);
+        assert_eq!(
+            transition.entity_type,
+            entity_types::TYPE_HISTORY_TRANSITION
+        );
 
         // Decode and verify fields
-        let val: ciborium::Value =
-            ciborium::from_reader(transition.data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(transition.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
         let event_field = map
             .iter()
@@ -954,8 +975,7 @@ mod tests {
                 entity_ecf::Value::Array(vec![entity_ecf::text("created")]),
             ),
         ]));
-        let config_entity =
-            Entity::new(entity_types::TYPE_HISTORY_CONFIG, config_data).unwrap();
+        let config_entity = Entity::new(entity_types::TYPE_HISTORY_CONFIG, config_data).unwrap();
         let config_hash = store.put(config_entity).unwrap();
         li.set(
             &format!("/{}/system/history/config/docs-created-only", pid),
@@ -1025,8 +1045,7 @@ mod tests {
         let head_hash = li.get(&head_path).unwrap();
         let transition = store.get(&head_hash).unwrap();
 
-        let val: ciborium::Value =
-            ciborium::from_reader(transition.data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(transition.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
 
         // Verify author

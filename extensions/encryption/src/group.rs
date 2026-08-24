@@ -22,15 +22,19 @@
 use entity_hash::Hash;
 use sha2::{Digest, Sha256};
 
-use crate::aead::{random_key, random_nonce, xchacha_decrypt, xchacha_encrypt, AEAD_KEY_SIZE, AEAD_NONCE_SIZE};
-use crate::ecdh::{generate_or_load_x25519, x25519_shared, X25519_PRIVATE_SIZE, X25519_PUBLIC_SIZE};
+use crate::aad;
+use crate::aead::{
+    random_key, random_nonce, xchacha_decrypt, xchacha_encrypt, AEAD_KEY_SIZE, AEAD_NONCE_SIZE,
+};
+use crate::ecdh::{
+    generate_or_load_x25519, x25519_shared, X25519_PRIVATE_SIZE, X25519_PUBLIC_SIZE,
+};
 use crate::peer::derive_aead_key;
 use crate::registry::{
     group_mode_suite_allowed, AEAD_ID_XCHACHA20_POLY1305, ENC_KEY_TYPE_X25519, KDF_ID_HKDF_SHA256,
 };
 use crate::types::{EncryptionError, MODE_GROUP, WRAPPED_KEYS_DEFAULT_CEILING};
 use crate::wrapper::{EncryptedData, WrappedKey};
-use crate::aad;
 
 /// SHA-256(`group_aead_key`) — the F2-1 binding emitted into the §5.2
 /// group-outer AAD.
@@ -145,8 +149,13 @@ pub fn group_add_member(
     }
     group_mode_suite_allowed(existing.aead_id, existing.kdf_id)?;
 
-    let wrap = wrap_for_member(new_member, group_aead_key, existing.aead_id, existing.kdf_id)
-        .map_err(|e| EncryptionError::InvalidWrapper(format!("wrap for new member: {e}")))?;
+    let wrap = wrap_for_member(
+        new_member,
+        group_aead_key,
+        existing.aead_id,
+        existing.kdf_id,
+    )
+    .map_err(|e| EncryptionError::InvalidWrapper(format!("wrap for new member: {e}")))?;
 
     let mut out = existing.clone();
     out.wrapped_keys.push(wrap);
@@ -235,9 +244,9 @@ fn wrap_for_member(
             m.pubkey.len()
         )));
     }
-    let member_hash = m.pubkey_hash.ok_or_else(|| {
-        EncryptionError::InvalidWrapper("member pubkey_hash required".into())
-    })?;
+    let member_hash = m
+        .pubkey_hash
+        .ok_or_else(|| EncryptionError::InvalidWrapper("member pubkey_hash required".into()))?;
 
     let eph_seed = m.ephemeral_private_seed.clone().unwrap_or_default();
     let (eph_seed, eph_pub) = generate_or_load_x25519(&eph_seed)?;
@@ -254,7 +263,14 @@ fn wrap_for_member(
 
     let shared = x25519_shared(&eph_seed, &m.pubkey)?;
     let wrap_key = derive_aead_key(&shared, &wrap_nonce, &member_hash)?;
-    let aad = aad::group_wrap_aad(ENC_KEY_TYPE_X25519, aead_id, kdf_id, &wrap_nonce, &member_hash, &eph_pub);
+    let aad = aad::group_wrap_aad(
+        ENC_KEY_TYPE_X25519,
+        aead_id,
+        kdf_id,
+        &wrap_nonce,
+        &member_hash,
+        &eph_pub,
+    );
     let wrapped = xchacha_encrypt(&wrap_key, &wrap_nonce, &aad, group_key)?;
 
     Ok(WrappedKey {

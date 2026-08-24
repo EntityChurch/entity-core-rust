@@ -85,14 +85,10 @@ fn extract_field(name: &str, target: &ComputeValue, ctx: &mut EvalContext<'_>) -
                 }
             }
         }
-        ComputeValue::Primitive(Value::Map(_)) => {
-            match target.as_primitive().unwrap().get(name) {
-                Some(v) => v.clone(),
-                None => {
-                    return ComputeError::NotFound(format!("Field not found: {}", name)).to_value()
-                }
-            }
-        }
+        ComputeValue::Primitive(Value::Map(_)) => match target.as_primitive().unwrap().get(name) {
+            Some(v) => v.clone(),
+            None => return ComputeError::NotFound(format!("Field not found: {}", name)).to_value(),
+        },
         _ => {
             return ComputeError::TypeMismatch(
                 "Field access requires an entity with data, got non-entity value".into(),
@@ -129,20 +125,16 @@ pub(super) fn eval_index(
     let items = match array_value_as_slice(&array_val) {
         Some(items) => items,
         None => {
-            return ComputeError::TypeMismatch(
-                "compute/index requires array operand".into(),
-            )
-            .to_value()
+            return ComputeError::TypeMismatch("compute/index requires array operand".into())
+                .to_value()
         }
     };
 
     let idx_i128 = match index_val.as_i128() {
         Some(i) => i,
         None => {
-            return ComputeError::TypeMismatch(
-                "compute/index requires integer index".into(),
-            )
-            .to_value()
+            return ComputeError::TypeMismatch("compute/index requires integer index".into())
+                .to_value()
         }
     };
 
@@ -155,11 +147,8 @@ pub(super) fn eval_index(
     }
     let len = items.len() as i128;
     if idx_i128 >= len {
-        return ComputeError::IndexOutOfRange(format!(
-            "index {} >= length {}",
-            idx_i128, len
-        ))
-        .to_value();
+        return ComputeError::IndexOutOfRange(format!("index {} >= length {}", idx_i128, len))
+            .to_value();
     }
 
     ComputeValue::Primitive(items[idx_i128 as usize].clone())
@@ -183,10 +172,8 @@ pub(super) fn eval_length(
     let items = match array_value_as_slice(&array_val) {
         Some(items) => items,
         None => {
-            return ComputeError::TypeMismatch(
-                "compute/length requires array operand".into(),
-            )
-            .to_value()
+            return ComputeError::TypeMismatch("compute/length requires array operand".into())
+                .to_value()
         }
     };
 

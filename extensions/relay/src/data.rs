@@ -31,8 +31,8 @@ use entity_entity::Entity;
 use entity_hash::Hash;
 use entity_types::{
     TYPE_PEER_INBOX_RELAY, TYPE_RELAY_ADVERTISE, TYPE_RELAY_FORWARD_REQUEST,
-    TYPE_RELAY_FORWARD_RESULT, TYPE_RELAY_POLL_REQUEST, TYPE_RELAY_POLL_RESULT, TYPE_RELAY_PUT_RESULT,
-    TYPE_RELAY_STORE_ENTRY,
+    TYPE_RELAY_FORWARD_RESULT, TYPE_RELAY_POLL_REQUEST, TYPE_RELAY_POLL_RESULT,
+    TYPE_RELAY_PUT_RESULT, TYPE_RELAY_STORE_ENTRY,
 };
 
 use crate::RelayError;
@@ -100,7 +100,10 @@ impl ForwardRequest {
         // omitempty: drop `route` entirely when None/empty so a single-hop
         // request stays byte-identical to v1.0 (§3.1).
         if let Some(route) = self.route.as_ref().filter(|r| !r.is_empty()) {
-            fields.push((text("route"), Value::Array(route.iter().map(text).collect())));
+            fields.push((
+                text("route"),
+                Value::Array(route.iter().map(text).collect()),
+            ));
         }
         fields
     }
@@ -404,7 +407,9 @@ impl PollRequest {
         let map = decode_map(data)?;
         Ok(Self {
             namespace: field_text(&map, "namespace")?,
-            since: get_field(&map, "since").and_then(|v| v.as_bytes()).map(|b| b.to_vec()),
+            since: get_field(&map, "since")
+                .and_then(|v| v.as_bytes())
+                .map(|b| b.to_vec()),
             limit: field_u64_opt(&map, "limit"),
         })
     }
@@ -489,15 +494,21 @@ fn encode(entity_type: &str, fields: Vec<(Value, Value)>) -> Result<Entity, Rela
 }
 
 fn decode_map(data: &[u8]) -> Result<Vec<(Value, Value)>, RelayError> {
-    let value: Value = ciborium::from_reader(data).map_err(|e| RelayError::Decode(e.to_string()))?;
+    let value: Value =
+        ciborium::from_reader(data).map_err(|e| RelayError::Decode(e.to_string()))?;
     value
         .into_map()
         .map_err(|_| RelayError::Decode("expected CBOR map".into()))
 }
 
 fn get_field<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
-    map.iter()
-        .find_map(|(k, v)| if k.as_text() == Some(key) { Some(v) } else { None })
+    map.iter().find_map(|(k, v)| {
+        if k.as_text() == Some(key) {
+            Some(v)
+        } else {
+            None
+        }
+    })
 }
 
 fn field_text(map: &[(Value, Value)], key: &str) -> Result<String, RelayError> {
@@ -508,7 +519,9 @@ fn field_text(map: &[(Value, Value)], key: &str) -> Result<String, RelayError> {
 }
 
 fn field_text_opt(map: &[(Value, Value)], key: &str) -> Option<String> {
-    get_field(map, key).and_then(|v| v.as_text()).map(|s| s.to_string())
+    get_field(map, key)
+        .and_then(|v| v.as_text())
+        .map(|s| s.to_string())
 }
 
 fn field_u64(map: &[(Value, Value)], key: &str) -> Result<u64, RelayError> {
@@ -556,8 +569,8 @@ fn field_text_array_opt(map: &[(Value, Value)], key: &str) -> Option<Vec<String>
 }
 
 fn field_hash(map: &[(Value, Value)], key: &str) -> Result<Hash, RelayError> {
-    let v = get_field(map, key)
-        .ok_or_else(|| RelayError::Decode(format!("missing {} field", key)))?;
+    let v =
+        get_field(map, key).ok_or_else(|| RelayError::Decode(format!("missing {} field", key)))?;
     let b = v
         .as_bytes()
         .ok_or_else(|| RelayError::Decode(format!("{} must be byte string", key)))?;

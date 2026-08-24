@@ -63,12 +63,17 @@ pub fn resolve_or_error(
     authorized_data_hashes: &HashSet<Hash>,
     label: &str,
 ) -> Result<Entity, ComputeValue> {
-    match resolve(hash, included, encountered, content_store, authorized_data_hashes) {
+    match resolve(
+        hash,
+        included,
+        encountered,
+        content_store,
+        authorized_data_hashes,
+    ) {
         Some(entity) => Ok(entity),
-        None => Err(ComputeError::NotFound(format!(
-            "Cannot resolve hash for {}: {}",
-            label, hash
-        ))
-        .to_value()),
+        None => Err(
+            ComputeError::NotFound(format!("Cannot resolve hash for {}: {}", label, hash))
+                .to_value(),
+        ),
     }
 }

@@ -18,8 +18,8 @@ fn spawn_task<F: std::future::Future<Output = ()> + 'static>(f: F) {
     wasm_bindgen_futures::spawn_local(f);
 }
 use entity_handler::{
-    ExecuteOptions, Handler, HandlerContext, HandlerError, HandlerResult,
-    STATUS_BAD_REQUEST, STATUS_OK,
+    ExecuteOptions, Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST,
+    STATUS_OK,
 };
 use entity_store::{ContentStore, LocationIndex};
 
@@ -165,9 +165,8 @@ impl InboxHandler {
                             entity_ecf::text("accepted"),
                             entity_ecf::Value::Bool(true),
                         )]));
-                        let result_entity =
-                            Entity::new("system/inbox/receive-result", result_data)
-                                .map_err(|e| HandlerError::Internal(e.to_string()))?;
+                        let result_entity = Entity::new("system/inbox/receive-result", result_data)
+                            .map_err(|e| HandlerError::Internal(e.to_string()))?;
                         return Ok(HandlerResult {
                             status: STATUS_OK,
                             result: result_entity,
@@ -184,10 +183,7 @@ impl InboxHandler {
                 entity_ecf::text("content_hash"),
                 entity_ecf::Value::Bytes(stored_hash.to_bytes().to_vec()),
             ),
-            (
-                entity_ecf::text("path"),
-                entity_ecf::text(&storage_path),
-            ),
+            (entity_ecf::text("path"), entity_ecf::text(&storage_path)),
         ]));
         let result_entity = Entity::new("system/inbox/receive-result", result_data)
             .map_err(|e| HandlerError::Internal(e.to_string()))?;
@@ -195,10 +191,9 @@ impl InboxHandler {
         Ok(HandlerResult {
             status: STATUS_OK,
             result: result_entity,
-        included: std::collections::HashMap::new(),
+            included: std::collections::HashMap::new(),
         })
     }
-
 }
 
 /// Advance a continuation asynchronously (runs in a spawned task).
@@ -211,13 +206,12 @@ async fn try_advance_continuation_async(
     location_index: &Arc<dyn LocationIndex>,
 ) -> bool {
     // Per INBOX spec §3.2: unwrap InboxDeliveryData before advancing.
-    let (result_bytes, status) =
-        if params_entity.entity_type == "system/protocol/inbox/delivery" {
-            extract_delivery_fields(&params_entity.data)
-                .unwrap_or_else(|| (params_entity.data.clone(), STATUS_OK))
-        } else {
-            (params_entity.data.clone(), STATUS_OK)
-        };
+    let (result_bytes, status) = if params_entity.entity_type == "system/protocol/inbox/delivery" {
+        extract_delivery_fields(&params_entity.data)
+            .unwrap_or_else(|| (params_entity.data.clone(), STATUS_OK))
+    } else {
+        (params_entity.data.clone(), STATUS_OK)
+    };
 
     // Build advance request: {result: <inline value>, status: <status>}
     // The result is embedded as an inline CBOR value (not byte-string wrapped)
@@ -340,7 +334,9 @@ mod tests {
     use entity_store::{MemoryContentStore, MemoryLocationIndex};
 
     fn test_peer_id() -> String {
-        entity_crypto::Keypair::from_seed([42u8; 32]).peer_id().to_string()
+        entity_crypto::Keypair::from_seed([42u8; 32])
+            .peer_id()
+            .to_string()
     }
 
     fn make_inbox() -> InboxHandler {
@@ -353,13 +349,20 @@ mod tests {
 
     fn make_test_execute(operation: &str, params_data: &[u8], resource_path: &str) -> Entity {
         // Per spec §3.4, params is an inline entity {content_hash, data, type}.
-        let params_entity = Entity::new("system/inbox/receive-params", params_data.to_vec()).unwrap();
+        let params_entity =
+            Entity::new("system/inbox/receive-params", params_data.to_vec()).unwrap();
         let params_data_val: ciborium::Value =
             ciborium::from_reader(params_data).unwrap_or(ciborium::Value::Null);
         let params_inline = entity_ecf::Value::Map(vec![
-            (entity_ecf::text("content_hash"), entity_ecf::Value::Bytes(params_entity.content_hash.to_bytes().to_vec())),
+            (
+                entity_ecf::text("content_hash"),
+                entity_ecf::Value::Bytes(params_entity.content_hash.to_bytes().to_vec()),
+            ),
             (entity_ecf::text("data"), params_data_val),
-            (entity_ecf::text("type"), entity_ecf::text("system/inbox/receive-params")),
+            (
+                entity_ecf::text("type"),
+                entity_ecf::text("system/inbox/receive-params"),
+            ),
         ]);
         let mut fields = vec![
             (entity_ecf::text("operation"), entity_ecf::text(operation)),
@@ -368,10 +371,7 @@ mod tests {
                 entity_ecf::text("request_id"),
                 entity_ecf::text("test-req-1"),
             ),
-            (
-                entity_ecf::text("uri"),
-                entity_ecf::text("system/inbox"),
-            ),
+            (entity_ecf::text("uri"), entity_ecf::text("system/inbox")),
         ];
         if !resource_path.is_empty() {
             fields.push((
@@ -387,9 +387,10 @@ mod tests {
     }
 
     fn make_ctx(_inbox: &InboxHandler, operation: &str, resource_path: &str) -> HandlerContext {
-        let params_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-            (entity_ecf::text("message"), entity_ecf::text("hello")),
-        ]));
+        let params_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+            entity_ecf::text("message"),
+            entity_ecf::text("hello"),
+        )]));
         let params = Entity::new("system/inbox/receive-params", params_data.clone()).unwrap();
         let execute = make_test_execute(operation, &params_data, resource_path);
         let resource_target = if resource_path.is_empty() {
@@ -556,10 +557,7 @@ mod tests {
             ),
             (
                 entity_ecf::text("result"),
-                entity_ecf::Value::Map(vec![(
-                    entity_ecf::text("key"),
-                    entity_ecf::text("value"),
-                )]),
+                entity_ecf::Value::Map(vec![(entity_ecf::text("key"), entity_ecf::text("value"))]),
             ),
             (entity_ecf::text("status"), entity_ecf::integer(200)),
         ]));

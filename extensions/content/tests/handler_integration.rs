@@ -34,7 +34,12 @@ fn hash_record(h: &Hash) -> Value {
     Value::Bytes(h.to_bytes())
 }
 
-fn run(handler: &SystemContentHandler, op: &str, params: Entity, with_resource: bool) -> HandlerResult {
+fn run(
+    handler: &SystemContentHandler,
+    op: &str,
+    params: Entity,
+    with_resource: bool,
+) -> HandlerResult {
     let mut builder = HandlerContext::builder(params.clone(), params)
         .pattern(format!("/{}/system/content", PEER_ID))
         .operation(op)
@@ -99,7 +104,10 @@ fn get_returns_found_and_missing_partition() {
 
     let v: Value = ciborium::from_reader(res.result.data.as_slice()).unwrap();
     let found = v.get("found").and_then(|v| v.as_array().cloned()).unwrap();
-    let missing = v.get("missing").and_then(|v| v.as_array().cloned()).unwrap();
+    let missing = v
+        .get("missing")
+        .and_then(|v| v.as_array().cloned())
+        .unwrap();
     assert_eq!(found.len(), 1);
     assert_eq!(missing.len(), 1);
 
@@ -169,15 +177,13 @@ fn ingest_envelope_mode_inlines_root_and_validates_included_hashes() {
 
     // The root we want to pass through.
     let root_data = cbor_map! { "peer_id" => text("root-peer") };
-    let root_entity =
-        Entity::new("system/peer", entity_ecf::to_ecf(&root_data)).unwrap();
-    let root_hash = root_entity.content_hash.clone();
+    let root_entity = Entity::new("system/peer", entity_ecf::to_ecf(&root_data)).unwrap();
+    let root_hash = root_entity.content_hash;
 
     // One extra included entity (hash-keyed map).
     let extra_data = cbor_map! { "peer_id" => text("extra-peer") };
-    let extra_entity =
-        Entity::new("system/peer", entity_ecf::to_ecf(&extra_data)).unwrap();
-    let extra_hash = extra_entity.content_hash.clone();
+    let extra_entity = Entity::new("system/peer", entity_ecf::to_ecf(&extra_data)).unwrap();
+    let extra_hash = extra_entity.content_hash;
 
     let included = Value::Map(vec![(
         hash_record(&extra_hash),
@@ -275,8 +281,7 @@ fn get_respects_configured_frame_budget() {
     // strict in-request-order subset; the rest land in `missing`
     // regardless of local presence; requester retries with `missing`.
     let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
-    let handler = SystemContentHandler::new(PEER_ID, store.clone())
-        .with_frame_budget(4096);
+    let handler = SystemContentHandler::new(PEER_ID, store.clone()).with_frame_budget(4096);
 
     let payload = vec![0u8; 1024];
     let mut hashes: Vec<Hash> = Vec::with_capacity(6);
@@ -294,8 +299,7 @@ fn get_respects_configured_frame_budget() {
         hashes.push(h);
     }
 
-    let request_hashes: Vec<Value> =
-        hashes.iter().map(hash_record).collect();
+    let request_hashes: Vec<Value> = hashes.iter().map(hash_record).collect();
     let params = Entity::new(
         "system/content/get-request",
         entity_ecf::to_ecf(&cbor_map! {
@@ -307,10 +311,7 @@ fn get_respects_configured_frame_budget() {
     assert_eq!(res.status, STATUS_OK);
 
     let v: Value = ciborium::from_reader(res.result.data.as_slice()).unwrap();
-    let found = v
-        .get("found")
-        .and_then(|v| v.as_array().cloned())
-        .unwrap();
+    let found = v.get("found").and_then(|v| v.as_array().cloned()).unwrap();
     let missing = v
         .get("missing")
         .and_then(|v| v.as_array().cloned())
@@ -346,8 +347,7 @@ fn get_retry_with_missing_hashes_completes_closure() {
     // for the `missing` set with a budget that fits — every entity now
     // delivered; closure complete from the requester's POV.
     let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
-    let handler = SystemContentHandler::new(PEER_ID, store.clone())
-        .with_frame_budget(4096);
+    let handler = SystemContentHandler::new(PEER_ID, store.clone()).with_frame_budget(4096);
 
     let payload = vec![0u8; 1024];
     let mut hashes: Vec<Hash> = Vec::with_capacity(6);
@@ -391,10 +391,7 @@ fn get_retry_with_missing_hashes_completes_closure() {
     let res2 = run(&handler, "get", params2, true);
     assert_eq!(res2.status, STATUS_OK);
     let v2: Value = ciborium::from_reader(res2.result.data.as_slice()).unwrap();
-    let found2 = v2
-        .get("found")
-        .and_then(|v| v.as_array().cloned())
-        .unwrap();
+    let found2 = v2.get("found").and_then(|v| v.as_array().cloned()).unwrap();
     let missing2 = v2
         .get("missing")
         .and_then(|v| v.as_array().cloned())

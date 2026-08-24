@@ -1,3 +1,9 @@
+// result_large_err: evaluation plumbing uses `Result<_, ComputeValue>`
+// — the Err IS a full compute value (the §6 error-value channel), by
+// design, so evaluation errors flow as ordinary values. Cold path;
+// boxing would churn every evaluator seam.
+#![allow(clippy::result_large_err)]
+
 pub mod builtins;
 pub mod engine;
 pub mod eval;
@@ -12,12 +18,12 @@ use async_trait::async_trait;
 use ciborium::Value;
 use entity_ecf::ValueExt;
 use entity_entity::{Entity, EntityUri};
+use entity_handler::{
+    Bounds, ExecuteOptions, Handler, HandlerContext, HandlerError, HandlerResult,
+    STATUS_BAD_REQUEST, STATUS_FORBIDDEN, STATUS_NOT_FOUND,
+};
 #[cfg(test)]
 use entity_hash::Hash;
-use entity_handler::{
-    Bounds, ExecuteOptions, Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST,
-    STATUS_FORBIDDEN, STATUS_NOT_FOUND,
-};
 use entity_store::{ContentStore, LocationIndex};
 
 use crate::eval::EvalContext;
@@ -121,7 +127,10 @@ impl ComputeHandler {
         let hash = match self.location_index.get(&qualified) {
             Some(h) => h,
             None => {
-                let err = make_error_entity("not_found", &format!("No entity at path: {}", expression_uri));
+                let err = make_error_entity(
+                    "not_found",
+                    &format!("No entity at path: {}", expression_uri),
+                );
                 return Ok(HandlerResult::error(STATUS_NOT_FOUND, err));
             }
         };
@@ -129,7 +138,10 @@ impl ComputeHandler {
         let expression = match self.content_store.get(&hash) {
             Some(e) => e,
             None => {
-                let err = make_error_entity("not_found", &format!("No entity at path: {}", expression_uri));
+                let err = make_error_entity(
+                    "not_found",
+                    &format!("No entity at path: {}", expression_uri),
+                );
                 return Ok(HandlerResult::error(STATUS_NOT_FOUND, err));
             }
         };
@@ -138,7 +150,10 @@ impl ComputeHandler {
         if !is_compute_expression(&expression) {
             let err = make_error_entity(
                 "invalid_expression",
-                &format!("Entity at path is not a compute expression (type: {})", expression.entity_type),
+                &format!(
+                    "Entity at path is not a compute expression (type: {})",
+                    expression.entity_type
+                ),
             );
             return Ok(HandlerResult::error(STATUS_BAD_REQUEST, err));
         }
@@ -149,7 +164,8 @@ impl ComputeHandler {
             ctx.bounds.as_ref(),
         );
 
-        let dispatch_execute = build_dispatch_execute(ctx, &self.local_peer_id, Arc::clone(&self.content_store));
+        let dispatch_execute =
+            build_dispatch_execute(ctx, &self.local_peer_id, Arc::clone(&self.content_store));
 
         // Explicit eval (proposal §6.1): ctx.capability = caller's cap (the eval
         // authority), ctx.caller_capability = absent (the caller IS the source —
@@ -203,13 +219,17 @@ impl ComputeHandler {
                             }
                         }
                     } else {
-                        let err = make_error_entity("permission_denied",
-                            "Install requires a caller capability (installation grant)");
+                        let err = make_error_entity(
+                            "permission_denied",
+                            "Install requires a caller capability (installation grant)",
+                        );
                         return Ok(HandlerResult::error(STATUS_FORBIDDEN, err));
                     }
                 } else {
-                    let err = make_error_entity("permission_denied",
-                        "Install requires a caller capability (installation grant)");
+                    let err = make_error_entity(
+                        "permission_denied",
+                        "Install requires a caller capability (installation grant)",
+                    );
                     return Ok(HandlerResult::error(STATUS_FORBIDDEN, err));
                 }
             }
@@ -247,7 +267,10 @@ impl ComputeHandler {
         let hash = match self.location_index.get(&qualified_root) {
             Some(h) => h,
             None => {
-                let err = make_error_entity("not_found", &format!("No expression at path: {}", root_path));
+                let err = make_error_entity(
+                    "not_found",
+                    &format!("No expression at path: {}", root_path),
+                );
                 return Ok(HandlerResult::error(STATUS_NOT_FOUND, err));
             }
         };
@@ -255,13 +278,19 @@ impl ComputeHandler {
         let expression = match self.content_store.get(&hash) {
             Some(e) => e,
             None => {
-                let err = make_error_entity("not_found", &format!("No expression at path: {}", root_path));
+                let err = make_error_entity(
+                    "not_found",
+                    &format!("No expression at path: {}", root_path),
+                );
                 return Ok(HandlerResult::error(STATUS_NOT_FOUND, err));
             }
         };
 
         if !is_compute_expression(&expression) {
-            let err = make_error_entity("invalid_expression", "Entity at path is not a compute expression");
+            let err = make_error_entity(
+                "invalid_expression",
+                "Entity at path is not a compute expression",
+            );
             return Ok(HandlerResult::error(STATUS_BAD_REQUEST, err));
         }
 
@@ -312,17 +341,21 @@ impl ComputeHandler {
                 let resolve = |h: &entity_hash::Hash| -> Option<Entity> {
                     included_ref.get(h).cloned().or_else(|| cs.get(h))
                 };
-                let auth_result =
-                    match entity_protocol::check_creator_authority(cap_hash, &author, included_ref, resolve) {
-                        Ok(r) => r,
-                        Err(_) => {
-                            let err = make_error_entity(
-                                "chain_unreachable",
-                                "compute/apply.capability authority chain has unreachable links",
-                            );
-                            return Ok(HandlerResult::error(STATUS_NOT_FOUND, err));
-                        }
-                    };
+                let auth_result = match entity_protocol::check_creator_authority(
+                    cap_hash,
+                    &author,
+                    included_ref,
+                    resolve,
+                ) {
+                    Ok(r) => r,
+                    Err(_) => {
+                        let err = make_error_entity(
+                            "chain_unreachable",
+                            "compute/apply.capability authority chain has unreachable links",
+                        );
+                        return Ok(HandlerResult::error(STATUS_NOT_FOUND, err));
+                    }
+                };
                 if !auth_result.found {
                     let err = make_error_entity(
                         "embedded_cap_unauthorized",
@@ -355,8 +388,10 @@ impl ComputeHandler {
                 &caller_cap,
                 &self.local_peer_id,
             ) {
-                let err = make_error_entity("permission_denied",
-                    &format!("Capability does not cover read: {}", path));
+                let err = make_error_entity(
+                    "permission_denied",
+                    &format!("Capability does not cover read: {}", path),
+                );
                 return Ok(HandlerResult::error(STATUS_FORBIDDEN, err));
             }
         }
@@ -373,8 +408,13 @@ impl ComputeHandler {
                 &caller_cap,
                 &self.local_peer_id,
             ) {
-                let err = make_error_entity("permission_denied",
-                    &format!("Capability does not cover handler: {}.{}", target.path, target.operation));
+                let err = make_error_entity(
+                    "permission_denied",
+                    &format!(
+                        "Capability does not cover handler: {}.{}",
+                        target.path, target.operation
+                    ),
+                );
                 return Ok(HandlerResult::error(STATUS_FORBIDDEN, err));
             }
         }
@@ -390,8 +430,10 @@ impl ComputeHandler {
             &caller_cap,
             &self.local_peer_id,
         ) {
-            let err = make_error_entity("permission_denied",
-                &format!("Capability does not cover result write: {}", result_path));
+            let err = make_error_entity(
+                "permission_denied",
+                &format!("Capability does not cover result write: {}", result_path),
+            );
             return Ok(HandlerResult::error(STATUS_FORBIDDEN, err));
         }
 
@@ -407,8 +449,10 @@ impl ComputeHandler {
                 &caller_cap,
                 &self.local_peer_id,
             ) {
-                let err = make_error_entity("permission_denied",
-                    &format!("Capability does not cover write: {}", path));
+                let err = make_error_entity(
+                    "permission_denied",
+                    &format!("Capability does not cover write: {}", path),
+                );
                 return Ok(HandlerResult::error(STATUS_FORBIDDEN, err));
             }
         }
@@ -422,14 +466,21 @@ impl ComputeHandler {
                     let hint_hash = match self.location_index.get(&qualified_hint) {
                         Some(h) => h,
                         None => {
-                            let err = make_error_entity("not_found",
-                                &format!("No entity at hint path: {}", hint_path));
+                            let err = make_error_entity(
+                                "not_found",
+                                &format!("No entity at hint path: {}", hint_path),
+                            );
                             return Ok(HandlerResult::error(STATUS_NOT_FOUND, err));
                         }
                     };
                     if hint_hash != *hash {
-                        let err = make_error_entity("hash_mismatch",
-                            &format!("Entity at {} has different hash than expression references", hint_path));
+                        let err = make_error_entity(
+                            "hash_mismatch",
+                            &format!(
+                                "Entity at {} has different hash than expression references",
+                                hint_path
+                            ),
+                        );
                         return Ok(HandlerResult::error(STATUS_BAD_REQUEST, err));
                     }
                     if !entity_capability::check_permission(
@@ -443,14 +494,18 @@ impl ComputeHandler {
                         &caller_cap,
                         &self.local_peer_id,
                     ) {
-                        let err = make_error_entity("permission_denied",
-                            &format!("Caller grant does not cover tree GET at: {}", hint_path));
+                        let err = make_error_entity(
+                            "permission_denied",
+                            &format!("Caller grant does not cover tree GET at: {}", hint_path),
+                        );
                         return Ok(HandlerResult::error(STATUS_FORBIDDEN, err));
                     }
                     authorized_data_hashes.push(hash.to_bytes().to_vec());
                 } else {
-                    let err = make_error_entity("no_authorization_path",
-                        "compute/lookup/hash without path hint requires content_store_access");
+                    let err = make_error_entity(
+                        "no_authorization_path",
+                        "compute/lookup/hash without path hint requires content_store_access",
+                    );
                     return Ok(HandlerResult::error(STATUS_BAD_REQUEST, err));
                 }
             }
@@ -460,7 +515,9 @@ impl ComputeHandler {
         let subgraph_id = walker::deterministic_id(&root_path);
         let subgraph_path = format!("system/compute/processes/{}", subgraph_id);
 
-        let author = ctx.author.unwrap_or_else(|| entity_hash::Hash::compute("empty", b""));
+        let author = ctx
+            .author
+            .unwrap_or_else(|| entity_hash::Hash::compute("empty", b""));
 
         // Persist the installation grant to the content store so the reactive
         // engine can load it for §7.2 grant validation.
@@ -469,30 +526,50 @@ impl ComputeHandler {
             let _ = self.content_store.put(entity);
             h
         } else {
-            ctx.capability_hash.unwrap_or_else(|| entity_hash::Hash::compute("empty", b""))
+            ctx.capability_hash
+                .unwrap_or_else(|| entity_hash::Hash::compute("empty", b""))
         };
 
         let metadata_fields = vec![
-            (Value::Text("authorized_data_hashes".into()),
-             Value::Array(authorized_data_hashes.into_iter().map(Value::Bytes).collect())),
-            (Value::Text("installation_grant".into()),
-             Value::Bytes(cap_hash.to_bytes().to_vec())),
-            (Value::Text("installed_by".into()),
-             Value::Bytes(author.to_bytes().to_vec())),
-            (Value::Text("result_path".into()),
-             entity_ecf::text(&result_path)),
-            (Value::Text("root_expression".into()),
-             Value::Bytes(expression.content_hash.to_bytes().to_vec())),
-            (Value::Text("root_expression_path".into()),
-             entity_ecf::text(&root_path)),
-            (Value::Text("status".into()),
-             entity_ecf::text("active")),
+            (
+                Value::Text("authorized_data_hashes".into()),
+                Value::Array(
+                    authorized_data_hashes
+                        .into_iter()
+                        .map(Value::Bytes)
+                        .collect(),
+                ),
+            ),
+            (
+                Value::Text("installation_grant".into()),
+                Value::Bytes(cap_hash.to_bytes().to_vec()),
+            ),
+            (
+                Value::Text("installed_by".into()),
+                Value::Bytes(author.to_bytes().to_vec()),
+            ),
+            (
+                Value::Text("result_path".into()),
+                entity_ecf::text(&result_path),
+            ),
+            (
+                Value::Text("root_expression".into()),
+                Value::Bytes(expression.content_hash.to_bytes().to_vec()),
+            ),
+            (
+                Value::Text("root_expression_path".into()),
+                entity_ecf::text(&root_path),
+            ),
+            (Value::Text("status".into()), entity_ecf::text("active")),
         ];
         let metadata_data = Value::Map(metadata_fields);
         let metadata_entity = Entity::new(TYPE_SUBGRAPH, entity_ecf::to_ecf(&metadata_data))
             .expect("subgraph metadata entity");
 
-        let metadata_hash = self.content_store.put(metadata_entity).expect("store metadata");
+        let metadata_hash = self
+            .content_store
+            .put(metadata_entity)
+            .expect("store metadata");
         let qualified_subgraph = eval::qualify_path(&subgraph_path, &self.local_peer_id);
         self.location_index.set(&qualified_subgraph, metadata_hash);
 
@@ -535,8 +612,11 @@ impl ComputeHandler {
             "result_path" => entity_ecf::text(&result_path),
             "subgraph_path" => entity_ecf::text(&subgraph_path)
         };
-        let result_entity = Entity::new("system/compute/install-result", entity_ecf::to_ecf(&result_data))
-            .expect("install result");
+        let result_entity = Entity::new(
+            "system/compute/install-result",
+            entity_ecf::to_ecf(&result_data),
+        )
+        .expect("install result");
 
         Ok(HandlerResult::ok(result_entity))
     }
@@ -678,7 +758,10 @@ pub fn dispatch_entity_native(
         None => {
             let err = make_error_entity(
                 "handler_expression_missing",
-                &format!("Expression entity missing in content store: {}", expression_path),
+                &format!(
+                    "Expression entity missing in content store: {}",
+                    expression_path
+                ),
             );
             return Ok(HandlerResult::error(STATUS_NOT_FOUND, err));
         }
@@ -713,7 +796,11 @@ pub fn dispatch_entity_native(
     );
     scope.set(
         "caller_capability".to_string(),
-        match ctx.caller_capability.as_ref().and_then(|c| c.to_entity().ok()) {
+        match ctx
+            .caller_capability
+            .as_ref()
+            .and_then(|c| c.to_entity().ok())
+        {
             Some(e) => ComputeValue::Entity(e),
             None => ComputeValue::Primitive(Value::Null),
         },
@@ -721,11 +808,7 @@ pub fn dispatch_entity_native(
 
     // §7.1 verified by the caller; budget is constrained by the handler grant
     // (its compute constraints, if any) plus request bounds.
-    let mut budget = init_budget(
-        None,
-        ctx.matching_grant.as_ref(),
-        ctx.bounds.as_ref(),
-    );
+    let mut budget = init_budget(None, ctx.matching_grant.as_ref(), ctx.bounds.as_ref());
 
     let dispatch_execute = build_dispatch_execute(ctx, local_peer_id, Arc::clone(&content_store));
 
@@ -770,10 +853,7 @@ fn resource_target_to_entity(rt: &entity_capability::ResourceTarget) -> Entity {
 ///   any other entity → 200, pass-through
 ///   primitive → 200, wrapped as `{type: output_type, data: <cbor of primitive>}`
 ///   closure → 400 (closures have no wire representation; expression author error)
-fn unwrap_native_dispatch_result(
-    value: ComputeValue,
-    output_type: Option<&str>,
-) -> HandlerResult {
+fn unwrap_native_dispatch_result(value: ComputeValue, output_type: Option<&str>) -> HandlerResult {
     match value {
         ComputeValue::Error(err) => HandlerResult::ok(err.to_entity()),
         ComputeValue::Entity(e) => {
@@ -868,9 +948,7 @@ pub fn init_budget(
     Budget::new(operations, cap_depth)
 }
 
-fn extract_compute_constraints(
-    grant: Option<&entity_capability::GrantEntry>,
-) -> (u64, u64) {
+fn extract_compute_constraints(grant: Option<&entity_capability::GrantEntry>) -> (u64, u64) {
     let grant = match grant {
         Some(g) => g,
         None => return (PEER_DEFAULT_MAX_OPS, PEER_DEFAULT_MAX_DEPTH),
@@ -977,11 +1055,8 @@ fn build_dispatch_execute<'a>(
                     }
                     unwrap_handler_result(&handler_result)
                 }
-                Err(e) => ComputeError::InvalidExpression(format!(
-                    "Handler dispatch error: {}",
-                    e
-                ))
-                .to_value(),
+                Err(e) => ComputeError::InvalidExpression(format!("Handler dispatch error: {}", e))
+                    .to_value(),
             }
         }
 
@@ -989,10 +1064,8 @@ fn build_dispatch_execute<'a>(
         {
             let _ = (qualified_path, options, params, operation, &exec_fn);
             let _ = &content_store;
-            ComputeError::InvalidExpression(
-                "Handler dispatch not available in WASM context".into(),
-            )
-            .to_value()
+            ComputeError::InvalidExpression("Handler dispatch not available in WASM context".into())
+                .to_value()
         }
     };
 
@@ -1043,12 +1116,10 @@ mod entity_native_tests {
     }
 
     fn make_handler_entity(expression_path: Option<&str>) -> Entity {
-        let mut fields = vec![
-            (
-                Value::Text("interface".into()),
-                entity_ecf::text("system/handler/app/echo"),
-            ),
-        ];
+        let mut fields = vec![(
+            Value::Text("interface".into()),
+            entity_ecf::text("system/handler/app/echo"),
+        )];
         if let Some(p) = expression_path {
             fields.push((Value::Text("expression_path".into()), entity_ecf::text(p)));
         }
@@ -1063,7 +1134,10 @@ mod entity_native_tests {
     #[test]
     fn test_extract_expression_path_present() {
         let h = make_handler_entity(Some("app/echo/expr"));
-        assert_eq!(extract_expression_path(&h), Some("app/echo/expr".to_string()));
+        assert_eq!(
+            extract_expression_path(&h),
+            Some("app/echo/expr".to_string())
+        );
     }
 
     #[test]
@@ -1204,9 +1278,8 @@ mod entity_native_tests {
         let grant = wildcard_grant();
         let ctx = make_handler_context("run");
 
-        let result =
-            dispatch_entity_native("app/echo/expr", &grant, cs, li, TEST_PID, &ctx, None)
-                .expect("dispatch ok");
+        let result = dispatch_entity_native("app/echo/expr", &grant, cs, li, TEST_PID, &ctx, None)
+            .expect("dispatch ok");
         assert_eq!(result.status, STATUS_BAD_REQUEST);
         // Transport failure → substrate `system/protocol/error` (not the
         // `compute/error` value type), so callers extract `code` uniformly.
@@ -1261,9 +1334,8 @@ mod entity_native_tests {
         let grant = wildcard_grant();
         let ctx = make_handler_context("run");
 
-        let result =
-            dispatch_entity_native("app/echo/expr", &grant, cs, li, TEST_PID, &ctx, None)
-                .expect("dispatch ok");
+        let result = dispatch_entity_native("app/echo/expr", &grant, cs, li, TEST_PID, &ctx, None)
+            .expect("dispatch ok");
         assert_eq!(result.status, 200);
         assert_eq!(result.result.entity_type, "primitive/any");
         let v: ciborium::Value =
@@ -1283,14 +1355,20 @@ mod entity_native_tests {
         let arr_data = entity_ecf::cbor_map! {
             "value" => Value::Array(vec![entity_ecf::integer(1)])
         };
-        let arr_h = cs.put(Entity::new(TYPE_LITERAL, entity_ecf::to_ecf(&arr_data)).unwrap()).unwrap();
+        let arr_h = cs
+            .put(Entity::new(TYPE_LITERAL, entity_ecf::to_ecf(&arr_data)).unwrap())
+            .unwrap();
         let idx_data = entity_ecf::cbor_map! { "value" => entity_ecf::integer(-1) };
-        let idx_h = cs.put(Entity::new(TYPE_LITERAL, entity_ecf::to_ecf(&idx_data)).unwrap()).unwrap();
+        let idx_h = cs
+            .put(Entity::new(TYPE_LITERAL, entity_ecf::to_ecf(&idx_data)).unwrap())
+            .unwrap();
         let index_data = entity_ecf::cbor_map! {
             "array" => Value::Bytes(arr_h.to_bytes().to_vec()),
             "index" => Value::Bytes(idx_h.to_bytes().to_vec())
         };
-        let index_h = cs.put(Entity::new(TYPE_INDEX, entity_ecf::to_ecf(&index_data)).unwrap()).unwrap();
+        let index_h = cs
+            .put(Entity::new(TYPE_INDEX, entity_ecf::to_ecf(&index_data)).unwrap())
+            .unwrap();
 
         let expr_path = format!("/{}/app/work/expr", TEST_PID);
         li.set(&expr_path, index_h);
@@ -1303,7 +1381,10 @@ mod entity_native_tests {
         });
 
         let result = handler.handle_eval(&ctx).expect("handle_eval ok");
-        assert_eq!(result.status, 200, "evaluated compute/error must surface at 200");
+        assert_eq!(
+            result.status, 200,
+            "evaluated compute/error must surface at 200"
+        );
         assert_eq!(result.result.entity_type, TYPE_ERROR);
         let data: ciborium::Value =
             ciborium::from_reader(result.result.data.as_slice()).expect("decode error");
@@ -1347,10 +1428,12 @@ mod entity_native_tests {
         let grant = wildcard_grant();
         let ctx = make_handler_context("run");
 
-        let result =
-            dispatch_entity_native("app/echo/expr", &grant, cs, li, TEST_PID, &ctx, None)
-                .expect("dispatch ok");
-        assert_eq!(result.status, 200, "evaluated compute/error must surface at 200");
+        let result = dispatch_entity_native("app/echo/expr", &grant, cs, li, TEST_PID, &ctx, None)
+            .expect("dispatch ok");
+        assert_eq!(
+            result.status, 200,
+            "evaluated compute/error must surface at 200"
+        );
         assert_eq!(result.result.entity_type, TYPE_ERROR);
         let data: ciborium::Value =
             ciborium::from_reader(result.result.data.as_slice()).expect("decode error");
@@ -1402,7 +1485,7 @@ mod entity_native_tests {
             grants: vec![entity_capability::GrantEntry {
                 handlers: entity_capability::PathScope::new(vec!["system/compute".into()]),
                 resources: entity_capability::PathScope::new(vec![
-                    "app/work/restricted-eval".into(),
+                    "app/work/restricted-eval".into()
                 ]),
                 operations: entity_capability::IdScope::new(vec!["eval".into()]),
                 peers: None,

@@ -246,8 +246,7 @@ pub const TYPE_IDENTITY_PEER_CONFIG: &str = "system/identity/peer-config";
 pub const TYPE_IDENTITY_IDENTITY_BINDING: &str = "system/identity/identity-binding";
 pub const TYPE_IDENTITY_CONFIGURE_REQUEST: &str = "system/identity/configure-request";
 pub const TYPE_IDENTITY_CONFIGURE_RESULT: &str = "system/identity/configure-result";
-pub const TYPE_IDENTITY_CREATE_QUORUM_REQUEST: &str =
-    "system/identity/create-quorum-request";
+pub const TYPE_IDENTITY_CREATE_QUORUM_REQUEST: &str = "system/identity/create-quorum-request";
 pub const TYPE_IDENTITY_CREATE_QUORUM_RESULT: &str = "system/identity/create-quorum-result";
 pub const TYPE_IDENTITY_CREATE_ATTESTATION_REQUEST: &str =
     "system/identity/create-attestation-request";
@@ -372,7 +371,7 @@ pub const CONTENT_CHUNKING_FASTCDC: u64 = 1;
 /// blob's chunk_size, not local default) makes mixed-version
 /// deployments safe — peers running this 1 MiB default exchange
 /// content with peers still on 4 MiB without spurious rewrites.
-pub const CONTENT_DEFAULT_CHUNK_SIZE: u64 = 1 * 1024 * 1024;
+pub const CONTENT_DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024;
 /// EXTENSION-CONTENT §10.1 `MIN_CHUNK_SIZE` (64 KiB). Also the §4.3
 /// inline-include threshold.
 pub const CONTENT_MIN_CHUNK_SIZE: u64 = 64 * 1024;
@@ -427,10 +426,7 @@ impl TypeDefinition {
 
     /// ECF-encode this definition and wrap it as a `system/type` entity.
     pub fn to_entity(&self) -> Result<Entity, TypesError> {
-        let mut map_entries = vec![(
-            entity_ecf::text("name"),
-            entity_ecf::text(&self.name),
-        )];
+        let mut map_entries = vec![(entity_ecf::text("name"), entity_ecf::text(&self.name))];
 
         if let Some(ref extends) = self.extends {
             map_entries.push((entity_ecf::text("extends"), entity_ecf::text(extends)));
@@ -449,8 +445,7 @@ impl TypeDefinition {
         }
 
         if !self.layout.is_empty() {
-            let arr: Vec<entity_ecf::Value> =
-                self.layout.iter().map(entity_ecf::text).collect();
+            let arr: Vec<entity_ecf::Value> = self.layout.iter().map(entity_ecf::text).collect();
             map_entries.push((entity_ecf::text("layout"), entity_ecf::array(arr)));
         }
 
@@ -510,10 +505,7 @@ impl ConstraintRef {
     fn to_value(&self) -> entity_ecf::Value {
         let hash = self.content_hash();
         entity_ecf::Value::Map(vec![
-            (
-                entity_ecf::text("data"),
-                self.data.clone(),
-            ),
+            (entity_ecf::text("data"), self.data.clone()),
             (
                 entity_ecf::text("type"),
                 entity_ecf::text(&self.constraint_type),
@@ -716,10 +708,7 @@ impl FieldSpec {
             entries.push((entity_ecf::text("map_of"), mo.to_value()));
         }
         if self.optional {
-            entries.push((
-                entity_ecf::text("optional"),
-                entity_ecf::bool_val(true),
-            ));
+            entries.push((entity_ecf::text("optional"), entity_ecf::bool_val(true)));
         }
         if let Some(ref tr) = self.type_ref {
             entries.push((entity_ecf::text("type_ref"), entity_ecf::text(tr)));
@@ -826,9 +815,8 @@ impl PeerData {
                 actual: entity.entity_type.clone(),
             });
         }
-        let value: ciborium::Value =
-            ciborium::from_reader(entity.data.as_slice())
-                .map_err(|e| TypesError::DecodeError(e.to_string()))?;
+        let value: ciborium::Value = ciborium::from_reader(entity.data.as_slice())
+            .map_err(|e| TypesError::DecodeError(e.to_string()))?;
         let map = value
             .as_map()
             .ok_or_else(|| TypesError::DecodeError("expected CBOR map".into()))?;
@@ -847,15 +835,17 @@ impl PeerData {
         Ok(Self {
             public_key: public_key
                 .ok_or_else(|| TypesError::DecodeError("missing public_key".into()))?,
-            key_type: key_type
-                .ok_or_else(|| TypesError::DecodeError("missing key_type".into()))?,
+            key_type: key_type.ok_or_else(|| TypesError::DecodeError("missing key_type".into()))?,
         })
     }
 
     /// Encode to an entity — V7 §3.5 v7.65 canonical shape.
     pub fn to_entity(&self) -> Result<Entity, TypesError> {
         let value = entity_ecf::Value::Map(vec![
-            (entity_ecf::text("key_type"), entity_ecf::text(&self.key_type)),
+            (
+                entity_ecf::text("key_type"),
+                entity_ecf::text(&self.key_type),
+            ),
             (
                 entity_ecf::text("public_key"),
                 entity_ecf::Value::Bytes(self.public_key.clone()),
@@ -924,9 +914,8 @@ impl SignatureData {
                 actual: entity.entity_type.clone(),
             });
         }
-        let value: ciborium::Value =
-            ciborium::from_reader(entity.data.as_slice())
-                .map_err(|e| TypesError::DecodeError(e.to_string()))?;
+        let value: ciborium::Value = ciborium::from_reader(entity.data.as_slice())
+            .map_err(|e| TypesError::DecodeError(e.to_string()))?;
         let map = value
             .as_map()
             .ok_or_else(|| TypesError::DecodeError("expected CBOR map".into()))?;
@@ -961,10 +950,8 @@ impl SignatureData {
         }
 
         Ok(Self {
-            target: target
-                .ok_or_else(|| TypesError::DecodeError("missing target".into()))?,
-            signer: signer
-                .ok_or_else(|| TypesError::DecodeError("missing signer".into()))?,
+            target: target.ok_or_else(|| TypesError::DecodeError("missing target".into()))?,
+            signer: signer.ok_or_else(|| TypesError::DecodeError("missing signer".into()))?,
             algorithm: algorithm
                 .ok_or_else(|| TypesError::DecodeError("missing algorithm".into()))?,
             signature: signature
@@ -1076,8 +1063,7 @@ impl PublishedRootData {
         }
 
         Ok(Self {
-            peer_id: peer_id
-                .ok_or_else(|| TypesError::DecodeError("missing peer_id".into()))?,
+            peer_id: peer_id.ok_or_else(|| TypesError::DecodeError("missing peer_id".into()))?,
             root_hash: root_hash
                 .ok_or_else(|| TypesError::DecodeError("missing root_hash".into()))?,
             seq: seq.ok_or_else(|| TypesError::DecodeError("missing seq".into()))?,
@@ -1111,8 +1097,7 @@ impl PublishedRootData {
             ));
         }
         let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(entries));
-        Entity::new(TYPE_PUBLISHED_ROOT, data)
-            .map_err(|e| TypesError::EntityError(e.to_string()))
+        Entity::new(TYPE_PUBLISHED_ROOT, data).map_err(|e| TypesError::EntityError(e.to_string()))
     }
 }
 
@@ -1219,7 +1204,10 @@ mod tests {
         fields.insert("age".into(), FieldSpec::optional("primitive/uint"));
         let td = TypeDefinition::with_fields("test/person", fields);
         assert_eq!(td.fields.len(), 2);
-        assert!(td.layout.is_empty(), "layout should be empty unless explicitly set");
+        assert!(
+            td.layout.is_empty(),
+            "layout should be empty unless explicitly set"
+        );
     }
 
     #[test]
@@ -1346,7 +1334,10 @@ mod tests {
     fn test_peer_data_decodes_legacy_v7_64_shape() {
         let legacy = entity_ecf::Value::Map(vec![
             (entity_ecf::text("key_type"), entity_ecf::text("ed25519")),
-            (entity_ecf::text("peer_id"), entity_ecf::text("legacy-form-pid")),
+            (
+                entity_ecf::text("peer_id"),
+                entity_ecf::text("legacy-form-pid"),
+            ),
             (
                 entity_ecf::text("public_key"),
                 entity_ecf::Value::Bytes(vec![9, 8, 7]),
@@ -1466,8 +1457,7 @@ mod tests {
             predecessor: None,
         };
         let entity = pr.to_entity().unwrap();
-        let value: ciborium::Value =
-            ciborium::from_reader(entity.data.as_slice()).unwrap();
+        let value: ciborium::Value = ciborium::from_reader(entity.data.as_slice()).unwrap();
         let keys: Vec<&str> = value
             .as_map()
             .unwrap()

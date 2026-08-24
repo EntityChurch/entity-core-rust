@@ -27,8 +27,7 @@ pub fn expand(input: &str, binding: &dyn PeerBinding) -> Result<String, String> 
     if alias.is_empty() {
         return Err("expected @<alias>... after '@'".into());
     }
-    let pid =
-        lookup(alias, binding).ok_or_else(|| format!("unknown peer alias: @{}", alias))?;
+    let pid = lookup(alias, binding).ok_or_else(|| format!("unknown peer alias: @{}", alias))?;
     let suffix_norm = if suffix.is_empty() { "/" } else { suffix };
     Ok(format!("/{}{}", pid, suffix_norm))
 }
@@ -118,10 +117,18 @@ mod tests {
     }
 
     impl PeerBinding for StubBinding {
-        fn peer_id(&self) -> &str { &self.bound }
-        fn primary_peer_id(&self) -> String { self.primary.clone() }
-        fn peer_ids(&self) -> Vec<String> { self.peers.clone() }
-        fn connected_peers(&self) -> Vec<String> { self.remotes.clone() }
+        fn peer_id(&self) -> &str {
+            &self.bound
+        }
+        fn primary_peer_id(&self) -> String {
+            self.primary.clone()
+        }
+        fn peer_ids(&self) -> Vec<String> {
+            self.peers.clone()
+        }
+        fn connected_peers(&self) -> Vec<String> {
+            self.remotes.clone()
+        }
         fn peer_label(&self, pid: &str) -> Option<String> {
             self.labels.get(pid).cloned()
         }

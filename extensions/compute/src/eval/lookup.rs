@@ -46,10 +46,8 @@ pub(super) fn eval_lookup_tree(
         Some(p) => p,
         None => {
             return EvalResult::Value(
-                ComputeError::InvalidExpression(
-                    "compute/lookup/tree missing 'path' field".into(),
-                )
-                .to_value(),
+                ComputeError::InvalidExpression("compute/lookup/tree missing 'path' field".into())
+                    .to_value(),
             )
         }
     };
@@ -144,10 +142,8 @@ pub(super) fn eval_lookup_hash(
         Some(h) => h,
         None => {
             return EvalResult::Value(
-                ComputeError::InvalidExpression(
-                    "compute/lookup/hash missing 'hash' field".into(),
-                )
-                .to_value(),
+                ComputeError::InvalidExpression("compute/lookup/hash missing 'hash' field".into())
+                    .to_value(),
             )
         }
     };

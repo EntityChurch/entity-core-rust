@@ -121,7 +121,12 @@ fn peer_pattern_1_canonical_form_match() {
     // The peers IdScope and the resources path both use canonical form;
     // runtime peer_id is the same canonical string.
     assert!(
-        grant.peers.as_ref().unwrap().include.contains(&canonical_pid),
+        grant
+            .peers
+            .as_ref()
+            .unwrap()
+            .include
+            .contains(&canonical_pid),
         "canonical pattern includes canonical runtime peer_id"
     );
 }
@@ -199,8 +204,7 @@ fn peer_mut_2_unknown_peer_no_auto_correlation() {
     let kp_bob = Keypair::from_seed(SEED_B);
 
     let alice_pid = PeerId::from_public_key(&kp_alice.public_key_bytes());
-    let bob_sha256_pid =
-        build_legacy_sha256_peer_id(&kp_bob.public_key_bytes());
+    let bob_sha256_pid = build_legacy_sha256_peer_id(&kp_bob.public_key_bytes());
 
     // Pre-handshake, only the wire strings are visible. Decoding gives
     // raw digest bytes — no way to derive Bob's pubkey from his
@@ -222,7 +226,10 @@ fn peer_mut_2_unknown_peer_no_auto_correlation() {
     // is the ONLY structural cross-form bridge (and only for identity-
     // multihash form).
     let (alice_recovered, _kt) = alice_pid.derive_public_key().unwrap();
-    assert_eq!(alice_recovered.as_slice(), kp_alice.public_key_bytes().as_slice());
+    assert_eq!(
+        alice_recovered.as_slice(),
+        kp_alice.public_key_bytes().as_slice()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -249,8 +256,7 @@ fn composition_1_interleaved_v7_64_and_v7_65_entities_decode() {
             ecf::Value::Bytes(kp_legacy.public_key_bytes().to_vec()),
         ),
     ]);
-    let legacy_entity =
-        Entity::new(TYPE_PEER, ecf::to_ecf(&legacy_data_value)).unwrap();
+    let legacy_entity = Entity::new(TYPE_PEER, ecf::to_ecf(&legacy_data_value)).unwrap();
     let legacy_hash: Hash = legacy_entity.content_hash;
 
     // v7.65-shape entity: data is {key_type, public_key}.

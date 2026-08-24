@@ -3,6 +3,13 @@
 //! An Entity is the fundamental unit of data: `{type, data}` with a content hash.
 //! An Envelope wraps an entity with included entities (signatures, identities, capabilities).
 
+// Same rationale as entity-hash's crate-level allow: `EntityError`
+// embeds `HashMismatch { expected: Hash, actual: Hash }` (two 64-byte
+// inline-buffer `Copy` values, ≥132 bytes), over clippy's 128-byte
+// `result_large_err` threshold. Cold error path; boxing would churn
+// every constructor for no runtime win.
+#![allow(clippy::result_large_err)]
+
 use std::collections::BTreeMap;
 
 use entity_hash::Hash;
@@ -80,7 +87,9 @@ impl Entity {
         format_code: u8,
     ) -> Result<Self, EntityError> {
         if entity_type.is_empty() {
-            return Err(EntityError::InvalidType("entity type cannot be empty".into()));
+            return Err(EntityError::InvalidType(
+                "entity type cannot be empty".into(),
+            ));
         }
         if data.is_empty() {
             return Err(EntityError::MissingField("data".into()));
@@ -258,9 +267,9 @@ impl EntityUri {
     ///
     /// Format: `entity://<peer_id>/<path>` or `entity://<peer_id>`.
     pub fn parse(s: &str) -> Result<Self, EntityError> {
-        let rest = s.strip_prefix(URI_SCHEME).ok_or_else(|| {
-            EntityError::InvalidUri(format!("expected '{}' prefix", URI_SCHEME))
-        })?;
+        let rest = s
+            .strip_prefix(URI_SCHEME)
+            .ok_or_else(|| EntityError::InvalidUri(format!("expected '{}' prefix", URI_SCHEME)))?;
         match rest.find('/') {
             Some(idx) => Ok(Self {
                 peer_id: rest[..idx].to_string(),
@@ -744,8 +753,10 @@ mod tests {
         assert!(!EntityUri::is_peer_id("system"));
         assert!(!EntityUri::is_peer_id("short"));
         assert!(!EntityUri::is_peer_id("")); // too short
-        // 46 chars with invalid Base58 char (0, O, I, l)
-        assert!(!EntityUri::is_peer_id("0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"));
+                                             // 46 chars with invalid Base58 char (0, O, I, l)
+        assert!(!EntityUri::is_peer_id(
+            "0AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        ));
     }
 
     // --- qualify_path tests ---
@@ -800,7 +811,10 @@ mod tests {
     fn test_qualify_path_absolute_peer_wildcard() {
         let pid = entity_crypto::Keypair::from_seed([42u8; 32]).peer_id();
         let result = EntityUri::qualify_path("/*/system/tree", pid.as_str());
-        assert_eq!(result, "/*/system/tree", "absolute peer wildcard passes through");
+        assert_eq!(
+            result, "/*/system/tree",
+            "absolute peer wildcard passes through"
+        );
     }
 
     #[test]
@@ -849,12 +863,18 @@ mod tests {
 
     #[test]
     fn test_clean_path_collapse_double_slash() {
-        assert_eq!(EntityUri::clean_path("/peer//system/tree"), "/peer/system/tree");
+        assert_eq!(
+            EntityUri::clean_path("/peer//system/tree"),
+            "/peer/system/tree"
+        );
     }
 
     #[test]
     fn test_clean_path_preserve_leading_slash() {
-        assert_eq!(EntityUri::clean_path("/peer/system/tree"), "/peer/system/tree");
+        assert_eq!(
+            EntityUri::clean_path("/peer/system/tree"),
+            "/peer/system/tree"
+        );
     }
 
     #[test]
@@ -890,7 +910,10 @@ mod tests {
     #[test]
     fn test_clean_path_dot_segments_ok() {
         // Segments starting with . are fine — only ./ and ../ at start are reserved
-        assert_eq!(EntityUri::clean_path("/peer/.hidden/config"), "/peer/.hidden/config");
+        assert_eq!(
+            EntityUri::clean_path("/peer/.hidden/config"),
+            "/peer/.hidden/config"
+        );
     }
 
     // --- is_absolute tests ---

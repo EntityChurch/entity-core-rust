@@ -31,6 +31,5 @@ pub use closure::{at_peer, ensure_closure, EnsureClosureError, GET_BATCH_SIZE};
 pub use handler::SystemContentHandler;
 pub use miss_hook::{MissOutcome, MissResolver};
 pub use verify::{
-    blob_chunk_hashes, blob_chunk_size, reassemble, reassemble_stream, verify_content,
-    VerifyError,
+    blob_chunk_hashes, blob_chunk_size, reassemble, reassemble_stream, verify_content, VerifyError,
 };

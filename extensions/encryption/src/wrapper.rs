@@ -146,6 +146,9 @@ impl EncryptionPubkeyData {
     /// the recipient's *authored* hash under their home format
     /// (`ENC-ROUNDTRIP-FORMAT-1`); the sender MUST NOT re-derive it under a
     /// different format (§7.6).
+    // result_large_err: `HashError` inlines two 64-byte-buffer `Hash`
+    // values in its mismatch variant (see entity-hash's crate allow).
+    #[allow(clippy::result_large_err)]
     pub fn content_hash_format(&self, format: u8) -> Result<Hash, entity_hash::HashError> {
         let data = to_ecf(&self.to_ecf_value());
         Hash::compute_format(crate::types::TYPE_ENCRYPTION_PUBKEY, &data, format)

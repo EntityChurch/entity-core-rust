@@ -107,8 +107,14 @@ impl SnapshotNodeData {
             .collect();
 
         let value = entity_ecf::Value::Map(vec![
-            (entity_ecf::text("map"), entity_ecf::Value::Bytes(bitmap_bytes)),
-            (entity_ecf::text("data"), entity_ecf::Value::Array(data_array)),
+            (
+                entity_ecf::text("map"),
+                entity_ecf::Value::Bytes(bitmap_bytes),
+            ),
+            (
+                entity_ecf::text("data"),
+                entity_ecf::Value::Array(data_array),
+            ),
         ]);
         entity_ecf::to_ecf(&value)
     }
@@ -214,8 +220,8 @@ fn count_entries(store: &dyn ContentStore, node: &SnapshotNodeData) -> Result<us
         match entry {
             Entry::Bucket(b) => total += b.len(),
             Entry::Link(h) => {
-                let sub = load_trie_node(store, *h)
-                    .ok_or_else(|| "missing sub-node".to_string())?;
+                let sub =
+                    load_trie_node(store, *h).ok_or_else(|| "missing sub-node".to_string())?;
                 total += count_entries(store, &sub)?;
             }
         }
@@ -243,8 +249,8 @@ fn flatten_entries_into(
         match entry {
             Entry::Bucket(b) => out.extend(b.iter().cloned()),
             Entry::Link(h) => {
-                let sub = load_trie_node(store, *h)
-                    .ok_or_else(|| "missing sub-node".to_string())?;
+                let sub =
+                    load_trie_node(store, *h).ok_or_else(|| "missing sub-node".to_string())?;
                 flatten_entries_into(store, &sub, out)?;
             }
         }
@@ -327,7 +333,13 @@ pub fn trie_step(node: &SnapshotNodeData, relative_key: &str, level: usize) -> T
     match &node.data[idx] {
         Entry::Bucket(tuples) => tuples
             .iter()
-            .find_map(|(k, v)| if k == relative_key { Some(TrieStep::Found(*v)) } else { None })
+            .find_map(|(k, v)| {
+                if k == relative_key {
+                    Some(TrieStep::Found(*v))
+                } else {
+                    None
+                }
+            })
             .unwrap_or(TrieStep::Absent),
         Entry::Link(sub_hash) => TrieStep::Descend(*sub_hash),
     }
@@ -342,11 +354,7 @@ pub fn trie_step(node: &SnapshotNodeData, relative_key: &str, level: usize) -> T
 /// cryptographically — a host cannot inject a `path → hash` binding the
 /// publisher never committed to (PROPOSAL-PEER-MANIFEST §1.1 threat model).
 /// Returns `None` if the key is absent or any node along the path is missing.
-pub fn trie_get(
-    store: &dyn ContentStore,
-    root_hash: Hash,
-    relative_key: &str,
-) -> Option<Hash> {
+pub fn trie_get(store: &dyn ContentStore, root_hash: Hash, relative_key: &str) -> Option<Hash> {
     let mut node = load_trie_node(store, root_hash)?;
     let mut level = 0usize;
     loop {
@@ -433,8 +441,8 @@ fn put_at_node(
             }
         }
         Entry::Link(sub_hash) => {
-            let sub = load_trie_node(store, *sub_hash)
-                .ok_or_else(|| "missing sub-node".to_string())?;
+            let sub =
+                load_trie_node(store, *sub_hash).ok_or_else(|| "missing sub-node".to_string())?;
             let new_sub = put_at_node(store, &sub, hash_bytes, level + 1, key, value_hash)?;
             let new_sub_hash = store_trie_node(store, &new_sub)?;
             let mut new_data = node.data.clone();
@@ -493,8 +501,8 @@ fn remove_at_node(
             }
         }
         Entry::Link(sub_hash) => {
-            let sub = load_trie_node(store, *sub_hash)
-                .ok_or_else(|| "missing sub-node".to_string())?;
+            let sub =
+                load_trie_node(store, *sub_hash).ok_or_else(|| "missing sub-node".to_string())?;
             match remove_at_node(store, &sub, hash_bytes, level + 1, key, false)? {
                 RemoveOutcome::Unchanged => return Ok(RemoveOutcome::Unchanged),
                 RemoveOutcome::Modified(new_sub) => {
@@ -539,13 +547,9 @@ fn remove_at_node(
 }
 
 /// Create a trie node entity and store it in the content store.
-pub fn store_trie_node(
-    store: &dyn ContentStore,
-    node: &SnapshotNodeData,
-) -> Result<Hash, String> {
+pub fn store_trie_node(store: &dyn ContentStore, node: &SnapshotNodeData) -> Result<Hash, String> {
     let data = node.to_ecf_bytes();
-    let entity =
-        Entity::new(TYPE_TREE_SNAPSHOT_NODE, data).map_err(|e| e.to_string())?;
+    let entity = Entity::new(TYPE_TREE_SNAPSHOT_NODE, data).map_err(|e| e.to_string())?;
     store.put(entity).map_err(|e| e.to_string())
 }
 
@@ -820,7 +824,10 @@ mod tests {
             0x64, 0x64, 0x61, 0x74, 0x61, // text(4) "data"
             0x80, // array(0)
         ];
-        assert_eq!(bytes, expected, "empty-root node bytes diverge from §3.1 fixture");
+        assert_eq!(
+            bytes, expected,
+            "empty-root node bytes diverge from §3.1 fixture"
+        );
     }
 
     /// Conformance fixture #2: single binding at relative_key="" with
@@ -1058,7 +1065,7 @@ mod tests {
     #[test]
     fn test_trie_fuzz_put_remove_canonical_form() {
         use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash as _, Hasher};
+        use std::hash::Hash as _;
 
         // 32 keys is enough to push past BUCKET_SIZE=3 at level 0 and force
         // sub-node creation; covers collapse paths when keys are removed.
@@ -1073,7 +1080,9 @@ mod tests {
 
             let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
             let mut rand = || {
-                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 state
             };
 
@@ -1094,7 +1103,8 @@ mod tests {
             let built = build_trie(&store, &bindings).unwrap();
             let inc = incremental.unwrap();
             assert_eq!(
-                inc, built,
+                inc,
+                built,
                 "seed {} diverged: incremental {:?} vs build {:?} (size {})",
                 seed,
                 inc,

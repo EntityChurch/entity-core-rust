@@ -45,7 +45,12 @@ impl ResolutionLog {
         let max_seq = location_index
             .list(&prefix)
             .into_iter()
-            .filter_map(|e| e.path.rsplit('/').next().and_then(|s| s.parse::<u64>().ok()))
+            .filter_map(|e| {
+                e.path
+                    .rsplit('/')
+                    .next()
+                    .and_then(|s| s.parse::<u64>().ok())
+            })
             .max();
         let next = max_seq.map(|m| m + 1).unwrap_or(0);
         Self {

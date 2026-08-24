@@ -22,10 +22,7 @@ pub fn atomic_write(target: &Path, data: &[u8]) -> std::io::Result<()> {
     let dir = target.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "target has no parent")
     })?;
-    let basename = target
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("tmp");
+    let basename = target.file_name().and_then(|s| s.to_str()).unwrap_or("tmp");
 
     // Pick a unique sibling name; uniqueness is best-effort via pid+counter.
     // Collisions retry once.
@@ -38,7 +35,10 @@ pub fn atomic_write(target: &Path, data: &[u8]) -> std::io::Result<()> {
         Ok(f) => f,
         Err(_) => {
             tmp_path = dir.join(format!(".{basename}.{}.tmp", random_suffix()));
-            OpenOptions::new().write(true).create_new(true).open(&tmp_path)?
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?
         }
     };
 
@@ -99,10 +99,7 @@ where
     let dir = target.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "target has no parent")
     })?;
-    let basename = target
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("tmp");
+    let basename = target.file_name().and_then(|s| s.to_str()).unwrap_or("tmp");
 
     let mut tmp_path = dir.join(format!(".{basename}.{}.tmp", random_suffix()));
     let file_result = OpenOptions::new()
@@ -113,7 +110,10 @@ where
         Ok(f) => f,
         Err(_) => {
             tmp_path = dir.join(format!(".{basename}.{}.tmp", random_suffix()));
-            OpenOptions::new().write(true).create_new(true).open(&tmp_path)?
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp_path)?
         }
     };
 
@@ -146,4 +146,3 @@ fn random_suffix() -> u64 {
     // Mix in pid to reduce collision risk across processes.
     nanos ^ (std::process::id() as u64)
 }
-

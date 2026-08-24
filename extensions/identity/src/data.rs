@@ -5,7 +5,7 @@ use entity_capability::{decode_grant_entry, encode_grant_entry, GrantEntry};
 use entity_ecf::{text, to_ecf, Value};
 use entity_entity::Entity;
 use entity_hash::Hash;
-use entity_types::{TYPE_IDENTITY_PEER_CONFIG, TYPE_IDENTITY_IDENTITY_BINDING};
+use entity_types::{TYPE_IDENTITY_IDENTITY_BINDING, TYPE_IDENTITY_PEER_CONFIG};
 
 use crate::IdentityError;
 
@@ -51,7 +51,12 @@ impl PeerConfigData {
         if !self.bindings.is_empty() {
             fields.push((
                 text("bindings"),
-                Value::Array(self.bindings.iter().map(IdentityBindingData::to_value).collect()),
+                Value::Array(
+                    self.bindings
+                        .iter()
+                        .map(IdentityBindingData::to_value)
+                        .collect(),
+                ),
             ));
         }
         fields.push((
@@ -138,16 +143,20 @@ pub(crate) fn get_field<'a>(
     map: &'a [(ciborium::Value, ciborium::Value)],
     key: &str,
 ) -> Option<&'a ciborium::Value> {
-    map.iter()
-        .find_map(|(k, v)| if k.as_text() == Some(key) { Some(v) } else { None })
+    map.iter().find_map(|(k, v)| {
+        if k.as_text() == Some(key) {
+            Some(v)
+        } else {
+            None
+        }
+    })
 }
 
 pub(crate) fn field_hash(
     map: &[(ciborium::Value, ciborium::Value)],
     key: &str,
 ) -> Result<Hash, IdentityError> {
-    let v = get_field(map, key)
-        .ok_or_else(|| IdentityError::Decode(format!("missing {}", key)))?;
+    let v = get_field(map, key).ok_or_else(|| IdentityError::Decode(format!("missing {}", key)))?;
     let bytes = v
         .as_bytes()
         .ok_or_else(|| IdentityError::Decode(format!("{} must be bytes", key)))?;
@@ -175,8 +184,7 @@ pub(crate) fn field_hash_array(
     map: &[(ciborium::Value, ciborium::Value)],
     key: &str,
 ) -> Result<Vec<Hash>, IdentityError> {
-    let v = get_field(map, key)
-        .ok_or_else(|| IdentityError::Decode(format!("missing {}", key)))?;
+    let v = get_field(map, key).ok_or_else(|| IdentityError::Decode(format!("missing {}", key)))?;
     let arr = v
         .as_array()
         .ok_or_else(|| IdentityError::Decode(format!("{} must be array", key)))?;
@@ -194,14 +202,16 @@ pub(crate) fn field_u64(
     map: &[(ciborium::Value, ciborium::Value)],
     key: &str,
 ) -> Result<u64, IdentityError> {
-    let v = get_field(map, key)
-        .ok_or_else(|| IdentityError::Decode(format!("missing {}", key)))?;
+    let v = get_field(map, key).ok_or_else(|| IdentityError::Decode(format!("missing {}", key)))?;
     let i = v
         .as_integer()
         .ok_or_else(|| IdentityError::Decode(format!("{} must be integer", key)))?;
     let n: i128 = i.into();
     if n < 0 {
-        return Err(IdentityError::Decode(format!("{} must be non-negative", key)));
+        return Err(IdentityError::Decode(format!(
+            "{} must be non-negative",
+            key
+        )));
     }
     Ok(n as u64)
 }
@@ -218,7 +228,10 @@ pub(crate) fn field_u64_opt(
                 .ok_or_else(|| IdentityError::Decode(format!("{} must be integer", key)))?;
             let n: i128 = i.into();
             if n < 0 {
-                return Err(IdentityError::Decode(format!("{} must be non-negative", key)));
+                return Err(IdentityError::Decode(format!(
+                    "{} must be non-negative",
+                    key
+                )));
             }
             Ok(Some(n as u64))
         }

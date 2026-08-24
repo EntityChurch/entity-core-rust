@@ -81,7 +81,9 @@ impl<'a> ContinuationOps<'a> {
         let path = path.into();
         let typecheck = check_install_body_type(&body);
         let opts = path_resource_opts(path);
-        let fut = self.ctx.execute("system/continuation", "install", body, opts);
+        let fut = self
+            .ctx
+            .execute("system/continuation", "install", body, opts);
         async move {
             typecheck?;
             let result = fut.await?;
@@ -99,7 +101,9 @@ impl<'a> ContinuationOps<'a> {
         let path = path.into();
         let typecheck = check_install_body_type(&body);
         let opts = path_resource_opts(path);
-        let fut = self.ctx.execute("system/continuation", "install", body, opts);
+        let fut = self
+            .ctx
+            .execute("system/continuation", "install", body, opts);
         async move {
             typecheck?;
             let result = fut.await?;
@@ -124,15 +128,17 @@ impl<'a> ContinuationOps<'a> {
         &self,
         path: impl Into<String>,
         resolution: Option<Entity>,
-    ) -> impl std::future::Future<Output = Result<entity_handler::HandlerResult, SdkError>> + Send + 'static
-    {
+    ) -> impl std::future::Future<Output = Result<entity_handler::HandlerResult, SdkError>>
+           + Send
+           + 'static {
         let opts = path_resource_opts(path.into());
         let params = build_resume_params(resolution);
-        let fut = self.ctx.execute("system/continuation", "resume", params, opts);
+        let fut = self
+            .ctx
+            .execute("system/continuation", "resume", params, opts);
         async move {
             let result = fut.await?;
-            if let Some(err) =
-                SdkError::from_handler_result(&result, "system/continuation:resume")
+            if let Some(err) = SdkError::from_handler_result(&result, "system/continuation:resume")
             {
                 return Err(err);
             }
@@ -150,11 +156,12 @@ impl<'a> ContinuationOps<'a> {
     {
         let opts = path_resource_opts(path.into());
         let params = build_resume_params(resolution);
-        let fut = self.ctx.execute("system/continuation", "resume", params, opts);
+        let fut = self
+            .ctx
+            .execute("system/continuation", "resume", params, opts);
         async move {
             let result = fut.await?;
-            if let Some(err) =
-                SdkError::from_handler_result(&result, "system/continuation:resume")
+            if let Some(err) = SdkError::from_handler_result(&result, "system/continuation:resume")
             {
                 return Err(err);
             }
@@ -195,8 +202,8 @@ impl<'a> ContinuationOps<'a> {
         result_bytes: Vec<u8>,
         status: Option<u32>,
     ) -> impl std::future::Future<Output = Result<entity_handler::HandlerResult, SdkError>>
-    + Send
-    + 'static {
+           + Send
+           + 'static {
         let params = build_advance_params(result_bytes, status);
         let opts = path_resource_opts(path.into());
         let fut = self
@@ -235,12 +242,9 @@ impl<'a> ContinuationOps<'a> {
         path: impl Into<String>,
     ) -> impl std::future::Future<Output = Result<(), SdkError>> + Send + 'static {
         let opts = path_resource_opts(path.into());
-        let fut = self.ctx.execute(
-            "system/continuation",
-            "abandon",
-            empty_params(),
-            opts,
-        );
+        let fut = self
+            .ctx
+            .execute("system/continuation", "abandon", empty_params(), opts);
         async move {
             let result = fut.await?;
             check_2xx(&result, "abandon")
@@ -255,12 +259,9 @@ impl<'a> ContinuationOps<'a> {
         path: impl Into<String>,
     ) -> impl std::future::Future<Output = Result<(), SdkError>> + 'static {
         let opts = path_resource_opts(path.into());
-        let fut = self.ctx.execute(
-            "system/continuation",
-            "abandon",
-            empty_params(),
-            opts,
-        );
+        let fut = self
+            .ctx
+            .execute("system/continuation", "abandon", empty_params(), opts);
         async move {
             let result = fut.await?;
             check_2xx(&result, "abandon")
@@ -307,8 +308,7 @@ fn build_advance_params(result_bytes: Vec<u8>, status: Option<u32>) -> Entity {
     }
     // ECF sort: result, status (already sorted).
     let data = entity_ecf::to_ecf(&ciborium::Value::Map(fields));
-    Entity::new("primitive/any", data)
-        .expect("advance-params entity construction is infallible")
+    Entity::new("primitive/any", data).expect("advance-params entity construction is infallible")
 }
 
 /// Precheck the install body's entity_type. Per `EXTENSION-CONTINUATION`,
@@ -341,14 +341,10 @@ fn build_resume_params(resolution: Option<Entity>) -> Entity {
         )],
     };
     let data = entity_ecf::to_ecf(&ciborium::Value::Map(map));
-    Entity::new("primitive/any", data)
-        .expect("primitive/any entity construction is infallible")
+    Entity::new("primitive/any", data).expect("primitive/any entity construction is infallible")
 }
 
-fn check_2xx(
-    result: &entity_handler::HandlerResult,
-    op: &'static str,
-) -> Result<(), SdkError> {
+fn check_2xx(result: &entity_handler::HandlerResult, op: &'static str) -> Result<(), SdkError> {
     match SdkError::from_handler_result(result, format!("system/continuation:{op}")) {
         Some(err) => Err(err),
         None => Ok(()),
@@ -379,7 +375,11 @@ mod tests {
         let missing = format!("/{}/system/continuation/suspended/does-not-exist", pid);
 
         let result = ctx.continuation().abandon(missing).await;
-        assert!(result.is_err(), "expected Err for missing path, got {:?}", result);
+        assert!(
+            result.is_err(),
+            "expected Err for missing path, got {:?}",
+            result
+        );
     }
 
     /// Install with a body of the wrong entity_type is rejected at the
@@ -395,8 +395,7 @@ mod tests {
         // Body whose entity_type is not system/continuation*.
         // Use a non-empty CBOR-encoded payload to satisfy Entity::new
         // (it rejects empty data).
-        let placeholder_data =
-            entity_ecf::to_ecf(&ciborium::Value::Map(Vec::new()));
+        let placeholder_data = entity_ecf::to_ecf(&ciborium::Value::Map(Vec::new()));
         let bad_body = Entity::new("app/state/setting", placeholder_data).unwrap();
 
         let result = ctx.continuation().install(path, bad_body).await;
@@ -493,9 +492,8 @@ mod tests {
             result.status
         );
         // Decode the result body and verify `advanced: false`.
-        let val: ciborium::Value =
-            ciborium::de::from_reader(result.result.data.as_slice())
-                .expect("advancement-result is valid CBOR");
+        let val: ciborium::Value = ciborium::de::from_reader(result.result.data.as_slice())
+            .expect("advancement-result is valid CBOR");
         let map = val.as_map().expect("advancement-result is a map");
         let advanced = map
             .iter()

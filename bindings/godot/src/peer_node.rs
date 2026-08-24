@@ -765,8 +765,7 @@ impl EntityPeer {
                 let params_type = ctx.params.entity_type.clone();
                 let params_data = ctx.params.data.clone();
                 let pattern = pattern_for_body.clone();
-                let (resp_tx, resp_rx) =
-                    tokio::sync::oneshot::channel::<HandlerOutcome>();
+                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel::<HandlerOutcome>();
                 // Insert the oneshot tx so respond_to_handler can find it.
                 if let Ok(mut map) = pending.lock() {
                     map.insert(request_id, resp_tx);
@@ -804,12 +803,8 @@ impl EntityPeer {
                         }
                         Ok(HandlerOutcome::Err { kind, message }) => Err(match kind {
                             HandlerErrorKind::Internal => HandlerError::Internal(message),
-                            HandlerErrorKind::NotSupported => {
-                                HandlerError::NotSupported(message)
-                            }
-                            HandlerErrorKind::InvalidParams => {
-                                HandlerError::InvalidParams(message)
-                            }
+                            HandlerErrorKind::NotSupported => HandlerError::NotSupported(message),
+                            HandlerErrorKind::InvalidParams => HandlerError::InvalidParams(message),
                         }),
                         Err(_) => Err(HandlerError::Internal(
                             "response oneshot channel dropped".into(),
@@ -1207,15 +1202,13 @@ impl EntityPeer {
         // manager's handle.
         let runtime_ref = match std::mem::replace(&mut self.runtime, RuntimeRef::Unset) {
             RuntimeRef::Borrowed(h) => RuntimeRef::Borrowed(h),
-            RuntimeRef::Unset | RuntimeRef::Owned(_) => {
-                match tokio::runtime::Runtime::new() {
-                    Ok(rt) => RuntimeRef::Owned(rt),
-                    Err(e) => {
-                        godot_error!("EntityPeer: failed to create runtime: {}", e);
-                        return;
-                    }
+            RuntimeRef::Unset | RuntimeRef::Owned(_) => match tokio::runtime::Runtime::new() {
+                Ok(rt) => RuntimeRef::Owned(rt),
+                Err(e) => {
+                    godot_error!("EntityPeer: failed to create runtime: {}", e);
+                    return;
                 }
-            }
+            },
         };
         let handle = runtime_ref
             .handle()
@@ -1291,14 +1284,12 @@ impl EntityPeer {
                     stripped.to_string()
                 }
             };
-            match entity_peer::transport::MemoryListener::bind(
-                endpoint.clone(),
-                registry,
-            ) {
+            match entity_peer::transport::MemoryListener::bind(endpoint.clone(), registry) {
                 Ok(listener) => {
                     godot_print!(
                         "EntityPeer: listening on memory://{} as {}",
-                        endpoint, peer_id
+                        endpoint,
+                        peer_id
                     );
                     let shared_for_server = shared.clone();
                     handle.spawn(async move {
@@ -1525,11 +1516,7 @@ impl EntityPeer {
     /// toggle when the holder's cap is operator-class for the panel's
     /// target. Wraps `PeerContext::is_operator_class_for`.
     #[func]
-    fn is_operator_class_for(
-        &self,
-        cap_hash: PackedByteArray,
-        target_pattern: GString,
-    ) -> bool {
+    fn is_operator_class_for(&self, cap_hash: PackedByteArray, target_pattern: GString) -> bool {
         let Some(ctx) = self.ctx.as_ref() else {
             godot_error!("EntityPeer.is_operator_class_for: peer not started");
             return false;
@@ -1608,10 +1595,7 @@ impl EntityPeer {
         ) {
             Ok(leaf) => EntityData::from_entity(&leaf).to_variant(),
             Err(e) => {
-                godot_error!(
-                    "EntityPeer.mint_cross_peer_chain_capability: {}",
-                    e
-                );
+                godot_error!("EntityPeer.mint_cross_peer_chain_capability: {}", e);
                 Variant::nil()
             }
         }
@@ -2013,9 +1997,10 @@ impl EntityPeer {
 
         let _guard = runtime.enter();
         let prefix_str = prefix.to_string();
-        let queue = std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::VecDeque::<(String, Vec<u8>)>::new(),
-        ));
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<(
+            String,
+            Vec<u8>,
+        )>::new()));
         let queue_for_callback = queue.clone();
 
         let handle = ctx.store().on_prefix_change(prefix_str, move |event| {
@@ -2051,14 +2036,14 @@ impl EntityPeer {
         if !self.check_async_preconditions("execute_async") {
             return None;
         }
-        let params = match entity_entity::Entity::new(&params_type.to_string(), params_data.to_vec())
-        {
-            Ok(e) => e,
-            Err(e) => {
-                godot_error!("EntityPeer.execute_async: params creation failed: {}", e);
-                return None;
-            }
-        };
+        let params =
+            match entity_entity::Entity::new(&params_type.to_string(), params_data.to_vec()) {
+                Ok(e) => e,
+                Err(e) => {
+                    godot_error!("EntityPeer.execute_async: params creation failed: {}", e);
+                    return None;
+                }
+            };
         let (fut, slot) = PeerOpFuture::new_pending();
         let ctx = self.ctx.as_ref()?.clone();
         let rt = self.runtime.handle()?;
@@ -2110,19 +2095,17 @@ impl EntityPeer {
         if !self.check_async_preconditions("execute_async_with_capability") {
             return None;
         }
-        let params = match entity_entity::Entity::new(
-            &params_type.to_string(),
-            params_data.to_vec(),
-        ) {
-            Ok(e) => e,
-            Err(e) => {
-                godot_error!(
-                    "EntityPeer.execute_async_with_capability: params creation failed: {}",
-                    e
-                );
-                return None;
-            }
-        };
+        let params =
+            match entity_entity::Entity::new(&params_type.to_string(), params_data.to_vec()) {
+                Ok(e) => e,
+                Err(e) => {
+                    godot_error!(
+                        "EntityPeer.execute_async_with_capability: params creation failed: {}",
+                        e
+                    );
+                    return None;
+                }
+            };
         let cap_hash_bytes = capability_hash.to_vec();
         let cap_hash = match entity_hash::Hash::from_bytes(&cap_hash_bytes) {
             Ok(h) => h,
@@ -2227,19 +2210,17 @@ impl EntityPeer {
         if !self.check_async_preconditions("execute_async_with_options") {
             return None;
         }
-        let params = match entity_entity::Entity::new(
-            &params_type.to_string(),
-            params_data.to_vec(),
-        ) {
-            Ok(e) => e,
-            Err(e) => {
-                godot_error!(
-                    "EntityPeer.execute_async_with_options: params creation failed: {}",
-                    e
-                );
-                return None;
-            }
-        };
+        let params =
+            match entity_entity::Entity::new(&params_type.to_string(), params_data.to_vec()) {
+                Ok(e) => e,
+                Err(e) => {
+                    godot_error!(
+                        "EntityPeer.execute_async_with_options: params creation failed: {}",
+                        e
+                    );
+                    return None;
+                }
+            };
         let cap_hash_bytes = capability_hash.to_vec();
         let cap_hash = match entity_hash::Hash::from_bytes(&cap_hash_bytes) {
             Ok(h) => h,
@@ -2356,9 +2337,7 @@ impl EntityPeer {
         // Mirror sdk.rs::build_put_params: data must be decoded CBOR Value,
         // not Value::Bytes — handler re-encodes whatever Value it extracts;
         // sending Value::Bytes(raw) double-wraps and corrupts.
-        let data_value: entity_ecf::Value = match ciborium::from_reader(
-            entity.data.as_slice(),
-        ) {
+        let data_value: entity_ecf::Value = match ciborium::from_reader(entity.data.as_slice()) {
             Ok(v) => v,
             Err(e) => {
                 godot_error!(
@@ -2370,12 +2349,13 @@ impl EntityPeer {
             }
         };
         let entity_cbor = entity_ecf::Value::Map(vec![
-            (entity_ecf::text("type"), entity_ecf::text(&entity.entity_type)),
+            (
+                entity_ecf::text("type"),
+                entity_ecf::text(&entity.entity_type),
+            ),
             (entity_ecf::text("data"), data_value),
         ]);
-        let params_map = entity_ecf::Value::Map(vec![
-            (entity_ecf::text("entity"), entity_cbor),
-        ]);
+        let params_map = entity_ecf::Value::Map(vec![(entity_ecf::text("entity"), entity_cbor)]);
         let mut params_bytes = Vec::new();
         if let Err(e) = ciborium::into_writer(&params_map, &mut params_bytes) {
             godot_error!(
@@ -2429,7 +2409,10 @@ impl EntityPeer {
         let (fut, slot) = PeerOpFuture::new_pending();
         let rt = self.runtime.handle()?;
         rt.spawn(async move {
-            let raw = match ctx.execute(handler_uri, "put".to_string(), params, opts).await {
+            let raw = match ctx
+                .execute(handler_uri, "put".to_string(), params, opts)
+                .await
+            {
                 Ok(result) => OpResultRaw::Entity(Some(result.result)),
                 Err(e) => OpResultRaw::Err(e.to_string()),
             };
@@ -2469,7 +2452,10 @@ impl EntityPeer {
         let op_str = operation.to_string();
         let (tx, rx) = std::sync::mpsc::channel();
         handle.spawn(async move {
-            let result = ctx_clone.peer().execute(&handler_str, &op_str, params).await;
+            let result = ctx_clone
+                .peer()
+                .execute(&handler_str, &op_str, params)
+                .await;
             let _ = tx.send(result);
         });
         let result = rx
@@ -2885,7 +2871,12 @@ impl EntityPeer {
         let events = filters
             .get("events")
             .and_then(|v| v.try_to::<PackedStringArray>().ok())
-            .map(|arr| arr.to_vec().into_iter().map(|g| g.to_string()).collect::<Vec<_>>());
+            .map(|arr| {
+                arr.to_vec()
+                    .into_iter()
+                    .map(|g| g.to_string())
+                    .collect::<Vec<_>>()
+            });
         let options = entity_sdk::HistoryQueryOptions {
             limit,
             since,
@@ -2974,11 +2965,7 @@ impl EntityPeer {
     /// `author` / `timestamp` / `message` are NOT exposed — revision
     /// entries are structural-only.
     #[func]
-    fn revision_log_async(
-        &mut self,
-        prefix: GString,
-        branch: GString,
-    ) -> Option<Gd<PeerOpFuture>> {
+    fn revision_log_async(&mut self, prefix: GString, branch: GString) -> Option<Gd<PeerOpFuture>> {
         if !self.check_async_preconditions("revision_log_async") {
             return None;
         }
@@ -3292,9 +3279,10 @@ impl EntityPeer {
         let rt = self.runtime.handle()?;
         let prefix_owned = prefix.to_string();
 
-        let queue = std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::VecDeque::<(String, Vec<u8>)>::new(),
-        ));
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<(
+            String,
+            Vec<u8>,
+        )>::new()));
         let queue_for_cb = queue.clone();
 
         rt.spawn(async move {
@@ -3360,9 +3348,10 @@ impl EntityPeer {
         let rt = self.runtime.handle()?;
         let prefix_owned = prefix.to_string();
 
-        let queue = std::sync::Arc::new(std::sync::Mutex::new(
-            std::collections::VecDeque::<(String, Vec<u8>)>::new(),
-        ));
+        let queue = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<(
+            String,
+            Vec<u8>,
+        )>::new()));
         let queue_for_cb = queue.clone();
 
         rt.spawn(async move {
@@ -3420,7 +3409,11 @@ impl EntityPeer {
                 .filter_map(|i| events.get(i).map(|g| g.to_string()))
                 .collect()
         };
-        let max_depth_opt = if max_depth > 0 { Some(max_depth as u64) } else { None };
+        let max_depth_opt = if max_depth > 0 {
+            Some(max_depth as u64)
+        } else {
+            None
+        };
 
         let data = build_history_config_data(&pattern_s, true, &events_vec, max_depth_opt);
         let entity = match entity_entity::Entity::new(entity_types::TYPE_HISTORY_CONFIG, data) {
@@ -3495,11 +3488,7 @@ impl EntityPeer {
     /// produced a `compute/error`. Transport / 404 / 400 failures
     /// surface as `null` with a `godot_error!` log.
     #[func]
-    fn compute_eval_async(
-        &mut self,
-        expr_path: GString,
-        budget: i64,
-    ) -> Option<Gd<PeerOpFuture>> {
+    fn compute_eval_async(&mut self, expr_path: GString, budget: i64) -> Option<Gd<PeerOpFuture>> {
         if !self.check_async_preconditions("compute_eval_async") {
             return None;
         }
@@ -3508,7 +3497,11 @@ impl EntityPeer {
         let rt = self.runtime.handle()?;
         let path_owned = expr_path.to_string();
         let opts = entity_sdk::compute::EvalOptions {
-            budget: if budget > 0 { Some(budget as u64) } else { None },
+            budget: if budget > 0 {
+                Some(budget as u64)
+            } else {
+                None
+            },
         };
         rt.spawn(async move {
             let raw = match ctx.compute().eval(path_owned, opts).await {
@@ -3656,7 +3649,11 @@ impl EntityPeer {
         let opts = entity_sdk::identity_bootstrap::BootstrapOptions {
             quorum_threshold: if threshold > 0 { threshold as usize } else { 1 },
             additional_signers: vec![],
-            label: if label_s.is_empty() { None } else { Some(label_s) },
+            label: if label_s.is_empty() {
+                None
+            } else {
+                Some(label_s)
+            },
             properties: crate::bootstrap_ops::decode_string_properties(&properties),
             force,
         };
@@ -3932,7 +3929,8 @@ impl EntityPeer {
         let resolution = if resolution_type.is_empty() {
             None
         } else {
-            match entity_entity::Entity::new(&resolution_type.to_string(), resolution_data.to_vec()) {
+            match entity_entity::Entity::new(&resolution_type.to_string(), resolution_data.to_vec())
+            {
                 Ok(e) => Some(e),
                 Err(e) => {
                     godot_error!(
@@ -3979,7 +3977,11 @@ impl EntityPeer {
         let rt = self.runtime.handle()?;
         let path_owned = path.to_string();
         let bytes = result_bytes.to_vec();
-        let status_opt = if status > 0 { Some(status as u32) } else { None };
+        let status_opt = if status > 0 {
+            Some(status as u32)
+        } else {
+            None
+        };
         rt.spawn(async move {
             let raw = match ctx
                 .continuation()
@@ -4106,21 +4108,20 @@ impl EntityPeer {
         let ctx = self.ctx.as_ref()?.clone();
         let rt = self.runtime.handle()?;
         let target_owned = target_path.to_string();
-        let params = match entity_entity::Entity::new(
-            &entity_type.to_string(),
-            params_data.to_vec(),
-        ) {
-            Ok(e) => e,
-            Err(e) => {
-                godot_error!(
-                    "EntityPeer.inbox_send_async: entity creation failed: {}",
-                    e
-                );
-                return None;
-            }
-        };
+        let params =
+            match entity_entity::Entity::new(&entity_type.to_string(), params_data.to_vec()) {
+                Ok(e) => e,
+                Err(e) => {
+                    godot_error!("EntityPeer.inbox_send_async: entity creation failed: {}", e);
+                    return None;
+                }
+            };
         let rid_str = request_id.to_string();
-        let rid = if rid_str.is_empty() { None } else { Some(rid_str) };
+        let rid = if rid_str.is_empty() {
+            None
+        } else {
+            Some(rid_str)
+        };
         rt.spawn(async move {
             let raw = match ctx.inbox_send(target_owned, params, rid).await {
                 Ok(path) => OpResultRaw::InboxSend(path),
@@ -4230,7 +4231,11 @@ impl EntityPeer {
 
     /// Shared backend for the put-based config helpers (enable_*).
     /// Returns the future and registers it on `self.pending`.
-    fn spawn_put(&mut self, path: String, entity: entity_entity::Entity) -> Option<Gd<PeerOpFuture>> {
+    fn spawn_put(
+        &mut self,
+        path: String,
+        entity: entity_entity::Entity,
+    ) -> Option<Gd<PeerOpFuture>> {
         if !self.check_async_preconditions("enable_history/enable_revision") {
             return None;
         }
@@ -4280,10 +4285,7 @@ impl EntityPeer {
 /// tree for debuggability.
 /// Decode a `ClockValue` from a GDScript Dictionary tagged by `kind`.
 /// Returns a user-facing error string suitable for `godot_error!`.
-fn decode_clock_value(
-    dict: &VarDictionary,
-    label: &str,
-) -> Result<entity_sdk::ClockValue, String> {
+fn decode_clock_value(dict: &VarDictionary, label: &str) -> Result<entity_sdk::ClockValue, String> {
     let kind_v = dict
         .get("kind")
         .ok_or_else(|| format!("{}: missing `kind` field", label))?;
@@ -4386,10 +4388,7 @@ fn build_history_config_data(
         ),
     ];
     if let Some(d) = max_depth {
-        fields.push((
-            entity_ecf::text("max_depth"),
-            entity_ecf::integer(d as i64),
-        ));
+        fields.push((entity_ecf::text("max_depth"), entity_ecf::integer(d as i64)));
     }
     entity_ecf::to_ecf(&entity_ecf::Value::Map(fields))
 }
@@ -4412,41 +4411,63 @@ fn build_query_expression_entity(dict: &VarDictionary) -> Result<entity_entity::
     let mut fields: Vec<(entity_ecf::Value, entity_ecf::Value)> = Vec::new();
 
     if let Some(v) = dict.get("type_filter") {
-        let s = v.try_to::<GString>()
+        let s = v
+            .try_to::<GString>()
             .map_err(|e| format!("`type_filter` must be a String: {}", e))?;
-        fields.push((entity_ecf::text("type_filter"), entity_ecf::text(s.to_string())));
+        fields.push((
+            entity_ecf::text("type_filter"),
+            entity_ecf::text(s.to_string()),
+        ));
     }
     if let Some(v) = dict.get("ref_filter") {
-        let pba = v.try_to::<PackedByteArray>()
+        let pba = v
+            .try_to::<PackedByteArray>()
             .map_err(|e| format!("`ref_filter` must be a PackedByteArray: {}", e))?;
-        fields.push((entity_ecf::text("ref_filter"), entity_ecf::bytes(pba.to_vec())));
+        fields.push((
+            entity_ecf::text("ref_filter"),
+            entity_ecf::bytes(pba.to_vec()),
+        ));
     }
     if let Some(v) = dict.get("path_filter") {
-        let s = v.try_to::<GString>()
+        let s = v
+            .try_to::<GString>()
             .map_err(|e| format!("`path_filter` must be a String: {}", e))?;
-        fields.push((entity_ecf::text("path_filter"), entity_ecf::text(s.to_string())));
+        fields.push((
+            entity_ecf::text("path_filter"),
+            entity_ecf::text(s.to_string()),
+        ));
     }
     if let Some(v) = dict.get("path_prefix") {
-        let s = v.try_to::<GString>()
+        let s = v
+            .try_to::<GString>()
             .map_err(|e| format!("`path_prefix` must be a String: {}", e))?;
-        fields.push((entity_ecf::text("path_prefix"), entity_ecf::text(s.to_string())));
+        fields.push((
+            entity_ecf::text("path_prefix"),
+            entity_ecf::text(s.to_string()),
+        ));
     }
     if let Some(v) = dict.get("limit") {
-        let n = v.try_to::<i64>()
+        let n = v
+            .try_to::<i64>()
             .map_err(|e| format!("`limit` must be an int: {}", e))?;
         if n > 0 {
             fields.push((entity_ecf::text("limit"), entity_ecf::integer(n)));
         }
     }
     if let Some(v) = dict.get("cursor") {
-        let s = v.try_to::<GString>()
+        let s = v
+            .try_to::<GString>()
             .map_err(|e| format!("`cursor` must be a String: {}", e))?;
         fields.push((entity_ecf::text("cursor"), entity_ecf::text(s.to_string())));
     }
     if let Some(v) = dict.get("include_entities") {
-        let b = v.try_to::<bool>()
+        let b = v
+            .try_to::<bool>()
             .map_err(|e| format!("`include_entities` must be a bool: {}", e))?;
-        fields.push((entity_ecf::text("include_entities"), entity_ecf::bool_val(b)));
+        fields.push((
+            entity_ecf::text("include_entities"),
+            entity_ecf::bool_val(b),
+        ));
     }
 
     let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(fields));
@@ -4465,9 +4486,7 @@ fn build_query_expression_entity(dict: &VarDictionary) -> Result<entity_entity::
 ///
 /// constraints / allowances are v2 (extension fields with primitive/any
 /// values) — not surfaced in v1. Add when a consumer materializes.
-fn parse_grant_entries(
-    grants: &VarArray,
-) -> Result<Vec<entity_capability::GrantEntry>, String> {
+fn parse_grant_entries(grants: &VarArray) -> Result<Vec<entity_capability::GrantEntry>, String> {
     use entity_capability::{GrantEntry, IdScope, PathScope};
     if grants.is_empty() {
         return Err("grants array must be non-empty".into());
@@ -4630,9 +4649,7 @@ fn parse_subscribe_options(opts: &Dictionary) -> entity_sdk::subscription::Subsc
         if let Ok(b) = v.try_to::<bool>() {
             out.include_payload = b;
         } else {
-            godot_warn!(
-                "subscribe_l1_with_options: include_payload must be bool; ignoring"
-            );
+            godot_warn!("subscribe_l1_with_options: include_payload must be bool; ignoring");
         }
     }
 
@@ -4656,9 +4673,7 @@ fn parse_subscribe_options(opts: &Dictionary) -> entity_sdk::subscription::Subsc
             }
             out.events = Some(list);
         } else {
-            godot_warn!(
-                "subscribe_l1_with_options: events must be Array of String; ignoring"
-            );
+            godot_warn!("subscribe_l1_with_options: events must be Array of String; ignoring");
         }
     }
 
@@ -4735,7 +4750,14 @@ fn build_revision_log_params(prefix: &str) -> entity_entity::Entity {
 /// `extensions/revision/src/dag.rs:30`.
 fn decode_revision_log_result(
     result: &entity_entity::Entity,
-) -> Result<(String, Vec<crate::peer_op_future::RevisionVersionInfo>, bool), String> {
+) -> Result<
+    (
+        String,
+        Vec<crate::peer_op_future::RevisionVersionInfo>,
+        bool,
+    ),
+    String,
+> {
     use ciborium::Value as CV;
 
     let root_value: CV = ciborium::from_reader(result.data.as_slice())
@@ -4772,8 +4794,8 @@ fn decode_revision_log_result(
         }
     }
 
-    let root_data = root_entity_data
-        .ok_or_else(|| "revision log: envelope missing `root.data`".to_string())?;
+    let root_data =
+        root_entity_data.ok_or_else(|| "revision log: envelope missing `root.data`".to_string())?;
     let result_map = match &root_data {
         CV::Map(m) => m,
         _ => return Err("revision log: root.data is not a map".into()),
@@ -4919,14 +4941,14 @@ mod tests {
         // this test fails before GDScript callers see `peer_phase() == ""`.
         for phase_str in &["starting", "ready", "draining"] {
             let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-                (entity_ecf::text("last_phase_transition"), entity_ecf::integer(0)),
+                (
+                    entity_ecf::text("last_phase_transition"),
+                    entity_ecf::integer(0),
+                ),
                 (entity_ecf::text("phase"), entity_ecf::text(*phase_str)),
             ]));
-            let entity = entity_entity::Entity::new(
-                entity_types::TYPE_PEER_SELF_STATUS,
-                data,
-            )
-            .expect("status entity construction");
+            let entity = entity_entity::Entity::new(entity_types::TYPE_PEER_SELF_STATUS, data)
+                .expect("status entity construction");
             let decoded = decode_phase_from_status_entity(&entity);
             assert_eq!(decoded.as_deref(), Some(*phase_str));
         }
@@ -4940,8 +4962,7 @@ mod tests {
             entity_ecf::text("last_phase_transition"),
             entity_ecf::integer(0),
         )]));
-        let entity =
-            entity_entity::Entity::new(entity_types::TYPE_PEER_SELF_STATUS, data).unwrap();
+        let entity = entity_entity::Entity::new(entity_types::TYPE_PEER_SELF_STATUS, data).unwrap();
         assert!(decode_phase_from_status_entity(&entity).is_none());
     }
 

@@ -21,7 +21,9 @@ use entity_handler::{
 use entity_hash::Hash;
 use entity_store::{ContentStore, LocationIndex};
 
-use crate::data::{decode_map, field_hash, field_hash_opt, field_u64_opt, get_field, AttestationData};
+use crate::data::{
+    decode_map, field_hash, field_hash_opt, field_u64_opt, get_field, AttestationData,
+};
 use crate::helpers::{is_attestation_live, verify_attestation_signature, AttestationCtx};
 use crate::index::AttestationIndex;
 use crate::{AttestationError, KIND_REVOCATION};
@@ -89,7 +91,9 @@ impl AttestationHandler {
     }
 
     fn resource_path(&self, ctx: &HandlerContext) -> Option<String> {
-        ctx.resource_target.as_ref().and_then(|rt| rt.targets.first().cloned())
+        ctx.resource_target
+            .as_ref()
+            .and_then(|rt| rt.targets.first().cloned())
     }
 }
 
@@ -128,10 +132,7 @@ impl AttestationHandler {
     // §6.1 create
     // -------------------------------------------------------------------
 
-    async fn handle_create(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_create(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let resource = match self.resource_path(ctx) {
             Some(r) => r,
             None => {
@@ -209,10 +210,7 @@ impl AttestationHandler {
     // §6.2 supersede
     // -------------------------------------------------------------------
 
-    async fn handle_supersede(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_supersede(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let resource = match self.resource_path(ctx) {
             Some(r) => r,
             None => {
@@ -282,10 +280,7 @@ impl AttestationHandler {
     // §6.3 revoke (convenience wrapper)
     // -------------------------------------------------------------------
 
-    async fn handle_revoke(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_revoke(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let resource = match self.resource_path(ctx) {
             Some(r) => r,
             None => {
@@ -332,10 +327,7 @@ impl AttestationHandler {
     // §6.4 verify (orchestration helper)
     // -------------------------------------------------------------------
 
-    async fn handle_verify(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_verify(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let map = match decode_map(&ctx.params.data) {
             Ok(m) => m,
             Err(e) => return Ok(error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string())),
@@ -425,12 +417,14 @@ fn verify_result(valid: bool, reason: Option<&str>) -> HandlerResult {
     if let Some(r) = reason {
         fields.push((text("reason"), text(r)));
     }
-    let result = Entity::new(entity_types::TYPE_PROTOCOL_STATUS, to_ecf(&Value::Map(fields)))
-        .unwrap();
+    let result = Entity::new(
+        entity_types::TYPE_PROTOCOL_STATUS,
+        to_ecf(&Value::Map(fields)),
+    )
+    .unwrap();
     HandlerResult {
         status: STATUS_OK,
         result,
         included: HashMap::new(),
     }
 }
-

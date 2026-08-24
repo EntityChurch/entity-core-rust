@@ -261,10 +261,8 @@ impl PeerOpFuture {
         // fires would miss the signal. `result()` reads this cache so
         // late-arriving consumers still get the value.
         self.cached_result = Some(variant.clone());
-        self.base_mut().call_deferred(
-            "emit_signal",
-            &["completed".to_variant(), variant],
-        );
+        self.base_mut()
+            .call_deferred("emit_signal", &["completed".to_variant(), variant]);
         true
     }
 
@@ -285,10 +283,8 @@ impl PeerOpFuture {
         self.emitted = true;
         self.cached_result = Some(Variant::nil());
         godot_error!("PeerOpFuture failed: {}", msg);
-        self.base_mut().call_deferred(
-            "emit_signal",
-            &["completed".to_variant(), Variant::nil()],
-        );
+        self.base_mut()
+            .call_deferred("emit_signal", &["completed".to_variant(), Variant::nil()]);
     }
 }
 
@@ -362,9 +358,11 @@ fn raw_to_variant(raw: OpResultRaw) -> Variant {
         OpResultRaw::TypeList(list) => type_list_to_variant(list),
         OpResultRaw::HistoryQuery(r) => history_query_to_variant(r),
         OpResultRaw::HistoryRollback(h) => history_rollback_ok_to_variant(h),
-        OpResultRaw::RevisionLog { prefix, versions, has_more } => {
-            revision_log_to_variant(prefix, versions, has_more)
-        }
+        OpResultRaw::RevisionLog {
+            prefix,
+            versions,
+            has_more,
+        } => revision_log_to_variant(prefix, versions, has_more),
         OpResultRaw::RevisionCheckout {
             head,
             target_version,
@@ -408,7 +406,10 @@ fn query_results_to_variant(qr: entity_sdk::QueryResults) -> Variant {
         let mut hash_pba = PackedByteArray::new();
         hash_pba.extend(m.content_hash.to_bytes().iter().copied());
         md.set(GString::from("content_hash"), hash_pba);
-        md.set(GString::from("entity_type"), GString::from(m.entity_type.as_str()));
+        md.set(
+            GString::from("entity_type"),
+            GString::from(m.entity_type.as_str()),
+        );
         let entity_var = match m.entity {
             Some(ref e) => EntityData::from_entity(e).to_variant(),
             None => Variant::nil(),
@@ -549,7 +550,10 @@ fn connect_to_to_variant(r: Result<String, String>) -> Variant {
     match r {
         Ok(remote) => {
             out.set(GString::from("status"), GString::from("ok"));
-            out.set(GString::from("remote_peer_id"), GString::from(remote.as_str()));
+            out.set(
+                GString::from("remote_peer_id"),
+                GString::from(remote.as_str()),
+            );
         }
         Err(e) => {
             out.set(GString::from("status"), GString::from("error"));
@@ -624,7 +628,10 @@ fn revision_status_to_variant(r: entity_sdk::revision::RevisionStatus) -> Varian
 
 fn revision_config_to_variant(r: entity_sdk::revision::ConfigResult) -> Variant {
     let mut out = VarDictionary::new();
-    out.set(GString::from("config_path"), GString::from(r.config_path.as_str()));
+    out.set(
+        GString::from("config_path"),
+        GString::from(r.config_path.as_str()),
+    );
     match r.config_hash {
         Some(h) => out.set(GString::from("config_hash"), hash_to_pba(&h)),
         None => out.set(GString::from("config_hash"), Variant::nil()),
@@ -634,11 +641,17 @@ fn revision_config_to_variant(r: entity_sdk::revision::ConfigResult) -> Variant 
         None => out.set(GString::from("previous_hash"), Variant::nil()),
     }
     match r.tracking_config_path {
-        Some(p) => out.set(GString::from("tracking_config_path"), GString::from(p.as_str())),
+        Some(p) => out.set(
+            GString::from("tracking_config_path"),
+            GString::from(p.as_str()),
+        ),
         None => out.set(GString::from("tracking_config_path"), Variant::nil()),
     }
     match r.tracking_config_action {
-        Some(a) => out.set(GString::from("tracking_config_action"), GString::from(a.as_str())),
+        Some(a) => out.set(
+            GString::from("tracking_config_action"),
+            GString::from(a.as_str()),
+        ),
         None => out.set(GString::from("tracking_config_action"), Variant::nil()),
     }
     out.to_variant()
@@ -658,10 +671,7 @@ fn revision_merge_config_to_variant(r: entity_sdk::revision::MergeConfigResult) 
 fn handler_result_to_variant(r: entity_handler::HandlerResult) -> Variant {
     let mut out = VarDictionary::new();
     out.set(GString::from("status"), r.status as i64);
-    out.set(
-        GString::from("result"),
-        EntityData::from_entity(&r.result),
-    );
+    out.set(GString::from("result"), EntityData::from_entity(&r.result));
     out.to_variant()
 }
 
@@ -691,12 +701,18 @@ fn type_list_to_variant(list: Vec<entity_sdk::TypeInfo>) -> Variant {
     let mut out = VarArray::new();
     for t in list {
         let mut d = VarDictionary::new();
-        d.set(GString::from("type_path"), GString::from(t.type_path.as_str()));
+        d.set(
+            GString::from("type_path"),
+            GString::from(t.type_path.as_str()),
+        );
         let mut fields = VarArray::new();
         for f in t.fields {
             let mut fd = VarDictionary::new();
             fd.set(GString::from("name"), GString::from(f.name.as_str()));
-            fd.set(GString::from("type_ref"), GString::from(f.type_ref.as_str()));
+            fd.set(
+                GString::from("type_ref"),
+                GString::from(f.type_ref.as_str()),
+            );
             fd.set(GString::from("optional"), f.optional);
             fields.push(&fd.to_variant());
         }

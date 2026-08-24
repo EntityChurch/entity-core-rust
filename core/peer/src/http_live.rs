@@ -302,10 +302,7 @@ impl HttpLiveListener {
     /// [`Self::with_scope`]), `GET /content/{hex(H)}` returns 404 —
     /// serving is "enabled but no scope," which is a configuration
     /// bug at the operator level.
-    pub async fn bind_poll(
-        addr: &str,
-        poll_prefix: impl Into<String>,
-    ) -> Result<Self, PeerError> {
+    pub async fn bind_poll(addr: &str, poll_prefix: impl Into<String>) -> Result<Self, PeerError> {
         let prefix = normalize_prefix(poll_prefix.into());
         bind_inner(addr, None, Some(prefix)).await
     }
@@ -409,9 +406,11 @@ impl HttpLiveListener {
         let routes = Arc::new(self.routes);
         let sessions = self.sessions;
         loop {
-            let (stream, peer_addr) = self.inner.accept().await.map_err(|e| {
-                PeerError::ConnectionError(format!("http_live accept: {}", e))
-            })?;
+            let (stream, peer_addr) = self
+                .inner
+                .accept()
+                .await
+                .map_err(|e| PeerError::ConnectionError(format!("http_live accept: {}", e)))?;
             tracing::debug!(remote = %peer_addr, "http_live: accepted connection");
 
             let io = TokioIo::new(stream);
@@ -678,10 +677,7 @@ async fn handle_execute_post(
         Ok(c) => c.to_bytes(),
         Err(e) => {
             tracing::warn!(error = %e, "http_live: failed to read request body");
-            return text_response(
-                StatusCode::BAD_REQUEST,
-                format!("body read failed: {}", e),
-            );
+            return text_response(StatusCode::BAD_REQUEST, format!("body read failed: {}", e));
         }
     };
 
@@ -722,7 +718,10 @@ async fn handle_execute_post(
         .header(SESSION_HEADER, session_id)
         .body(Full::new(Bytes::from(response_bytes)))
         .unwrap_or_else(|_| {
-            text_response(StatusCode::INTERNAL_SERVER_ERROR, "response build failed".into())
+            text_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "response build failed".into(),
+            )
         })
 }
 
@@ -797,10 +796,7 @@ async fn handle_content_get(
     Response::builder()
         .status(StatusCode::OK)
         .header(hyper::header::CONTENT_TYPE, "application/cbor")
-        .header(
-            hyper::header::CACHE_CONTROL,
-            "immutable, max-age=31536000",
-        )
+        .header(hyper::header::CACHE_CONTROL, "immutable, max-age=31536000")
         .header(hyper::header::ETAG, etag)
         .body(Full::new(Bytes::from(body)))
         .unwrap_or_else(|_| {
@@ -858,7 +854,7 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
 /// Decode lowercase OR uppercase hex into bytes. Strict — any
 /// non-hex char or odd length is an error. Length is caller-checked.
 fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err("odd-length hex string".to_string());
     }
     let mut out = Vec::with_capacity(s.len() / 2);
@@ -1119,12 +1115,10 @@ async fn render_listing(
                 );
             }
         }
-        let info = children
-            .entry(child_name.to_string())
-            .or_insert(ChildInfo {
-                hash: None,
-                has_children: false,
-            });
+        let info = children.entry(child_name.to_string()).or_insert(ChildInfo {
+            hash: None,
+            has_children: false,
+        });
         if has_more {
             info.has_children = true;
         } else {
@@ -1144,7 +1138,10 @@ async fn render_listing(
                 None => entity_ecf::Value::Null,
             };
             let entry_map = entity_ecf::Value::Map(vec![
-                (entity_ecf::text("has_children"), entity_ecf::bool_val(info.has_children)),
+                (
+                    entity_ecf::text("has_children"),
+                    entity_ecf::bool_val(info.has_children),
+                ),
                 (entity_ecf::text("hash"), hash_val),
             ]);
             (entity_ecf::text(name), entry_map)
@@ -1163,24 +1160,25 @@ async fn render_listing(
         // optional per V7 §3.9 (Amendment 5) so absent ⇒ last page.
     ]));
 
-    let listing_entity = match entity_entity::Entity::new(
-        entity_types::TYPE_TREE_LISTING,
-        listing_data,
-    ) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::error!(error = %e, "http_live: failed to build listing entity");
-            return text_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "listing build failed".into(),
-            );
-        }
-    };
+    let listing_entity =
+        match entity_entity::Entity::new(entity_types::TYPE_TREE_LISTING, listing_data) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!(error = %e, "http_live: failed to build listing entity");
+                return text_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "listing build failed".into(),
+                );
+            }
+        };
 
     // Wire entity (3-key) per §6.5.3.1. NO Cache-Control immutable —
     // listings are mutable views.
     let body = entity_wire::encode_entity(&listing_entity);
-    let etag = format!("\"{}\"", hex_encode(&listing_entity.content_hash.to_bytes()));
+    let etag = format!(
+        "\"{}\"",
+        hex_encode(&listing_entity.content_hash.to_bytes())
+    );
     Response::builder()
         .status(StatusCode::OK)
         .header(hyper::header::CONTENT_TYPE, "application/cbor")
@@ -1230,10 +1228,7 @@ async fn handle_all_peers_listing(
 /// (revocation lives there per PROPOSAL-PEER-MANIFEST-STATIC-
 /// HANDSHAKE); a short `max-age` is used so a CDN can cache briefly
 /// but revocation propagates.
-async fn handle_manifest_get(
-    shared: Arc<PeerShared>,
-    routes: &Routes,
-) -> Response<Full<Bytes>> {
+async fn handle_manifest_get(shared: Arc<PeerShared>, routes: &Routes) -> Response<Full<Bytes>> {
     // Prefer an explicitly-configured static manifest hash; otherwise serve the
     // current published-root head pointer (Phase P — dynamic re-publishing keeps
     // MANIFEST_GET fresh as the tree root changes). PROPOSAL-PEER-MANIFEST §4.

@@ -159,6 +159,11 @@ impl RelayForwarder for PeerRelayForwarder {
                     next_hop: ctx.next_hop.to_string(),
                 },
                 Err(e) => {
+                    // Amendment 12 §A1 ruling E (pinned normative): the RELAY
+                    // terminal-hop forward MUST NOT demote peer liveness — a
+                    // store-and-forward target is not "a connection believed
+                    // active," and Mode-S fallback owns this path's failure
+                    // semantics. Plain pool eviction only; no suspect write.
                     self.pool.remove(ctx.next_hop);
                     tracing::debug!(
                         destination = %ctx.destination,

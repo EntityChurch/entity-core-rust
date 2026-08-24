@@ -296,10 +296,7 @@ impl Handler for RevisionHandler {
 // ---------------------------------------------------------------------------
 
 impl RevisionHandler {
-    async fn handle_commit(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_commit(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let prefix = decode_commit_params(&ctx.params.data)?;
 
         let lock = self.get_prefix_lock(&prefix);
@@ -339,7 +336,7 @@ impl RevisionHandler {
         Ok(HandlerResult {
             status: STATUS_OK,
             result,
-        included: std::collections::HashMap::new(),
+            included: std::collections::HashMap::new(),
         })
     }
 }
@@ -349,17 +346,20 @@ impl RevisionHandler {
 // ---------------------------------------------------------------------------
 
 impl RevisionHandler {
-    async fn handle_config(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_config(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let params = decode_config_params(&ctx.params.data)?;
 
         match params.action.as_str() {
             "set" => self.handle_config_set(ctx, &params).await,
             "delete" => self.handle_config_delete(ctx, &params).await,
-            _ => Ok(error_result(STATUS_BAD_REQUEST, "config/invalid-action",
-                &format!("action must be \"set\" or \"delete\", got {:?}", params.action))),
+            _ => Ok(error_result(
+                STATUS_BAD_REQUEST,
+                "config/invalid-action",
+                &format!(
+                    "action must be \"set\" or \"delete\", got {:?}",
+                    params.action
+                ),
+            )),
         }
     }
 
@@ -368,11 +368,13 @@ impl RevisionHandler {
         ctx: &HandlerContext,
         params: &ConfigParams,
     ) -> Result<HandlerResult, HandlerError> {
-        let config_data = params.config_data.as_ref()
-            .ok_or_else(|| HandlerError::InvalidParams("config field required for action \"set\"".into()))?;
+        let config_data = params.config_data.as_ref().ok_or_else(|| {
+            HandlerError::InvalidParams("config field required for action \"set\"".into())
+        })?;
 
-        let config = engine::decode_revision_config(config_data)
-            .ok_or_else(|| HandlerError::InvalidParams("invalid revision config entity data".into()))?;
+        let config = engine::decode_revision_config(config_data).ok_or_else(|| {
+            HandlerError::InvalidParams("invalid revision config entity data".into())
+        })?;
 
         if let Err(e) = engine::validate_revision_config(&config) {
             return Ok(error_result(e.status, &e.code, &e.message));
@@ -387,8 +389,11 @@ impl RevisionHandler {
         if let Some(ref expected) = params.expected_hash {
             let current = self.location_index.get(&config_path);
             if current.as_ref() != Some(expected) {
-                return Ok(error_result(STATUS_CONFLICT, "config/concurrent-modification",
-                    &format!("expected {:?}, actual {:?}", expected, current)));
+                return Ok(error_result(
+                    STATUS_CONFLICT,
+                    "config/concurrent-modification",
+                    &format!("expected {:?}, actual {:?}", expected, current),
+                ));
             }
         }
 
@@ -401,7 +406,9 @@ impl RevisionHandler {
 
         let config_entity = Entity::new("system/revision/config", config_data.clone())
             .map_err(|e| HandlerError::Internal(e.to_string()))?;
-        let config_hash = self.content_store.put(config_entity)
+        let config_hash = self
+            .content_store
+            .put(config_entity)
             .map_err(|e| HandlerError::Internal(e.to_string()))?;
 
         let emit_ctx = build_handler_emit_ctx(ctx);
@@ -413,34 +420,54 @@ impl RevisionHandler {
         if enabling {
             let tc = engine::build_tracking_config_entity(&canonical, true)
                 .ok_or_else(|| HandlerError::Internal("failed to build tracking-config".into()))?;
-            let tc_hash = self.content_store.put(tc)
+            let tc_hash = self
+                .content_store
+                .put(tc)
                 .map_err(|e| HandlerError::Internal(e.to_string()))?;
-            let tc_cascade = self.location_index
-                .set_with_context(&tracking_path, tc_hash, emit_ctx.clone());
+            let tc_cascade =
+                self.location_index
+                    .set_with_context(&tracking_path, tc_hash, emit_ctx.clone());
             if !tc_cascade.binding_committed {
-                return Ok(error_result(STATUS_INTERNAL_ERROR,
-                    "config/tracking-config-write-failed", "tracking-config binding rejected"));
+                return Ok(error_result(
+                    STATUS_INTERNAL_ERROR,
+                    "config/tracking-config-write-failed",
+                    "tracking-config binding rejected",
+                ));
             }
-            tracking_action = Some(if previous_hash.is_some() { "updated" } else { "created" }.into());
+            tracking_action = Some(
+                if previous_hash.is_some() {
+                    "updated"
+                } else {
+                    "created"
+                }
+                .into(),
+            );
         }
 
         // Write the config
-        let cfg_cascade = self.location_index
-            .set_with_context(&config_path, config_hash, emit_ctx.clone());
+        let cfg_cascade =
+            self.location_index
+                .set_with_context(&config_path, config_hash, emit_ctx.clone());
         if !cfg_cascade.binding_committed {
-            return Ok(error_result(STATUS_INTERNAL_ERROR,
-                "config/config-write-failed", "config binding rejected"));
+            return Ok(error_result(
+                STATUS_INTERNAL_ERROR,
+                "config/config-write-failed",
+                "config binding rejected",
+            ));
         }
 
         // §6.1 ordering: disable tracking-config AFTER config write
         if !config.auto_version && was_auto_version {
-            let (_, _cascade) = self.location_index
+            let (_, _cascade) = self
+                .location_index
                 .remove_with_context(&tracking_path, emit_ctx);
             tracking_action = Some("deleted".into());
         }
 
         Ok(HandlerResult::ok(build_config_result(
-            &config_path, Some(config_hash), previous_hash,
+            &config_path,
+            Some(config_hash),
+            previous_hash,
             tracking_action.as_ref().map(|_| tracking_path.as_str()),
             tracking_action.as_deref(),
         )?))
@@ -464,27 +491,41 @@ impl RevisionHandler {
         let previous_hash = self.location_index.get(&config_path);
         let previous_hash = match previous_hash {
             Some(h) => h,
-            None => return Ok(error_result(STATUS_NOT_FOUND, "config/not-found",
-                &format!("no config at name {:?}", params.name))),
+            None => {
+                return Ok(error_result(
+                    STATUS_NOT_FOUND,
+                    "config/not-found",
+                    &format!("no config at name {:?}", params.name),
+                ))
+            }
         };
 
         if let Some(ref expected) = params.expected_hash {
             if *expected != previous_hash {
-                return Ok(error_result(STATUS_CONFLICT, "config/concurrent-modification",
-                    &format!("expected {:?}, actual {:?}", expected, previous_hash)));
+                return Ok(error_result(
+                    STATUS_CONFLICT,
+                    "config/concurrent-modification",
+                    &format!("expected {:?}, actual {:?}", expected, previous_hash),
+                ));
             }
         }
 
-        let prev_config = self.content_store.get(&previous_hash)
+        let prev_config = self
+            .content_store
+            .get(&previous_hash)
             .and_then(|e| engine::decode_revision_config(&e.data));
-        let was_auto_version = prev_config.as_ref().map(|c| c.auto_version).unwrap_or(false);
+        let was_auto_version = prev_config
+            .as_ref()
+            .map(|c| c.auto_version)
+            .unwrap_or(false);
 
         let emit_ctx = build_handler_emit_ctx(ctx);
         let mut tracking_action: Option<String> = None;
         let mut tracking_path_out: Option<String> = None;
 
         // Delete config binding
-        let (_, _cascade) = self.location_index
+        let (_, _cascade) = self
+            .location_index
             .remove_with_context(&config_path, emit_ctx.clone());
 
         // Delete tracking-config if was auto-versioned
@@ -499,7 +540,9 @@ impl RevisionHandler {
         }
 
         Ok(HandlerResult::ok(build_config_result(
-            &config_path, None, Some(previous_hash),
+            &config_path,
+            None,
+            Some(previous_hash),
             tracking_path_out.as_deref(),
             tracking_action.as_deref(),
         )?))
@@ -557,9 +600,10 @@ impl RevisionHandler {
 
         match params.action.as_str() {
             "set" => {
-                let config_data = params.config_data.as_ref().ok_or_else(|| {
-                    HandlerError::InvalidParams("missing_config".into())
-                })?;
+                let config_data = params
+                    .config_data
+                    .as_ref()
+                    .ok_or_else(|| HandlerError::InvalidParams("missing_config".into()))?;
 
                 // EXTENSION-REVISION v3.1 §2.3 strategy-rejection contract:
                 // `deletion_resolution: lww` / `keep-both` MUST be rejected
@@ -666,9 +710,8 @@ struct MergeConfigParams {
 }
 
 fn decode_merge_config_params(data: &[u8]) -> Result<MergeConfigParams, HandlerError> {
-    let val: ciborium::Value = ciborium::from_reader(data).map_err(|e| {
-        HandlerError::InvalidParams(format!("merge-config/invalid-params: {}", e))
-    })?;
+    let val: ciborium::Value = ciborium::from_reader(data)
+        .map_err(|e| HandlerError::InvalidParams(format!("merge-config/invalid-params: {}", e)))?;
     let map = val.as_map().ok_or_else(|| {
         HandlerError::InvalidParams("merge-config/invalid-params: expected map".into())
     })?;
@@ -702,14 +745,12 @@ fn decode_merge_config_params(data: &[u8]) -> Result<MergeConfigParams, HandlerE
         }
     }
     Ok(MergeConfigParams {
-        scope: scope.ok_or_else(|| {
-            HandlerError::InvalidParams("merge-config/missing-scope".into())
-        })?,
+        scope: scope
+            .ok_or_else(|| HandlerError::InvalidParams("merge-config/missing-scope".into()))?,
         name: name
             .ok_or_else(|| HandlerError::InvalidParams("merge-config/missing-name".into()))?,
-        action: action.ok_or_else(|| {
-            HandlerError::InvalidParams("merge-config/missing-action".into())
-        })?,
+        action: action
+            .ok_or_else(|| HandlerError::InvalidParams("merge-config/missing-action".into()))?,
         config_data,
         expected_hash,
     })
@@ -744,7 +785,8 @@ struct ConfigParams {
 fn decode_config_params(data: &[u8]) -> Result<ConfigParams, HandlerError> {
     let val: ciborium::Value = ciborium::from_reader(data)
         .map_err(|e| HandlerError::InvalidParams(format!("config/invalid-params: {}", e)))?;
-    let map = val.as_map()
+    let map = val
+        .as_map()
         .ok_or_else(|| HandlerError::InvalidParams("config/invalid-params: expected map".into()))?;
 
     let mut name = None;
@@ -759,16 +801,18 @@ fn decode_config_params(data: &[u8]) -> Result<ConfigParams, HandlerError> {
             Some("config") => {
                 if !v.is_null() {
                     let mut buf = Vec::new();
-                    ciborium::into_writer(v, &mut buf)
-                        .map_err(|e| HandlerError::InvalidParams(format!("config encode: {}", e)))?;
+                    ciborium::into_writer(v, &mut buf).map_err(|e| {
+                        HandlerError::InvalidParams(format!("config encode: {}", e))
+                    })?;
                     config_data = Some(buf);
                 }
             }
             Some("expected_hash") => {
                 if !v.is_null() {
                     if let Some(bytes) = v.as_bytes() {
-                        expected_hash = Some(Hash::from_bytes(bytes)
-                            .map_err(|e| HandlerError::InvalidParams(format!("expected_hash: {}", e)))?);
+                        expected_hash = Some(Hash::from_bytes(bytes).map_err(|e| {
+                            HandlerError::InvalidParams(format!("expected_hash: {}", e))
+                        })?);
                     }
                 }
             }
@@ -778,11 +822,19 @@ fn decode_config_params(data: &[u8]) -> Result<ConfigParams, HandlerError> {
 
     let name = name.ok_or_else(|| HandlerError::InvalidParams("config/missing-name".into()))?;
     if name.is_empty() {
-        return Err(HandlerError::InvalidParams("config/missing-name: name must not be empty".into()));
+        return Err(HandlerError::InvalidParams(
+            "config/missing-name: name must not be empty".into(),
+        ));
     }
-    let action = action.ok_or_else(|| HandlerError::InvalidParams("config/invalid-action: missing".into()))?;
+    let action = action
+        .ok_or_else(|| HandlerError::InvalidParams("config/invalid-action: missing".into()))?;
 
-    Ok(ConfigParams { name, action, config_data, expected_hash })
+    Ok(ConfigParams {
+        name,
+        action,
+        config_data,
+        expected_hash,
+    })
 }
 
 fn build_handler_emit_ctx(ctx: &HandlerContext) -> ExecutionContext {
@@ -810,9 +862,7 @@ fn build_config_result(
     tracking_action: Option<&str>,
 ) -> Result<Entity, HandlerError> {
     use entity_ecf::{text, Value};
-    let mut fields = vec![
-        (text("config_path"), text(config_path)),
-    ];
+    let mut fields = vec![(text("config_path"), text(config_path))];
     if let Some(h) = config_hash {
         fields.push((text("config_hash"), Value::Bytes(h.to_bytes().to_vec())));
     }
@@ -835,10 +885,7 @@ fn build_config_result(
 // ---------------------------------------------------------------------------
 
 impl RevisionHandler {
-    async fn handle_log(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_log(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let (prefix, limit, since) = decode_log_params(&ctx.params.data)?;
         let effective_limit = limit.unwrap_or(50);
 
@@ -850,14 +897,8 @@ impl RevisionHandler {
             None => {
                 // No versions yet
                 let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-                    (
-                        entity_ecf::text("has_more"),
-                        entity_ecf::bool_val(false),
-                    ),
-                    (
-                        entity_ecf::text("prefix"),
-                        entity_ecf::text(&prefix),
-                    ),
+                    (entity_ecf::text("has_more"), entity_ecf::bool_val(false)),
+                    (entity_ecf::text("prefix"), entity_ecf::text(&prefix)),
                     (
                         entity_ecf::text("versions"),
                         entity_ecf::Value::Array(vec![]),
@@ -891,14 +932,8 @@ impl RevisionHandler {
         }
 
         let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-            (
-                entity_ecf::text("has_more"),
-                entity_ecf::bool_val(has_more),
-            ),
-            (
-                entity_ecf::text("prefix"),
-                entity_ecf::text(&prefix),
-            ),
+            (entity_ecf::text("has_more"), entity_ecf::bool_val(has_more)),
+            (entity_ecf::text("prefix"), entity_ecf::text(&prefix)),
             (
                 entity_ecf::text("versions"),
                 entity_ecf::Value::Array(version_hash_values),
@@ -916,10 +951,7 @@ impl RevisionHandler {
 // ---------------------------------------------------------------------------
 
 impl RevisionHandler {
-    async fn handle_status(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_status(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let prefix = decode_prefix_only(&ctx.params.data)?;
 
         let abs_prefix = resolve_prefix(&prefix, &self.local_peer_id);
@@ -946,12 +978,10 @@ impl RevisionHandler {
             }
         }
 
-        let mut fields = vec![
-            (
-                entity_ecf::text("conflicts"),
-                entity_ecf::integer(conflict_count as i64),
-            ),
-        ];
+        let mut fields = vec![(
+            entity_ecf::text("conflicts"),
+            entity_ecf::integer(conflict_count as i64),
+        )];
 
         if let Some(h) = head_hash {
             fields.push((
@@ -989,10 +1019,7 @@ impl RevisionHandler {
             entity_ecf::integer(pending_count as i64),
         ));
 
-        fields.push((
-            entity_ecf::text("prefix"),
-            entity_ecf::text(&prefix),
-        ));
+        fields.push((entity_ecf::text("prefix"), entity_ecf::text(&prefix)));
 
         if !remote_pairs.is_empty() {
             fields.push((
@@ -1010,7 +1037,7 @@ impl RevisionHandler {
         Ok(HandlerResult {
             status: STATUS_OK,
             result,
-        included: std::collections::HashMap::new(),
+            included: std::collections::HashMap::new(),
         })
     }
 }
@@ -1042,7 +1069,7 @@ impl RevisionHandler {
         Ok(HandlerResult {
             status: STATUS_OK,
             result,
-        included: std::collections::HashMap::new(),
+            included: std::collections::HashMap::new(),
         })
     }
 }
@@ -1052,10 +1079,7 @@ impl RevisionHandler {
 // ---------------------------------------------------------------------------
 
 impl RevisionHandler {
-    async fn handle_branch(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_branch(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let (prefix, action, name, from) = decode_branch_params(&ctx.params.data)?;
 
         let abs_prefix = resolve_prefix(&prefix, &self.local_peer_id);
@@ -1100,7 +1124,7 @@ impl RevisionHandler {
                 Ok(HandlerResult {
                     status: STATUS_OK,
                     result,
-                included: std::collections::HashMap::new(),
+                    included: std::collections::HashMap::new(),
                 })
             }
             "list" => {
@@ -1137,7 +1161,7 @@ impl RevisionHandler {
                 Ok(HandlerResult {
                     status: STATUS_OK,
                     result,
-                included: std::collections::HashMap::new(),
+                    included: std::collections::HashMap::new(),
                 })
             }
             "delete" => {
@@ -1175,7 +1199,7 @@ impl RevisionHandler {
                 Ok(HandlerResult {
                     status: STATUS_OK,
                     result,
-                included: std::collections::HashMap::new(),
+                    included: std::collections::HashMap::new(),
                 })
             }
             _ => Ok(error_result(
@@ -1192,10 +1216,7 @@ impl RevisionHandler {
 // ---------------------------------------------------------------------------
 
 impl RevisionHandler {
-    async fn handle_tag(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_tag(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let (prefix, action, name, version) = decode_tag_params(&ctx.params.data)?;
 
         let abs_prefix = resolve_prefix(&prefix, &self.local_peer_id);
@@ -1237,7 +1258,7 @@ impl RevisionHandler {
                 Ok(HandlerResult {
                     status: STATUS_OK,
                     result,
-                included: std::collections::HashMap::new(),
+                    included: std::collections::HashMap::new(),
                 })
             }
             "list" => {
@@ -1264,7 +1285,7 @@ impl RevisionHandler {
                 Ok(HandlerResult {
                     status: STATUS_OK,
                     result,
-                included: std::collections::HashMap::new(),
+                    included: std::collections::HashMap::new(),
                 })
             }
             "delete" => {
@@ -1292,7 +1313,7 @@ impl RevisionHandler {
                 Ok(HandlerResult {
                     status: STATUS_OK,
                     result,
-                included: std::collections::HashMap::new(),
+                    included: std::collections::HashMap::new(),
                 })
             }
             _ => Ok(error_result(
@@ -1309,10 +1330,7 @@ impl RevisionHandler {
 // ---------------------------------------------------------------------------
 
 impl RevisionHandler {
-    async fn handle_checkout(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_checkout(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let (prefix, branch, version_hash) = decode_checkout_params(&ctx.params.data)?;
 
         let abs_prefix = resolve_prefix(&prefix, &self.local_peer_id);
@@ -1386,10 +1404,11 @@ impl RevisionHandler {
         // baseline (§4.4.12 v3.2). Removable set is exactly paths in
         // committed-head-trie ∧ absent-from-target — live-tree-only
         // paths are preserved.
-        let cascade_warnings = self.apply_snapshot_diff(&prefix, &committed_head_bindings, &target_snap_bindings)
-            .map_err(|rejected| HandlerError::Internal(
-                format!("checkout binding rejected at {}", rejected),
-            ))?;
+        let cascade_warnings = self
+            .apply_snapshot_diff(&prefix, &committed_head_bindings, &target_snap_bindings)
+            .map_err(|rejected| {
+                HandlerError::Internal(format!("checkout binding rejected at {}", rejected))
+            })?;
 
         // Post-op head. Under auto-version OFF it equals target_version; under
         // auto-version ON it is the final intermediate V_N whose root matches
@@ -1404,10 +1423,7 @@ impl RevisionHandler {
                 entity_ecf::text("head"),
                 entity_ecf::Value::Bytes(final_head.to_bytes().to_vec()),
             ),
-            (
-                entity_ecf::text("status"),
-                entity_ecf::text("checked_out"),
-            ),
+            (entity_ecf::text("status"), entity_ecf::text("checked_out")),
             (
                 entity_ecf::text("target_version"),
                 entity_ecf::Value::Bytes(target_version.to_bytes().to_vec()),
@@ -1439,7 +1455,9 @@ impl RevisionHandler {
             ));
             fields.push((
                 entity_ecf::text("warning"),
-                entity_ecf::text("tree has uncommitted changes that will be overwritten by checkout"),
+                entity_ecf::text(
+                    "tree has uncommitted changes that will be overwritten by checkout",
+                ),
             ));
         }
         fields.sort_by(|(a, _), (b, _)| ecf_key_cmp(a, b));
@@ -1450,7 +1468,7 @@ impl RevisionHandler {
         Ok(HandlerResult {
             status: STATUS_OK,
             result,
-        included: std::collections::HashMap::new(),
+            included: std::collections::HashMap::new(),
         })
     }
 }
@@ -1460,10 +1478,7 @@ impl RevisionHandler {
 // ---------------------------------------------------------------------------
 
 impl RevisionHandler {
-    async fn handle_merge(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_merge(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let mp = decode_merge_params(&ctx.params.data)?;
         let prefix = mp.prefix;
         let remote_version = mp.remote_version;
@@ -1509,7 +1524,14 @@ impl RevisionHandler {
             }
             Relationship::Behind => {
                 if dry_run {
-                    return Ok(merge_status_result("would_merge", Some(remote_version), &[], 0, 0, &[]));
+                    return Ok(merge_status_result(
+                        "would_merge",
+                        Some(remote_version),
+                        &[],
+                        0,
+                        0,
+                        &[],
+                    ));
                 }
                 // EXTENSION-REVISION v3.2 §4.4.4 (A.3) version-transcription
                 // invariant: fast-forward MUST NOT diff against the live
@@ -1527,10 +1549,14 @@ impl RevisionHandler {
                 }
                 // Apply remote bindings to tree
                 let remote_bindings = self.get_version_bindings(remote_version)?;
-                let ff_warnings = self.apply_snapshot_diff(&prefix, &local_head_bindings, &remote_bindings)
-                    .map_err(|rejected| HandlerError::Internal(
-                        format!("fast-forward binding rejected at {}", rejected),
-                    ))?;
+                let ff_warnings = self
+                    .apply_snapshot_diff(&prefix, &local_head_bindings, &remote_bindings)
+                    .map_err(|rejected| {
+                        HandlerError::Internal(format!(
+                            "fast-forward binding rejected at {}",
+                            rejected
+                        ))
+                    })?;
 
                 return Ok(merge_status_result(
                     "fast_forward",
@@ -1547,14 +1573,25 @@ impl RevisionHandler {
         }
 
         // Content-identity check: if local and remote have the same root trie, they're converged
-        let local_entry = self.content_store.get(&local_head)
+        let local_entry = self
+            .content_store
+            .get(&local_head)
             .and_then(|e| decode_revision_entry(&e));
-        let remote_entry = self.content_store.get(&remote_version)
+        let remote_entry = self
+            .content_store
+            .get(&remote_version)
             .and_then(|e| decode_revision_entry(&e));
 
         if let (Some(ref le), Some(ref re)) = (&local_entry, &remote_entry) {
             if le.root == re.root {
-                return Ok(merge_status_result("converged_identical", None, &[], 0, 0, &[]));
+                return Ok(merge_status_result(
+                    "converged_identical",
+                    None,
+                    &[],
+                    0,
+                    0,
+                    &[],
+                ));
             }
         }
 
@@ -1605,8 +1642,11 @@ impl RevisionHandler {
             } else {
                 "would_conflict"
             };
-            let conflict_paths: Vec<String> = merge_result.conflicts.iter()
-                .map(|c| c.path.clone()).collect();
+            let conflict_paths: Vec<String> = merge_result
+                .conflicts
+                .iter()
+                .map(|c| c.path.clone())
+                .collect();
             return Ok(merge_status_result(
                 dry_status,
                 None,
@@ -1622,20 +1662,31 @@ impl RevisionHandler {
         // intermediates produced during binding application descend from the
         // merge version rather than orphaning (PROPOSAL-REVISION-AUTO-VERSION-FIX
         // §6A.1).
-        let merged_root = trie::build_trie(
-            self.content_store.as_ref(),
-            &merge_result.merged_bindings,
-        )
-        .map_err(HandlerError::Internal)?;
+        let merged_root =
+            trie::build_trie(self.content_store.as_ref(), &merge_result.merged_bindings)
+                .map_err(HandlerError::Internal)?;
 
         // Oscillation detection
         // W6: oscillation_depth from config, clamped to min 2
-        let osc_depth = prefix_config.as_ref()
+        let osc_depth = prefix_config
+            .as_ref()
             .and_then(|c| c.oscillation_depth)
             .map(|d| std::cmp::max(2, d as usize))
             .unwrap_or(8);
-        if detect_oscillation(self.content_store.as_ref(), merged_root, local_head, osc_depth) {
-            return Ok(merge_status_result("oscillation_detected", None, &[], 0, 0, &[]));
+        if detect_oscillation(
+            self.content_store.as_ref(),
+            merged_root,
+            local_head,
+            osc_depth,
+        ) {
+            return Ok(merge_status_result(
+                "oscillation_detected",
+                None,
+                &[],
+                0,
+                0,
+                &[],
+            ));
         }
 
         // Create merge version using RevisionEntryData
@@ -1646,8 +1697,7 @@ impl RevisionHandler {
             root: merged_root,
             parents,
         };
-        let version_entity =
-            build_revision_entry(&entry_data).map_err(HandlerError::Internal)?;
+        let version_entity = build_revision_entry(&entry_data).map_err(HandlerError::Internal)?;
         let version_hash = self
             .content_store
             .put(version_entity)
@@ -1665,22 +1715,24 @@ impl RevisionHandler {
 
         // Apply merged state to tree
         let current_bindings = self.compute_snapshot_bindings(&prefix);
-        let mut cascade_warnings = self.apply_snapshot_diff(
-            &prefix, &current_bindings, &merge_result.merged_bindings,
-        ).map_err(|rejected| HandlerError::Internal(
-            format!("merge binding rejected at {}", rejected),
-        ))?;
+        let mut cascade_warnings = self
+            .apply_snapshot_diff(&prefix, &current_bindings, &merge_result.merged_bindings)
+            .map_err(|rejected| {
+                HandlerError::Internal(format!("merge binding rejected at {}", rejected))
+            })?;
 
         // Apply deletions (peer-qualified tree paths)
         let del_ctx = ExecutionContext::default();
         for path in &merge_result.deletions {
             let full_path = format!("{}{}", self.qualify_tree_prefix(&prefix), path);
-            let (_removed, cascade) =
-                self.location_index.remove_with_context(&full_path, del_ctx.clone());
-            collect_cascade_warnings(&cascade, &full_path, &mut cascade_warnings)
-                .map_err(|rejected| HandlerError::Internal(
-                    format!("merge deletion rejected at {}", rejected),
-                ))?;
+            let (_removed, cascade) = self
+                .location_index
+                .remove_with_context(&full_path, del_ctx.clone());
+            collect_cascade_warnings(&cascade, &full_path, &mut cascade_warnings).map_err(
+                |rejected| {
+                    HandlerError::Internal(format!("merge deletion rejected at {}", rejected))
+                },
+            )?;
         }
 
         // Store conflicts (excluded path — ordering irrelevant for auto-version)
@@ -1697,8 +1749,11 @@ impl RevisionHandler {
             .map_err(HandlerError::Internal)?;
         }
 
-        let conflict_paths: Vec<String> = merge_result.conflicts.iter()
-            .map(|c| c.path.clone()).collect();
+        let conflict_paths: Vec<String> = merge_result
+            .conflicts
+            .iter()
+            .map(|c| c.path.clone())
+            .collect();
         let status = if !conflict_paths.is_empty() {
             "merged_with_conflicts"
         } else {
@@ -1721,10 +1776,7 @@ impl RevisionHandler {
 // ---------------------------------------------------------------------------
 
 impl RevisionHandler {
-    async fn handle_resolve(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_resolve(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let (prefix, path, resolved_hash) = decode_resolve_params(&ctx.params.data)?;
 
         let abs_prefix = resolve_prefix(&prefix, &self.local_peer_id);
@@ -1794,10 +1846,7 @@ impl RevisionHandler {
 // ---------------------------------------------------------------------------
 
 impl RevisionHandler {
-    async fn handle_diff(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_diff(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let (prefix, base_version, target_version) = decode_diff_params(&ctx.params.data)?;
 
         let _ = prefix; // prefix kept for API consistency
@@ -1859,22 +1908,13 @@ impl RevisionHandler {
         }
 
         let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-            (
-                entity_ecf::text("added"),
-                entity_ecf::Value::Map(added),
-            ),
+            (entity_ecf::text("added"), entity_ecf::Value::Map(added)),
             (
                 entity_ecf::text("base"),
                 entity_ecf::Value::Bytes(base_version.to_bytes().to_vec()),
             ),
-            (
-                entity_ecf::text("changed"),
-                entity_ecf::Value::Map(changed),
-            ),
-            (
-                entity_ecf::text("removed"),
-                entity_ecf::Value::Map(removed),
-            ),
+            (entity_ecf::text("changed"), entity_ecf::Value::Map(changed)),
+            (entity_ecf::text("removed"), entity_ecf::Value::Map(removed)),
             (
                 entity_ecf::text("target"),
                 entity_ecf::Value::Bytes(target_version.to_bytes().to_vec()),
@@ -1914,12 +1954,12 @@ impl RevisionHandler {
         let _guard = lock.lock().await;
 
         // Get the version to cherry-pick
-        let version_entity = self.content_store.get(&version_hash).ok_or_else(|| {
-            HandlerError::InvalidParams("version not found".into())
-        })?;
-        let entry = decode_revision_entry(&version_entity).ok_or_else(|| {
-            HandlerError::InvalidParams("invalid revision entry".into())
-        })?;
+        let version_entity = self
+            .content_store
+            .get(&version_hash)
+            .ok_or_else(|| HandlerError::InvalidParams("version not found".into()))?;
+        let entry = decode_revision_entry(&version_entity)
+            .ok_or_else(|| HandlerError::InvalidParams("invalid revision entry".into()))?;
 
         // Need parent to compute diff
         if entry.parents.is_empty() {
@@ -1954,9 +1994,10 @@ impl RevisionHandler {
 
         // Get local head
         let head_path = rev_head_path(&self.local_peer_id, &ph);
-        let local_head = self.location_index.get(&head_path).ok_or_else(|| {
-            HandlerError::InvalidParams("no head for this prefix".into())
-        })?;
+        let local_head = self
+            .location_index
+            .get(&head_path)
+            .ok_or_else(|| HandlerError::InvalidParams("no head for this prefix".into()))?;
 
         // Three-way merge: ancestor = version's parent bindings, local = current, remote = version's bindings
         let ancestor_bindings = self.get_version_bindings(parent_hash)?;
@@ -1983,11 +2024,9 @@ impl RevisionHandler {
 
         // Build trie from merged bindings and create new revision entry
         // BEFORE applying bindings (PROPOSAL-REVISION-AUTO-VERSION-FIX §6A.2).
-        let merged_root = trie::build_trie(
-            self.content_store.as_ref(),
-            &merge_result.merged_bindings,
-        )
-        .map_err(HandlerError::Internal)?;
+        let merged_root =
+            trie::build_trie(self.content_store.as_ref(), &merge_result.merged_bindings)
+                .map_err(HandlerError::Internal)?;
 
         let mut parents = vec![local_head];
         trie::sorted_parents(&mut parents);
@@ -2011,20 +2050,22 @@ impl RevisionHandler {
 
         // Apply merged state to tree.
         let current_bindings = self.compute_snapshot_bindings(&prefix);
-        let mut cascade_warnings = self.apply_snapshot_diff(
-            &prefix, &current_bindings, &merge_result.merged_bindings,
-        ).map_err(|rejected| HandlerError::Internal(
-            format!("cherry-pick binding rejected at {}", rejected),
-        ))?;
+        let mut cascade_warnings = self
+            .apply_snapshot_diff(&prefix, &current_bindings, &merge_result.merged_bindings)
+            .map_err(|rejected| {
+                HandlerError::Internal(format!("cherry-pick binding rejected at {}", rejected))
+            })?;
         let del_ctx = ExecutionContext::default();
         for path in &merge_result.deletions {
             let full_path = format!("{}{}", self.qualify_tree_prefix(&prefix), path);
-            let (_removed, cascade) =
-                self.location_index.remove_with_context(&full_path, del_ctx.clone());
-            collect_cascade_warnings(&cascade, &full_path, &mut cascade_warnings)
-                .map_err(|rejected| HandlerError::Internal(
-                    format!("cherry-pick deletion rejected at {}", rejected),
-                ))?;
+            let (_removed, cascade) = self
+                .location_index
+                .remove_with_context(&full_path, del_ctx.clone());
+            collect_cascade_warnings(&cascade, &full_path, &mut cascade_warnings).map_err(
+                |rejected| {
+                    HandlerError::Internal(format!("cherry-pick deletion rejected at {}", rejected))
+                },
+            )?;
         }
         for conflict in &merge_result.conflicts {
             store_conflict(
@@ -2073,7 +2114,7 @@ impl RevisionHandler {
         Ok(HandlerResult {
             status: STATUS_OK,
             result,
-        included: std::collections::HashMap::new(),
+            included: std::collections::HashMap::new(),
         })
     }
 }
@@ -2083,10 +2124,7 @@ impl RevisionHandler {
 // ---------------------------------------------------------------------------
 
 impl RevisionHandler {
-    async fn handle_revert(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_revert(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let vop = decode_version_op_params(&ctx.params.data)?;
         let prefix = vop.prefix;
         let version_hash = vop.version;
@@ -2097,12 +2135,12 @@ impl RevisionHandler {
         let lock = self.get_prefix_lock(&prefix);
         let _guard = lock.lock().await;
 
-        let version_entity = self.content_store.get(&version_hash).ok_or_else(|| {
-            HandlerError::InvalidParams("version not found".into())
-        })?;
-        let entry = decode_revision_entry(&version_entity).ok_or_else(|| {
-            HandlerError::InvalidParams("invalid revision entry".into())
-        })?;
+        let version_entity = self
+            .content_store
+            .get(&version_hash)
+            .ok_or_else(|| HandlerError::InvalidParams("version not found".into()))?;
+        let entry = decode_revision_entry(&version_entity)
+            .ok_or_else(|| HandlerError::InvalidParams("invalid revision entry".into()))?;
 
         if entry.parents.is_empty() {
             return Ok(error_result(
@@ -2133,9 +2171,10 @@ impl RevisionHandler {
         };
 
         let head_path = rev_head_path(&self.local_peer_id, &ph);
-        let local_head = self.location_index.get(&head_path).ok_or_else(|| {
-            HandlerError::InvalidParams("no head for this prefix".into())
-        })?;
+        let local_head = self
+            .location_index
+            .get(&head_path)
+            .ok_or_else(|| HandlerError::InvalidParams("no head for this prefix".into()))?;
         let ancestor_bindings = self.get_version_bindings(version_hash)?;
         let local_bindings = self.get_version_bindings(local_head)?;
         let parent_bindings_raw = self.get_version_bindings(parent_hash)?;
@@ -2178,11 +2217,9 @@ impl RevisionHandler {
 
         // Build trie from merged bindings and create new revision entry
         // BEFORE applying bindings (PROPOSAL-REVISION-AUTO-VERSION-FIX §6A.3).
-        let merged_root = trie::build_trie(
-            self.content_store.as_ref(),
-            &merge_result.merged_bindings,
-        )
-        .map_err(HandlerError::Internal)?;
+        let merged_root =
+            trie::build_trie(self.content_store.as_ref(), &merge_result.merged_bindings)
+                .map_err(HandlerError::Internal)?;
 
         let mut parents = vec![local_head];
         trie::sorted_parents(&mut parents);
@@ -2206,20 +2243,22 @@ impl RevisionHandler {
 
         // Apply merged state to tree.
         let current_bindings = self.compute_snapshot_bindings(&prefix);
-        let mut cascade_warnings = self.apply_snapshot_diff(
-            &prefix, &current_bindings, &merge_result.merged_bindings,
-        ).map_err(|rejected| HandlerError::Internal(
-            format!("revert binding rejected at {}", rejected),
-        ))?;
+        let mut cascade_warnings = self
+            .apply_snapshot_diff(&prefix, &current_bindings, &merge_result.merged_bindings)
+            .map_err(|rejected| {
+                HandlerError::Internal(format!("revert binding rejected at {}", rejected))
+            })?;
         let del_ctx = ExecutionContext::default();
         for path in &merge_result.deletions {
             let full_path = format!("{}{}", self.qualify_tree_prefix(&prefix), path);
-            let (_removed, cascade) =
-                self.location_index.remove_with_context(&full_path, del_ctx.clone());
-            collect_cascade_warnings(&cascade, &full_path, &mut cascade_warnings)
-                .map_err(|rejected| HandlerError::Internal(
-                    format!("revert deletion rejected at {}", rejected),
-                ))?;
+            let (_removed, cascade) = self
+                .location_index
+                .remove_with_context(&full_path, del_ctx.clone());
+            collect_cascade_warnings(&cascade, &full_path, &mut cascade_warnings).map_err(
+                |rejected| {
+                    HandlerError::Internal(format!("revert deletion rejected at {}", rejected))
+                },
+            )?;
         }
         for conflict in &merge_result.conflicts {
             store_conflict(
@@ -2268,7 +2307,7 @@ impl RevisionHandler {
         Ok(HandlerResult {
             status: STATUS_OK,
             result,
-        included: std::collections::HashMap::new(),
+            included: std::collections::HashMap::new(),
         })
     }
 }
@@ -2278,10 +2317,7 @@ impl RevisionHandler {
 // ---------------------------------------------------------------------------
 
 impl RevisionHandler {
-    async fn handle_fetch(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_fetch(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let (prefix, depth, since) = decode_log_params(&ctx.params.data)?;
         let effective_depth = depth.unwrap_or(50);
 
@@ -2293,10 +2329,7 @@ impl RevisionHandler {
             None => {
                 // No head — nothing to fetch
                 let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-                    (
-                        entity_ecf::text("has_more"),
-                        entity_ecf::bool_val(false),
-                    ),
+                    (entity_ecf::text("has_more"), entity_ecf::bool_val(false)),
                     (
                         entity_ecf::text("versions"),
                         entity_ecf::Value::Array(vec![]),
@@ -2335,10 +2368,7 @@ impl RevisionHandler {
         }
 
         let mut fields = vec![
-            (
-                entity_ecf::text("has_more"),
-                entity_ecf::bool_val(has_more),
-            ),
+            (entity_ecf::text("has_more"), entity_ecf::bool_val(has_more)),
             (
                 entity_ecf::text("head"),
                 entity_ecf::Value::Bytes(head_hash.to_bytes().to_vec()),
@@ -2363,10 +2393,7 @@ impl RevisionHandler {
 // ---------------------------------------------------------------------------
 
 impl RevisionHandler {
-    async fn handle_push(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_push(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let (prefix, remote) = decode_push_params(&ctx.params.data)?;
 
         let abs_prefix = resolve_prefix(&prefix, &self.local_peer_id);
@@ -2438,7 +2465,8 @@ impl RevisionHandler {
         if let Some(head) = self.location_index.get(&head_path) {
             let history = walk_history(self.content_store.as_ref(), head, 1000, None);
             let root_valid = history.iter().any(|vh| {
-                self.content_store.get(vh)
+                self.content_store
+                    .get(vh)
                     .and_then(|e| decode_revision_entry(&e))
                     .map(|entry| entry.root == snapshot_root)
                     .unwrap_or(false)
@@ -2479,10 +2507,7 @@ impl RevisionHandler {
         }
 
         let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-            (
-                entity_ecf::text("found"),
-                entity_ecf::Value::Array(found),
-            ),
+            (entity_ecf::text("found"), entity_ecf::Value::Array(found)),
             (
                 entity_ecf::text("missing"),
                 entity_ecf::Value::Array(missing),
@@ -2501,10 +2526,7 @@ impl RevisionHandler {
 // ---------------------------------------------------------------------------
 
 impl RevisionHandler {
-    async fn handle_fetch_diff(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_fetch_diff(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         // EXTENSION-REVISION v3.6 §4.4.19: fetch-diff is unambiguously
         // executor-local under any dispatch shape — the implicit target is
         // the executor peer's current head, the base lookup is in the
@@ -2548,7 +2570,9 @@ impl RevisionHandler {
                 ));
             }
         };
-        let target_root = match self.content_store.get(&head_hash)
+        let target_root = match self
+            .content_store
+            .get(&head_hash)
             .and_then(|e| decode_revision_entry(&e))
         {
             Some(entry) => entry.root,
@@ -2580,15 +2604,14 @@ impl RevisionHandler {
                     return Ok(error_result(
                         STATUS_BAD_REQUEST,
                         "base_not_a_version",
-                        &format!("base hash does not resolve to a version entry: {}", base_hash),
+                        &format!(
+                            "base hash does not resolve to a version entry: {}",
+                            base_hash
+                        ),
                     ));
                 }
             };
-            trie::collect_reachable_hashes(
-                self.content_store.as_ref(),
-                base_root,
-                &mut skip,
-            );
+            trie::collect_reachable_hashes(self.content_store.as_ref(), base_root, &mut skip);
         }
 
         // Walk target collecting the diff closure.
@@ -2660,10 +2683,7 @@ fn decode_fetch_diff_params(data: &[u8]) -> Result<(String, Option<Hash>), Handl
 const PULL_MAX_ROUNDS: usize = 32;
 
 impl RevisionHandler {
-    async fn handle_pull(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_pull(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let params = decode_fetch_params(&ctx.params.data)?;
         if params.prefix.is_empty() {
             return Ok(error_result(
@@ -2770,7 +2790,10 @@ impl RevisionHandler {
                 return Ok(error_result(
                     STATUS_INTERNAL_ERROR,
                     "remote_empty",
-                    &format!("remote {} has no versions at prefix {}", remote, local_prefix),
+                    &format!(
+                        "remote {} has no versions at prefix {}",
+                        remote, local_prefix
+                    ),
                 ));
             }
         };
@@ -2803,7 +2826,8 @@ impl RevisionHandler {
             if missing.is_empty() {
                 break;
             }
-            let fe_params = build_fetch_entities_params_entity(&remote_pull_prefix, root, &missing)?;
+            let fe_params =
+                build_fetch_entities_params_entity(&remote_pull_prefix, root, &missing)?;
             let fe_resp = match execute_fn(
                 remote_uri.clone(),
                 "fetch-entities".to_string(),
@@ -2866,9 +2890,8 @@ impl RevisionHandler {
                 entity_ecf::Value::Bytes(head.to_bytes().to_vec()),
             ),
         ]));
-        let merge_params_entity =
-            Entity::new("system/revision/merge-params", merge_params_data)
-                .map_err(|e| HandlerError::Internal(e.to_string()))?;
+        let merge_params_entity = Entity::new("system/revision/merge-params", merge_params_data)
+            .map_err(|e| HandlerError::Internal(e.to_string()))?;
         let merge_ctx = clone_ctx_with(ctx, merge_params_entity, "merge".to_string());
         self.handle_merge(&merge_ctx).await
     }
@@ -2934,9 +2957,7 @@ fn build_fetch_entities_params_entity(
 /// Decode an envelope's CBOR data into (root, included) pairs. The result
 /// entity at `root` is reconstructed from the inline `{type, data, content_hash}`
 /// shape produced by `build_envelope_result`/`entity_to_inline`.
-fn decode_envelope(
-    data: &[u8],
-) -> Result<(Entity, Vec<(Hash, Entity)>), HandlerError> {
+fn decode_envelope(data: &[u8]) -> Result<(Entity, Vec<(Hash, Entity)>), HandlerError> {
     let val: ciborium::Value = ciborium::from_reader(data)
         .map_err(|e| HandlerError::Internal(format!("envelope decode: {}", e)))?;
     let map = val
@@ -2953,11 +2974,9 @@ fn decode_envelope(
             Some("included") => {
                 if let Some(inc_map) = v.as_map() {
                     for (ik, iv) in inc_map {
-                        let hash_bytes = ik
-                            .as_bytes()
-                            .ok_or_else(|| HandlerError::Internal(
-                                "envelope included key not bytes".into(),
-                            ))?;
+                        let hash_bytes = ik.as_bytes().ok_or_else(|| {
+                            HandlerError::Internal("envelope included key not bytes".into())
+                        })?;
                         let h = Hash::from_bytes(hash_bytes)
                             .map_err(|e| HandlerError::Internal(e.to_string()))?;
                         included.push((h, inline_to_entity(iv)?));
@@ -2993,8 +3012,7 @@ fn inline_to_entity(v: &ciborium::Value) -> Result<Entity, HandlerError> {
     let mut data_bytes = Vec::new();
     ciborium::into_writer(data_value, &mut data_bytes)
         .map_err(|e| HandlerError::Internal(format!("inline data encode: {}", e)))?;
-    Entity::new(&entity_type, data_bytes)
-        .map_err(|e| HandlerError::Internal(e.to_string()))
+    Entity::new(&entity_type, data_bytes).map_err(|e| HandlerError::Internal(e.to_string()))
 }
 
 /// Decode `head` from a `system/revision/fetch-result` entity's CBOR data.
@@ -3167,9 +3185,8 @@ impl RevisionHandler {
         let version_entity = self.content_store.get(&version_hash).ok_or_else(|| {
             HandlerError::Internal(format!("version entity not found: {}", version_hash))
         })?;
-        let entry = decode_revision_entry(&version_entity).ok_or_else(|| {
-            HandlerError::Internal("failed to decode revision entry".into())
-        })?;
+        let entry = decode_revision_entry(&version_entity)
+            .ok_or_else(|| HandlerError::Internal("failed to decode revision entry".into()))?;
 
         Ok(trie::collect_all_bindings(
             self.content_store.as_ref(),
@@ -3206,12 +3223,13 @@ impl RevisionHandler {
         // Remove paths not in target, plus paths whose target binding
         // is the canonical deletion marker.
         for rel_path in current.keys() {
-            let should_remove = !target.contains_key(rel_path)
-                || target.get(rel_path) == Some(&marker_hash);
+            let should_remove =
+                !target.contains_key(rel_path) || target.get(rel_path) == Some(&marker_hash);
             if should_remove {
                 let full_path = format!("{}{}", tree_prefix, rel_path);
-                let (_removed, cascade) =
-                    self.location_index.remove_with_context(&full_path, ctx.clone());
+                let (_removed, cascade) = self
+                    .location_index
+                    .remove_with_context(&full_path, ctx.clone());
                 collect_cascade_warnings(&cascade, &full_path, &mut warnings)?;
             }
         }
@@ -3221,8 +3239,9 @@ impl RevisionHandler {
                 continue;
             }
             let full_path = format!("{}{}", tree_prefix, rel_path);
-            let cascade =
-                self.location_index.set_with_context(&full_path, *hash, ctx.clone());
+            let cascade = self
+                .location_index
+                .set_with_context(&full_path, *hash, ctx.clone());
             collect_cascade_warnings(&cascade, &full_path, &mut warnings)?;
         }
         Ok(warnings)
@@ -3302,7 +3321,11 @@ pub(crate) mod commit_logic {
             if let Some(ref cfg) = config {
                 let mut filtered = BTreeMap::new();
                 for (path, hash) in &raw_bindings {
-                    if cfg.exclude.iter().any(|pat| crate::engine::exclude_pattern_matches(pat, path)) {
+                    if cfg
+                        .exclude
+                        .iter()
+                        .any(|pat| crate::engine::exclude_pattern_matches(pat, path))
+                    {
                         continue;
                     }
                     if !cfg.exclude_types.is_empty() {
@@ -3391,7 +3414,9 @@ pub(crate) mod commit_logic {
         let ab_path = crate::rev_active_branch_path(local_peer_id, &ph);
         if let Some(ab_hash) = location_index.get(&ab_path) {
             if let Some(ab_entity) = content_store.get(&ab_hash) {
-                if let Ok(val) = ciborium::from_reader::<ciborium::Value, _>(ab_entity.data.as_slice()) {
+                if let Ok(val) =
+                    ciborium::from_reader::<ciborium::Value, _>(ab_entity.data.as_slice())
+                {
                     if let Some(map) = val.as_map() {
                         for (k, v) in map {
                             if k.as_text() == Some("name") {
@@ -3477,14 +3502,17 @@ fn decode_fetch_params(data: &[u8]) -> Result<FetchParams, HandlerError> {
         }
     }
 
-    let prefix =
-        prefix.ok_or_else(|| HandlerError::InvalidParams("missing 'prefix'".into()))?;
-    Ok(FetchParams { prefix, remote_prefix, remote, since, depth })
+    let prefix = prefix.ok_or_else(|| HandlerError::InvalidParams("missing 'prefix'".into()))?;
+    Ok(FetchParams {
+        prefix,
+        remote_prefix,
+        remote,
+        since,
+        depth,
+    })
 }
 
-fn decode_log_params(
-    data: &[u8],
-) -> Result<(String, Option<usize>, Option<Hash>), HandlerError> {
+fn decode_log_params(data: &[u8]) -> Result<(String, Option<usize>, Option<Hash>), HandlerError> {
     let val: ciborium::Value = ciborium::from_reader(data)
         .map_err(|e| HandlerError::InvalidParams(format!("decode: {}", e)))?;
     let map = val
@@ -3510,8 +3538,7 @@ fn decode_log_params(
         }
     }
 
-    let prefix =
-        prefix.ok_or_else(|| HandlerError::InvalidParams("missing 'prefix'".into()))?;
+    let prefix = prefix.ok_or_else(|| HandlerError::InvalidParams("missing 'prefix'".into()))?;
     Ok((prefix, limit, since))
 }
 
@@ -3591,10 +3618,8 @@ fn decode_branch_params(
         }
     }
 
-    let prefix =
-        prefix.ok_or_else(|| HandlerError::InvalidParams("missing 'prefix'".into()))?;
-    let action =
-        action.ok_or_else(|| HandlerError::InvalidParams("missing 'action'".into()))?;
+    let prefix = prefix.ok_or_else(|| HandlerError::InvalidParams("missing 'prefix'".into()))?;
+    let action = action.ok_or_else(|| HandlerError::InvalidParams("missing 'action'".into()))?;
     Ok((prefix, action, name, from))
 }
 
@@ -3626,10 +3651,8 @@ fn decode_tag_params(
         }
     }
 
-    let prefix =
-        prefix.ok_or_else(|| HandlerError::InvalidParams("missing 'prefix'".into()))?;
-    let action =
-        action.ok_or_else(|| HandlerError::InvalidParams("missing 'action'".into()))?;
+    let prefix = prefix.ok_or_else(|| HandlerError::InvalidParams("missing 'prefix'".into()))?;
+    let action = action.ok_or_else(|| HandlerError::InvalidParams("missing 'action'".into()))?;
     Ok((prefix, action, name, version))
 }
 
@@ -3659,8 +3682,7 @@ fn decode_checkout_params(
         }
     }
 
-    let prefix =
-        prefix.ok_or_else(|| HandlerError::InvalidParams("missing 'prefix'".into()))?;
+    let prefix = prefix.ok_or_else(|| HandlerError::InvalidParams("missing 'prefix'".into()))?;
     Ok((prefix, branch, version))
 }
 
@@ -3701,8 +3723,7 @@ fn decode_merge_params(data: &[u8]) -> Result<MergeParams, HandlerError> {
         }
     }
 
-    let prefix =
-        prefix.ok_or_else(|| HandlerError::InvalidParams("missing 'prefix'".into()))?;
+    let prefix = prefix.ok_or_else(|| HandlerError::InvalidParams("missing 'prefix'".into()))?;
     let remote_version = remote_version
         .ok_or_else(|| HandlerError::InvalidParams("missing 'remote_version'".into()))?;
     Ok(MergeParams {
@@ -3738,8 +3759,7 @@ fn decode_resolve_params(data: &[u8]) -> Result<(String, String, Option<Hash>), 
         }
     }
 
-    let prefix =
-        prefix.ok_or_else(|| HandlerError::InvalidParams("missing 'prefix'".into()))?;
+    let prefix = prefix.ok_or_else(|| HandlerError::InvalidParams("missing 'prefix'".into()))?;
     let path = path.ok_or_else(|| HandlerError::InvalidParams("missing 'path'".into()))?;
     Ok((prefix, path, resolved))
 }
@@ -3772,11 +3792,9 @@ fn decode_diff_params(data: &[u8]) -> Result<(String, Hash, Hash), HandlerError>
         }
     }
 
-    let prefix =
-        prefix.ok_or_else(|| HandlerError::InvalidParams("missing 'prefix'".into()))?;
+    let prefix = prefix.ok_or_else(|| HandlerError::InvalidParams("missing 'prefix'".into()))?;
     let base = base.ok_or_else(|| HandlerError::InvalidParams("missing 'base'".into()))?;
-    let target =
-        target.ok_or_else(|| HandlerError::InvalidParams("missing 'target'".into()))?;
+    let target = target.ok_or_else(|| HandlerError::InvalidParams("missing 'target'".into()))?;
     Ok((prefix, base, target))
 }
 
@@ -3816,11 +3834,13 @@ fn decode_version_op_params(data: &[u8]) -> Result<VersionOpParams, HandlerError
         }
     }
 
-    let prefix =
-        prefix.ok_or_else(|| HandlerError::InvalidParams("missing 'prefix'".into()))?;
-    let version =
-        version.ok_or_else(|| HandlerError::InvalidParams("missing 'version'".into()))?;
-    Ok(VersionOpParams { prefix, version, parent })
+    let prefix = prefix.ok_or_else(|| HandlerError::InvalidParams("missing 'prefix'".into()))?;
+    let version = version.ok_or_else(|| HandlerError::InvalidParams("missing 'version'".into()))?;
+    Ok(VersionOpParams {
+        prefix,
+        version,
+        parent,
+    })
 }
 
 /// Decode params for push: {prefix, remote}
@@ -3842,10 +3862,8 @@ fn decode_push_params(data: &[u8]) -> Result<(String, String), HandlerError> {
         }
     }
 
-    let prefix =
-        prefix.ok_or_else(|| HandlerError::InvalidParams("missing 'prefix'".into()))?;
-    let remote =
-        remote.ok_or_else(|| HandlerError::InvalidParams("missing 'remote'".into()))?;
+    let prefix = prefix.ok_or_else(|| HandlerError::InvalidParams("missing 'prefix'".into()))?;
+    let remote = remote.ok_or_else(|| HandlerError::InvalidParams("missing 'remote'".into()))?;
     Ok((prefix, remote))
 }
 
@@ -3884,8 +3902,7 @@ fn decode_fetch_entities_params(data: &[u8]) -> Result<(String, Hash, Vec<Hash>)
         }
     }
 
-    let prefix =
-        prefix.ok_or_else(|| HandlerError::InvalidParams("missing 'prefix'".into()))?;
+    let prefix = prefix.ok_or_else(|| HandlerError::InvalidParams("missing 'prefix'".into()))?;
     let snapshot =
         snapshot.ok_or_else(|| HandlerError::InvalidParams("missing 'snapshot'".into()))?;
     Ok((prefix, snapshot, hashes))
@@ -3905,20 +3922,32 @@ fn decode_fetch_entities_params(data: &[u8]) -> Result<(String, Hash, Vec<Hash>)
 /// entity's data bytes back to a CBOR Value so it embeds as the native type
 /// (typically a map), not as a byte string containing CBOR.
 fn entity_to_inline(entity: &Entity) -> entity_ecf::Value {
-    let data_value: entity_ecf::Value = ciborium::from_reader(entity.data.as_slice())
-        .unwrap_or(entity_ecf::Value::Null);
+    let data_value: entity_ecf::Value =
+        ciborium::from_reader(entity.data.as_slice()).unwrap_or(entity_ecf::Value::Null);
     entity_ecf::Value::Map(vec![
-        (entity_ecf::text("content_hash"), entity_ecf::Value::Bytes(entity.content_hash.to_bytes().to_vec())),
+        (
+            entity_ecf::text("content_hash"),
+            entity_ecf::Value::Bytes(entity.content_hash.to_bytes().to_vec()),
+        ),
         (entity_ecf::text("data"), data_value),
-        (entity_ecf::text("type"), entity_ecf::text(&entity.entity_type)),
+        (
+            entity_ecf::text("type"),
+            entity_ecf::text(&entity.entity_type),
+        ),
     ])
 }
 
-fn build_envelope_result(root: Entity, included: std::collections::HashMap<Hash, Entity>) -> Entity {
+fn build_envelope_result(
+    root: Entity,
+    included: std::collections::HashMap<Hash, Entity>,
+) -> Entity {
     let included_entries: Vec<_> = included
         .iter()
         .map(|(hash, entity)| {
-            (entity_ecf::Value::Bytes(hash.to_bytes().to_vec()), entity_to_inline(entity))
+            (
+                entity_ecf::Value::Bytes(hash.to_bytes().to_vec()),
+                entity_to_inline(entity),
+            )
         })
         .collect();
 
@@ -3946,7 +3975,11 @@ fn error_result(status: u32, code: &str, message: &str) -> HandlerResult {
     // when its type matches; mismatch falls back to status-default codes
     // (404→"not_found", etc), masking spec-pinned codes like `base_not_found`.
     let result = Entity::new(entity_types::TYPE_ERROR, data).unwrap();
-    HandlerResult { status, result, included: std::collections::HashMap::new() }
+    HandlerResult {
+        status,
+        result,
+        included: std::collections::HashMap::new(),
+    }
 }
 
 fn merge_status_result(
@@ -3965,9 +3998,7 @@ fn merge_status_result(
     if !conflict_paths.is_empty() {
         fields.push((
             entity_ecf::text("conflicts"),
-            entity_ecf::Value::Array(
-                conflict_paths.iter().map(|p| entity_ecf::text(p)).collect(),
-            ),
+            entity_ecf::Value::Array(conflict_paths.iter().map(entity_ecf::text).collect()),
         ));
     }
     if deleted_count > 0 {
@@ -4002,9 +4033,7 @@ fn merge_status_result(
 }
 
 fn push_status_result(status: &str, versions: usize) -> HandlerResult {
-    let mut fields = vec![
-        (entity_ecf::text("status"), entity_ecf::text(status)),
-    ];
+    let mut fields = vec![(entity_ecf::text("status"), entity_ecf::text(status))];
     if versions > 0 {
         fields.push((
             entity_ecf::text("versions"),
@@ -4163,7 +4192,12 @@ mod tests {
         }
     }
 
-    fn put_entity(store: &dyn ContentStore, li: &dyn LocationIndex, path: &str, content: &str) -> Hash {
+    fn put_entity(
+        store: &dyn ContentStore,
+        li: &dyn LocationIndex,
+        path: &str,
+        content: &str,
+    ) -> Hash {
         let data = entity_ecf::to_ecf(&entity_ecf::text(content));
         let entity = Entity::new("test/type", data).unwrap();
         let hash = store.put(entity).unwrap();
@@ -4182,8 +4216,7 @@ mod tests {
     /// Otherwise return the entity as-is.
     fn unwrap_envelope(entity: &Entity) -> Entity {
         if entity.entity_type == entity_types::TYPE_ENVELOPE {
-            let val: ciborium::Value =
-                ciborium::from_reader(entity.data.as_slice()).unwrap();
+            let val: ciborium::Value = ciborium::from_reader(entity.data.as_slice()).unwrap();
             let map = val.as_map().unwrap();
             let root = map
                 .iter()
@@ -4246,7 +4279,9 @@ mod tests {
         assert!(root.is_some());
 
         // Head should now be set
-        assert!(li.get(&rev_head_path(&test_peer_id(), &test_ph("data/"))).is_some());
+        assert!(li
+            .get(&rev_head_path(&test_peer_id(), &test_ph("data/")))
+            .is_some());
     }
 
     fn make_merge_config_params(
@@ -4265,8 +4300,10 @@ mod tests {
             config_fields.push((entity_ecf::text("strategy"), entity_ecf::text(s)));
         }
         if let Some(dr) = deletion_resolution {
-            config_fields
-                .push((entity_ecf::text("deletion_resolution"), entity_ecf::text(dr)));
+            config_fields.push((
+                entity_ecf::text("deletion_resolution"),
+                entity_ecf::text(dr),
+            ));
         }
         let mut fields: Vec<(entity_ecf::Value, entity_ecf::Value)> = vec![
             (entity_ecf::text("scope"), entity_ecf::text(scope)),
@@ -4290,14 +4327,18 @@ mod tests {
         let (store, li) = make_stores();
         let handler = make_handler(store.clone(), li.clone());
         let params = make_merge_config_params(
-            "path", "test", "set", Some("*"), Some("three-way"), Some("lww"),
+            "path",
+            "test",
+            "set",
+            Some("*"),
+            Some("three-way"),
+            Some("lww"),
         );
         let ctx = make_ctx("merge-config", params);
         let result = handler.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_BAD_REQUEST, "lww must be rejected");
         // The error entity carries the canonical `invalid_strategy` code.
-        let v: ciborium::Value =
-            ciborium::from_reader(result.result.data.as_slice()).unwrap();
+        let v: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let map = v.as_map().unwrap();
         let code = map
             .iter()
@@ -4311,10 +4352,7 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(code, "invalid_strategy");
         // Binding MUST NOT have landed.
-        let path = format!(
-            "/{}/system/revision/config/merge/path/test",
-            test_peer_id()
-        );
+        let path = format!("/{}/system/revision/config/merge/path/test", test_peer_id());
         assert!(
             li.get(&path).is_none(),
             "rejected config MUST NOT be bound at the merge-config path"
@@ -4328,13 +4366,17 @@ mod tests {
         let (store, li) = make_stores();
         let handler = make_handler(store.clone(), li.clone());
         let params = make_merge_config_params(
-            "path", "test", "set", Some("*"), Some("three-way"), Some("keep-both"),
+            "path",
+            "test",
+            "set",
+            Some("*"),
+            Some("three-way"),
+            Some("keep-both"),
         );
         let ctx = make_ctx("merge-config", params);
         let result = handler.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_BAD_REQUEST);
-        let v: ciborium::Value =
-            ciborium::from_reader(result.result.data.as_slice()).unwrap();
+        let v: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let map = v.as_map().unwrap();
         let code = map
             .iter()
@@ -4362,7 +4404,12 @@ mod tests {
             "deterministic",
         ] {
             let params = make_merge_config_params(
-                "path", "test", "set", Some("*"), Some("three-way"), Some(dr),
+                "path",
+                "test",
+                "set",
+                Some("*"),
+                Some("three-way"),
+                Some(dr),
             );
             let ctx = make_ctx("merge-config", params);
             let result = handler.handle(&ctx).await.unwrap();
@@ -4373,10 +4420,7 @@ mod tests {
             );
         }
         // Binding is present at the canonical path.
-        let path = format!(
-            "/{}/system/revision/config/merge/path/test",
-            test_peer_id()
-        );
+        let path = format!("/{}/system/revision/config/merge/path/test", test_peer_id());
         assert!(li.get(&path).is_some());
     }
 
@@ -4526,18 +4570,19 @@ mod tests {
         handler.handle(&ctx).await.unwrap();
 
         // Create branch
-        let params = make_params("data/", vec![
-            ("action", entity_ecf::text("create")),
-            ("name", entity_ecf::text("feature")),
-        ]);
+        let params = make_params(
+            "data/",
+            vec![
+                ("action", entity_ecf::text("create")),
+                ("name", entity_ecf::text("feature")),
+            ],
+        );
         let ctx = make_ctx("branch", params);
         let result = handler.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
 
         // List branches
-        let params = make_params("data/", vec![
-            ("action", entity_ecf::text("list")),
-        ]);
+        let params = make_params("data/", vec![("action", entity_ecf::text("list"))]);
         let ctx = make_ctx("branch", params);
         let result = handler.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
@@ -4548,10 +4593,13 @@ mod tests {
         }
 
         // Delete branch
-        let params = make_params("data/", vec![
-            ("action", entity_ecf::text("delete")),
-            ("name", entity_ecf::text("feature")),
-        ]);
+        let params = make_params(
+            "data/",
+            vec![
+                ("action", entity_ecf::text("delete")),
+                ("name", entity_ecf::text("feature")),
+            ],
+        );
         let ctx = make_ctx("branch", params);
         let result = handler.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
@@ -4568,19 +4616,25 @@ mod tests {
         handler.handle(&ctx).await.unwrap();
 
         // Create tag
-        let params = make_params("data/", vec![
-            ("action", entity_ecf::text("create")),
-            ("name", entity_ecf::text("v1.0")),
-        ]);
+        let params = make_params(
+            "data/",
+            vec![
+                ("action", entity_ecf::text("create")),
+                ("name", entity_ecf::text("v1.0")),
+            ],
+        );
         let ctx = make_ctx("tag", params);
         let result = handler.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
 
         // Try to create same tag again — should fail with 409
-        let params = make_params("data/", vec![
-            ("action", entity_ecf::text("create")),
-            ("name", entity_ecf::text("v1.0")),
-        ]);
+        let params = make_params(
+            "data/",
+            vec![
+                ("action", entity_ecf::text("create")),
+                ("name", entity_ecf::text("v1.0")),
+            ],
+        );
         let ctx = make_ctx("tag", params);
         let result = handler.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_CONFLICT);
@@ -4598,10 +4652,13 @@ mod tests {
         handler.handle(&ctx).await.unwrap();
 
         // Create a branch at current head
-        let params = make_params("data/", vec![
-            ("action", entity_ecf::text("create")),
-            ("name", entity_ecf::text("feature")),
-        ]);
+        let params = make_params(
+            "data/",
+            vec![
+                ("action", entity_ecf::text("create")),
+                ("name", entity_ecf::text("feature")),
+            ],
+        );
         let ctx = make_ctx("branch", params);
         handler.handle(&ctx).await.unwrap();
 
@@ -4612,9 +4669,7 @@ mod tests {
         handler.handle(&ctx).await.unwrap();
 
         // Checkout the feature branch (should revert data/foo to v1)
-        let params = make_params("data/", vec![
-            ("branch", entity_ecf::text("feature")),
-        ]);
+        let params = make_params("data/", vec![("branch", entity_ecf::text("feature"))]);
         let ctx = make_ctx("checkout", params);
         let result = handler.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
@@ -4634,8 +4689,7 @@ mod tests {
         let ctx = make_ctx("pull", params);
         let result = handler.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_BAD_REQUEST);
-        let val: ciborium::Value =
-            ciborium::from_reader(result.result.data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let code = val
             .as_map()
             .unwrap()
@@ -4656,15 +4710,11 @@ mod tests {
         // execute_fn). Production wiring always provides one.
         let (store, li) = make_stores();
         let handler = make_handler(store.clone(), li.clone());
-        let params = make_params(
-            "data/",
-            vec![("remote", entity_ecf::text("bogus-peer-id"))],
-        );
+        let params = make_params("data/", vec![("remote", entity_ecf::text("bogus-peer-id"))]);
         let ctx = make_ctx("pull", params);
         let result = handler.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_INTERNAL_ERROR);
-        let val: ciborium::Value =
-            ciborium::from_reader(result.result.data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let code = val
             .as_map()
             .unwrap()
@@ -4904,7 +4954,10 @@ mod tests {
         });
         let conflict_entity = Entity::new("system/revision/conflict", conflict_data).unwrap();
         let conflict_hash = store.put(conflict_entity).unwrap();
-        li.set(&rev_conflict_path(&test_peer_id(), &test_ph("data/"), "foo"), conflict_hash);
+        li.set(
+            &rev_conflict_path(&test_peer_id(), &test_ph("data/"), "foo"),
+            conflict_hash,
+        );
 
         // Put a resolved entity
         let resolved_data = entity_ecf::to_ecf(&entity_ecf::text("resolved"));
@@ -4927,9 +4980,18 @@ mod tests {
 
         assert_eq!(result.status, STATUS_OK);
         // Conflict should be removed
-        assert!(li.get(&rev_conflict_path(&test_peer_id(), &test_ph("data/"), "foo")).is_none());
+        assert!(li
+            .get(&rev_conflict_path(
+                &test_peer_id(),
+                &test_ph("data/"),
+                "foo"
+            ))
+            .is_none());
         // Resolved entity should be at the qualified tree path
-        assert_eq!(li.get(&format!("/{}/data/foo", test_peer_id())), Some(resolved_hash));
+        assert_eq!(
+            li.get(&format!("/{}/data/foo", test_peer_id())),
+            Some(resolved_hash)
+        );
     }
 
     fn extract_version_hash(result: &Entity) -> Hash {
@@ -4952,14 +5014,29 @@ mod tests {
         let pid = test_peer_id();
 
         // v1: file1, file2 (stored at qualified paths, bare prefix in params)
-        put_entity(store.as_ref(), li.as_ref(), &format!("/{}/data/file1", pid), "content1");
-        put_entity(store.as_ref(), li.as_ref(), &format!("/{}/data/file2", pid), "content2");
+        put_entity(
+            store.as_ref(),
+            li.as_ref(),
+            &format!("/{}/data/file1", pid),
+            "content1",
+        );
+        put_entity(
+            store.as_ref(),
+            li.as_ref(),
+            &format!("/{}/data/file2", pid),
+            "content2",
+        );
         let ctx = make_ctx("commit", make_params("data/", vec![]));
         let r1 = handler.handle(&ctx).await.unwrap();
         let v1 = extract_version_hash(&r1.result);
 
         // v2: file1, file2, file3
-        put_entity(store.as_ref(), li.as_ref(), &format!("/{}/data/file3", pid), "content3");
+        put_entity(
+            store.as_ref(),
+            li.as_ref(),
+            &format!("/{}/data/file3", pid),
+            "content3",
+        );
         let ctx = make_ctx("commit", make_params("data/", vec![]));
         handler.handle(&ctx).await.unwrap();
 
@@ -4982,8 +5059,14 @@ mod tests {
             "file3 should not exist after checkout to v1"
         );
         // file1, file2 should still exist
-        assert!(li.get(&format!("/{}/data/file1", pid)).is_some(), "file1 should still exist");
-        assert!(li.get(&format!("/{}/data/file2", pid)).is_some(), "file2 should still exist");
+        assert!(
+            li.get(&format!("/{}/data/file1", pid)).is_some(),
+            "file1 should still exist"
+        );
+        assert!(
+            li.get(&format!("/{}/data/file2", pid)).is_some(),
+            "file2 should still exist"
+        );
     }
 
     /// Same as above but with already-qualified prefix in params (idempotent qualification).
@@ -4995,20 +5078,38 @@ mod tests {
         let qualified_prefix = format!("/{}/data/", pid);
 
         // v1: file1, file2 (at qualified paths, qualified prefix in params)
-        put_entity(store.as_ref(), li.as_ref(), &format!("{}file1", qualified_prefix), "content1");
-        put_entity(store.as_ref(), li.as_ref(), &format!("{}file2", qualified_prefix), "content2");
+        put_entity(
+            store.as_ref(),
+            li.as_ref(),
+            &format!("{}file1", qualified_prefix),
+            "content1",
+        );
+        put_entity(
+            store.as_ref(),
+            li.as_ref(),
+            &format!("{}file2", qualified_prefix),
+            "content2",
+        );
         let ctx = make_ctx("commit", make_params(&qualified_prefix, vec![]));
         let r1 = handler.handle(&ctx).await.unwrap();
         let v1 = extract_version_hash(&r1.result);
 
         // v2: add file3
-        put_entity(store.as_ref(), li.as_ref(), &format!("{}file3", qualified_prefix), "content3");
+        put_entity(
+            store.as_ref(),
+            li.as_ref(),
+            &format!("{}file3", qualified_prefix),
+            "content3",
+        );
         let ctx = make_ctx("commit", make_params(&qualified_prefix, vec![]));
         handler.handle(&ctx).await.unwrap();
 
         // Checkout to v1 (qualified prefix in params — tests idempotent qualification)
         let params_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-            (entity_ecf::text("prefix"), entity_ecf::text(&qualified_prefix)),
+            (
+                entity_ecf::text("prefix"),
+                entity_ecf::text(&qualified_prefix),
+            ),
             (
                 entity_ecf::text("version"),
                 entity_ecf::Value::Bytes(v1.to_bytes().to_vec()),
@@ -5024,8 +5125,14 @@ mod tests {
             li.get(&format!("{}file3", qualified_prefix)).is_none(),
             "file3 should not exist after checkout to v1"
         );
-        assert!(li.get(&format!("{}file1", qualified_prefix)).is_some(), "file1 should still exist");
-        assert!(li.get(&format!("{}file2", qualified_prefix)).is_some(), "file2 should still exist");
+        assert!(
+            li.get(&format!("{}file1", qualified_prefix)).is_some(),
+            "file1 should still exist"
+        );
+        assert!(
+            li.get(&format!("{}file2", qualified_prefix)).is_some(),
+            "file2 should still exist"
+        );
     }
 
     // -------------------------------------------------------------------
@@ -5042,9 +5149,14 @@ mod tests {
 
     impl OrderingSpy {
         fn new(inner: Arc<MemoryLocationIndex>) -> Arc<Self> {
-            Arc::new(Self { inner, log: std::sync::Mutex::new(Vec::new()) })
+            Arc::new(Self {
+                inner,
+                log: std::sync::Mutex::new(Vec::new()),
+            })
         }
-        fn log(&self) -> Vec<String> { self.log.lock().unwrap().clone() }
+        fn log(&self) -> Vec<String> {
+            self.log.lock().unwrap().clone()
+        }
     }
 
     impl entity_store::LocationIndex for OrderingSpy {
@@ -5052,8 +5164,12 @@ mod tests {
             self.log.lock().unwrap().push(format!("set {}", path));
             self.inner.set(path, hash);
         }
-        fn get(&self, path: &str) -> Option<Hash> { self.inner.get(path) }
-        fn has(&self, path: &str) -> bool { self.inner.has(path) }
+        fn get(&self, path: &str) -> Option<Hash> {
+            self.inner.get(path)
+        }
+        fn has(&self, path: &str) -> bool {
+            self.inner.has(path)
+        }
         fn remove(&self, path: &str) -> Option<Hash> {
             self.log.lock().unwrap().push(format!("remove {}", path));
             self.inner.remove(path)
@@ -5095,10 +5211,7 @@ mod tests {
 
         // Create a branch "main" pointing at base + mark as active.
         let tph = test_ph("data/");
-        inner_li.set(
-            &rev_branch_path(&peer, &tph, "main"),
-            base_v,
-        );
+        inner_li.set(&rev_branch_path(&peer, &tph, "main"), base_v);
         // Set active branch to main.
         let ab_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
             entity_ecf::text("name"),
@@ -5106,10 +5219,7 @@ mod tests {
         )]));
         let ab_entity = Entity::new("system/revision/active-branch", ab_data).unwrap();
         let ab_hash = store.put(ab_entity).unwrap();
-        inner_li.set(
-            &rev_active_branch_path(&peer, &tph),
-            ab_hash,
-        );
+        inner_li.set(&rev_active_branch_path(&peer, &tph), ab_hash);
 
         // Local diverges: modify base.
         put_entity(store.as_ref(), inner_li.as_ref(), &qp("data/base"), "local");
@@ -5118,18 +5228,25 @@ mod tests {
 
         // Build a remote divergent version: roll head back, write different data, commit, then push head forward.
         inner_li.set(&rev_head_path(&peer, &tph), base_v);
-        put_entity(store.as_ref(), inner_li.as_ref(), &qp("data/base"), "remote");
-        put_entity(store.as_ref(), inner_li.as_ref(), &qp("data/extra"), "remote_only");
+        put_entity(
+            store.as_ref(),
+            inner_li.as_ref(),
+            &qp("data/base"),
+            "remote",
+        );
+        put_entity(
+            store.as_ref(),
+            inner_li.as_ref(),
+            &qp("data/extra"),
+            "remote_only",
+        );
         let ctx = make_ctx("commit", make_params("data/", vec![]));
         let remote = handler.handle(&ctx).await.unwrap();
         let remote_v = extract_version_hash(&remote.result);
 
         // Restore head to local to set up the diverged state.
         let local_v = extract_version_hash(&local.result);
-        inner_li.set(
-            &rev_head_path(&peer, &tph),
-            local_v,
-        );
+        inner_li.set(&rev_head_path(&peer, &tph), local_v);
         // Clear the spy log — we only want the merge's writes.
         spy.log.lock().unwrap().clear();
 
@@ -5146,8 +5263,7 @@ mod tests {
         let _ = handler.handle(&ctx).await.unwrap();
 
         let log = spy.log();
-        let head_pos = position(&log, "/head")
-            .expect("head should be advanced");
+        let head_pos = position(&log, "/head").expect("head should be advanced");
         let branch_pos = position(&log, "/branches/main")
             .expect("active branch should be advanced — regression test");
         let data_pos = log
@@ -5171,12 +5287,18 @@ mod tests {
         let (store, inner_li) = make_stores();
         let spy = OrderingSpy::new(inner_li.clone());
         let li: Arc<dyn entity_store::LocationIndex> = spy.clone();
-        let handler =
-            Arc::new(RevisionHandler::new(store.clone(), li.clone(), test_peer_id()));
+        let handler = Arc::new(RevisionHandler::new(
+            store.clone(),
+            li.clone(),
+            test_peer_id(),
+        ));
 
         // v1 base, v2 adds bar, v3 modifies foo.
         put_entity(store.as_ref(), inner_li.as_ref(), "data/foo", "base");
-        handler.handle(&make_ctx("commit", make_params("data/", vec![]))).await.unwrap();
+        handler
+            .handle(&make_ctx("commit", make_params("data/", vec![])))
+            .await
+            .unwrap();
 
         put_entity(store.as_ref(), inner_li.as_ref(), "data/bar", "bar");
         let r2 = handler
@@ -5186,7 +5308,10 @@ mod tests {
         let v2 = extract_version_hash(&r2.result);
 
         put_entity(store.as_ref(), inner_li.as_ref(), "data/foo", "modified");
-        handler.handle(&make_ctx("commit", make_params("data/", vec![]))).await.unwrap();
+        handler
+            .handle(&make_ctx("commit", make_params("data/", vec![])))
+            .await
+            .unwrap();
 
         spy.log.lock().unwrap().clear();
         let params_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
@@ -5197,7 +5322,10 @@ mod tests {
             ),
         ]));
         let params = Entity::new("system/revision/cherry-pick-params", params_data).unwrap();
-        let _ = handler.handle(&make_ctx("cherry-pick", params)).await.unwrap();
+        let _ = handler
+            .handle(&make_ctx("cherry-pick", params))
+            .await
+            .unwrap();
 
         let log = spy.log();
         let head_pos = position(&log, "/head").unwrap_or(usize::MAX);
@@ -5226,8 +5354,11 @@ mod tests {
         let (store, inner_li) = make_stores();
         let spy = OrderingSpy::new(inner_li.clone());
         let li: Arc<dyn entity_store::LocationIndex> = spy.clone();
-        let handler =
-            Arc::new(RevisionHandler::new(store.clone(), li.clone(), test_peer_id()));
+        let handler = Arc::new(RevisionHandler::new(
+            store.clone(),
+            li.clone(),
+            test_peer_id(),
+        ));
 
         put_entity(store.as_ref(), inner_li.as_ref(), "data/file1", "v1");
         let r1 = handler
@@ -5237,7 +5368,10 @@ mod tests {
         let v1 = extract_version_hash(&r1.result);
 
         put_entity(store.as_ref(), inner_li.as_ref(), "data/file2", "v2");
-        handler.handle(&make_ctx("commit", make_params("data/", vec![]))).await.unwrap();
+        handler
+            .handle(&make_ctx("commit", make_params("data/", vec![])))
+            .await
+            .unwrap();
 
         spy.log.lock().unwrap().clear();
         let params_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
@@ -5252,7 +5386,10 @@ mod tests {
 
         let log = spy.log();
         let head_pos = position(&log, "/head").unwrap_or(usize::MAX);
-        if let Some(first_data) = log.iter().position(|s| s.contains("/data/") && !s.contains("system/")) {
+        if let Some(first_data) = log
+            .iter()
+            .position(|s| s.contains("/data/") && !s.contains("system/"))
+        {
             assert!(
                 head_pos < first_data,
                 "head must precede data writes; log = {:?}",
@@ -5281,7 +5418,10 @@ mod tests {
             .await
             .unwrap();
         let v2 = extract_version_hash(&r2.result);
-        assert_eq!(v1, v2, "second commit must return current head, not a new entry");
+        assert_eq!(
+            v1, v2,
+            "second commit must return current head, not a new entry"
+        );
 
         // Log should show exactly one version.
         let log_result = handler
@@ -5322,10 +5462,7 @@ mod tests {
         ]));
         let cfg_entity = Entity::new("system/revision/config", cfg_data).unwrap();
         let cfg_hash = store.put(cfg_entity).unwrap();
-        li.set(
-            &rev_config_path(&peer, &test_ph("data/")),
-            cfg_hash,
-        );
+        li.set(&rev_config_path(&peer, &test_ph("data/")), cfg_hash);
 
         let params_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
             (entity_ecf::text("prefix"), entity_ecf::text("data/")),
@@ -5355,14 +5492,24 @@ mod tests {
         let v1 = extract_version_hash(&r.result);
 
         // v2: local edits shared
-        put_entity(store.as_ref(), li.as_ref(), &qp("data/shared"), "local_edit");
+        put_entity(
+            store.as_ref(),
+            li.as_ref(),
+            &qp("data/shared"),
+            "local_edit",
+        );
         let ctx = make_ctx("commit", make_params("data/", vec![]));
         let r = handler.handle(&ctx).await.unwrap();
         let v2_local = extract_version_hash(&r.result);
 
         // Roll head back to v1, create divergent remote version
         li.set(&rev_head_path(&pid, &test_ph("data/")), v1);
-        put_entity(store.as_ref(), li.as_ref(), &qp("data/shared"), "remote_edit");
+        put_entity(
+            store.as_ref(),
+            li.as_ref(),
+            &qp("data/shared"),
+            "remote_edit",
+        );
         let ctx = make_ctx("commit", make_params("data/", vec![]));
         let r = handler.handle(&ctx).await.unwrap();
         let v2_remote = extract_version_hash(&r.result);
@@ -5388,13 +5535,17 @@ mod tests {
         // keep_both_strategy_applied: status must be "merged" (no conflicts)
         let status = decode_result_field(&result.result, "status").unwrap();
         assert_eq!(
-            status.as_text().unwrap(), "merged",
+            status.as_text().unwrap(),
+            "merged",
             "keep-both should resolve edit-vs-edit without conflicts"
         );
 
         // keep_both_original_entity: one side's entity at original path
         let original_binding = li.get(&qp("data/shared"));
-        assert!(original_binding.is_some(), "original path should have a binding");
+        assert!(
+            original_binding.is_some(),
+            "original path should have a binding"
+        );
 
         // keep_both_additional_binding: other side at .keep-both-{hex} path
         let tree_entries = li.list(&qp("data/"));
@@ -5403,9 +5554,13 @@ mod tests {
             .filter(|e| e.path.contains(".keep-both-"))
             .collect();
         assert_eq!(
-            keep_both_entries.len(), 1,
+            keep_both_entries.len(),
+            1,
             "should have exactly 1 keep-both binding, got: {:?}",
-            keep_both_entries.iter().map(|e| &e.path).collect::<Vec<_>>()
+            keep_both_entries
+                .iter()
+                .map(|e| &e.path)
+                .collect::<Vec<_>>()
         );
         let kb_path = &keep_both_entries[0].path;
         assert!(
@@ -5425,10 +5580,7 @@ mod tests {
     fn fetch_diff_params(prefix: &str, base: Option<Hash>) -> Entity {
         let mut extras: Vec<(&str, entity_ecf::Value)> = Vec::new();
         if let Some(b) = base {
-            extras.push((
-                "base",
-                entity_ecf::Value::Bytes(b.to_bytes().to_vec()),
-            ));
+            extras.push(("base", entity_ecf::Value::Bytes(b.to_bytes().to_vec())));
         }
         make_params(prefix, extras)
     }
@@ -5444,7 +5596,10 @@ mod tests {
         put_entity(store.as_ref(), li.as_ref(), "data/b", "bravo");
         put_entity(store.as_ref(), li.as_ref(), "data/c", "charlie");
 
-        let commit = handler.handle(&make_ctx("commit", make_params("data/", vec![]))).await.unwrap();
+        let commit = handler
+            .handle(&make_ctx("commit", make_params("data/", vec![])))
+            .await
+            .unwrap();
         assert_eq!(commit.status, STATUS_OK);
 
         let ctx = make_ctx("fetch-diff", fetch_diff_params("data/", None));
@@ -5453,8 +5608,7 @@ mod tests {
         assert_eq!(result.result.entity_type, entity_types::TYPE_ENVELOPE);
 
         // Envelope must contain at least: trie root node + 3 leaf entities.
-        let val: ciborium::Value =
-            ciborium::from_reader(result.result.data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
         let included = map
             .iter()
@@ -5480,26 +5634,41 @@ mod tests {
             );
         }
         // First commit becomes the base.
-        let commit1 = handler.handle(&make_ctx("commit", make_params("data/", vec![]))).await.unwrap();
+        let commit1 = handler
+            .handle(&make_ctx("commit", make_params("data/", vec![])))
+            .await
+            .unwrap();
         assert_eq!(commit1.status, STATUS_OK);
         let base_hash = {
             let ph = test_ph("data/");
-            li.get(&format!("/{}/system/revision/{}/head", test_peer_id(), ph)).unwrap()
+            li.get(&format!("/{}/system/revision/{}/head", test_peer_id(), ph))
+                .unwrap()
         };
 
         // Change one leaf, commit again.
         put_entity(store.as_ref(), li.as_ref(), "data/leaf-05", "v1");
-        let commit2 = handler.handle(&make_ctx("commit", make_params("data/", vec![]))).await.unwrap();
+        let commit2 = handler
+            .handle(&make_ctx("commit", make_params("data/", vec![])))
+            .await
+            .unwrap();
         assert_eq!(commit2.status, STATUS_OK);
 
-        let full = handler.handle(&make_ctx("fetch-diff", fetch_diff_params("data/", None))).await.unwrap();
-        let incr = handler.handle(&make_ctx("fetch-diff", fetch_diff_params("data/", Some(base_hash)))).await.unwrap();
+        let full = handler
+            .handle(&make_ctx("fetch-diff", fetch_diff_params("data/", None)))
+            .await
+            .unwrap();
+        let incr = handler
+            .handle(&make_ctx(
+                "fetch-diff",
+                fetch_diff_params("data/", Some(base_hash)),
+            ))
+            .await
+            .unwrap();
         assert_eq!(full.status, STATUS_OK);
         assert_eq!(incr.status, STATUS_OK);
 
         let included_len = |e: &Entity| -> usize {
-            let val: ciborium::Value =
-                ciborium::from_reader(e.data.as_slice()).unwrap();
+            let val: ciborium::Value = ciborium::from_reader(e.data.as_slice()).unwrap();
             let map = val.as_map().unwrap();
             map.iter()
                 .find(|(k, _)| k.as_text() == Some("included"))
@@ -5553,8 +5722,7 @@ mod tests {
         let result = handler.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_NOT_FOUND);
 
-        let val: ciborium::Value =
-            ciborium::from_reader(result.result.data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let code = val
             .as_map()
             .unwrap()
@@ -5575,7 +5743,10 @@ mod tests {
         let handler = make_handler(store.clone(), li.clone());
 
         put_entity(store.as_ref(), li.as_ref(), "data/a", "alpha");
-        handler.handle(&make_ctx("commit", make_params("data/", vec![]))).await.unwrap();
+        handler
+            .handle(&make_ctx("commit", make_params("data/", vec![])))
+            .await
+            .unwrap();
 
         // Use a clearly bogus base hash (zero-type, all-ones digest).
         let bogus = Hash::compute("test/type", b"some-bogus-data-that-is-never-stored");
@@ -5583,8 +5754,7 @@ mod tests {
         let result = handler.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_NOT_FOUND);
 
-        let val: ciborium::Value =
-            ciborium::from_reader(result.result.data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let code = val
             .as_map()
             .unwrap()
@@ -5605,7 +5775,10 @@ mod tests {
         let handler = make_handler(store.clone(), li.clone());
 
         put_entity(store.as_ref(), li.as_ref(), "data/a", "alpha");
-        handler.handle(&make_ctx("commit", make_params("data/", vec![]))).await.unwrap();
+        handler
+            .handle(&make_ctx("commit", make_params("data/", vec![])))
+            .await
+            .unwrap();
 
         // Insert a non-revision entity into the store, use its hash as base.
         let bogus_data = entity_ecf::to_ecf(&entity_ecf::text("not-a-version"));
@@ -5616,8 +5789,7 @@ mod tests {
         let result = handler.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_BAD_REQUEST);
 
-        let val: ciborium::Value =
-            ciborium::from_reader(result.result.data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let code = val
             .as_map()
             .unwrap()

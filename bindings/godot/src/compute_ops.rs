@@ -34,7 +34,9 @@
 
 use godot::prelude::*;
 
-use entity_sdk::compute::{ComputeEvalResult, ComputeInstallResult, ComputeValue, InstalledSubgraph};
+use entity_sdk::compute::{
+    ComputeEvalResult, ComputeInstallResult, ComputeValue, InstalledSubgraph,
+};
 
 use crate::entity_resource::EntityData;
 
@@ -152,7 +154,10 @@ pub(crate) fn installed_subgraph_to_dict(s: &InstalledSubgraph) -> Dictionary {
     let mut hash_pba = PackedByteArray::new();
     hash_pba.extend(s.metadata_hash.to_bytes().to_vec());
     dict.set("metadata_hash", hash_pba);
-    dict.set("root_expression_path", GString::from(&s.root_expression_path));
+    dict.set(
+        "root_expression_path",
+        GString::from(&s.root_expression_path),
+    );
     dict.set("result_path", GString::from(&s.result_path));
     dict.set("status", GString::from(&s.status));
     let mut grant_pba = PackedByteArray::new();

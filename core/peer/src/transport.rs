@@ -115,10 +115,14 @@ pub trait Connector: Send + Sync {
 /// Native: TcpConnector. WASM: NoConnector (outbound connections not supported without explicit setup).
 pub fn default_connector() -> std::sync::Arc<dyn Connector> {
     #[cfg(not(target_arch = "wasm32"))]
-    { std::sync::Arc::new(TcpConnector) }
+    {
+        std::sync::Arc::new(TcpConnector)
+    }
 
     #[cfg(target_arch = "wasm32")]
-    { std::sync::Arc::new(NoConnector) }
+    {
+        std::sync::Arc::new(NoConnector)
+    }
 }
 
 /// Stub connector for WASM — outbound connections require explicit WebSocket setup.
@@ -130,10 +134,13 @@ pub struct NoConnector;
 impl Connector for NoConnector {
     async fn connect(&self, addr: &str) -> Result<Connection, TransportError> {
         Err(TransportError::ConnectError(format!(
-            "no connector configured (tried to connect to {})", addr
+            "no connector configured (tried to connect to {})",
+            addr
         )))
     }
-    fn transport_type(&self) -> &'static str { "none" }
+    fn transport_type(&self) -> &'static str {
+        "none"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -146,106 +153,105 @@ mod tcp {
     use std::net::SocketAddr;
     use tokio::net::TcpStream;
 
-/// TCP listener wrapping `tokio::net::TcpListener`.
-pub struct TcpTransportListener {
-    inner: tokio::net::TcpListener,
-    local_addr: SocketAddr,
-}
-
-impl TcpTransportListener {
-    /// Bind a TCP listener on the given address.
-    pub async fn bind(addr: &str) -> Result<Self, TransportError> {
-        let inner = tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(|e| TransportError::BindError(format!("{}: {}", addr, e)))?;
-        let local_addr = inner
-            .local_addr()
-            .map_err(|e| TransportError::BindError(format!("local_addr: {}", e)))?;
-        Ok(Self { inner, local_addr })
+    /// TCP listener wrapping `tokio::net::TcpListener`.
+    pub struct TcpTransportListener {
+        inner: tokio::net::TcpListener,
+        local_addr: SocketAddr,
     }
 
-    /// The actual `SocketAddr` bound to (useful for port-0 auto-assignment).
-    pub fn socket_addr(&self) -> SocketAddr {
-        self.local_addr
-    }
-}
-
-#[async_trait]
-impl Listener for TcpTransportListener {
-    async fn accept(&self) -> Result<Connection, TransportError> {
-        let (stream, remote_addr) = self
-            .inner
-            .accept()
-            .await
-            .map_err(|e| TransportError::AcceptError(e.to_string()))?;
-
-        // Disable Nagle for request/response RPC. Without TCP_NODELAY, small
-        // writes interact with the peer's delayed-ACK timer to add ~40 ms per
-        // round-trip on localhost. Non-fatal if it fails.
-        if let Err(e) = stream.set_nodelay(true) {
-            tracing::warn!(remote = %remote_addr, error = %e, "tcp accept: set_nodelay failed");
+    impl TcpTransportListener {
+        /// Bind a TCP listener on the given address.
+        pub async fn bind(addr: &str) -> Result<Self, TransportError> {
+            let inner = tokio::net::TcpListener::bind(addr)
+                .await
+                .map_err(|e| TransportError::BindError(format!("{}: {}", addr, e)))?;
+            let local_addr = inner
+                .local_addr()
+                .map_err(|e| TransportError::BindError(format!("local_addr: {}", e)))?;
+            Ok(Self { inner, local_addr })
         }
 
-        let (reader, writer) = tokio::io::split(stream);
-        Ok(Connection {
-            reader: Box::new(reader),
-            writer: Box::new(writer),
-            remote_addr: remote_addr.to_string(),
-            transport_type: "tcp",
-        })
+        /// The actual `SocketAddr` bound to (useful for port-0 auto-assignment).
+        pub fn socket_addr(&self) -> SocketAddr {
+            self.local_addr
+        }
     }
 
-    fn local_addr(&self) -> String {
-        self.local_addr.to_string()
-    }
+    #[async_trait]
+    impl Listener for TcpTransportListener {
+        async fn accept(&self) -> Result<Connection, TransportError> {
+            let (stream, remote_addr) = self
+                .inner
+                .accept()
+                .await
+                .map_err(|e| TransportError::AcceptError(e.to_string()))?;
 
-    fn transport_type(&self) -> &'static str {
-        "tcp"
-    }
-}
+            // Disable Nagle for request/response RPC. Without TCP_NODELAY, small
+            // writes interact with the peer's delayed-ACK timer to add ~40 ms per
+            // round-trip on localhost. Non-fatal if it fails.
+            if let Err(e) = stream.set_nodelay(true) {
+                tracing::warn!(remote = %remote_addr, error = %e, "tcp accept: set_nodelay failed");
+            }
 
-/// TCP connector for outbound connections.
-pub struct TcpConnector;
-
-#[async_trait]
-impl Connector for TcpConnector {
-    async fn connect(&self, addr: &str) -> Result<Connection, TransportError> {
-        // `tokio::net::TcpStream::connect` resolves via getaddrinfo and
-        // does not know about URL schemes — passing `tcp://host:port`
-        // makes it try to resolve `tcp://host` as a hostname, which
-        // fails with "Name or service not known". Accept both bare
-        // `host:port` (legacy direct callers, in-process tests) and
-        // the D-14 wire shape `tcp://host:port` published in
-        // TcpProfileData.endpoint_url.
-        let host_port = addr.strip_prefix("tcp://").unwrap_or(addr);
-        let stream = TcpStream::connect(host_port)
-            .await
-            .map_err(|e| TransportError::ConnectError(format!("{}: {}", addr, e)))?;
-
-        // Disable Nagle (see TcpTransportListener::accept for rationale).
-        if let Err(e) = stream.set_nodelay(true) {
-            tracing::warn!(addr = %addr, error = %e, "tcp connect: set_nodelay failed");
+            let (reader, writer) = tokio::io::split(stream);
+            Ok(Connection {
+                reader: Box::new(reader),
+                writer: Box::new(writer),
+                remote_addr: remote_addr.to_string(),
+                transport_type: "tcp",
+            })
         }
 
-        let remote_addr = stream
-            .peer_addr()
-            .map(|a| a.to_string())
-            .unwrap_or_else(|_| addr.to_string());
+        fn local_addr(&self) -> String {
+            self.local_addr.to_string()
+        }
 
-        let (reader, writer) = tokio::io::split(stream);
-        Ok(Connection {
-            reader: Box::new(reader),
-            writer: Box::new(writer),
-            remote_addr,
-            transport_type: "tcp",
-        })
+        fn transport_type(&self) -> &'static str {
+            "tcp"
+        }
     }
 
-    fn transport_type(&self) -> &'static str {
-        "tcp"
-    }
-}
+    /// TCP connector for outbound connections.
+    pub struct TcpConnector;
 
+    #[async_trait]
+    impl Connector for TcpConnector {
+        async fn connect(&self, addr: &str) -> Result<Connection, TransportError> {
+            // `tokio::net::TcpStream::connect` resolves via getaddrinfo and
+            // does not know about URL schemes — passing `tcp://host:port`
+            // makes it try to resolve `tcp://host` as a hostname, which
+            // fails with "Name or service not known". Accept both bare
+            // `host:port` (legacy direct callers, in-process tests) and
+            // the D-14 wire shape `tcp://host:port` published in
+            // TcpProfileData.endpoint_url.
+            let host_port = addr.strip_prefix("tcp://").unwrap_or(addr);
+            let stream = TcpStream::connect(host_port)
+                .await
+                .map_err(|e| TransportError::ConnectError(format!("{}: {}", addr, e)))?;
+
+            // Disable Nagle (see TcpTransportListener::accept for rationale).
+            if let Err(e) = stream.set_nodelay(true) {
+                tracing::warn!(addr = %addr, error = %e, "tcp connect: set_nodelay failed");
+            }
+
+            let remote_addr = stream
+                .peer_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| addr.to_string());
+
+            let (reader, writer) = tokio::io::split(stream);
+            Ok(Connection {
+                reader: Box::new(reader),
+                writer: Box::new(writer),
+                remote_addr,
+                transport_type: "tcp",
+            })
+        }
+
+        fn transport_type(&self) -> &'static str {
+            "tcp"
+        }
+    }
 } // mod tcp
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -381,10 +387,7 @@ mod websocket {
             Poll::Ready(Ok(data.len()))
         }
 
-        fn poll_flush(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             if !self.buf.is_empty() {
                 let data = std::mem::take(&mut self.buf);
                 let msg = Message::Binary(data.into());
@@ -543,7 +546,9 @@ mod wasm_websocket {
     unsafe impl<T> Sync for SendWrapper<T> {}
 
     impl<T> SendWrapper<T> {
-        fn inner_mut(&mut self) -> &mut T { &mut self.0 }
+        fn inner_mut(&mut self) -> &mut T {
+            &mut self.0
+        }
     }
 
     fn ws_err(e: ws_stream_wasm::WsErr) -> std::io::Error {
@@ -617,10 +622,7 @@ mod wasm_websocket {
             Poll::Ready(Ok(data.len()))
         }
 
-        fn poll_flush(
-            mut self: Pin<&mut Self>,
-            cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
             if !self.buf.is_empty() {
                 let data = std::mem::take(&mut self.buf);
                 let msg = WsMessage::Binary(data);
@@ -634,7 +636,8 @@ mod wasm_websocket {
                         return Poll::Pending;
                     }
                 }
-                if let Err(e) = Sink::<WsMessage>::start_send(Pin::new(self.inner.inner_mut()), msg) {
+                if let Err(e) = Sink::<WsMessage>::start_send(Pin::new(self.inner.inner_mut()), msg)
+                {
                     return Poll::Ready(Err(ws_err(e)));
                 }
             }
@@ -664,8 +667,15 @@ mod wasm_websocket {
             let (sink, stream) = ws_stream.split();
 
             Ok(Connection {
-                reader: Box::new(BrowserWsReader { inner: SendWrapper(stream), buf: Vec::new(), pos: 0 }),
-                writer: Box::new(BrowserWsWriter { inner: SendWrapper(sink), buf: Vec::new() }),
+                reader: Box::new(BrowserWsReader {
+                    inner: SendWrapper(stream),
+                    buf: Vec::new(),
+                    pos: 0,
+                }),
+                writer: Box::new(BrowserWsWriter {
+                    inner: SendWrapper(sink),
+                    buf: Vec::new(),
+                }),
                 remote_addr: addr.to_string(),
                 transport_type: "websocket",
             })
@@ -818,7 +828,12 @@ mod memory {
             // Remove ourselves so subsequent connects to this endpoint
             // fail with a clean ConnectError rather than handing out
             // connections to a closed receiver.
-            let _ = self.registry.listeners.lock().unwrap().remove(&self.endpoint);
+            let _ = self
+                .registry
+                .listeners
+                .lock()
+                .unwrap()
+                .remove(&self.endpoint);
         }
     }
 
@@ -1299,70 +1314,59 @@ mod message_port {
 
             let pending_for_closure = pending.clone();
             let listeners_for_closure = listeners.clone();
-            let on_message =
-                Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-                    let data = event.data();
-                    let bytes = match data.dyn_into::<Uint8Array>() {
-                        Ok(arr) => arr.to_vec(),
-                        Err(_) => return,
-                    };
-                    let msg: ControlMessage = match ciborium::from_reader(bytes.as_slice()) {
-                        Ok(m) => m,
-                        Err(_) => return,
-                    };
-                    match msg {
-                        ControlMessage::ChannelGranted { request_id } => {
-                            // The granted port is the first transferred port on the event.
-                            let port = event
-                                .ports()
-                                .get(0)
-                                .dyn_into::<MessagePort>()
-                                .ok();
-                            if let Some(tx) =
-                                pending_for_closure.borrow_mut().remove(&request_id)
-                            {
-                                if let Some(p) = port {
-                                    let _ = tx.send(Ok(p));
-                                } else {
-                                    let _ = tx.send(Err(
-                                        "ChannelGranted with no transferred port".into(),
-                                    ));
-                                }
+            let on_message = Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+                let data = event.data();
+                let bytes = match data.dyn_into::<Uint8Array>() {
+                    Ok(arr) => arr.to_vec(),
+                    Err(_) => return,
+                };
+                let msg: ControlMessage = match ciborium::from_reader(bytes.as_slice()) {
+                    Ok(m) => m,
+                    Err(_) => return,
+                };
+                match msg {
+                    ControlMessage::ChannelGranted { request_id } => {
+                        // The granted port is the first transferred port on the event.
+                        let port = event.ports().get(0).dyn_into::<MessagePort>().ok();
+                        if let Some(tx) = pending_for_closure.borrow_mut().remove(&request_id) {
+                            if let Some(p) = port {
+                                let _ = tx.send(Ok(p));
+                            } else {
+                                let _ =
+                                    tx.send(Err("ChannelGranted with no transferred port".into()));
                             }
                         }
-                        ControlMessage::ChannelDenied { request_id, reason } => {
-                            if let Some(tx) =
-                                pending_for_closure.borrow_mut().remove(&request_id)
-                            {
-                                let _ = tx.send(Err(reason));
-                            }
+                    }
+                    ControlMessage::ChannelDenied { request_id, reason } => {
+                        if let Some(tx) = pending_for_closure.borrow_mut().remove(&request_id) {
+                            let _ = tx.send(Err(reason));
                         }
-                        ControlMessage::IncomingChannel { from_peer, to_peer } => {
-                            let port = match event.ports().get(0).dyn_into::<MessagePort>() {
-                                Ok(p) => p,
-                                Err(_) => return,
-                            };
-                            let conn =
-                                connection_from_port(port, format!("xworker://{}", from_peer));
-                            match listeners_for_closure.borrow().get(&to_peer) {
-                                Some(tx) => {
-                                    let _ = tx.unbounded_send(conn);
-                                }
-                                None => {
-                                    web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(
+                    }
+                    ControlMessage::IncomingChannel { from_peer, to_peer } => {
+                        let port = match event.ports().get(0).dyn_into::<MessagePort>() {
+                            Ok(p) => p,
+                            Err(_) => return,
+                        };
+                        let conn = connection_from_port(port, format!("xworker://{}", from_peer));
+                        match listeners_for_closure.borrow().get(&to_peer) {
+                            Some(tx) => {
+                                let _ = tx.unbounded_send(conn);
+                            }
+                            None => {
+                                web_sys::console::warn_1(&wasm_bindgen::JsValue::from_str(
                                         &format!(
                                             "ControlPortClient: no listener bound for to_peer={} (from {}); dropping incoming channel",
                                             to_peer, from_peer
                                         ),
                                     ));
-                                    // `port` drops here; remote sees handshake failure / EOF.
-                                }
+                                // `port` drops here; remote sees handshake failure / EOF.
                             }
                         }
-                        // Connectors don't receive OpenChannel — only the broker does.
-                        ControlMessage::OpenChannel { .. } => {}
                     }
-                });
+                    // Connectors don't receive OpenChannel — only the broker does.
+                    ControlMessage::OpenChannel { .. } => {}
+                }
+            });
 
             port.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
             port.start();
@@ -1381,11 +1385,7 @@ mod message_port {
         /// Inserts into the demux map; replaces silently if the same
         /// endpoint is re-bound (paired with Drop in
         /// `MessagePortListener`).
-        pub fn register_listener(
-            &self,
-            endpoint: String,
-            sink: mpsc::UnboundedSender<Connection>,
-        ) {
+        pub fn register_listener(&self, endpoint: String, sink: mpsc::UnboundedSender<Connection>) {
             self.listeners.borrow_mut().insert(endpoint, sink);
         }
 
@@ -1446,10 +1446,7 @@ mod message_port {
             arr.copy_from(&buf);
             self.port.get().post_message(&arr).map_err(|e| {
                 self.pending.borrow_mut().remove(&request_id);
-                TransportError::ConnectError(format!(
-                    "control-port postMessage failed: {:?}",
-                    e
-                ))
+                TransportError::ConnectError(format!("control-port postMessage failed: {:?}", e))
             })?;
 
             // Race the broker response against a timeout. If the
@@ -1463,9 +1460,7 @@ mod message_port {
             futures::pin_mut!(rx);
             match select(rx, timeout).await {
                 Either::Left((Ok(Ok(port)), _)) => Ok(port),
-                Either::Left((Ok(Err(reason)), _)) => {
-                    Err(TransportError::ConnectError(reason))
-                }
+                Either::Left((Ok(Err(reason)), _)) => Err(TransportError::ConnectError(reason)),
                 Either::Left((Err(_), _)) => Err(TransportError::ConnectError(
                     "control-port response channel cancelled".into(),
                 )),
@@ -1475,7 +1470,8 @@ mod message_port {
                     self.pending.borrow_mut().remove(&request_id);
                     Err(TransportError::ConnectError(format!(
                         "open_channel({}) timed out after {} ms",
-                        peer_id, Self::OPEN_CHANNEL_TIMEOUT_MS
+                        peer_id,
+                        Self::OPEN_CHANNEL_TIMEOUT_MS
                     )))
                 }
             }
@@ -1559,10 +1555,7 @@ mod message_port {
         /// matches `local_endpoint` arrive at this listener's
         /// `accept`. Re-binding the same endpoint silently replaces
         /// the prior sink (Drop on the prior listener removes it).
-        pub fn bind(
-            local_endpoint: impl Into<String>,
-            control: Rc<ControlPortClient>,
-        ) -> Self {
+        pub fn bind(local_endpoint: impl Into<String>, control: Rc<ControlPortClient>) -> Self {
             let local_endpoint = local_endpoint.into();
             let (tx, rx) = mpsc::unbounded::<Connection>();
             control.register_listener(local_endpoint.clone(), tx);
@@ -1583,9 +1576,10 @@ mod message_port {
     #[async_trait(?Send)]
     impl Listener for MessagePortListener {
         async fn accept(&self) -> Result<Connection, TransportError> {
-            let conn = self.rx.lock().await.next().await.ok_or_else(|| {
-                TransportError::AcceptError("MessagePortListener closed".into())
-            })?;
+            let conn =
+                self.rx.lock().await.next().await.ok_or_else(|| {
+                    TransportError::AcceptError("MessagePortListener closed".into())
+                })?;
             Ok(conn)
         }
 

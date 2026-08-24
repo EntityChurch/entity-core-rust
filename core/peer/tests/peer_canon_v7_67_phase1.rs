@@ -191,8 +191,7 @@ fn hash_format_sha384_1_store_retrieve_round_trip() {
     )
     .unwrap();
 
-    let h =
-        Hash::compute_format(&entity.entity_type, &entity.data, HASH_ALGORITHM_SHA384).unwrap();
+    let h = Hash::compute_format(&entity.entity_type, &entity.data, HASH_ALGORITHM_SHA384).unwrap();
     let key = h.to_bytes();
 
     // Test-local content store keyed by the 49-byte SHA-384 wire form.
@@ -226,8 +225,11 @@ fn varint_multibyte_1_content_hash_format_two_byte_decode_then_reject() {
     let err = Hash::from_bytes(&wire).expect_err("128 unallocated");
     // Confirms the varint was read correctly (truncates to format_code = 0x80
     // for the error surface).
-    assert!(matches!(err, HashError::UnsupportedAlgorithm(0x80)),
-            "expected UnsupportedAlgorithm(0x80), got {:?}", err);
+    assert!(
+        matches!(err, HashError::UnsupportedAlgorithm(0x80)),
+        "expected UnsupportedAlgorithm(0x80), got {:?}",
+        err
+    );
 
     // Negative: a one-byte 0x00 + 32-byte digest decodes cleanly as
     // SHA-256, confirming the harness isn't broken.

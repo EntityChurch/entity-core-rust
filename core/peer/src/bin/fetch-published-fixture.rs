@@ -45,7 +45,7 @@ fn main() {
 
 #[cfg(all(feature = "http-live", not(target_arch = "wasm32")))]
 mod driver {
-    use entity_crypto::{verify_for_key_type, Keypair, KeyType};
+    use entity_crypto::{verify_for_key_type, KeyType, Keypair};
     use entity_entity::Entity;
     use entity_hash::Hash;
     use entity_peer::published_root::{content_url, manifest_url, signature_url};
@@ -101,9 +101,15 @@ mod driver {
 
     /// GET a URL, returning (status, body) or a transport error.
     fn get(client: &reqwest::blocking::Client, url: &str) -> Result<(u16, Vec<u8>), String> {
-        let resp = client.get(url).send().map_err(|e| format!("GET {url}: {e}"))?;
+        let resp = client
+            .get(url)
+            .send()
+            .map_err(|e| format!("GET {url}: {e}"))?;
         let status = resp.status().as_u16();
-        let body = resp.bytes().map_err(|e| format!("body {url}: {e}"))?.to_vec();
+        let body = resp
+            .bytes()
+            .map_err(|e| format!("body {url}: {e}"))?
+            .to_vec();
         Ok((status, body))
     }
 
@@ -267,7 +273,8 @@ mod driver {
             ));
         }
         let head = Hash::compute(&m_type, &m_data);
-        let manifest_entity = Entity::new(&m_type, m_data).map_err(|e| format!("v1 entity: {e}"))?;
+        let manifest_entity =
+            Entity::new(&m_type, m_data).map_err(|e| format!("v1 entity: {e}"))?;
         let pr = PublishedRootData::from_entity(&manifest_entity)
             .map_err(|e| format!("v1 published-root data: {e}"))?;
         if pr.peer_id != derived_peer_id {
@@ -284,8 +291,10 @@ mod driver {
         }
 
         // Signature carriage: TREE_GET invariant pointer → CONTENT_GET sig.
-        let (sp_status, ptr_body) =
-            get(&client, &signature_url(&base, &derived_peer_id, &head, ".bin"))?;
+        let (sp_status, ptr_body) = get(
+            &client,
+            &signature_url(&base, &derived_peer_id, &head, ".bin"),
+        )?;
         if sp_status != 200 {
             return Err(format!(
                 "v2 signature pointer (invariant path) → HTTP {sp_status}"
@@ -296,7 +305,8 @@ mod driver {
         if sc_status != 200 {
             return Err(format!("v2 signature CONTENT_GET → HTTP {sc_status}"));
         }
-        let sig_entity = fetch_and_rehash(&sig_body, &sig_hash).map_err(|e| format!("v2 sig: {e}"))?;
+        let sig_entity =
+            fetch_and_rehash(&sig_body, &sig_hash).map_err(|e| format!("v2 sig: {e}"))?;
         if sig_entity.entity_type != TYPE_SIGNATURE {
             return Err(format!(
                 "v2 signature entity type {:?} != {TYPE_SIGNATURE}",
@@ -319,8 +329,13 @@ mod driver {
                 derived_identity_hash.to_hex()
             ));
         }
-        verify_for_key_type(KeyType::Ed25519, &pinned_pubkey, &head.to_bytes(), &sig.signature)
-            .map_err(|e| format!("v2 signature does not verify under pinned key: {e}"))?;
+        verify_for_key_type(
+            KeyType::Ed25519,
+            &pinned_pubkey,
+            &head.to_bytes(),
+            &sig.signature,
+        )
+        .map_err(|e| format!("v2 signature does not verify under pinned key: {e}"))?;
         pass(&format!(
             "v1+v2: manifest served + signature verified (seq={} root={})",
             pr.seq,
@@ -334,7 +349,8 @@ mod driver {
             if ts != 200 {
                 return Err(format!("v3 TREE_GET {} → HTTP {ts}", e.path));
             }
-            let ptr = parse_pointer(&ptr_body).map_err(|err| format!("v3 {} pointer: {err}", e.path))?;
+            let ptr =
+                parse_pointer(&ptr_body).map_err(|err| format!("v3 {} pointer: {err}", e.path))?;
             if ptr != want {
                 return Err(format!(
                     "v3 tree pointer at {} = {} != pinned {}",
@@ -347,7 +363,8 @@ mod driver {
             if cs != 200 {
                 return Err(format!("v4 CONTENT_GET {} → HTTP {cs}", e.path));
             }
-            let entity = fetch_and_rehash(&content, &ptr).map_err(|err| format!("v4 {}: {err}", e.path))?;
+            let entity =
+                fetch_and_rehash(&content, &ptr).map_err(|err| format!("v4 {}: {err}", e.path))?;
             if entity.content_hash != want {
                 return Err(format!("v4 {} re-hash drift", e.path));
             }
@@ -372,7 +389,8 @@ mod driver {
             if cs != 200 {
                 return Err(format!("v5 CONTENT_GET {} → HTTP {cs}", e.path));
             }
-            let entity = fetch_and_rehash(&content, &want).map_err(|err| format!("v5 {}: {err}", e.path))?;
+            let entity =
+                fetch_and_rehash(&content, &want).map_err(|err| format!("v5 {}: {err}", e.path))?;
             if entity.data != expected_data {
                 return Err(format!("v5 .data byte-equality drift at {}", e.path));
             }

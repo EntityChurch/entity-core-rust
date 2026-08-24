@@ -39,8 +39,8 @@ use crate::data::{hex_segment, RoleAssignmentData, RoleData, RoleDerivedTokenLin
 use crate::handler::role_metadata_ttl;
 use crate::helpers::{is_excluded, resolve_grant_templates};
 use crate::paths::{
-    path_role_assignment, path_role_definition, path_role_derived_link,
-    path_role_derived_token, peer_segment_from_hash,
+    path_role_assignment, path_role_definition, path_role_derived_link, path_role_derived_token,
+    peer_segment_from_hash,
 };
 
 /// Outcome of a successful startup-time role assignment.
@@ -115,6 +115,7 @@ pub fn startup_role_definition(
 ///
 /// The path-segment for the assignee is hex of `assignee_identity_hash`
 /// (SI-1).
+#[allow(clippy::too_many_arguments)] // R4 startup assignment: each input is a distinct SI seam
 pub fn startup_role_assignment(
     content_store: &Arc<dyn ContentStore>,
     location_index: &Arc<dyn LocationIndex>,
@@ -143,9 +144,9 @@ pub fn startup_role_assignment(
         .ok_or_else(|| StartupError::RoleNotFound(role_def_path.clone()))?;
     let role_entity = content_store
         .get(&role_hash)
-        .ok_or_else(|| StartupError::RoleNotFound(role_def_path))?;
-    let role_def = RoleData::from_entity(&role_entity)
-        .map_err(|e| StartupError::RoleDecode(e.to_string()))?;
+        .ok_or(StartupError::RoleNotFound(role_def_path))?;
+    let role_def =
+        RoleData::from_entity(&role_entity).map_err(|e| StartupError::RoleDecode(e.to_string()))?;
 
     // Resolve template grants for the assignee. `{peer_id}` substitutes
     // to hex of the assignee's identity hash (same form as path segments).
@@ -184,8 +185,8 @@ pub fn startup_role_assignment(
     // identity-entity hash directly (SI-8). v1.7 §5.3: startup-derived
     // caps still respect `role.metadata.ttl` (parent + caller bounds
     // don't apply at L0 — there's no parent, no caller cap).
-    let role_expires_at = role_metadata_ttl(&role_def.metadata)
-        .map(|ttl| now_ms.saturating_add(ttl));
+    let role_expires_at =
+        role_metadata_ttl(&role_def.metadata).map(|ttl| now_ms.saturating_add(ttl));
     let token = CapabilityToken {
         grants: derived_grants,
         granter: Granter::Single(identity_hash),
@@ -361,8 +362,7 @@ mod tests {
             _ => panic!("expected single-sig granter"),
         }
         assert_eq!(
-            token.grants[0].resources.include[0],
-            "shared/admin/*",
+            token.grants[0].resources.include[0], "shared/admin/*",
             "template variables must be resolved"
         );
 

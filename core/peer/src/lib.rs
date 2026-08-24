@@ -4,23 +4,29 @@
 //! and manages connections. PeerBuilder enforces initialization order.
 
 pub mod connection;
+pub mod connection_state;
 pub use entity_durability as durability;
 #[cfg(all(feature = "local-files", not(target_arch = "wasm32")))]
 pub use entity_local_files as local_files;
+#[cfg(all(feature = "http-live", not(target_arch = "wasm32")))]
+pub mod http_connection;
+#[cfg(all(feature = "http-live", not(target_arch = "wasm32")))]
+pub mod http_live;
 pub mod ingest;
+pub mod keepalive;
+pub mod liveness;
+#[cfg(feature = "network")]
+pub mod network_link;
+pub mod peer_status;
+pub mod published_root;
+#[cfg(feature = "relay")]
+pub mod relay_forwarder;
 pub mod remote;
 pub mod runtime;
 pub mod server;
 pub mod session_entity;
 pub mod transport;
 pub mod transport_profile;
-#[cfg(all(feature = "http-live", not(target_arch = "wasm32")))]
-pub mod http_live;
-#[cfg(all(feature = "http-live", not(target_arch = "wasm32")))]
-pub mod http_connection;
-pub mod published_root;
-#[cfg(feature = "relay")]
-pub mod relay_forwarder;
 
 pub use ingest::{ingest_envelope_signatures, IngestError};
 
@@ -28,10 +34,10 @@ use std::sync::Arc;
 
 use entity_capability::GrantEntry;
 use entity_crypto::{IdentityKeypair, Keypair, PeerId};
-use entity_handler::{AttestationStore, Handler, HandlerRegistry};
-use entity_hash::Hash;
 #[cfg(not(feature = "identity"))]
 use entity_handler::NoopAttestationStore;
+use entity_handler::{AttestationStore, Handler, HandlerRegistry};
+use entity_hash::Hash;
 use entity_store::{
     CascadeHalt, ContentStore, ContentStoreEvent, ContextFieldRegistration, ExecutionContext,
     LocationIndex, MemoryContentStore, MemoryLocationIndex, NotifyingContentStore,
@@ -70,6 +76,10 @@ pub struct PeerConfig {
     /// SHA-384 home peer authors SHA-256 on a connection to a SHA-256-only
     /// peer, §4.5a). Defaults to SHA-256 (`0x00`), the conformance floor.
     pub home_hash_format: u8,
+    /// §5 app-level keepalive over pooled outbound connections
+    /// (EXTENSION-NETWORK §2.3 / §5.4, Amendment 12 rung 2). Defaults to
+    /// the spec values (30s / 10s / 3, enabled).
+    pub keepalive: keepalive::KeepaliveConfig,
 }
 
 impl Default for PeerConfig {
@@ -82,6 +92,7 @@ impl Default for PeerConfig {
             durability_policy: durability::DurabilityPolicy::default(),
             content_get_frame_budget: None,
             home_hash_format: entity_hash::HASH_ALGORITHM_SHA256,
+            keepalive: keepalive::KeepaliveConfig::default(),
         }
     }
 }
@@ -96,8 +107,7 @@ impl Default for PeerConfig {
 /// `Some(grants)` if the resolver accepts the peer; `None` to fall
 /// through to the connect handler's static fallback (currently
 /// `default_connection_grants`).
-pub type GrantResolver =
-    Arc<dyn Fn(&PeerId, &Hash) -> Option<Vec<GrantEntry>> + Send + Sync>;
+pub type GrantResolver = Arc<dyn Fn(&PeerId, &Hash) -> Option<Vec<GrantEntry>> + Send + Sync>;
 
 /// Shared state passed to connection tasks (Arc'd).
 pub struct PeerShared {
@@ -115,8 +125,15 @@ pub struct PeerShared {
     pub handler_registry: Arc<HandlerRegistry>,
     pub tree: Arc<TreeHandler>,
     pub config: PeerConfig,
-    /// Outbound connection pool for remote execute.
-    pub remote: remote::RemoteState,
+    /// Outbound connection pool for remote execute. `Arc` so every
+    /// `Peer::shared()` snapshot references the SAME pool — connection
+    /// state is per-peer, not per-snapshot. (Pre-Amendment-12 each
+    /// snapshot minted a fresh pool, so `connect_to`'s pooled connection
+    /// was silently dropped and every `execute()` re-dialed; a persistent
+    /// pool is load-bearing for the §A1 liveness contract, whose trigger
+    /// is a failed dispatch over a dead *pooled* connection, and for the
+    /// §5 keepalive loop that monitors it.)
+    pub remote: Arc<remote::RemoteState>,
     /// Connector for outbound connections to remote peers.
     pub connector: Arc<dyn transport::Connector>,
     /// Identity-attestation lookup for the cap-verifier
@@ -166,6 +183,9 @@ pub struct Peer {
     config: PeerConfig,
     /// Connector for outbound connections.
     connector: Arc<dyn transport::Connector>,
+    /// Outbound connection pool — one per Peer, shared into every
+    /// `shared()` snapshot (see the `PeerShared::remote` doc).
+    remote: Arc<remote::RemoteState>,
     /// Event broadcast sender for tree changes.
     event_tx: broadcast::Sender<TreeChangeEvent>,
     /// Event broadcast sender for content store events.
@@ -175,6 +195,12 @@ pub struct Peer {
     /// Subscription engine (started when run() is called).
     #[cfg(feature = "subscription")]
     sub_engine: Option<Arc<entity_subscription::engine::Engine>>,
+    /// `system/network` handler — held so `start_engines` can inject the
+    /// imperative `PeerLink` seam (connect/keepalive/self-execute) once a
+    /// `shared()` snapshot exists (post-construction wiring, same shape as
+    /// the subscription delivery function).
+    #[cfg(feature = "network")]
+    network_handler: Arc<entity_network::NetworkHandler>,
     // Clock, history, and revision engines are synchronous emit hooks.
     // Their Arc references are held by the NotifyingLocationIndex sync_hooks list.
     /// Identity-attestation lookup (mirror of PeerShared.attestation_store
@@ -192,8 +218,7 @@ pub struct Peer {
     /// `(author, request_id)` → preserved handle. Shared across all
     /// `shared()` snapshots so dedup applies peer-wide
     /// (EXTENSION-DURABILITY §5 / Amendment 1).
-    preserved_requests:
-        Arc<std::sync::Mutex<std::collections::HashMap<(String, String), String>>>,
+    preserved_requests: Arc<std::sync::Mutex<std::collections::HashMap<(String, String), String>>>,
     /// `local/files` handler instance — held so reverse-write can be
     /// wired in `start_engines` and so external callers can register
     /// root mappings.
@@ -285,7 +310,7 @@ impl Peer {
             handler_registry: self.handler_registry.clone(),
             tree: self.tree.clone(),
             config: self.config.clone(),
-            remote: remote::RemoteState::new(),
+            remote: self.remote.clone(),
             connector: self.connector.clone(),
             attestation_store: self.attestation_store.clone(),
             grant_resolver: self.grant_resolver.clone(),
@@ -348,7 +373,10 @@ impl Peer {
     ///
     /// Safe to call multiple times — only the first call starts engines.
     pub fn start_engines(&self, shared: &Arc<PeerShared>) {
-        if self.engines_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        if self
+            .engines_started
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
             tracing::debug!("start_engines: already started, skipping");
             return; // Already started
         }
@@ -448,6 +476,18 @@ impl Peer {
             entity_local_files::start_reverse_write(self.local_files_handler.clone(), events);
         }
 
+        // EXTENSION-NETWORK rung 3: inject the imperative `PeerLink` seam
+        // (connect-if-needed / evict / self-execute / deliver-token mint /
+        // backoff timer) now that a `shared()` snapshot exists. The handler
+        // was registered + granted at build time; this is the post-
+        // construction wiring the extension's crate-DAG position requires
+        // (mirror of the subscription delivery function above).
+        #[cfg(feature = "network")]
+        {
+            let link = Arc::new(network_link::PeerNetworkLink::new(shared.clone()));
+            self.network_handler.bind(link);
+        }
+
         // Suppress unused variable warning when subscription feature is disabled
         let _ = shared;
     }
@@ -465,7 +505,13 @@ impl Peer {
         operation: &str,
         params: entity_entity::Entity,
     ) -> Result<entity_handler::HandlerResult, entity_handler::HandlerError> {
-        self.execute_with_options(handler, operation, params, entity_handler::ExecuteOptions::default()).await
+        self.execute_with_options(
+            handler,
+            operation,
+            params,
+            entity_handler::ExecuteOptions::default(),
+        )
+        .await
     }
 
     /// Execute with explicit options (resource target, request_id, etc.).
@@ -495,13 +541,7 @@ impl Peer {
             None,
             None,
         );
-        let result = execute_fn(
-            handler.to_string(),
-            operation.to_string(),
-            params,
-            options,
-        )
-        .await;
+        let result = execute_fn(handler.to_string(), operation.to_string(), params, options).await;
         match &result {
             Ok(r) => tracing::debug!(
                 handler = %handler,
@@ -563,31 +603,8 @@ impl Peer {
     /// dispatching to remote URIs targeting this peer.
     pub async fn connect_to(&self, addr: &str) -> Result<String, PeerError> {
         let shared = self.shared();
-        let conn = shared.connector.connect(addr).await.map_err(|e| {
-            PeerError::ConnectionError(format!("connect to {}: {}", addr, e))
-        })?;
-        // §6.11(b): hand the reader a reentry dispatch context so deliveries
-        // the remote pushes back over this connection (e.g. subscription
-        // notifications when we run no listener it could dial) are dispatched
-        // locally and answered, rather than dropped as unexpected EXECUTEs.
-        let remote = remote::perform_connect_with_dispatch(
-            conn,
-            &shared.keypair,
-            shared.config.home_hash_format,
-            Some(shared.clone()),
-        )
-        .await?;
-        let remote_peer_id = remote.remote_peer_id.clone();
-        // R6 §9: write dialer-side held_capability before inserting
-        // into the pool — same path get_or_connect takes for tree-
-        // discovered peers (remote.rs `write_held_session_entity`).
-        remote::write_held_session_entity(
-            shared.content_store.as_ref(),
-            shared.location_index.as_ref(),
-            shared.peer_id.as_str(),
-            &remote,
-        );
-        shared.remote.insert(&remote_peer_id, remote);
+        let endpoint = remote::connect_and_pool(&shared, addr).await?;
+        let remote_peer_id = endpoint.remote_peer_id().to_string();
         tracing::info!(remote_peer = %remote_peer_id, addr = %addr, "connected to remote peer");
         Ok(remote_peer_id)
     }
@@ -608,7 +625,10 @@ impl Peer {
     /// which WASM accept loops aren't. WASM peers run a single listener
     /// via `run()`.
     #[cfg(not(target_arch = "wasm32"))]
-    pub async fn run_multi(&self, listeners: Vec<Box<dyn transport::Listener>>) -> Result<(), PeerError> {
+    pub async fn run_multi(
+        &self,
+        listeners: Vec<Box<dyn transport::Listener>>,
+    ) -> Result<(), PeerError> {
         let shared = self.shared();
         self.start_engines(&shared);
         server::run_multi(listeners, shared).await
@@ -868,6 +888,14 @@ impl PeerBuilder {
         self
     }
 
+    /// Set the §5 keepalive configuration (EXTENSION-NETWORK §2.3;
+    /// defaults 30s/10s/3, enabled). Tests inject short intervals here
+    /// rather than waiting out the ~100s default envelope.
+    pub fn keepalive(mut self, config: keepalive::KeepaliveConfig) -> Self {
+        self.config.keepalive = config;
+        self
+    }
+
     /// Set the outbound connector for remote peer connections.
     /// Defaults to `TcpConnector` if not set.
     pub fn connector(mut self, connector: Arc<dyn transport::Connector>) -> Self {
@@ -1010,8 +1038,7 @@ impl PeerBuilder {
             self.query_indexes = Some(Arc::new(query_idx));
         }
         // A persistent store can self-determine `Stored` durability (EXTENSION-DURABILITY §4).
-        self.config.durability_policy.max_self_determinable =
-            durability::DurabilityLevel::Stored;
+        self.config.durability_policy.max_self_determinable = durability::DurabilityLevel::Stored;
         Ok(self)
     }
 
@@ -1038,8 +1065,7 @@ impl PeerBuilder {
         self.content_store = Some(Arc::new(cs));
         self.location_index = Some(Arc::new(li));
         // OPFS journals durably (EXTENSION-DURABILITY §4) — self-determine `Stored`.
-        self.config.durability_policy.max_self_determinable =
-            durability::DurabilityLevel::Stored;
+        self.config.durability_policy.max_self_determinable = durability::DurabilityLevel::Stored;
         Ok(self)
     }
 
@@ -1073,8 +1099,7 @@ impl PeerBuilder {
         self.location_index = Some(Arc::new(li));
         // IDB persists durably (best-effort write-behind) — self-determine
         // `Stored` (EXTENSION-DURABILITY §4).
-        self.config.durability_policy.max_self_determinable =
-            durability::DurabilityLevel::Stored;
+        self.config.durability_policy.max_self_determinable = durability::DurabilityLevel::Stored;
         Ok(self)
     }
 
@@ -1134,13 +1159,12 @@ impl PeerBuilder {
             .unwrap_or_else(|| Arc::new(entity_query::QueryIndexes::new()));
 
         #[cfg(feature = "query")]
-        let base_location_index: Arc<dyn LocationIndex> = Arc::new(
-            entity_query::IndexingLocationIndex::new(
+        let base_location_index: Arc<dyn LocationIndex> =
+            Arc::new(entity_query::IndexingLocationIndex::new(
                 base_location_index,
                 content_store.clone(),
                 query_indexes.clone(),
-            ),
-        );
+            ));
 
         // Wrap location index with emit pathway dispatcher (SYSTEM-COMPOSITION §1.3)
         // Two-phase delivery: sync hooks (Phase 1) + broadcast (Phase 2)
@@ -1176,12 +1200,26 @@ impl PeerBuilder {
 
         // Bootstrap: store handler manifest + interface entities in the tree
         bootstrap_handler(
-            &content_store, &notifying_li, &pid,
-            "tree", "system/tree", &["get", "put", "snapshot", "diff", "merge", "extract", "create", "destroy"],
+            &content_store,
+            &notifying_li,
+            &pid,
+            "tree",
+            "system/tree",
+            &[
+                "get", "put", "snapshot", "diff", "merge", "extract", "create", "destroy",
+            ],
         )?;
+        // §A5 (advertise-what-you-dispatch): `ping` (§5.1) is a connect
+        // op dispatched on established connections and MUST appear in
+        // the manifest — behavioral support without advertisement is the
+        // D-class declared-surface divergence the validator flags.
         bootstrap_handler(
-            &content_store, &notifying_li, &pid,
-            "connect", "system/protocol/connect", &["authenticate", "hello"],
+            &content_store,
+            &notifying_li,
+            &pid,
+            "connect",
+            "system/protocol/connect",
+            &["authenticate", "hello", "ping"],
         )?;
 
         // Bootstrap: register and seed all core types into the tree
@@ -1206,10 +1244,7 @@ impl PeerBuilder {
         let identity_hash = content_store
             .put(identity)
             .map_err(|e| PeerError::BuildError(e.to_string()))?;
-        notifying_li.set(
-            &format!("/{}/system/identity/{}", pid, pid),
-            identity_hash,
-        );
+        notifying_li.set(&format!("/{}/system/identity/{}", pid, pid), identity_hash);
 
         // RE-2: announce the local peer's runtime status to the tree.
         // `starting` is written early so any observer reading the tree
@@ -1231,13 +1266,21 @@ impl PeerBuilder {
         for h in self.custom_handlers {
             let pattern = h.pattern().to_string();
             let bare_pattern = entity_entity::EntityUri::strip_peer_prefix(&pattern).to_string();
-            let name = bare_pattern.rsplit('/').next().unwrap_or(&bare_pattern).to_string();
+            let name = bare_pattern
+                .rsplit('/')
+                .next()
+                .unwrap_or(&bare_pattern)
+                .to_string();
             let ops: Vec<String> = h.operations().iter().map(|s| s.to_string()).collect();
             handler_registry.register(h);
             let op_refs: Vec<&str> = ops.iter().map(|s| s.as_str()).collect();
             bootstrap_handler(
-                &content_store, &notifying_li, &pid,
-                &name, &bare_pattern, &op_refs,
+                &content_store,
+                &notifying_li,
+                &pid,
+                &name,
+                &bare_pattern,
+                &op_refs,
             )?;
         }
 
@@ -1252,8 +1295,12 @@ impl PeerBuilder {
             ));
             handler_registry.register(inbox);
             bootstrap_handler(
-                &content_store, &notifying_li, &pid,
-                "inbox", "system/inbox", &["receive"],
+                &content_store,
+                &notifying_li,
+                &pid,
+                "inbox",
+                "system/inbox",
+                &["receive"],
             )?;
         }
 
@@ -1266,8 +1313,12 @@ impl PeerBuilder {
             ));
             handler_registry.register(continuation);
             bootstrap_handler(
-                &content_store, &notifying_li, &pid,
-                "continuations", "system/continuation", &["advance", "resume", "abandon"],
+                &content_store,
+                &notifying_li,
+                &pid,
+                "continuations",
+                "system/continuation",
+                &["advance", "resume", "abandon"],
             )?;
         }
 
@@ -1293,8 +1344,12 @@ impl PeerBuilder {
             ));
             handler_registry.register(subscription);
             bootstrap_handler(
-                &content_store, &notifying_li, &pid,
-                "subscriptions", "system/subscription", &["subscribe", "unsubscribe"],
+                &content_store,
+                &notifying_li,
+                &pid,
+                "subscriptions",
+                "system/subscription",
+                &["subscribe", "unsubscribe"],
             )?;
             sub_engine
         };
@@ -1308,8 +1363,12 @@ impl PeerBuilder {
             ));
             handler_registry.register(clock_handler);
             bootstrap_handler(
-                &content_store, &notifying_li, &pid,
-                "clock", "system/clock", &["now", "compare", "tick"],
+                &content_store,
+                &notifying_li,
+                &pid,
+                "clock",
+                "system/clock",
+                &["now", "compare", "tick"],
             )?;
 
             // Store default clock config
@@ -1334,13 +1393,29 @@ impl PeerBuilder {
             ));
             handler_registry.register(revision_handler);
             bootstrap_handler(
-                &content_store, &notifying_li, &pid,
-                "revision", "system/revision",
+                &content_store,
+                &notifying_li,
+                &pid,
+                "revision",
+                "system/revision",
                 &[
-                    "branch", "checkout", "cherry-pick", "commit", "config",
-                    "diff", "fetch", "fetch-entities", "find-ancestor", "log",
-                    "merge", "merge-config", "push", "resolve", "revert",
-                    "status", "tag",
+                    "branch",
+                    "checkout",
+                    "cherry-pick",
+                    "commit",
+                    "config",
+                    "diff",
+                    "fetch",
+                    "fetch-entities",
+                    "find-ancestor",
+                    "log",
+                    "merge",
+                    "merge-config",
+                    "push",
+                    "resolve",
+                    "revert",
+                    "status",
+                    "tag",
                 ],
             )?;
         }
@@ -1354,8 +1429,11 @@ impl PeerBuilder {
             ));
             handler_registry.register(history_handler);
             bootstrap_handler(
-                &content_store, &notifying_li, &pid,
-                "history", "system/history",
+                &content_store,
+                &notifying_li,
+                &pid,
+                "history",
+                "system/history",
                 &["query", "rollback"],
             )?;
         }
@@ -1380,8 +1458,11 @@ impl PeerBuilder {
             );
             handler_registry.register(compute_handler);
             bootstrap_handler(
-                &content_store, &notifying_li, &pid,
-                "compute", "system/compute",
+                &content_store,
+                &notifying_li,
+                &pid,
+                "compute",
+                "system/compute",
                 &["eval", "install", "uninstall"],
             )?;
         }
@@ -1397,14 +1478,32 @@ impl PeerBuilder {
             handler_registry.register(query_handler);
             // Query handler bootstrap with input/output types per EXTENSION-QUERY §5.1
             let query_ops = entity_ecf::Value::Map(vec![
-                (entity_ecf::text("count"), entity_ecf::Value::Map(vec![
-                    (entity_ecf::text("input_type"), entity_ecf::text("system/query/expression")),
-                    (entity_ecf::text("output_type"), entity_ecf::text("primitive/uint")),
-                ])),
-                (entity_ecf::text("find"), entity_ecf::Value::Map(vec![
-                    (entity_ecf::text("input_type"), entity_ecf::text("system/query/expression")),
-                    (entity_ecf::text("output_type"), entity_ecf::text("system/query/result")),
-                ])),
+                (
+                    entity_ecf::text("count"),
+                    entity_ecf::Value::Map(vec![
+                        (
+                            entity_ecf::text("input_type"),
+                            entity_ecf::text("system/query/expression"),
+                        ),
+                        (
+                            entity_ecf::text("output_type"),
+                            entity_ecf::text("primitive/uint"),
+                        ),
+                    ]),
+                ),
+                (
+                    entity_ecf::text("find"),
+                    entity_ecf::Value::Map(vec![
+                        (
+                            entity_ecf::text("input_type"),
+                            entity_ecf::text("system/query/expression"),
+                        ),
+                        (
+                            entity_ecf::text("output_type"),
+                            entity_ecf::text("system/query/result"),
+                        ),
+                    ]),
+                ),
             ]);
             // 1. Interface entity (public contract)
             let query_iface_data = entity_ecf::to_ecf(&entity_ecf::cbor_map! {
@@ -1412,18 +1511,22 @@ impl PeerBuilder {
                 "operations" => query_ops,
                 "pattern" => entity_ecf::text("system/query")
             });
-            let iface = entity_entity::Entity::new(entity_types::TYPE_HANDLER_INTERFACE, query_iface_data)
-                .map_err(|e| PeerError::BuildError(e.to_string()))?;
-            let ih = content_store.put(iface)
+            let iface =
+                entity_entity::Entity::new(entity_types::TYPE_HANDLER_INTERFACE, query_iface_data)
+                    .map_err(|e| PeerError::BuildError(e.to_string()))?;
+            let ih = content_store
+                .put(iface)
                 .map_err(|e| PeerError::BuildError(e.to_string()))?;
             notifying_li.set(&format!("/{}/system/handler/system/query", pid), ih);
             // 2. Handler entity (dispatch target, references interface)
             let query_handler_data = entity_ecf::to_ecf(&entity_ecf::cbor_map! {
                 "interface" => entity_ecf::text("system/handler/system/query")
             });
-            let handler_ent = entity_entity::Entity::new(entity_types::TYPE_HANDLER, query_handler_data)
-                .map_err(|e| PeerError::BuildError(e.to_string()))?;
-            let hh = content_store.put(handler_ent)
+            let handler_ent =
+                entity_entity::Entity::new(entity_types::TYPE_HANDLER, query_handler_data)
+                    .map_err(|e| PeerError::BuildError(e.to_string()))?;
+            let hh = content_store
+                .put(handler_ent)
                 .map_err(|e| PeerError::BuildError(e.to_string()))?;
             notifying_li.set(&format!("/{}/system/query", pid), hh);
         }
@@ -1431,7 +1534,8 @@ impl PeerBuilder {
         // Identity hash — needed for handler grants, clock engine, history engine
         let identity_hash = entity_hash::Hash::compute(
             entity_crypto::TYPE_PEER,
-            &keypair.peer_entity()
+            &keypair
+                .peer_entity()
                 .map_err(|e| PeerError::BuildError(e.to_string()))?
                 .data,
         );
@@ -1452,8 +1556,11 @@ impl PeerBuilder {
             ));
             handler_registry.register(handlers_handler);
             bootstrap_handler(
-                &content_store, &notifying_li, &pid,
-                "handler", "system/handler",
+                &content_store,
+                &notifying_li,
+                &pid,
+                "handler",
+                "system/handler",
                 &["register", "unregister"],
             )?;
         }
@@ -1470,14 +1577,22 @@ impl PeerBuilder {
             let echo = Arc::new(entity_conformance::EchoHandler::new(&pid));
             handler_registry.register(echo);
             bootstrap_handler(
-                &content_store, &notifying_li, &pid,
-                "echo", "system/validate/echo", &["echo"],
+                &content_store,
+                &notifying_li,
+                &pid,
+                "echo",
+                "system/validate/echo",
+                &["echo"],
             )?;
             let dispatch = Arc::new(entity_conformance::DispatchOutboundHandler::new(&pid));
             handler_registry.register(dispatch);
             bootstrap_handler(
-                &content_store, &notifying_li, &pid,
-                "dispatch-outbound", "system/validate/dispatch-outbound", &["dispatch"],
+                &content_store,
+                &notifying_li,
+                &pid,
+                "dispatch-outbound",
+                "system/validate/dispatch-outbound",
+                &["dispatch"],
             )?;
             tracing::warn!(
                 "GUIDE-CONFORMANCE §7a handlers ENABLED (system/validate/echo + \
@@ -1496,20 +1611,21 @@ impl PeerBuilder {
             let identity_entity = keypair
                 .peer_entity()
                 .map_err(|e| PeerError::BuildError(e.to_string()))?;
-            let capability_handler = Arc::new(
-                entity_capability_handler::CapabilityHandler::new(
-                    content_store.clone(),
-                    notifying_li.clone(),
-                    pid.clone(),
-                    identity_hash,
-                    identity_entity,
-                    keypair.clone_identity(),
-                ),
-            );
+            let capability_handler = Arc::new(entity_capability_handler::CapabilityHandler::new(
+                content_store.clone(),
+                notifying_li.clone(),
+                pid.clone(),
+                identity_hash,
+                identity_entity,
+                keypair.clone_identity(),
+            ));
             handler_registry.register(capability_handler);
             bootstrap_handler(
-                &content_store, &notifying_li, &pid,
-                "capability", "system/capability",
+                &content_store,
+                &notifying_li,
+                &pid,
+                "capability",
+                "system/capability",
                 &["request", "delegate", "revoke"],
             )?;
         }
@@ -1551,8 +1667,11 @@ impl PeerBuilder {
             ));
             handler_registry.register(attestation_handler);
             bootstrap_handler(
-                &content_store, &notifying_li, &pid,
-                "attestation", "system/attestation",
+                &content_store,
+                &notifying_li,
+                &pid,
+                "attestation",
+                "system/attestation",
                 &["create", "supersede", "revoke", "verify"],
             )?;
 
@@ -1566,12 +1685,11 @@ impl PeerBuilder {
             // Registered EARLY in the cascade so subsequent hooks +
             // handlers (identity/process_attestation, quorum cache
             // invalidation, etc.) see the bound entity in the index.
-            let attestation_hook =
-                Arc::new(entity_attestation::AttestationIndexHook::new(
-                    attestation_index.clone(),
-                    content_store.clone(),
-                    pid.clone(),
-                ));
+            let attestation_hook = Arc::new(entity_attestation::AttestationIndexHook::new(
+                attestation_index.clone(),
+                content_store.clone(),
+                pid.clone(),
+            ));
             emit_dispatcher.register_hook(attestation_hook);
         }
 
@@ -1587,20 +1705,22 @@ impl PeerBuilder {
             ));
             handler_registry.register(quorum_handler);
             bootstrap_handler(
-                &content_store, &notifying_li, &pid,
-                "quorum", "system/quorum",
+                &content_store,
+                &notifying_li,
+                &pid,
+                "quorum",
+                "system/quorum",
                 &["create", "update", "publish", "verify"],
             )?;
         }
 
         #[cfg(feature = "identity")]
-        let attestation_store: Arc<dyn AttestationStore> = Arc::new(
-            entity_identity::IdentityAttestationStore::new(
+        let attestation_store: Arc<dyn AttestationStore> =
+            Arc::new(entity_identity::IdentityAttestationStore::new(
                 attestation_index.clone(),
                 content_store.clone(),
                 notifying_li.clone(),
-            ),
-        );
+            ));
         #[cfg(not(feature = "identity"))]
         let attestation_store: Arc<dyn AttestationStore> = Arc::new(NoopAttestationStore);
 
@@ -1619,8 +1739,11 @@ impl PeerBuilder {
             handler_registry.register(identity_handler);
             // EXTENSION-IDENTITY v3.2 — 7 generic ops (preserved from v3.0).
             bootstrap_handler(
-                &content_store, &notifying_li, &pid,
-                "identity", "system/identity",
+                &content_store,
+                &notifying_li,
+                &pid,
+                "identity",
+                "system/identity",
                 &[
                     "configure",
                     "create_quorum",
@@ -1650,11 +1773,19 @@ impl PeerBuilder {
             ));
             handler_registry.register(role_handler);
             bootstrap_handler(
-                &content_store, &notifying_li, &pid,
-                "role", "system/role",
+                &content_store,
+                &notifying_li,
+                &pid,
+                "role",
+                "system/role",
                 &[
-                    "assign", "unassign", "exclude", "unexclude",
-                    "define", "re-derive", "delegate",
+                    "assign",
+                    "unassign",
+                    "exclude",
+                    "unexclude",
+                    "define",
+                    "re-derive",
+                    "delegate",
                 ],
             )?;
 
@@ -1663,13 +1794,11 @@ impl PeerBuilder {
             // actually fleet-wide; without this, sibling peers in a
             // multi-device fleet would keep role-derived tokens for an
             // excluded peer until the next manual re-derive.
-            let exclusion_sweep_hook = Arc::new(
-                entity_role::RoleExclusionSweepHook::new(
-                    content_store.clone(),
-                    notifying_li.clone(),
-                    pid.clone(),
-                ),
-            );
+            let exclusion_sweep_hook = Arc::new(entity_role::RoleExclusionSweepHook::new(
+                content_store.clone(),
+                notifying_li.clone(),
+                pid.clone(),
+            ));
             emit_dispatcher.register_hook(exclusion_sweep_hook);
         }
 
@@ -1698,8 +1827,11 @@ impl PeerBuilder {
             ));
             handler_registry.register(registry_handler);
             bootstrap_handler(
-                &content_store, &notifying_li, &pid,
-                "registry", "system/registry",
+                &content_store,
+                &notifying_li,
+                &pid,
+                "registry",
+                "system/registry",
                 &["resolve", "invalidate-cache"],
             )?;
 
@@ -1710,8 +1842,11 @@ impl PeerBuilder {
             ));
             handler_registry.register(local_name_handler);
             bootstrap_handler(
-                &content_store, &notifying_li, &pid,
-                "registry-local-name", "system/registry/local-name",
+                &content_store,
+                &notifying_li,
+                &pid,
+                "registry-local-name",
+                "system/registry/local-name",
                 &["bind", "unbind", "list", "update-transports"],
             )?;
 
@@ -1732,8 +1867,11 @@ impl PeerBuilder {
             ));
             handler_registry.register(register_handler);
             bootstrap_handler(
-                &content_store, &notifying_li, &pid,
-                "registry-peer-issued", "system/registry/peer-issued",
+                &content_store,
+                &notifying_li,
+                &pid,
+                "registry-peer-issued",
+                "system/registry/peer-issued",
                 &["register-request", "revoke-request", "renew-request"],
             )?;
         }
@@ -1744,7 +1882,11 @@ impl PeerBuilder {
         // registering it here is free until discovery is actually exercised. On
         // wasm32 the handler registers with no backend; `:scan(mdns)` then
         // returns `unsupported_backend` (§3.4) rather than failing.
+        // vec_init_then_push: the push below is cfg-gated (native-only
+        // backend on an otherwise-empty wasm32 list) — a literal can't
+        // express that.
         #[cfg(feature = "discovery")]
+        #[allow(clippy::vec_init_then_push)]
         {
             #[allow(unused_mut)]
             let mut backends: Vec<Arc<dyn entity_discovery::DiscoveryBackend>> = Vec::new();
@@ -1759,8 +1901,11 @@ impl PeerBuilder {
             ));
             handler_registry.register(discovery_handler);
             bootstrap_handler(
-                &content_store, &notifying_li, &pid,
-                "discovery", "system/discovery",
+                &content_store,
+                &notifying_li,
+                &pid,
+                "discovery",
+                "system/discovery",
                 &["scan", "announce", "announce-stop"],
             )?;
         }
@@ -1808,11 +1953,47 @@ impl PeerBuilder {
             );
             handler_registry.register(relay_handler);
             bootstrap_handler(
-                &content_store, &notifying_li, &pid,
-                "relay", "system/relay",
+                &content_store,
+                &notifying_li,
+                &pid,
+                "relay",
+                "system/relay",
                 &["forward", "put", "poll", "advertise"],
             )?;
         }
+
+        // EXTENSION-NETWORK §3–§4 (Amendment 12 rung 3) — `system/network`:
+        // the maintain-peer reconnect lifecycle over the §A3 liveness floor.
+        // Registered here so the §6.9 grant loop mints its handler grant
+        // from `internal_scope()` (the §3.1 block + the two graph-authorizing
+        // entries); the imperative connect/keepalive seam (`PeerLink`) is
+        // injected at `start_engines` once `shared()` exists. Held as an Arc
+        // on the Peer so the bind can reach it post-construction.
+        #[cfg(feature = "network")]
+        let network_handler = {
+            let handler = Arc::new(entity_network::NetworkHandler::new(
+                content_store.clone(),
+                notifying_li.clone(),
+                pid.clone(),
+            ));
+            handler_registry.register(handler.clone());
+            bootstrap_handler(
+                &content_store,
+                &notifying_li,
+                &pid,
+                "network",
+                "system/network",
+                &[
+                    "maintain-peer",
+                    "release-peer",
+                    "status",
+                    "close",
+                    "reconnect",
+                    "restore-subscriptions",
+                ],
+            )?;
+            handler
+        };
 
         // EXTENSION-TYPE v1.1 — `system/type` (validate + compare + compatible)
         // and `system/type/constraint/*` (standard constraint handler over
@@ -1871,11 +2052,8 @@ impl PeerBuilder {
             let handler_data = entity_ecf::to_ecf(&entity_ecf::cbor_map! {
                 "interface" => entity_ecf::text("system/handler/system/type/constraint")
             });
-            let handler_ent = entity_entity::Entity::new(
-                entity_types::TYPE_HANDLER,
-                handler_data,
-            )
-            .map_err(|e| PeerError::BuildError(e.to_string()))?;
+            let handler_ent = entity_entity::Entity::new(entity_types::TYPE_HANDLER, handler_data)
+                .map_err(|e| PeerError::BuildError(e.to_string()))?;
             let hh = content_store
                 .put(handler_ent)
                 .map_err(|e| PeerError::BuildError(e.to_string()))?;
@@ -1888,8 +2066,11 @@ impl PeerBuilder {
             ));
             handler_registry.register(type_handler);
             bootstrap_handler(
-                &content_store, &notifying_li, &pid,
-                "types", "system/type",
+                &content_store,
+                &notifying_li,
+                &pid,
+                "types",
+                "system/type",
                 &["validate", "compare", "compatible"],
             )?;
         }
@@ -1945,11 +2126,9 @@ impl PeerBuilder {
                 ]),
                 "pattern" => entity_ecf::text("system/content/*")
             });
-            let iface = entity_entity::Entity::new(
-                entity_types::TYPE_HANDLER_INTERFACE,
-                iface_data,
-            )
-            .map_err(|e| PeerError::BuildError(e.to_string()))?;
+            let iface =
+                entity_entity::Entity::new(entity_types::TYPE_HANDLER_INTERFACE, iface_data)
+                    .map_err(|e| PeerError::BuildError(e.to_string()))?;
             let iface_hash = content_store
                 .put(iface)
                 .map_err(|e| PeerError::BuildError(e.to_string()))?;
@@ -1961,11 +2140,8 @@ impl PeerBuilder {
             let handler_data = entity_ecf::to_ecf(&entity_ecf::cbor_map! {
                 "interface" => entity_ecf::text("system/handler/system/content")
             });
-            let handler_ent = entity_entity::Entity::new(
-                entity_types::TYPE_HANDLER,
-                handler_data,
-            )
-            .map_err(|e| PeerError::BuildError(e.to_string()))?;
+            let handler_ent = entity_entity::Entity::new(entity_types::TYPE_HANDLER, handler_data)
+                .map_err(|e| PeerError::BuildError(e.to_string()))?;
             let hh = content_store
                 .put(handler_ent)
                 .map_err(|e| PeerError::BuildError(e.to_string()))?;
@@ -1988,8 +2164,11 @@ impl PeerBuilder {
             ));
             handler_registry.register(h.clone());
             bootstrap_handler(
-                &content_store, &notifying_li, &pid,
-                "local-files", "local/files",
+                &content_store,
+                &notifying_li,
+                &pid,
+                "local-files",
+                "local/files",
                 &["read", "write", "list", "delete", "watch"],
             )?;
             // Domain types (§11) — written into the tree at handler install.
@@ -2013,12 +2192,18 @@ impl PeerBuilder {
         let registered_patterns = handler_registry.patterns();
         for pattern in &registered_patterns {
             let bare = entity_entity::EntityUri::strip_peer_prefix(pattern).to_string();
-            let scope = handler_registry.get(pattern)
+            let scope = handler_registry
+                .get(pattern)
                 .and_then(|h| h.internal_scope())
                 .unwrap_or_else(entity_capability::wildcard_handler_grant);
             create_handler_grant(
-                &bare, scope, &keypair, identity_hash,
-                &content_store, &notifying_li, &pid,
+                &bare,
+                scope,
+                &keypair,
+                identity_hash,
+                &content_store,
+                &notifying_li,
+                &pid,
             )?;
         }
 
@@ -2039,8 +2224,10 @@ impl PeerBuilder {
         // tree (§9.4 impl-defined; §6.9a.4 either model conformant).
         {
             let owner_identity = self.owner_identity.unwrap_or(identity_hash);
-            let mut seed_entries: Vec<(String, Vec<GrantEntry>)> =
-                vec![(owner_identity.to_hex(), entity_capability::owner_self_grant(&pid))];
+            let mut seed_entries: Vec<(String, Vec<GrantEntry>)> = vec![(
+                owner_identity.to_hex(),
+                entity_capability::owner_self_grant(&pid),
+            )];
             seed_entries.extend(self.seed_policy.iter().cloned());
             for (key, grants) in &seed_entries {
                 write_seed_policy_entry(&content_store, &notifying_li, &pid, key, grants)?;
@@ -2108,12 +2295,11 @@ impl PeerBuilder {
         // produces are picked up by the same-cascade tracker pass.
         #[cfg(feature = "revision")]
         {
-            let config_coord =
-                Arc::new(entity_revision::engine::ConfigCoordinationHook::new(
-                    content_store.clone(),
-                    notifying_li.clone(),
-                    pid.clone(),
-                ));
+            let config_coord = Arc::new(entity_revision::engine::ConfigCoordinationHook::new(
+                content_store.clone(),
+                notifying_li.clone(),
+                pid.clone(),
+            ));
             emit_dispatcher.register_hook(config_coord);
         }
 
@@ -2193,8 +2379,7 @@ impl PeerBuilder {
         // not the advertisement (§3 is explicitly SHOULD-tier in v0.1,
         // MAY-tier per Amendment 1 §9.2.6).
         {
-            let max_self =
-                self.config.durability_policy.max_self_determinable.clone();
+            let max_self = self.config.durability_policy.max_self_determinable.clone();
             let levels: Vec<entity_ecf::Value> = match max_self {
                 durability::DurabilityLevel::None => {
                     vec![entity_ecf::text("none")]
@@ -2218,10 +2403,7 @@ impl PeerBuilder {
                 .as_str()
                 .to_string();
             let ad_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-                (
-                    entity_ecf::text("levels"),
-                    entity_ecf::Value::Array(levels),
-                ),
+                (entity_ecf::text("levels"), entity_ecf::Value::Array(levels)),
                 (
                     entity_ecf::text("max_self_determinable"),
                     entity_ecf::text(&max_self_str),
@@ -2247,6 +2429,7 @@ impl PeerBuilder {
             tree,
             config: self.config,
             connector,
+            remote: Arc::new(remote::RemoteState::new()),
             event_tx,
             content_event_tx,
             engines_started: std::sync::atomic::AtomicBool::new(false),
@@ -2256,9 +2439,9 @@ impl PeerBuilder {
             attestation_index: attestation_index.clone(),
             #[cfg(feature = "subscription")]
             sub_engine: Some(sub_engine),
-            preserved_requests: Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            #[cfg(feature = "network")]
+            network_handler,
+            preserved_requests: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             #[cfg(all(feature = "local-files", not(target_arch = "wasm32")))]
             local_files_handler,
             dispatch_hooks: self.dispatch_hooks,
@@ -2326,10 +2509,7 @@ fn write_peer_self_status(
             entity_ecf::text("last_phase_transition"),
             entity_ecf::integer(now_ms as i64),
         ),
-        (
-            entity_ecf::text("phase"),
-            entity_ecf::text(phase.as_str()),
-        ),
+        (entity_ecf::text("phase"), entity_ecf::text(phase.as_str())),
     ];
     if let Some(started) = started_at {
         fields.push((
@@ -2338,11 +2518,8 @@ fn write_peer_self_status(
         ));
     }
     let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(fields));
-    let entity = entity_entity::Entity::new(
-        entity_types::TYPE_PEER_SELF_STATUS,
-        data,
-    )
-    .map_err(|e| PeerError::BuildError(format!("build self-status: {}", e)))?;
+    let entity = entity_entity::Entity::new(entity_types::TYPE_PEER_SELF_STATUS, data)
+        .map_err(|e| PeerError::BuildError(format!("build self-status: {}", e)))?;
     let hash = content_store
         .put(entity)
         .map_err(|e| PeerError::BuildError(e.to_string()))?;
@@ -2379,11 +2556,9 @@ fn bootstrap_handler(
         "operations" => ops,
         "pattern" => entity_ecf::text(bare_pattern)
     });
-    let interface = entity_entity::Entity::new(
-        entity_types::TYPE_HANDLER_INTERFACE,
-        interface_data,
-    )
-    .map_err(|e| PeerError::BuildError(e.to_string()))?;
+    let interface =
+        entity_entity::Entity::new(entity_types::TYPE_HANDLER_INTERFACE, interface_data)
+            .map_err(|e| PeerError::BuildError(e.to_string()))?;
     let iface_hash = store
         .put(interface)
         .map_err(|e| PeerError::BuildError(e.to_string()))?;
@@ -2600,10 +2775,7 @@ mod tests {
 
     #[test]
     fn test_peer_builder_basic() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
         assert!(!peer.peer_id().as_str().is_empty());
     }
 
@@ -2617,13 +2789,10 @@ mod tests {
     #[cfg(feature = "identity")]
     fn test_peer_lookup_attestation_default_not_attested() {
         // Fresh peer has no attestations — lookup returns NotAttested.
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
         let h = entity_hash::Hash::from_bytes(&{
             let mut b = vec![0u8];
-            b.extend(std::iter::repeat(0xCDu8).take(32));
+            b.extend(std::iter::repeat_n(0xCDu8, 32));
             b
         })
         .unwrap();
@@ -2642,18 +2811,21 @@ mod tests {
         use entity_attestation::AttestationData;
         use entity_ecf::text;
 
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
 
         // Issuing controller (the attesting party).
         let kp_ctrl = Keypair::from_seed([180u8; 32]);
-        let h_ctrl = peer.content_store().put(kp_ctrl.peer_entity().unwrap()).unwrap();
+        let h_ctrl = peer
+            .content_store()
+            .put(kp_ctrl.peer_entity().unwrap())
+            .unwrap();
 
         // Agent peer (the attested party).
         let kp_agent = Keypair::from_seed([181u8; 32]);
-        let h_agent = peer.content_store().put(kp_agent.peer_entity().unwrap()).unwrap();
+        let h_agent = peer
+            .content_store()
+            .put(kp_agent.peer_entity().unwrap())
+            .unwrap();
 
         // Build identity-cert(function=agent, mode=internal).
         let att = AttestationData {
@@ -2694,10 +2866,7 @@ mod tests {
 
     #[test]
     fn test_peer_has_tree_handler() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
         assert!(peer.handler_registry().get(&qp("system/tree")).is_some());
     }
 
@@ -2718,12 +2887,18 @@ mod tests {
             .expect("identity handler manifest missing");
         assert_eq!(entity.entity_type, entity_types::TYPE_HANDLER_INTERFACE);
         // Decode the manifest and confirm the v2.2 op list.
-        let value: ciborium::Value = ciborium::from_reader(entity.data.as_slice())
-            .expect("manifest CBOR decode");
+        let value: ciborium::Value =
+            ciborium::from_reader(entity.data.as_slice()).expect("manifest CBOR decode");
         let map = value.as_map().expect("manifest is a map");
         let ops_field = map
             .iter()
-            .find_map(|(k, v)| if k.as_text() == Some("operations") { Some(v) } else { None })
+            .find_map(|(k, v)| {
+                if k.as_text() == Some("operations") {
+                    Some(v)
+                } else {
+                    None
+                }
+            })
             .expect("operations field missing");
         // §3.12: operations is a CBOR map (op_name → op_spec), not an array.
         let ops = ops_field.as_map().expect("operations is a map");
@@ -2765,10 +2940,7 @@ mod tests {
 
     #[test]
     fn test_peer_tree_bootstrap() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
         let entity = peer.tree().get(&qp("system/tree"));
         assert!(entity.is_some());
         assert_eq!(entity.unwrap().entity_type, entity_types::TYPE_HANDLER);
@@ -2787,10 +2959,7 @@ mod tests {
 
     #[test]
     fn test_peer_tree_get_put() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
         let data = entity_ecf::to_ecf(&entity_ecf::text("test data"));
         let entity = entity_entity::Entity::new("test/type", data).unwrap();
         // Absolute, peer-qualified path per §5.4 validate_absolute_path.
@@ -2826,11 +2995,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_peer_with_dispatch_hook_observes_entry_and_exit() {
-        use std::sync::Mutex;
         use entity_handler::{ExecuteOptions, STATUS_OK};
+        use std::sync::Mutex;
 
-        let observed: Arc<Mutex<Vec<DispatchEvent>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let observed: Arc<Mutex<Vec<DispatchEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let observed_clone = observed.clone();
         let peer = PeerBuilder::new()
             .keypair(test_keypair())
@@ -2855,8 +3023,7 @@ mod tests {
             entity_ecf::text(&path),
         )]));
         let get_params =
-            entity_entity::Entity::new("system/tree/get-request", get_params_data)
-                .unwrap();
+            entity_entity::Entity::new("system/tree/get-request", get_params_data).unwrap();
         let result = peer
             .execute_with_options(
                 "system/tree",
@@ -2919,7 +3086,10 @@ mod tests {
             entity_types::TYPE_PROTOCOL_STATUS,
             entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
                 (entity_ecf::text("name"), entity_ecf::text("alice")),
-                (entity_ecf::text("target_peer_id"), entity_ecf::text("z6MkAlice")),
+                (
+                    entity_ecf::text("target_peer_id"),
+                    entity_ecf::text("z6MkAlice"),
+                ),
             ])),
         )
         .unwrap();
@@ -2971,15 +3141,22 @@ mod tests {
         // `system/registry/resolution-result` entity — NOT wrapped under
         // `system/protocol/status` with a `{result: {...}}` payload.
         assert_eq!(res.result.entity_type, "system/registry/resolution-result");
-        let outer: entity_ecf::Value =
-            ciborium::from_reader(res.result.data.as_slice()).unwrap();
+        let outer: entity_ecf::Value = ciborium::from_reader(res.result.data.as_slice()).unwrap();
         let rm = outer.as_map().unwrap();
-        let status = rm
-            .iter()
-            .find_map(|(k, v)| if k.as_text() == Some("status") { v.as_text() } else { None });
-        let peer_id = rm
-            .iter()
-            .find_map(|(k, v)| if k.as_text() == Some("peer_id") { v.as_text() } else { None });
+        let status = rm.iter().find_map(|(k, v)| {
+            if k.as_text() == Some("status") {
+                v.as_text()
+            } else {
+                None
+            }
+        });
+        let peer_id = rm.iter().find_map(|(k, v)| {
+            if k.as_text() == Some("peer_id") {
+                v.as_text()
+            } else {
+                None
+            }
+        });
         assert_eq!(status, Some("resolved"));
         assert_eq!(peer_id, Some("z6MkAlice"));
     }
@@ -3001,8 +3178,7 @@ mod tests {
         shared.content_store.put(leaf).unwrap();
         let mut bindings = BTreeMap::new();
         bindings.insert("system/x".to_string(), leaf_hash);
-        let root =
-            entity_tree::trie::build_trie(shared.content_store.as_ref(), &bindings).unwrap();
+        let root = entity_tree::trie::build_trie(shared.content_store.as_ref(), &bindings).unwrap();
 
         // Publish — MANIFEST_GET head now points at the signed published-root.
         let head = peer.publish_root(root).unwrap();
@@ -3010,12 +3186,13 @@ mod tests {
 
         // Verify the served published-root + its invariant-pointer signature
         // against the peer's real public key (the §7.4 consumer trust check).
-        let pr_bytes =
-            entity_wire::encode_entity(&shared.content_store.get(&head).unwrap());
+        let pr_bytes = entity_wire::encode_entity(&shared.content_store.get(&head).unwrap());
         let sig_path = entity_hash::invariant_signature_path(shared.peer_id.as_str(), &head);
-        let sig_hash = shared.location_index.get(&sig_path).expect("signature bound");
-        let sig_bytes =
-            entity_wire::encode_entity(&shared.content_store.get(&sig_hash).unwrap());
+        let sig_hash = shared
+            .location_index
+            .get(&sig_path)
+            .expect("signature bound");
+        let sig_bytes = entity_wire::encode_entity(&shared.content_store.get(&sig_hash).unwrap());
 
         let (verified_hash, data) = published_root::verify_signed_root(
             &pr_bytes,
@@ -3053,8 +3230,9 @@ mod tests {
         peer.tree().put(&path, entity).unwrap();
         let captures = observed.lock().unwrap();
         assert!(
-            captures.iter().any(|(p, k)| p == &path
-                && matches!(k, entity_store::ChangeType::Created)),
+            captures
+                .iter()
+                .any(|(p, k)| p == &path && matches!(k, entity_store::ChangeType::Created)),
             "binding hook should have observed Created event for {path}; got: {:?}",
             *captures
         );
@@ -3101,15 +3279,11 @@ mod tests {
     async fn test_root_tracker_fires_via_handler_dispatch() {
         use entity_handler::{Handler, HandlerContext};
 
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
 
         let build_put_ctx = |path: &str, entity: &entity_entity::Entity| {
             // Build an inline entity {data, type} map for params.entity.
-            let inner: ciborium::Value =
-                ciborium::from_reader(entity.data.as_slice()).unwrap();
+            let inner: ciborium::Value = ciborium::from_reader(entity.data.as_slice()).unwrap();
             let params = entity_ecf::Value::Map(vec![(
                 entity_ecf::text("entity"),
                 entity_ecf::Value::Map(vec![
@@ -3120,21 +3294,16 @@ mod tests {
                     ),
                 ]),
             )]);
-            let params_entity = entity_entity::Entity::new(
-                "system/tree/put-request",
-                entity_ecf::to_ecf(&params),
-            )
-            .unwrap();
+            let params_entity =
+                entity_entity::Entity::new("system/tree/put-request", entity_ecf::to_ecf(&params))
+                    .unwrap();
             let execute_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
                 (entity_ecf::text("operation"), entity_ecf::text("put")),
                 (entity_ecf::text("request_id"), entity_ecf::text("t1")),
                 (entity_ecf::text("uri"), entity_ecf::text("system/tree")),
             ]));
-            let execute = entity_entity::Entity::new(
-                entity_types::TYPE_EXECUTE,
-                execute_data,
-            )
-            .unwrap();
+            let execute =
+                entity_entity::Entity::new(entity_types::TYPE_EXECUTE, execute_data).unwrap();
             HandlerContext {
                 handler_grant: None,
                 caller_capability: None,
@@ -3168,21 +3337,15 @@ mod tests {
                 entity_ecf::text("system/validate/trie-track/"),
             ),
         ]));
-        let cfg = entity_entity::Entity::new("system/tree/tracking-config", cfg_data)
-            .unwrap();
-        let ctx = build_put_ctx(
-            &qp("system/tree/tracking-config/validate-trie-track"),
-            &cfg,
-        );
+        let cfg = entity_entity::Entity::new("system/tree/tracking-config", cfg_data).unwrap();
+        let ctx = build_put_ctx(&qp("system/tree/tracking-config/validate-trie-track"), &cfg);
         let result = peer.tree().handle(&ctx).await.unwrap();
         assert_eq!(result.status, entity_handler::STATUS_OK);
 
         // Data put under the tracked prefix (handler dispatch).
-        let doc = entity_entity::Entity::new(
-            "test/doc",
-            entity_ecf::to_ecf(&entity_ecf::text("hello")),
-        )
-        .unwrap();
+        let doc =
+            entity_entity::Entity::new("test/doc", entity_ecf::to_ecf(&entity_ecf::text("hello")))
+                .unwrap();
         let ctx = build_put_ctx(&qp("system/validate/trie-track/a.txt"), &doc);
         let result = peer.tree().handle(&ctx).await.unwrap();
         assert_eq!(result.status, entity_handler::STATUS_OK);
@@ -3212,10 +3375,7 @@ mod tests {
     ///   3. tree get system/tree/root/system/validate/trie-track
     #[tokio::test]
     async fn test_root_tracker_fires_via_notifying_li() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
 
         let cfg_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
             (entity_ecf::text("enabled"), entity_ecf::bool_val(true)),
@@ -3226,17 +3386,12 @@ mod tests {
         ]));
         let cfg = entity_entity::Entity::new("system/tree/tracking-config", cfg_data).unwrap();
         peer.tree()
-            .put(
-                &qp("system/tree/tracking-config/validate-trie-track"),
-                cfg,
-            )
+            .put(&qp("system/tree/tracking-config/validate-trie-track"), cfg)
             .unwrap();
 
-        let doc = entity_entity::Entity::new(
-            "test/doc",
-            entity_ecf::to_ecf(&entity_ecf::text("hello")),
-        )
-        .unwrap();
+        let doc =
+            entity_entity::Entity::new("test/doc", entity_ecf::to_ecf(&entity_ecf::text("hello")))
+                .unwrap();
         peer.tree()
             .put(&qp("system/validate/trie-track/a.txt"), doc)
             .unwrap();
@@ -3244,8 +3399,9 @@ mod tests {
         // Direct binding: the binding value is the trie root node's content
         // hash; tree.get returns the trie root node, NOT a wrapper entity
         // (EXTENSION-TREE §3.4.1 + TREE-ROOT-PATH-AMBIGUITY.md direct-binding).
-        let root_entity =
-            peer.tree().get(&qp("system/tree/root/system/validate/trie-track"));
+        let root_entity = peer
+            .tree()
+            .get(&qp("system/tree/root/system/validate/trie-track"));
         assert!(
             root_entity.is_some(),
             "tracked root must be materialized after config + data write"
@@ -3276,17 +3432,19 @@ mod tests {
 
     #[test]
     fn test_peer_type_definitions_seeded() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
 
         let handler_entity = peer.tree().get(&qp("system/type/system/handler"));
-        assert!(handler_entity.is_some(), "system/handler type not found in tree");
+        assert!(
+            handler_entity.is_some(),
+            "system/handler type not found in tree"
+        );
         let handler_entity = handler_entity.unwrap();
         assert_eq!(handler_entity.entity_type, entity_types::TYPE_TYPE);
 
-        let hello_entity = peer.tree().get(&qp("system/type/system/protocol/connect/hello"));
+        let hello_entity = peer
+            .tree()
+            .get(&qp("system/type/system/protocol/connect/hello"));
         assert!(hello_entity.is_some(), "hello type not found in tree");
         let hello_entity = hello_entity.unwrap();
         assert_eq!(hello_entity.entity_type, entity_types::TYPE_TYPE);
@@ -3309,28 +3467,52 @@ mod tests {
 
     #[test]
     fn test_peer_handler_interfaces_stored() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
 
         let tree_iface = peer.tree().get(&qp("system/handler/system/tree"));
         assert!(tree_iface.is_some(), "tree handler interface not found");
         let tree_iface = tree_iface.unwrap();
         assert_eq!(tree_iface.entity_type, entity_types::TYPE_HANDLER_INTERFACE);
 
-        let connect_iface = peer.tree().get(&qp("system/handler/system/protocol/connect"));
-        assert!(connect_iface.is_some(), "connect handler interface not found");
+        let connect_iface = peer
+            .tree()
+            .get(&qp("system/handler/system/protocol/connect"));
+        assert!(
+            connect_iface.is_some(),
+            "connect handler interface not found"
+        );
         let connect_iface = connect_iface.unwrap();
-        assert_eq!(connect_iface.entity_type, entity_types::TYPE_HANDLER_INTERFACE);
+        assert_eq!(
+            connect_iface.entity_type,
+            entity_types::TYPE_HANDLER_INTERFACE
+        );
+
+        // §A5 (advertise-what-you-dispatch): every op the connect
+        // handler dispatches on an established connection appears in
+        // its manifest — including the §5.1 keepalive `ping`.
+        let val: ciborium::Value = ciborium::from_reader(connect_iface.data.as_slice()).unwrap();
+        let ops = val
+            .as_map()
+            .unwrap()
+            .iter()
+            .find_map(|(k, v)| match k {
+                ciborium::Value::Text(t) if t == "operations" => v.as_map(),
+                _ => None,
+            })
+            .expect("connect interface has an operations map");
+        for required in ["authenticate", "hello", "ping"] {
+            assert!(
+                ops.iter()
+                    .any(|(k, _)| matches!(k, ciborium::Value::Text(t) if t == required)),
+                "connect manifest missing required operation `{}`",
+                required
+            );
+        }
     }
 
     #[test]
     fn test_type_hash_layout_only_on_system_hash() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
 
         fn has_field(data: &[u8], field: &str) -> bool {
             let val: ciborium::Value = ciborium::from_reader(data).unwrap();
@@ -3341,25 +3523,27 @@ mod tests {
         }
 
         let hash_type = peer.tree().get(&qp("system/type/system/hash")).unwrap();
-        assert!(has_field(&hash_type.data, "layout"), "system/hash type should have layout field");
+        assert!(
+            has_field(&hash_type.data, "layout"),
+            "system/hash type should have layout field"
+        );
 
         let handler_type = peer.tree().get(&qp("system/type/system/handler")).unwrap();
-        assert!(!has_field(&handler_type.data, "layout"), "system/handler type should NOT have layout field");
+        assert!(
+            !has_field(&handler_type.data, "layout"),
+            "system/handler type should NOT have layout field"
+        );
     }
 
     #[test]
     fn test_tree_listing_for_types() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
 
         let result = peer.tree().handle_listing(&qp("system/type/")).unwrap();
         assert_eq!(result.status, 200);
         assert_eq!(result.result.entity_type, entity_types::TYPE_TREE_LISTING);
 
-        let val: ciborium::Value =
-            ciborium::from_reader(result.result.data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
         let count = map
             .iter()
@@ -3378,37 +3562,49 @@ mod tests {
     #[test]
     #[cfg(all(feature = "inbox", feature = "continuation", feature = "subscription"))]
     fn test_peer_extension_handlers_registered() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
         assert!(peer.handler_registry().get(&qp("system/inbox")).is_some());
-        assert!(peer.handler_registry().get(&qp("system/continuation")).is_some());
-        assert!(peer.handler_registry().get(&qp("system/subscription")).is_some());
+        assert!(peer
+            .handler_registry()
+            .get(&qp("system/continuation"))
+            .is_some());
+        assert!(peer
+            .handler_registry()
+            .get(&qp("system/subscription"))
+            .is_some());
     }
 
     #[test]
     #[cfg(all(feature = "inbox", feature = "continuation", feature = "subscription"))]
     fn test_peer_extension_handlers_bootstrapped() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
         let inbox_entity = peer.tree().get(&qp("system/inbox"));
         assert!(inbox_entity.is_some(), "inbox handler manifest not found");
-        assert_eq!(inbox_entity.unwrap().entity_type, entity_types::TYPE_HANDLER);
+        assert_eq!(
+            inbox_entity.unwrap().entity_type,
+            entity_types::TYPE_HANDLER
+        );
 
         let cont_entity = peer.tree().get(&qp("system/continuation"));
-        assert!(cont_entity.is_some(), "continuation handler manifest not found");
+        assert!(
+            cont_entity.is_some(),
+            "continuation handler manifest not found"
+        );
         assert_eq!(cont_entity.unwrap().entity_type, entity_types::TYPE_HANDLER);
 
         let sub_entity = peer.tree().get(&qp("system/subscription"));
-        assert!(sub_entity.is_some(), "subscription handler manifest not found");
+        assert!(
+            sub_entity.is_some(),
+            "subscription handler manifest not found"
+        );
         assert_eq!(sub_entity.unwrap().entity_type, entity_types::TYPE_HANDLER);
 
         let inbox_iface = peer.tree().get(&qp("system/handler/system/inbox"));
         assert!(inbox_iface.is_some(), "inbox handler interface not found");
-        assert_eq!(inbox_iface.unwrap().entity_type, entity_types::TYPE_HANDLER_INTERFACE);
+        assert_eq!(
+            inbox_iface.unwrap().entity_type,
+            entity_types::TYPE_HANDLER_INTERFACE
+        );
     }
 
     #[tokio::test]
@@ -3425,10 +3621,7 @@ mod tests {
 
     #[test]
     fn test_peer_shared() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
         let shared = peer.shared();
         assert_eq!(shared.peer_id, *peer.peer_id());
         assert_eq!(shared.config.listen_addr, peer.config().listen_addr);
@@ -3438,10 +3631,7 @@ mod tests {
 
     #[test]
     fn test_peer_subscribe_events() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
         // Should be able to subscribe multiple times
         let _rx1 = peer.subscribe_events();
         let _rx2 = peer.subscribe_events();
@@ -3449,10 +3639,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_peer_start_engines() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
         let shared = peer.shared();
         // Should not panic even with all features enabled
         peer.start_engines(&shared);
@@ -3460,10 +3647,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_peer_start_engines_idempotent() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
         let shared = peer.shared();
         peer.start_engines(&shared);
         // Second call should be a no-op (not spawn duplicate tasks)
@@ -3472,10 +3656,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_peer_execute_tree_get() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
         // Put something in the tree first
         let data = entity_ecf::to_ecf(&entity_ecf::text("hello"));
         let entity = entity_entity::Entity::new("test/type", data).unwrap();
@@ -3488,7 +3669,11 @@ mod tests {
         });
         let params = entity_entity::Entity::new("system/tree/get/params", params_data).unwrap();
         let result = peer.execute("system/tree", "get", params).await;
-        assert!(result.is_ok(), "execute tree get failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "execute tree get failed: {:?}",
+            result.err()
+        );
         assert_eq!(result.unwrap().status, 200);
     }
 
@@ -3500,10 +3685,7 @@ mod tests {
         // with `code: "handler_not_found"`. Previously this site returned
         // `Err(HandlerError::Internal(_))`, which flattened both the status
         // and the substrate code at the SDK boundary.
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
         let params = entity_entity::Entity::new(
             "primitive/null",
             entity_ecf::to_ecf(&entity_ecf::Value::Null),
@@ -3524,10 +3706,7 @@ mod tests {
     #[cfg(feature = "compute")]
     #[tokio::test]
     async fn test_register_then_dispatch_tree_only_handler() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
         let pid = peer.shared().keypair.peer_id().to_string();
 
         // 1. Tree-put a compute expression that returns a constructed entity.
@@ -3536,11 +3715,9 @@ mod tests {
             "entity_type" => entity_ecf::text("app/echo/result"),
             "fields" => entity_ecf::Value::Map(vec![])
         };
-        let construct = entity_entity::Entity::new(
-            "compute/construct",
-            entity_ecf::to_ecf(&construct_data),
-        )
-        .unwrap();
+        let construct =
+            entity_entity::Entity::new("compute/construct", entity_ecf::to_ecf(&construct_data))
+                .unwrap();
         let expr_path = format!("/{}/app/echo/expr", pid);
         peer.tree().put(&expr_path, construct).unwrap();
 
@@ -3620,28 +3797,37 @@ mod tests {
             "system/handler",
             "manifest is system/handler entity"
         );
-        let interface = peer.tree().get(&format!("/{}/system/handler/app/echo", pid));
-        assert!(interface.is_some(), "interface at /system/handler/{{pattern}}");
+        let interface = peer
+            .tree()
+            .get(&format!("/{}/system/handler/app/echo", pid));
+        assert!(
+            interface.is_some(),
+            "interface at /system/handler/{{pattern}}"
+        );
         let grant = peer
             .tree()
             .get(&format!("/{}/system/capability/grants/app/echo", pid));
-        assert!(grant.is_some(), "grant at /system/capability/grants/{{pattern}}");
+        assert!(
+            grant.is_some(),
+            "grant at /system/capability/grants/{{pattern}}"
+        );
 
         // 4. Dispatch to the newly registered handler via tree-walk.
         // No compiled handler exists for "app/echo" in the registry — dispatch
         // MUST find the manifest in the tree (V7 §6.6) and route through
         // entity-native dispatch (PROPOSAL §1).
-        let empty_params =
-            entity_entity::Entity::new("primitive/null", entity_ecf::to_ecf(&entity_ecf::Value::Null))
-                .unwrap();
+        let empty_params = entity_entity::Entity::new(
+            "primitive/null",
+            entity_ecf::to_ecf(&entity_ecf::Value::Null),
+        )
+        .unwrap();
         let dispatch_result = peer
             .execute("app/echo", "compute", empty_params)
             .await
             .expect("dispatch to tree-only handler must succeed");
         assert_eq!(dispatch_result.status, 200);
         assert_eq!(
-            dispatch_result.result.entity_type,
-            "app/echo/result",
+            dispatch_result.result.entity_type, "app/echo/result",
             "expression returned its constructed entity"
         );
     }
@@ -3654,21 +3840,15 @@ mod tests {
     #[cfg(feature = "compute")]
     #[tokio::test]
     async fn test_register_then_dispatch_returns_wrapped_primitive() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
         let pid = peer.shared().keypair.peer_id().to_string();
 
         // Expression: compute/literal { value: 42 } — returns a bare primitive.
         let lit_data = entity_ecf::cbor_map! {
             "value" => entity_ecf::integer(42)
         };
-        let lit = entity_entity::Entity::new(
-            "compute/literal",
-            entity_ecf::to_ecf(&lit_data),
-        )
-        .unwrap();
+        let lit =
+            entity_entity::Entity::new("compute/literal", entity_ecf::to_ecf(&lit_data)).unwrap();
         let expr_path = format!("/{}/app/lit/expr", pid);
         peer.tree().put(&expr_path, lit).unwrap();
 
@@ -3777,10 +3957,7 @@ mod tests {
     #[cfg(feature = "compute")]
     #[tokio::test]
     async fn test_dispatch_rejects_foreign_granter_handler_grant() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
         let pid = peer.shared().keypair.peer_id().to_string();
         let local_identity = peer.shared().identity_hash;
 
@@ -3789,11 +3966,8 @@ mod tests {
         let lit_data = entity_ecf::cbor_map! {
             "value" => entity_ecf::integer(7)
         };
-        let lit = entity_entity::Entity::new(
-            "compute/literal",
-            entity_ecf::to_ecf(&lit_data),
-        )
-        .unwrap();
+        let lit =
+            entity_entity::Entity::new("compute/literal", entity_ecf::to_ecf(&lit_data)).unwrap();
         peer.tree()
             .put(&format!("/{}/app/echo/expr", pid), lit)
             .unwrap();
@@ -3901,10 +4075,7 @@ mod tests {
         // Dispatch with the foreign grant in place — MUST fail closed (§7.1
         // engages because load_local_handler_grant treats foreign-granter as
         // missing per §S2).
-        let denied = peer
-            .execute("app/echo", "compute", empty)
-            .await
-            .unwrap();
+        let denied = peer.execute("app/echo", "compute", empty).await.unwrap();
         assert_eq!(
             denied.status, 403,
             "foreign-granter handler grant must be rejected (spec-gap §S2)"
@@ -3927,11 +4098,8 @@ mod tests {
         let lit_data = entity_ecf::cbor_map! {
             "value" => entity_ecf::integer(7)
         };
-        let lit = entity_entity::Entity::new(
-            "compute/literal",
-            entity_ecf::to_ecf(&lit_data),
-        )
-        .unwrap();
+        let lit =
+            entity_entity::Entity::new("compute/literal", entity_ecf::to_ecf(&lit_data)).unwrap();
         peer.tree()
             .put(&format!("/{}/{}/expr", pid, pattern), lit)
             .unwrap();
@@ -3939,7 +4107,7 @@ mod tests {
         let mut manifest_fields = vec![
             (
                 entity_ecf::text("expression_path"),
-                entity_ecf::text(&format!("{}/expr", pattern)),
+                entity_ecf::text(format!("{}/expr", pattern)),
             ),
             (entity_ecf::text("internal_scope"), internal_scope),
             (entity_ecf::text("name"), entity_ecf::text("test-handler")),
@@ -4003,7 +4171,7 @@ mod tests {
                 entity_ecf::text("resources"),
                 entity_ecf::Value::Map(vec![(
                     entity_ecf::text("include"),
-                    entity_ecf::Value::Array(vec![entity_ecf::text(&format!("{}/*", pattern))]),
+                    entity_ecf::Value::Array(vec![entity_ecf::text(format!("{}/*", pattern))]),
                 )]),
             ),
         ])])
@@ -4181,8 +4349,7 @@ mod tests {
         assert_eq!(entity.entity_type, entity_types::TYPE_CAP_POLICY_ENTRY);
 
         // The entry grants owner authority scoped to the peer's own namespace.
-        let val: ciborium::Value =
-            ciborium::de::from_reader(entity.data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::de::from_reader(entity.data.as_slice()).unwrap();
         let grants_v = val
             .as_map()
             .unwrap()
@@ -4218,8 +4385,7 @@ mod tests {
         let pid = peer.shared().keypair.peer_id().to_string();
         let self_hex = peer.shared().identity_hash.to_hex();
 
-        let operator_path =
-            format!("/{}/system/capability/policy/{}", pid, operator.to_hex());
+        let operator_path = format!("/{}/system/capability/policy/{}", pid, operator.to_hex());
         assert!(
             peer.shared().location_index.get(&operator_path).is_some(),
             "owner seed keyed by the override operator identity"
@@ -4309,10 +4475,7 @@ mod tests {
             entity_ecf::to_ecf(&entity_ecf::Value::Null),
         )
         .unwrap();
-        let result = peer
-            .execute("app/pure", "compute", empty)
-            .await
-            .unwrap();
+        let result = peer.execute("app/pure", "compute", empty).await.unwrap();
         assert_eq!(
             result.status, 200,
             "pure-functional handler with empty grants must dispatch (§S3)"
@@ -4323,10 +4486,7 @@ mod tests {
     #[cfg(feature = "handlers")]
     #[tokio::test]
     async fn test_register_rejects_system_pattern() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
 
         let mut manifest_fields = vec![
             (entity_ecf::text("name"), entity_ecf::text("evil")),
@@ -4337,10 +4497,7 @@ mod tests {
                     entity_ecf::Value::Map(vec![]),
                 )]),
             ),
-            (
-                entity_ecf::text("pattern"),
-                entity_ecf::text("system/evil"),
-            ),
+            (entity_ecf::text("pattern"), entity_ecf::text("system/evil")),
         ];
         manifest_fields.sort_by(|(a, _), (b, _)| {
             let ab = entity_ecf::to_ecf(a);
@@ -4371,10 +4528,7 @@ mod tests {
     /// Integration test: execute tree put, receive event via subscribe_events.
     #[tokio::test]
     async fn test_execute_put_triggers_event() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
         let shared = peer.shared();
         peer.start_engines(&shared);
 
@@ -4396,17 +4550,17 @@ mod tests {
             }),
             ..Default::default()
         };
-        let result = peer.execute_with_options("system/tree", "put", params, opts).await.unwrap();
+        let result = peer
+            .execute_with_options("system/tree", "put", params, opts)
+            .await
+            .unwrap();
         assert_eq!(result.status, 200);
 
         // Should receive the tree change event
-        let evt = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            events.recv(),
-        )
-        .await
-        .expect("event timeout")
-        .expect("event recv error");
+        let evt = tokio::time::timeout(std::time::Duration::from_millis(100), events.recv())
+            .await
+            .expect("event timeout")
+            .expect("event recv error");
         assert_eq!(evt.path, path);
     }
 
@@ -4417,10 +4571,7 @@ mod tests {
     #[ignore]
     #[cfg(feature = "compute")]
     async fn perf_tco_if_chain_e2e() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
         let shared = peer.shared();
         peer.start_engines(&shared);
 
@@ -4433,8 +4584,7 @@ mod tests {
                     "type" => entity_ecf::text(entity_type)
                 }
             });
-            let params =
-                entity_entity::Entity::new("system/tree/put/params", params_data).unwrap();
+            let params = entity_entity::Entity::new("system/tree/put/params", params_data).unwrap();
             let opts = entity_handler::ExecuteOptions {
                 resource: Some(entity_capability::ResourceTarget {
                     targets: vec![path],
@@ -4454,7 +4604,9 @@ mod tests {
             "compute/literal",
             entity_ecf::cbor_map! { "value" => entity_ecf::bool_val(true) },
         );
-        peer.execute_with_options("system/tree", "put", p, o).await.unwrap();
+        peer.execute_with_options("system/tree", "put", p, o)
+            .await
+            .unwrap();
 
         let mut current_path = qp("perf-tco/final");
         let (p, o) = put_one(
@@ -4462,7 +4614,9 @@ mod tests {
             "compute/literal",
             entity_ecf::cbor_map! { "value" => entity_ecf::integer(42) },
         );
-        peer.execute_with_options("system/tree", "put", p, o).await.unwrap();
+        peer.execute_with_options("system/tree", "put", p, o)
+            .await
+            .unwrap();
 
         // Need the hash of cond_path + final_path to build an `if` referencing them.
         // Use peer's content store via shared.
@@ -4479,7 +4633,9 @@ mod tests {
                     "then" => entity_ecf::Value::Bytes(current_hash.to_bytes().to_vec())
                 },
             );
-            peer.execute_with_options("system/tree", "put", p, o).await.unwrap();
+            peer.execute_with_options("system/tree", "put", p, o)
+                .await
+                .unwrap();
             current_hash = shared.location_index.get(&if_path).unwrap();
             current_path = if_path;
         }
@@ -4522,10 +4678,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn perf_treeput_1100() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
         let shared = peer.shared();
         peer.start_engines(&shared);
 
@@ -4539,8 +4692,7 @@ mod tests {
                     "type" => entity_ecf::text("test/type")
                 }
             });
-            let params =
-                entity_entity::Entity::new("system/tree/put/params", params_data).unwrap();
+            let params = entity_entity::Entity::new("system/tree/put/params", params_data).unwrap();
             let opts = entity_handler::ExecuteOptions {
                 resource: Some(entity_capability::ResourceTarget {
                     targets: vec![path.clone()],
@@ -4573,7 +4725,10 @@ mod tests {
             (
                 entity_ecf::text("deliver_to"),
                 entity_ecf::Value::Map(vec![
-                    (entity_ecf::text("uri"), entity_ecf::text("system/inbox/test")),
+                    (
+                        entity_ecf::text("uri"),
+                        entity_ecf::text("system/inbox/test"),
+                    ),
                     (entity_ecf::text("operation"), entity_ecf::text("receive")),
                 ]),
             ),
@@ -4636,8 +4791,7 @@ mod tests {
     fn test_build_202_response() {
         let response = connection::build_202_response("test-req", None).unwrap();
         // Decode and verify it's a 202 response
-        let val: ciborium::Value =
-            ciborium::from_reader(response.root.data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(response.root.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
         let status = map
             .iter()
@@ -4652,10 +4806,7 @@ mod tests {
     /// Integration test: async delivery via Peer::execute dispatches to inbox.
     #[tokio::test]
     async fn test_async_delivery_to_inbox() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
         let shared = peer.shared();
         peer.start_engines(&shared);
 
@@ -4669,14 +4820,18 @@ mod tests {
         // Build an InboxDeliveryData entity and deliver it to system/inbox
         let result_data = entity_ecf::to_ecf(&entity_ecf::text("delivered-result"));
         let delivery_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-            (entity_ecf::text("original_request_id"), entity_ecf::text("async-req-1")),
-            (entity_ecf::text("result"), entity_ecf::Value::Bytes(result_data)),
+            (
+                entity_ecf::text("original_request_id"),
+                entity_ecf::text("async-req-1"),
+            ),
+            (
+                entity_ecf::text("result"),
+                entity_ecf::Value::Bytes(result_data),
+            ),
             (entity_ecf::text("status"), entity_ecf::integer(200)),
         ]));
-        let delivery_entity = entity_entity::Entity::new(
-            entity_types::TYPE_INBOX_DELIVERY,
-            delivery_data,
-        ).unwrap();
+        let delivery_entity =
+            entity_entity::Entity::new(entity_types::TYPE_INBOX_DELIVERY, delivery_data).unwrap();
 
         let inbox_path = qp("test/async-inbox");
         let opts = entity_handler::ExecuteOptions {
@@ -4688,7 +4843,9 @@ mod tests {
             ..Default::default()
         };
 
-        let result = peer.execute_with_options("system/inbox", "receive", delivery_entity, opts).await;
+        let result = peer
+            .execute_with_options("system/inbox", "receive", delivery_entity, opts)
+            .await;
         assert!(result.is_ok(), "inbox delivery failed: {:?}", result.err());
         assert_eq!(result.unwrap().status, 200);
 
@@ -4708,7 +4865,9 @@ mod tests {
     #[cfg(feature = "websocket")]
     #[tokio::test]
     async fn test_ws_listener_bind() {
-        let listener = transport::WebSocketListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = transport::WebSocketListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
         assert_ne!(listener.socket_addr().port(), 0);
         assert_eq!(listener.transport_type(), "websocket");
         assert!(listener.local_addr().starts_with("ws://"));
@@ -4750,7 +4909,13 @@ mod tests {
         assert_eq!(conn.transport_type, "websocket");
 
         // Perform handshake over WS connection
-        let remote_conn = remote::perform_connect(conn, &IdentityKeypair::Ed25519(client_kp.clone_inner()), entity_hash::HASH_ALGORITHM_SHA256).await.unwrap();
+        let remote_conn = remote::perform_connect(
+            conn,
+            &IdentityKeypair::Ed25519(client_kp.clone_inner()),
+            entity_hash::HASH_ALGORITHM_SHA256,
+        )
+        .await
+        .unwrap();
         assert_eq!(remote_conn.remote_peer_id, server_pid);
 
         // Clean up
@@ -4784,10 +4949,8 @@ mod tests {
 
         let shared_clone = shared.clone();
         let server_handle = tokio::spawn(async move {
-            let listeners: Vec<Box<dyn transport::Listener>> = vec![
-                Box::new(tcp_listener),
-                Box::new(ws_listener),
-            ];
+            let listeners: Vec<Box<dyn transport::Listener>> =
+                vec![Box::new(tcp_listener), Box::new(ws_listener)];
             let _ = server::run_multi(listeners, shared_clone).await;
         });
 
@@ -4800,7 +4963,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(tcp_conn.transport_type, "tcp");
-        let tcp_remote = remote::perform_connect(tcp_conn, &IdentityKeypair::Ed25519(client1.clone_inner()), entity_hash::HASH_ALGORITHM_SHA256).await.unwrap();
+        let tcp_remote = remote::perform_connect(
+            tcp_conn,
+            &IdentityKeypair::Ed25519(client1.clone_inner()),
+            entity_hash::HASH_ALGORITHM_SHA256,
+        )
+        .await
+        .unwrap();
         assert_eq!(tcp_remote.remote_peer_id, peer_pid);
 
         // Connect via WebSocket
@@ -4810,7 +4979,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ws_conn.transport_type, "websocket");
-        let ws_remote = remote::perform_connect(ws_conn, &IdentityKeypair::Ed25519(client2.clone_inner()), entity_hash::HASH_ALGORITHM_SHA256).await.unwrap();
+        let ws_remote = remote::perform_connect(
+            ws_conn,
+            &IdentityKeypair::Ed25519(client2.clone_inner()),
+            entity_hash::HASH_ALGORITHM_SHA256,
+        )
+        .await
+        .unwrap();
         assert_eq!(ws_remote.remote_peer_id, peer_pid);
 
         server_handle.abort();
@@ -4848,7 +5023,13 @@ mod tests {
         assert_eq!(conn.transport_type, "tcp");
 
         let client = Keypair::from_seed([43u8; 32]);
-        let remote = remote::perform_connect(conn, &IdentityKeypair::Ed25519(client.clone_inner()), entity_hash::HASH_ALGORITHM_SHA256).await.unwrap();
+        let remote = remote::perform_connect(
+            conn,
+            &IdentityKeypair::Ed25519(client.clone_inner()),
+            entity_hash::HASH_ALGORITHM_SHA256,
+        )
+        .await
+        .unwrap();
         assert_eq!(remote.remote_peer_id, peer.peer_id().to_string());
 
         server_handle.abort();
@@ -4865,9 +5046,9 @@ mod tests {
             entity_crypto::KeyType::Ed25519 => {
                 IdentityKeypair::Ed25519(Keypair::from_seed([seed; 32]))
             }
-            entity_crypto::KeyType::Ed448 => IdentityKeypair::Ed448(
-                entity_crypto::Ed448Keypair::from_seed(&[seed; 57]).unwrap(),
-            ),
+            entity_crypto::KeyType::Ed448 => {
+                IdentityKeypair::Ed448(entity_crypto::Ed448Keypair::from_seed(&[seed; 57]).unwrap())
+            }
             other => panic!("matrix_id: {other:?} has no sign/verify semantics"),
         }
     }
@@ -4953,16 +5134,18 @@ mod tests {
             })
             .expect("capability signature present in auth_included");
         assert_eq!(sig.signer, server_identity_hash, "cap signed by the server");
-        assert_eq!(sig.algorithm, server_kt.label(), "algorithm == server key_type");
+        assert_eq!(
+            sig.algorithm,
+            server_kt.label(),
+            "algorithm == server key_type"
+        );
         entity_crypto::verify_for_key_type(
             server_kt,
             &server_pubkey,
             &cap_hash.to_bytes(),
             &sig.signature,
         )
-        .unwrap_or_else(|_| {
-            panic!("cap signature must verify under {server_kt:?} server key")
-        });
+        .unwrap_or_else(|_| panic!("cap signature must verify under {server_kt:?} server key"));
 
         server_handle.abort();
     }
@@ -4991,12 +5174,11 @@ mod tests {
     /// identity hash **under that active format** (§4.5a + §1.8). Returns the
     /// active format the cap was minted under.
     async fn run_matrix_m3_cell(server_home: u8, client_home: u8) -> u8 {
-        let expected_active =
-            entity_protocol::negotiate_active_format(
-                &entity_protocol::default_advertised_hash_formats(client_home),
-                &entity_protocol::default_advertised_hash_formats(server_home),
-            )
-            .expect("server and client share a format");
+        let expected_active = entity_protocol::negotiate_active_format(
+            &entity_protocol::default_advertised_hash_formats(client_home),
+            &entity_protocol::default_advertised_hash_formats(server_home),
+        )
+        .expect("server and client share a format");
 
         let server = PeerBuilder::new()
             .identity_keypair(IdentityKeypair::Ed25519(Keypair::from_seed([0x31; 32])))
@@ -5109,10 +5291,17 @@ mod tests {
         // substrate authors its snapshot nodes through this same `Entity::new`
         // path, so substrate is SHA-384 transitively.
         let e = entity_entity::Entity::new("test/content", b"\x81\x01".to_vec()).unwrap();
-        assert_eq!(e.content_hash.algorithm, S384, "Entity::new follows home format");
+        assert_eq!(
+            e.content_hash.algorithm, S384,
+            "Entity::new follows home format"
+        );
 
         // (3) Storing it preserves the SHA-384 content hash byte-for-byte.
-        let stored = peer.shared().content_store.put(e.clone()).expect("content put");
+        let stored = peer
+            .shared()
+            .content_store
+            .put(e.clone())
+            .expect("content put");
         assert_eq!(stored.algorithm, S384, "stored content hash is SHA-384");
         assert_eq!(stored, e.content_hash, "store preserves byte-fidelity hash");
 
@@ -5136,8 +5325,7 @@ mod tests {
         for kt in [Ed25519, Ed448] {
             let kp = matrix_id(kt, 0x33);
             let entity = kp.peer_entity().expect("build system/peer entity");
-            let peer_data = entity_types::PeerData::from_entity(&entity)
-                .expect("decode PeerData");
+            let peer_data = entity_types::PeerData::from_entity(&entity).expect("decode PeerData");
             let derived = peer_data
                 .canonical_peer_id()
                 .unwrap_or_else(|| panic!("{kt:?}: canonical_peer_id returned None"));
@@ -5195,7 +5383,7 @@ mod tests {
             "system/params",
             entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
                 entity_ecf::text("path"),
-                entity_ecf::text(&format!("/{}/system/tree", server_pid)),
+                entity_ecf::text(format!("/{}/system/tree", server_pid)),
             )])),
         )
         .unwrap();
@@ -5248,7 +5436,9 @@ mod tests {
         server.tree().put(&test_path, test_entity).unwrap();
 
         // Start server with WS listener
-        let ws_listener = transport::WebSocketListener::bind("127.0.0.1:0").await.unwrap();
+        let ws_listener = transport::WebSocketListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
         let ws_port = ws_listener.socket_addr().port();
         let shared = server.shared();
         server.start_engines(&shared);
@@ -5319,8 +5509,9 @@ mod tests {
         let c_shared = c.shared();
         c.start_engines(&c_shared);
         let c_shared_run = c_shared.clone();
-        let c_handle =
-            tokio::spawn(async move { let _ = server::run(c_listener, c_shared_run).await; });
+        let c_handle = tokio::spawn(async move {
+            let _ = server::run(c_listener, c_shared_run).await;
+        });
 
         // --- Peer B (relay): TCP listener, wildcard seed; the PeerRelayForwarder
         //     is auto-wired by build() under the `relay` feature.
@@ -5336,8 +5527,9 @@ mod tests {
         let b_shared = b.shared();
         b.start_engines(&b_shared);
         let b_shared_run = b_shared.clone();
-        let b_handle =
-            tokio::spawn(async move { let _ = server::run(b_listener, b_shared_run).await; });
+        let b_handle = tokio::spawn(async move {
+            let _ = server::run(b_listener, b_shared_run).await;
+        });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
@@ -5390,7 +5582,10 @@ mod tests {
                 entity_ecf::text("entity"),
                 entity_ecf::Value::Map(vec![
                     (entity_ecf::text("data"), payload_value),
-                    (entity_ecf::text("type"), entity_ecf::text(&payload.entity_type)),
+                    (
+                        entity_ecf::text("type"),
+                        entity_ecf::text(&payload.entity_type),
+                    ),
                 ]),
             )])),
         )
@@ -5472,7 +5667,11 @@ mod tests {
             .as_map()
             .and_then(|m| {
                 m.iter().find_map(|(k, v)| {
-                    if k.as_text() == Some("status") { v.as_text() } else { None }
+                    if k.as_text() == Some("status") {
+                        v.as_text()
+                    } else {
+                        None
+                    }
                 })
             })
             .unwrap_or("");
@@ -5529,7 +5728,15 @@ mod tests {
         // Spawn a wildcard-seeded TCP peer; returns (peer, peer_id, port, shared,
         // join handle). The relay forwarder is auto-wired by build() under the
         // `relay` feature.
-        async fn spawn_peer(seed: u8) -> (Peer, String, u16, Arc<PeerShared>, tokio::task::JoinHandle<()>) {
+        async fn spawn_peer(
+            seed: u8,
+        ) -> (
+            Peer,
+            String,
+            u16,
+            Arc<PeerShared>,
+            tokio::task::JoinHandle<()>,
+        ) {
             let p = PeerBuilder::new()
                 .keypair(Keypair::from_seed([seed; 32]))
                 .listen_addr("127.0.0.1:0")
@@ -5542,13 +5749,21 @@ mod tests {
             let shared = p.shared();
             p.start_engines(&shared);
             let run = shared.clone();
-            let handle = tokio::spawn(async move { let _ = server::run(listener, run).await; });
+            let handle = tokio::spawn(async move {
+                let _ = server::run(listener, run).await;
+            });
             (p, pid, port, shared, handle)
         }
 
         // Publish `target`'s TCP transport profile into `host`'s tree so host's
         // forwarder can dial it (the next-hop resolution NETWORK §10 performs).
-        fn publish_profile(host_shared: &Arc<PeerShared>, host_pid: &str, host: &Peer, target_pid: &str, target_port: u16) {
+        fn publish_profile(
+            host_shared: &Arc<PeerShared>,
+            host_pid: &str,
+            host: &Peer,
+            target_pid: &str,
+            target_port: u16,
+        ) {
             let hex = remote::resolve_peer_id_hex(
                 target_pid,
                 host_shared.content_store.as_ref(),
@@ -5604,7 +5819,10 @@ mod tests {
                 entity_ecf::text("entity"),
                 entity_ecf::Value::Map(vec![
                     (entity_ecf::text("data"), payload_value),
-                    (entity_ecf::text("type"), entity_ecf::text(&payload.entity_type)),
+                    (
+                        entity_ecf::text("type"),
+                        entity_ecf::text(&payload.entity_type),
+                    ),
                 ]),
             )])),
         )
@@ -5668,7 +5886,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(resp.status, 200, "B :forward (intermediate hop) should succeed");
+        assert_eq!(
+            resp.status, 200,
+            "B :forward (intermediate hop) should succeed"
+        );
 
         // Allow the B→C→D chain to complete (each hop is its own dispatch).
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
@@ -5707,8 +5928,7 @@ mod tests {
             .unwrap();
         let server_pid = server.peer_id().to_string();
 
-        let listener =
-            MemoryListener::bind(server_pid.clone(), registry.clone()).unwrap();
+        let listener = MemoryListener::bind(server_pid.clone(), registry.clone()).unwrap();
         assert_eq!(listener.local_addr(), format!("memory://{}", server_pid));
         assert_eq!(listener.transport_type(), "memory");
 
@@ -5807,13 +6027,11 @@ mod tests {
         // with `minted_capability` set. R6 §9.3: one
         // `system/peer/session/{grantee}` per remote.
         dial().await;
-        let session_after_one = server_shared
-            .tree
-            .get(&session_path)
-            .expect("first dial must write the session entity at /{server}/system/peer/session/{client}");
-        let decoded_after_one =
-            crate::session_entity::PeerSession::from_entity(&session_after_one)
-                .expect("session entity decodes cleanly");
+        let session_after_one = server_shared.tree.get(&session_path).expect(
+            "first dial must write the session entity at /{server}/system/peer/session/{client}",
+        );
+        let decoded_after_one = crate::session_entity::PeerSession::from_entity(&session_after_one)
+            .expect("session entity decodes cleanly");
         let minted_hash_after_one = decoded_after_one
             .minted_capability
             .as_ref()
@@ -5828,9 +6046,8 @@ mod tests {
             .tree
             .get(&session_path)
             .expect("redial must leave the session entity in place");
-        let decoded_after_two =
-            crate::session_entity::PeerSession::from_entity(&session_after_two)
-                .expect("session entity still decodes");
+        let decoded_after_two = crate::session_entity::PeerSession::from_entity(&session_after_two)
+            .expect("session entity still decodes");
         let minted_hash_after_two = decoded_after_two
             .minted_capability
             .as_ref()
@@ -5955,8 +6172,7 @@ mod tests {
 
         // Server side: minted_capability set, held_capability absent.
         // v7.64: `{peer_id_hex}` not Base58.
-        let client_identity_hash =
-            Keypair::from_seed([51u8; 32]).peer_identity_hash();
+        let client_identity_hash = Keypair::from_seed([51u8; 32]).peer_identity_hash();
         let server_session_path = format!(
             "/{}/{}",
             server_pid,
@@ -5978,8 +6194,7 @@ mod tests {
         );
 
         // Client side: held_capability set, minted_capability absent.
-        let server_identity_hash =
-            Keypair::from_seed([50u8; 32]).peer_identity_hash();
+        let server_identity_hash = Keypair::from_seed([50u8; 32]).peer_identity_hash();
         let client_session_path = format!(
             "/{}/{}",
             client_pid,
@@ -6007,6 +6222,1080 @@ mod tests {
             server_minted.hash, client_held.hash,
             "bidirectional invariant: server's minted_capability.hash must equal client's held_capability.hash"
         );
+
+        server_handle.abort();
+    }
+
+    /// Read the `system/peer/status` entity `holder` keeps for the peer
+    /// whose identity hash is `remote_hash`, if any.
+    fn liveness_status_of(
+        shared: &Arc<PeerShared>,
+        remote_hash: &entity_hash::Hash,
+    ) -> Option<crate::peer_status::PeerStatusData> {
+        let path = format!(
+            "/{}/{}",
+            shared.peer_id.as_str(),
+            crate::peer_status::PeerStatusData::relative_path(remote_hash)
+        );
+        let h = shared.location_index.get(&path)?;
+        let e = shared.content_store.get(&h)?;
+        crate::peer_status::PeerStatusData::from_entity(&e).ok()
+    }
+
+    /// Poll until `shared` holds a status entity with the wanted status
+    /// for `remote_hash`, or fail after ~2s. Used for the responder
+    /// side, whose write settles as it produces the AUTHENTICATE
+    /// response (asynchronous relative to the dialer's connect return).
+    async fn wait_liveness_status(
+        shared: &Arc<PeerShared>,
+        remote_hash: &entity_hash::Hash,
+        want: &str,
+    ) -> crate::peer_status::PeerStatusData {
+        for _ in 0..200 {
+            if let Some(d) = liveness_status_of(shared, remote_hash) {
+                if d.status == want {
+                    return d;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("status never reached {:?}", want);
+    }
+
+    /// Amendment 12 §A3 baseline: a completed handshake (§6.2) writes
+    /// `system/peer/status = connected` on BOTH ends — the dialer
+    /// synchronously in `connect_to`, the responder as it grants the
+    /// connection capability.
+    #[tokio::test]
+    async fn a12_liveness_connected_on_establish_both_ends() {
+        use transport::{MemoryConnector, MemoryListener, MemoryTransportRegistry};
+        let registry = MemoryTransportRegistry::new();
+
+        let server = PeerBuilder::new()
+            .keypair(Keypair::from_seed([0x60u8; 32]))
+            .build()
+            .unwrap();
+        let server_pid = server.peer_id().to_string();
+        let server_shared = server.shared();
+        // The status path is keyed by the identity hash AS AUTHORED at
+        // build time — read it off the peer rather than re-deriving via
+        // the process-global home format (racy under the SHA-384-window
+        // tests, and the authored value is the ground truth anyway).
+        let server_hash = server_shared.identity_hash;
+        let listener = MemoryListener::bind(server_pid.clone(), registry.clone()).unwrap();
+        server.start_engines(&server_shared);
+        let shared_for_task = server_shared.clone();
+        let server_handle = tokio::spawn(async move {
+            let _ = server::run(listener, shared_for_task).await;
+        });
+        tokio::task::yield_now().await;
+
+        let client = PeerBuilder::new()
+            .keypair(Keypair::from_seed([0x61u8; 32]))
+            .connector(std::sync::Arc::new(MemoryConnector::new(registry.clone())))
+            .build()
+            .unwrap();
+        client.local_only();
+        let client_pid = client.peer_id().to_string();
+        let client_shared = client.shared();
+        let client_hash = client_shared.identity_hash;
+
+        client
+            .connect_to(&format!("memory://{}", server_pid))
+            .await
+            .unwrap();
+
+        // Dialer side: written synchronously during connect_to.
+        let d = liveness_status_of(&client_shared, &server_hash)
+            .expect("dialer has no status entity for server after connect");
+        assert_eq!(d.status, crate::peer_status::PEER_STATUS_CONNECTED);
+        assert_eq!(d.peer_id, server_pid);
+        assert!(d.reason.is_none() && d.last_error.is_none());
+        assert!(d.connected_at.is_some());
+
+        // Responder side: symmetric write as the server produced the grant.
+        let rd = wait_liveness_status(
+            &server_shared,
+            &client_hash,
+            crate::peer_status::PEER_STATUS_CONNECTED,
+        )
+        .await;
+        assert_eq!(rd.peer_id, client_pid);
+
+        server_handle.abort();
+    }
+
+    /// Amendment 12 §A1 anchor vector: a live two-peer session, drop one
+    /// side, and the surviving side's `system/peer/status` flips
+    /// connected → suspect (reason `transport-error`) the moment a
+    /// dispatch over the dead pooled connection fails. The write is a
+    /// plain tree entity through the notifying index, so a subscriber
+    /// sees it with no poll.
+    #[tokio::test]
+    async fn a12_liveness_suspect_on_transport_error() {
+        use transport::{MemoryConnector, MemoryListener, MemoryTransportRegistry};
+        let registry = MemoryTransportRegistry::new();
+
+        let server = PeerBuilder::new()
+            .keypair(Keypair::from_seed([0x62u8; 32]))
+            .build()
+            .unwrap();
+        let server_pid = server.peer_id().to_string();
+        let server_shared = server.shared();
+        let server_hash = server_shared.identity_hash;
+        let listener = MemoryListener::bind(server_pid.clone(), registry.clone()).unwrap();
+        server.start_engines(&server_shared);
+        let shared_for_task = server_shared.clone();
+        let server_handle = tokio::spawn(async move {
+            let _ = server::run(listener, shared_for_task).await;
+        });
+        tokio::task::yield_now().await;
+
+        let client = PeerBuilder::new()
+            .keypair(Keypair::from_seed([0x63u8; 32]))
+            .connector(std::sync::Arc::new(MemoryConnector::new(registry.clone())))
+            .build()
+            .unwrap();
+        client.local_only();
+        let client_shared = client.shared();
+
+        // Establish: dials + handshakes through the outbound pool, so the
+        // failing conn later is the pooled binding the no-clobber guard
+        // checks.
+        client
+            .connect_to(&format!("memory://{}", server_pid))
+            .await
+            .unwrap();
+        let baseline =
+            liveness_status_of(&client_shared, &server_hash).expect("connected baseline missing");
+        assert_eq!(baseline.status, crate::peer_status::PEER_STATUS_CONNECTED);
+        assert!(baseline.reason.is_none());
+
+        // Drop the server: aborting the accept-loop task drops its
+        // ConnectionGuard, which aborts every per-connection task — the
+        // client's pooled connection is now dead, but the pool still
+        // hands it out (the "browse over a dead pool" symptom).
+        server_handle.abort();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Next dispatch fails at the transport → §A1 demotion fires.
+        // (Any EXECUTE_RESPONSE — even 4xx — would be Ok here; only a
+        // transport failure errors.)
+        let params = entity_entity::Entity::new(
+            "system/params",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+                entity_ecf::text("path"),
+                entity_ecf::text(format!("/{}/system/tree", server_pid)),
+            )])),
+        )
+        .unwrap();
+        let res = client
+            .execute(&format!("/{}/system/tree", server_pid), "get", params)
+            .await;
+        assert!(
+            res.is_err(),
+            "expected transport error dispatching over dropped server"
+        );
+
+        // The surviving side flipped to suspect with the transport-error
+        // reason, and the dead conn is evicted.
+        let d = liveness_status_of(&client_shared, &server_hash)
+            .expect("client lost status entity for server after demotion");
+        assert_eq!(d.status, crate::peer_status::PEER_STATUS_SUSPECT);
+        assert_eq!(
+            d.reason.as_deref(),
+            Some(crate::peer_status::PEER_STATUS_REASON_TRANSPORT_ERROR)
+        );
+        assert!(
+            d.last_error.is_some(),
+            "suspect status should carry a coded last_error"
+        );
+        assert_eq!(d.peer_id, server_pid);
+        assert!(
+            client_shared.remote.get(&server_pid).is_none(),
+            "dead conn must be evicted from the pool"
+        );
+    }
+
+    /// Spin up a memory-transport server peer + a client peer with the
+    /// given keepalive config; returns (server_shared, server_handle,
+    /// client, client_shared, server_pid, server_hash).
+    async fn a12_keepalive_pair(
+        seed: u8,
+        cfg: keepalive::KeepaliveConfig,
+    ) -> (
+        Arc<PeerShared>,
+        tokio::task::JoinHandle<()>,
+        Peer,
+        Arc<PeerShared>,
+        String,
+        entity_hash::Hash,
+    ) {
+        use transport::{MemoryConnector, MemoryListener, MemoryTransportRegistry};
+        let registry = MemoryTransportRegistry::new();
+
+        let server = PeerBuilder::new()
+            .keypair(Keypair::from_seed([seed; 32]))
+            .build()
+            .unwrap();
+        let server_pid = server.peer_id().to_string();
+        let server_shared = server.shared();
+        let server_hash = server_shared.identity_hash;
+        let listener = MemoryListener::bind(server_pid.clone(), registry.clone()).unwrap();
+        server.start_engines(&server_shared);
+        let shared_for_task = server_shared.clone();
+        let server_handle = tokio::spawn(async move {
+            let _ = server::run(listener, shared_for_task).await;
+        });
+        tokio::task::yield_now().await;
+
+        let client = PeerBuilder::new()
+            .keypair(Keypair::from_seed([seed + 1; 32]))
+            .connector(std::sync::Arc::new(MemoryConnector::new(registry.clone())))
+            .keepalive(cfg)
+            .build()
+            .unwrap();
+        client.local_only();
+        let client_shared = client.shared();
+        client
+            .connect_to(&format!("memory://{}", server_pid))
+            .await
+            .unwrap();
+        (
+            server_shared,
+            server_handle,
+            client,
+            client_shared,
+            server_pid,
+            server_hash,
+        )
+    }
+
+    /// EXTENSION-NETWORK §5.1–§5.3: an EXECUTE `ping` on the connect
+    /// handler answers 200 with a `system/network/pong` echoing the
+    /// ping's timestamp/sequence plus the responder's clock. The ping
+    /// rides the ordinary signed EXECUTE path (verified), exempt only
+    /// from the handler-scope grant check (see SPEC-AMBIGUITIES).
+    #[tokio::test]
+    async fn a12_keepalive_ping_answers_pong() {
+        let disabled = keepalive::KeepaliveConfig {
+            enabled: false, // exercise the op directly, not the loop
+            ..Default::default()
+        };
+        let (_ss, server_handle, client, _cs, server_pid, _sh) =
+            a12_keepalive_pair(0x64, disabled).await;
+
+        let params = entity_entity::Entity::new(
+            "system/network/ping",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+                (
+                    entity_ecf::text("sequence"),
+                    entity_ecf::Value::Integer(42u64.into()),
+                ),
+                (
+                    entity_ecf::text("timestamp"),
+                    entity_ecf::Value::Integer(1_700_000_000_000u64.into()),
+                ),
+            ])),
+        )
+        .unwrap();
+        let resp = client
+            .execute(
+                &format!("/{}/system/protocol/connect", server_pid),
+                "ping",
+                params,
+            )
+            .await
+            .expect("ping round-trip");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.result.entity_type, "system/network/pong");
+        let value: ciborium::Value = ciborium::from_reader(resp.result.data.as_slice()).unwrap();
+        let map = value.into_map().expect("pong data is a map");
+        let field = |key: &str| -> Option<u64> {
+            map.iter().find_map(|(k, v)| match (k, v) {
+                (ciborium::Value::Text(t), ciborium::Value::Integer(i)) if t == key => {
+                    u64::try_from(*i).ok()
+                }
+                _ => None,
+            })
+        };
+        assert_eq!(field("sequence"), Some(42), "pong echoes sequence");
+        assert_eq!(
+            field("timestamp"),
+            Some(1_700_000_000_000),
+            "pong echoes timestamp"
+        );
+        assert!(field("server_time").unwrap_or(0) > 0, "server_time set");
+
+        server_handle.abort();
+    }
+
+    /// Amendment 12 rung-2 anchor: drop the peer, let the keepalive
+    /// loop run, and the survivor escalates to `disconnected` (reason
+    /// `keepalive-miss`) within the §A3 envelope
+    /// (interval_ms × max_missed + timeout_ms — short config injected),
+    /// with the dead conn evicted from the pool. The demotion write
+    /// carries the §A4 `last_seen` transition snapshot — the last
+    /// moment the survivor actually heard from the peer.
+    #[tokio::test]
+    async fn a12_keepalive_miss_escalates_to_disconnected() {
+        let short = keepalive::KeepaliveConfig {
+            interval_ms: 50,
+            timeout_ms: 60,
+            max_missed: 2,
+            enabled: true,
+        };
+        let (_ss, server_handle, client, client_shared, server_pid, server_hash) =
+            a12_keepalive_pair(0x66, short).await;
+
+        let baseline =
+            liveness_status_of(&client_shared, &server_hash).expect("connected baseline missing");
+        assert_eq!(baseline.status, crate::peer_status::PEER_STATUS_CONNECTED);
+
+        // One successful exchange so the endpoint has recorded activity
+        // — the freshness mark the §A4 demotion snapshot preserves.
+        let params = entity_entity::Entity::new(
+            "system/network/ping",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+                (
+                    entity_ecf::text("sequence"),
+                    entity_ecf::Value::Integer(1u64.into()),
+                ),
+                (
+                    entity_ecf::text("timestamp"),
+                    entity_ecf::Value::Integer(1_700_000_000_000u64.into()),
+                ),
+            ])),
+        )
+        .unwrap();
+        client
+            .execute(
+                &format!("/{}/system/protocol/connect", server_pid),
+                "ping",
+                params,
+            )
+            .await
+            .expect("pre-drop ping round-trip");
+
+        // Drop the server; the idle pooled connection goes dark. No
+        // dispatch ever runs — only the keepalive loop observes it.
+        server_handle.abort();
+
+        let d = wait_liveness_status(
+            &client_shared,
+            &server_hash,
+            crate::peer_status::PEER_STATUS_DISCONNECTED,
+        )
+        .await;
+        assert_eq!(
+            d.reason.as_deref(),
+            Some(crate::peer_status::PEER_STATUS_REASON_KEEPALIVE_MISS)
+        );
+        assert_eq!(d.peer_id, server_pid);
+        assert!(
+            d.last_seen.is_some(),
+            "demotion write must carry the §A4 last_seen transition snapshot"
+        );
+        assert!(
+            client_shared.remote.get(&server_pid).is_none(),
+            "dead conn must be evicted after keepalive escalation"
+        );
+    }
+
+    /// §3.13 `system/connection` transition writes (ruling C — full
+    /// NETWORK conformance tier, not floor): establish (dialer side)
+    /// records `active` with transport+address and the sibling status
+    /// entity carries the `connection` path ref; the keepalive demotion
+    /// flips the record to `closed`, preserving how we WERE attached.
+    #[tokio::test]
+    async fn a12_connection_transitions_active_to_closed() {
+        let short = keepalive::KeepaliveConfig {
+            interval_ms: 50,
+            timeout_ms: 60,
+            max_missed: 2,
+            enabled: true,
+        };
+        let (_ss, server_handle, _client, client_shared, server_pid, server_hash) =
+            a12_keepalive_pair(0x6a, short).await;
+
+        let conn_path = format!(
+            "/{}/{}",
+            client_shared.peer_id.as_str(),
+            connection_state::ConnectionData::relative_path(&server_hash)
+        );
+        let read_conn = || {
+            client_shared
+                .location_index
+                .get(&conn_path)
+                .and_then(|h| client_shared.content_store.get(&h))
+                .and_then(|e| connection_state::ConnectionData::from_entity(&e).ok())
+        };
+
+        // Establish transition: active, with attachment diagnostics.
+        let active = read_conn().expect("establish must write system/connection (dialer side)");
+        assert_eq!(active.status, connection_state::CONNECTION_STATUS_ACTIVE);
+        assert_eq!(active.peer_id, server_pid);
+        assert_eq!(active.transport, "memory");
+        assert_eq!(active.address, format!("memory://{}", server_pid));
+        assert!(active.established_at > 0);
+
+        // The status entity references the connection record (§3.13).
+        let status =
+            liveness_status_of(&client_shared, &server_hash).expect("connected baseline missing");
+        assert_eq!(
+            status.connection.as_deref(),
+            Some(conn_path.as_str()),
+            "status `connection` field must point at the system/connection path"
+        );
+
+        // Close/failure transition: drop the server, let keepalive
+        // escalate; the record flips to closed and still answers how we
+        // WERE attached.
+        server_handle.abort();
+        wait_liveness_status(
+            &client_shared,
+            &server_hash,
+            crate::peer_status::PEER_STATUS_DISCONNECTED,
+        )
+        .await;
+        let closed = read_conn().expect("closed record must remain readable");
+        assert_eq!(closed.status, connection_state::CONNECTION_STATUS_CLOSED);
+        assert_eq!(closed.transport, "memory");
+        assert_eq!(closed.established_at, active.established_at);
+    }
+
+    /// §A4 (rung-2 ruling 1) pinned as an invariant: the status entity
+    /// is TRANSITION-written only. Keepalive successes advance the
+    /// impl-internal freshness (`RemoteEndpoint::last_activity_ms`) but
+    /// MUST NOT rewrite the tree entity — no `last_seen` cadence
+    /// refresh, no subscriber fan-out, no CAS accretion on an idle
+    /// healthy connection. This is the negative test replacing the
+    /// rung-2 cadence-refresh vector after arch ruled the refresh a
+    /// spec defect (Go analog: `TestKeepaliveNoCadenceWrites`).
+    #[tokio::test]
+    async fn a12_keepalive_no_cadence_writes() {
+        let short = keepalive::KeepaliveConfig {
+            interval_ms: 40,
+            timeout_ms: 200,
+            max_missed: 3,
+            enabled: true,
+        };
+        let (_ss, server_handle, _client, client_shared, server_pid, server_hash) =
+            a12_keepalive_pair(0x68, short).await;
+
+        let baseline =
+            liveness_status_of(&client_shared, &server_hash).expect("connected baseline missing");
+        assert_eq!(baseline.status, crate::peer_status::PEER_STATUS_CONNECTED);
+        assert!(
+            baseline.last_seen.is_none(),
+            "establish write must not carry last_seen"
+        );
+
+        let status_path = format!(
+            "/{}/{}",
+            client_shared.peer_id.as_str(),
+            crate::peer_status::PeerStatusData::relative_path(&server_hash)
+        );
+        let h0 = client_shared
+            .location_index
+            .get(&status_path)
+            .expect("no status binding after establish");
+        let endpoint = client_shared
+            .remote
+            .get(&server_pid)
+            .expect("pooled outbound binding missing");
+        let activity0 = endpoint.last_activity_ms();
+
+        // Wait until the in-memory freshness advances past the
+        // establish-time mark — proof at least one keepalive pong
+        // landed (the impl-internal bookkeeping §A4 keeps).
+        let mut advanced = false;
+        for _ in 0..500 {
+            let a = endpoint.last_activity_ms();
+            if a != 0 && a > activity0 {
+                advanced = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            advanced,
+            "keepalive success never advanced in-memory freshness"
+        );
+
+        // Let several more keepalive intervals elapse so any (forbidden)
+        // cadence write would have landed.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        let h1 = client_shared
+            .location_index
+            .get(&status_path)
+            .expect("status binding vanished");
+        assert_eq!(
+            h1, h0,
+            "status entity rewritten at keepalive cadence — §A4: transition writes only"
+        );
+
+        server_handle.abort();
+    }
+
+    // -----------------------------------------------------------------
+    // EXTENSION-NETWORK Amendment 12 rung 3 — the maintain-peer reconnect
+    // lifecycle. In-process two-peer vectors over the full reactive stack
+    // (inbox + continuation + subscription + network), the Rust shape of
+    // Go's `ext/network/lifecycle_test.go`. These double as the Rust
+    // observation of PROPOSAL-CONTINUATION-LOST-ERROR-MARKER-MUST §4's
+    // reconnect-chain vectors: the reconnect-failure path MUST leave
+    // §3.10 lost-error markers (no-on_error forward non-2xx) bound under
+    // the continuation handler's own authority, keyed by RequestID.
+    // -----------------------------------------------------------------
+
+    #[cfg(feature = "network")]
+    fn maintain_request_entity(peer_id: &str, address: &str) -> entity_entity::Entity {
+        let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+            (entity_ecf::text("address"), entity_ecf::text(address)),
+            (entity_ecf::text("peer_id"), entity_ecf::text(peer_id)),
+        ]));
+        entity_entity::Entity::new(entity_network::TYPE_MAINTAIN_REQUEST, data).unwrap()
+    }
+
+    /// Drive the initial maintain-peer, retrying transient readiness-race
+    /// 502s: the in-memory server's accept loop may not be scheduled yet
+    /// when the client dials (a single `yield_now` after spawn is not a
+    /// deterministic readiness barrier under heavy parallel test load — the
+    /// same race the pre-existing `a12_keepalive_pair` peers carry). Each
+    /// failed FIRST call drops its session (§4.1 step 1), so a retry is a
+    /// clean fresh establish. Returns the 200 response.
+    #[cfg(feature = "network")]
+    async fn maintain_with_retry(
+        client: &Peer,
+        client_pid: &str,
+        params: entity_entity::Entity,
+    ) -> entity_handler::HandlerResult {
+        for _ in 0..100 {
+            let resp = client
+                .execute(
+                    &format!("/{}/system/network", client_pid),
+                    "maintain-peer",
+                    params.clone(),
+                )
+                .await
+                .expect("maintain-peer dispatch");
+            if resp.status == 200 {
+                return resp;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("maintain-peer never returned 200 within the readiness window");
+    }
+
+    /// Build a memory-transport server peer (engines + accept loop) and a
+    /// local-only client peer sharing `registry`. Returns the pieces the
+    /// rung-3 vectors drive. The client is NOT pre-connected — maintain-peer
+    /// performs the §4.1 step-1 establish.
+    #[cfg(feature = "network")]
+    async fn rung3_pair(
+        registry: std::sync::Arc<transport::MemoryTransportRegistry>,
+        server_seed: u8,
+        client_seed: u8,
+        client_keepalive: keepalive::KeepaliveConfig,
+    ) -> (
+        Peer,
+        Arc<PeerShared>,
+        tokio::task::JoinHandle<()>,
+        String,
+        Peer,
+        Arc<PeerShared>,
+    ) {
+        use transport::{MemoryConnector, MemoryListener};
+        let server = PeerBuilder::new()
+            .keypair(Keypair::from_seed([server_seed; 32]))
+            .build()
+            .unwrap();
+        let server_pid = server.peer_id().to_string();
+        let server_shared = server.shared();
+        let listener = MemoryListener::bind(server_pid.clone(), registry.clone()).unwrap();
+        server.start_engines(&server_shared);
+        let shared_for_task = server_shared.clone();
+        let server_handle = tokio::spawn(async move {
+            let _ = server::run(listener, shared_for_task).await;
+        });
+        tokio::task::yield_now().await;
+
+        let client = PeerBuilder::new()
+            .keypair(Keypair::from_seed([client_seed; 32]))
+            .connector(std::sync::Arc::new(MemoryConnector::new(registry)))
+            .keepalive(client_keepalive)
+            .build()
+            .unwrap();
+        client.local_only();
+        let client_shared = client.shared();
+        (
+            server,
+            server_shared,
+            server_handle,
+            server_pid,
+            client,
+            client_shared,
+        )
+    }
+
+    /// §4.1 happy path: maintain-peer connects, installs the three-
+    /// continuation graph + two lifecycle subscriptions, returns session
+    /// info. The graph residents ride the handler grant as
+    /// dispatch_capability (§11 / F2), and none routes on_error to
+    /// system/inbox/* (marker-proposal §5).
+    #[cfg(feature = "network")]
+    #[tokio::test]
+    async fn a12_rung3_maintain_peer_establishes_graph() {
+        let registry = transport::MemoryTransportRegistry::new();
+        let ka = keepalive::KeepaliveConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let (_server, _ss, server_handle, server_pid, client, client_shared) =
+            rung3_pair(registry, 0x80, 0x81, ka).await;
+        let client_pid = client_shared.peer_id.as_str().to_string();
+        let addr = format!("memory://{}", server_pid);
+
+        let resp = maintain_with_retry(
+            &client,
+            &client_pid,
+            maintain_request_entity(&server_pid, &addr),
+        )
+        .await;
+        assert_eq!(resp.status, 200, "maintain-peer returned non-200");
+        assert_eq!(
+            resp.result.entity_type,
+            entity_network::TYPE_MAINTAIN_RESULT
+        );
+        let result: ciborium::Value = ciborium::from_reader(resp.result.data.as_slice()).unwrap();
+        let rmap = result.as_map().unwrap();
+        let get = |k: &str| {
+            rmap.iter()
+                .find(|(kk, _)| kk.as_text() == Some(k))
+                .map(|(_, v)| v)
+        };
+        assert_eq!(get("peer_id").unwrap().as_text(), Some(server_pid.as_str()));
+        assert!(!get("session_id").unwrap().as_text().unwrap().is_empty());
+        let chain_id = get("chain_id").unwrap().as_text().unwrap();
+        assert!(
+            chain_id.starts_with("network/maintain/"),
+            "chain_id {:?} lacks the scheme",
+            chain_id
+        );
+        let subs = get("subscriptions").unwrap().as_array().unwrap();
+        assert_eq!(subs.len(), 2, "expected 2 lifecycle subscriptions");
+
+        // The graph is in the tree: two inbox residents + the managed-
+        // namespace backoff resident, all system/continuation entities
+        // carrying the handler grant as dispatch_capability, no on_error →
+        // system/inbox/*.
+        let grant_hash = client_shared
+            .location_index
+            .get(&format!(
+                "/{}/system/capability/grants/system/network",
+                client_pid
+            ))
+            .expect("network handler grant not bound");
+        for path in [
+            format!(
+                "/{}/system/inbox/network/{}/on-disconnect",
+                client_pid, server_pid
+            ),
+            format!(
+                "/{}/system/inbox/network/{}/on-reconnect",
+                client_pid, server_pid
+            ),
+            format!(
+                "/{}/system/network/peers/{}/on-reconnect-backoff",
+                client_pid, server_pid
+            ),
+        ] {
+            let h = client_shared
+                .location_index
+                .get(&path)
+                .unwrap_or_else(|| panic!("no continuation bound at {}", path));
+            let ent = client_shared.content_store.get(&h).unwrap();
+            assert_eq!(ent.entity_type, "system/continuation", "at {}", path);
+            let cont: ciborium::Value = ciborium::from_reader(ent.data.as_slice()).unwrap();
+            let cmap = cont.as_map().unwrap();
+            let dc = cmap
+                .iter()
+                .find(|(k, _)| k.as_text() == Some("dispatch_capability"))
+                .and_then(|(_, v)| match v {
+                    ciborium::Value::Bytes(b) => entity_hash::Hash::from_bytes(b).ok(),
+                    _ => None,
+                })
+                .expect("dispatch_capability present");
+            assert_eq!(dc, grant_hash, "continuation at {} rides wrong cap", path);
+            let on_error = cmap.iter().find(|(k, _)| k.as_text() == Some("on_error"));
+            assert!(
+                on_error.is_none(),
+                "continuation at {} carries on_error (marker-proposal §5 forbids inbox routing)",
+                path
+            );
+        }
+
+        // Idempotent re-entry: same params → same session.
+        let resp2 = client
+            .execute(
+                &format!("/{}/system/network", client_pid),
+                "maintain-peer",
+                maintain_request_entity(&server_pid, &addr),
+            )
+            .await
+            .unwrap();
+        let r2: ciborium::Value = ciborium::from_reader(resp2.result.data.as_slice()).unwrap();
+        let r2map = r2.as_map().unwrap();
+        let sid2 = r2map
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("session_id"))
+            .and_then(|(_, v)| v.as_text())
+            .unwrap();
+        let sid1 = get("session_id").unwrap().as_text().unwrap();
+        assert_eq!(sid1, sid2, "re-entry minted a new session");
+
+        server_handle.abort();
+    }
+
+    /// First imperative maintain-peer to an unreachable peer → 502
+    /// connection_failed, no graph, no session (§4.1 step 1).
+    #[cfg(feature = "network")]
+    #[tokio::test]
+    async fn a12_rung3_maintain_peer_connect_failure() {
+        let registry = transport::MemoryTransportRegistry::new();
+        let client = PeerBuilder::new()
+            .keypair(Keypair::from_seed([0x83; 32]))
+            .connector(std::sync::Arc::new(transport::MemoryConnector::new(
+                registry,
+            )))
+            .build()
+            .unwrap();
+        client.local_only();
+        let client_shared = client.shared();
+        let client_pid = client_shared.peer_id.as_str().to_string();
+        let ghost = Keypair::from_seed([0x84; 32]).peer_id().to_string();
+
+        let resp = client
+            .execute(
+                &format!("/{}/system/network", client_pid),
+                "maintain-peer",
+                maintain_request_entity(&ghost, "memory://nobody-home"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 502, "expected 502 connection_failed");
+        let v: ciborium::Value = ciborium::from_reader(resp.result.data.as_slice()).unwrap();
+        let code = v
+            .as_map()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("code"))
+            .and_then(|(_, v)| v.as_text());
+        assert_eq!(code, Some("connection_failed"));
+        assert!(
+            client_shared
+                .location_index
+                .get(&format!(
+                    "/{}/system/inbox/network/{}/on-disconnect",
+                    client_pid, ghost
+                ))
+                .is_none(),
+            "failed first maintain-peer installed the graph"
+        );
+    }
+
+    /// The rung-3 anchor vector: establish → kill the remote → the floor
+    /// demotes → the graph reconnects through backoff retries against the
+    /// restarted peer → status returns to connected and restore-
+    /// subscriptions ran. The failed attempts MUST leave §3.10 lost-error
+    /// markers (the marker-proposal §4 reconnect-chain evidence).
+    #[cfg(feature = "network")]
+    #[tokio::test]
+    async fn a12_rung3_reconnect_lifecycle() {
+        let registry = transport::MemoryTransportRegistry::new();
+        let short = keepalive::KeepaliveConfig {
+            interval_ms: 50,
+            timeout_ms: 60,
+            max_missed: 2,
+            enabled: true,
+        };
+        let (server, _ss, server_handle, server_pid, client, client_shared) =
+            rung3_pair(registry.clone(), 0x86, 0x87, short).await;
+        let client_pid = client_shared.peer_id.as_str().to_string();
+        let server_hash = server.shared().identity_hash;
+        let addr = format!("memory://{}", server_pid);
+
+        // Backoff tight so the retries fire fast.
+        let maintain = {
+            let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+                (entity_ecf::text("address"), entity_ecf::text(&addr)),
+                (
+                    entity_ecf::text("backoff"),
+                    entity_ecf::Value::Map(vec![
+                        (entity_ecf::text("max_ms"), entity_ecf::integer(200)),
+                        (entity_ecf::text("min_ms"), entity_ecf::integer(60)),
+                    ]),
+                ),
+                (entity_ecf::text("peer_id"), entity_ecf::text(&server_pid)),
+            ]));
+            entity_entity::Entity::new(entity_network::TYPE_MAINTAIN_REQUEST, data).unwrap()
+        };
+        let resp = maintain_with_retry(&client, &client_pid, maintain).await;
+        assert_eq!(resp.status, 200, "maintain-peer baseline");
+
+        // Connected baseline.
+        wait_liveness_status(&client_shared, &server_hash, "connected").await;
+
+        // Kill the server: aborting the accept loop drops its
+        // ConnectionGuard → the client's pooled conn dies. The §5.4
+        // keepalive demotes; the demotion write fires the on-disconnect
+        // continuation.
+        server_handle.abort();
+        drop(server);
+        // Wait for demotion off connected.
+        let mut demoted = false;
+        for _ in 0..400 {
+            if let Some(d) = liveness_status_of(&client_shared, &server_hash) {
+                if d.status != "connected" {
+                    demoted = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(demoted, "peer never demoted after kill");
+
+        // The graph is now retrying against a dead address: reconnect
+        // dispatches fail and land as lost-error markers (no-on_error
+        // forward non-2xx, keyed by RequestID).
+        let marker_prefix = format!("/{}/system/runtime/chain-errors/lost/", client_pid);
+        let mut saw_marker = false;
+        for _ in 0..400 {
+            if !client_shared.location_index.list(&marker_prefix).is_empty() {
+                saw_marker = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            saw_marker,
+            "reconnect failure never bound a §3.10 lost-error marker"
+        );
+
+        // Restart the server: same keypair, same memory endpoint — the
+        // retry loop must find it and re-establish without intervention.
+        let server2 = PeerBuilder::new()
+            .keypair(Keypair::from_seed([0x86; 32]))
+            .build()
+            .unwrap();
+        let server2_shared = server2.shared();
+        let listener2 = transport::MemoryListener::bind(server_pid.clone(), registry).unwrap();
+        server2.start_engines(&server2_shared);
+        let shared_for_task = server2_shared.clone();
+        let server2_handle = tokio::spawn(async move {
+            let _ = server::run(listener2, shared_for_task).await;
+        });
+
+        // Re-established after restart.
+        wait_liveness_status(&client_shared, &server_hash, "connected").await;
+
+        // The lifecycle subscriptions survived the outage (still two).
+        let subs = client_shared
+            .location_index
+            .list(&format!("/{}/system/subscription/", client_pid))
+            .into_iter()
+            .filter(|e| {
+                client_shared
+                    .content_store
+                    .get(&e.hash)
+                    .map(|ent| ent.entity_type == "system/subscription")
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(
+            subs, 2,
+            "lifecycle subscriptions did not survive the outage"
+        );
+
+        server2_handle.abort();
+    }
+
+    /// §4.2 release-peer: continuations deleted, lifecycle subscriptions
+    /// unsubscribed, terminal disconnected write on reason=shutdown.
+    #[cfg(feature = "network")]
+    #[tokio::test]
+    async fn a12_rung3_release_peer() {
+        let registry = transport::MemoryTransportRegistry::new();
+        let ka = keepalive::KeepaliveConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let (server, _ss, server_handle, server_pid, client, client_shared) =
+            rung3_pair(registry, 0x88, 0x89, ka).await;
+        let client_pid = client_shared.peer_id.as_str().to_string();
+        let server_hash = server.shared().identity_hash;
+        let addr = format!("memory://{}", server_pid);
+
+        maintain_with_retry(
+            &client,
+            &client_pid,
+            maintain_request_entity(&server_pid, &addr),
+        )
+        .await;
+
+        let release_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+            entity_ecf::text("peer_id"),
+            entity_ecf::text(&server_pid),
+        )]));
+        let release =
+            entity_entity::Entity::new(entity_network::TYPE_RELEASE_REQUEST, release_data).unwrap();
+        let resp = client
+            .execute(
+                &format!("/{}/system/network", client_pid),
+                "release-peer",
+                release,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 200, "release-peer returned non-200");
+        let v: ciborium::Value = ciborium::from_reader(resp.result.data.as_slice()).unwrap();
+        let cleaned = v
+            .as_map()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("cleaned_up"))
+            .and_then(|(_, v)| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        assert_eq!(cleaned, 3, "expected 3 cleaned-up continuation paths");
+
+        for path in [
+            format!(
+                "/{}/system/inbox/network/{}/on-disconnect",
+                client_pid, server_pid
+            ),
+            format!(
+                "/{}/system/inbox/network/{}/on-reconnect",
+                client_pid, server_pid
+            ),
+            format!(
+                "/{}/system/network/peers/{}/on-reconnect-backoff",
+                client_pid, server_pid
+            ),
+        ] {
+            assert!(
+                client_shared.location_index.get(&path).is_none(),
+                "continuation still bound at {} after release",
+                path
+            );
+        }
+        let surviving_subs = client_shared
+            .location_index
+            .list(&format!("/{}/system/subscription/", client_pid))
+            .into_iter()
+            .filter(|e| {
+                client_shared
+                    .content_store
+                    .get(&e.hash)
+                    .map(|ent| ent.entity_type == "system/subscription")
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(surviving_subs, 0, "lifecycle subscription survived release");
+
+        // Terminal disconnected write on shutdown.
+        let d = liveness_status_of(&client_shared, &server_hash)
+            .expect("status entity gone after release");
+        assert_eq!(d.status, "disconnected");
+
+        server_handle.abort();
+    }
+
+    /// §4.3 status: read-model over the §3.13 entities. pending_count is
+    /// bare zero (no §8 outbox, Amendment 11).
+    #[cfg(feature = "network")]
+    #[tokio::test]
+    async fn a12_rung3_status_op() {
+        let registry = transport::MemoryTransportRegistry::new();
+        let ka = keepalive::KeepaliveConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let (_server, _ss, server_handle, server_pid, client, client_shared) =
+            rung3_pair(registry, 0x8a, 0x8b, ka).await;
+        let client_pid = client_shared.peer_id.as_str().to_string();
+        let addr = format!("memory://{}", server_pid);
+
+        let mresp = maintain_with_retry(
+            &client,
+            &client_pid,
+            maintain_request_entity(&server_pid, &addr),
+        )
+        .await;
+        let mres: ciborium::Value = ciborium::from_reader(mresp.result.data.as_slice()).unwrap();
+        let want_sid = mres
+            .as_map()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("session_id"))
+            .and_then(|(_, v)| v.as_text())
+            .unwrap()
+            .to_string();
+
+        let empty = entity_entity::Entity::new(
+            "primitive/any",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![])),
+        )
+        .unwrap();
+        let resp = client
+            .execute(&format!("/{}/system/network", client_pid), "status", empty)
+            .await
+            .unwrap();
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.result.entity_type, entity_network::TYPE_NETWORK_STATUS);
+        let v: ciborium::Value = ciborium::from_reader(resp.result.data.as_slice()).unwrap();
+        let vmap = v.as_map().unwrap();
+        let pending = vmap
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("pending_count"))
+            .and_then(|(_, v)| v.as_integer())
+            .map(i128::from)
+            .unwrap();
+        assert_eq!(pending, 0, "pending_count must be bare zero (no §8 outbox)");
+        let peers = vmap
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("maintained_peers"))
+            .and_then(|(_, v)| v.as_array())
+            .unwrap();
+        let row = peers
+            .iter()
+            .find_map(|p| {
+                let pm = p.as_map()?;
+                let pid = pm
+                    .iter()
+                    .find(|(k, _)| k.as_text() == Some("peer_id"))
+                    .and_then(|(_, v)| v.as_text())?;
+                if pid == server_pid {
+                    Some(pm.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("status omitted the maintained peer");
+        let got_sid = row
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("session_id"))
+            .and_then(|(_, v)| v.as_text())
+            .unwrap();
+        assert_eq!(got_sid, want_sid, "status session_id mismatch");
+        let row_status = row
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("status"))
+            .and_then(|(_, v)| v.as_text())
+            .unwrap();
+        assert_eq!(row_status, "connected");
 
         server_handle.abort();
     }
@@ -6080,8 +7369,7 @@ mod tests {
             .build()
             .unwrap();
         let server_a_pid = server_a.peer_id().to_string();
-        let listener_a =
-            MemoryListener::bind(server_a_pid.clone(), reg_a.clone()).unwrap();
+        let listener_a = MemoryListener::bind(server_a_pid.clone(), reg_a.clone()).unwrap();
         let shared_a = server_a.shared();
         server_a.start_engines(&shared_a);
         let shared_a_clone = shared_a.clone();
@@ -6094,8 +7382,7 @@ mod tests {
             .build()
             .unwrap();
         let server_b_pid = server_b.peer_id().to_string();
-        let listener_b =
-            MemoryListener::bind(server_b_pid.clone(), reg_b.clone()).unwrap();
+        let listener_b = MemoryListener::bind(server_b_pid.clone(), reg_b.clone()).unwrap();
         let shared_b = server_b.shared();
         server_b.start_engines(&shared_b);
         let shared_b_clone = shared_b.clone();
@@ -6118,9 +7405,8 @@ mod tests {
         // test the simplest proof is registering ONE scheme and
         // verifying unknown schemes get the right error.
         let memory_connector = std::sync::Arc::new(MemoryConnector::new(reg_a.clone()));
-        let multi: std::sync::Arc<dyn transport::Connector> = std::sync::Arc::new(
-            MultiConnector::new().with("memory", memory_connector),
-        );
+        let multi: std::sync::Arc<dyn transport::Connector> =
+            std::sync::Arc::new(MultiConnector::new().with("memory", memory_connector));
 
         let client = PeerBuilder::new()
             .keypair(Keypair::from_seed([32u8; 32]))
@@ -6164,18 +7450,14 @@ mod tests {
         // its own scheme check. That's enough to prove which one was
         // picked.
         let reg = transport::MemoryTransportRegistry::new();
-        let c_ws: std::sync::Arc<dyn transport::Connector> = std::sync::Arc::new(
-            transport::MemoryConnector::new(reg.clone()),
-        );
-        let c_wss: std::sync::Arc<dyn transport::Connector> = std::sync::Arc::new(
-            transport::MemoryConnector::new(reg.clone()),
-        );
+        let c_ws: std::sync::Arc<dyn transport::Connector> =
+            std::sync::Arc::new(transport::MemoryConnector::new(reg.clone()));
+        let c_wss: std::sync::Arc<dyn transport::Connector> =
+            std::sync::Arc::new(transport::MemoryConnector::new(reg.clone()));
 
         // ws first, then wss — under starts_with this would mis-route
         // wss://...  to the ws entry. Exact-match doesn't.
-        let multi = MultiConnector::new()
-            .with("ws", c_ws)
-            .with("wss", c_wss);
+        let multi = MultiConnector::new().with("ws", c_ws).with("wss", c_wss);
 
         assert!(multi.handles("ws://anything"));
         assert!(multi.handles("wss://anything"));
@@ -6219,10 +7501,7 @@ mod tests {
         use entity_role::data::RoleData;
         use entity_role::paths::{path_role_assignment, path_role_definition};
 
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
 
         // Plant a role definition; necessary so the handler reaches the
         // RL2 step (otherwise it'd 404 before checking the caller cap).
@@ -6277,10 +7556,7 @@ mod tests {
     #[test]
     #[cfg(feature = "role")]
     fn role_handler_manifest_bootstrapped() {
-        let peer = PeerBuilder::new()
-            .keypair(test_keypair())
-            .build()
-            .unwrap();
+        let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
         let manifest_path = qp("system/handler/system/role");
         assert!(
             peer.location_index().get(&manifest_path).is_some(),

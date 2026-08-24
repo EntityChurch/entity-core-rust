@@ -145,7 +145,10 @@ impl StatCache {
             blob_hash,
             cache_write_time_ns: now_ns,
         };
-        self.entries.lock().unwrap().insert(path.to_path_buf(), entry);
+        self.entries
+            .lock()
+            .unwrap()
+            .insert(path.to_path_buf(), entry);
     }
 
     /// Drop a cache entry. Called on delete.
@@ -154,6 +157,7 @@ impl StatCache {
     }
 
     #[cfg(test)]
+    #[allow(clippy::len_without_is_empty)] // test-only introspection; no emptiness semantics
     pub fn len(&self) -> usize {
         self.entries.lock().unwrap().len()
     }
@@ -164,14 +168,7 @@ fn extract_fields(md: &Metadata) -> Option<(u64, u64, i128, i128, u64, u32)> {
     use std::os::unix::fs::MetadataExt;
     let mtime_ns = (md.mtime() as i128) * 1_000_000_000 + md.mtime_nsec() as i128;
     let ctime_ns = (md.ctime() as i128) * 1_000_000_000 + md.ctime_nsec() as i128;
-    Some((
-        md.dev(),
-        md.ino(),
-        mtime_ns,
-        ctime_ns,
-        md.size(),
-        md.mode(),
-    ))
+    Some((md.dev(), md.ino(), mtime_ns, ctime_ns, md.size(), md.mode()))
 }
 
 #[cfg(not(unix))]
@@ -255,8 +252,7 @@ mod tests {
         let c = StatCache::new();
         // Manually craft a within-window entry by setting
         // cache_write_time_ns to mtime_ns (the smudge fires).
-        let (dev, ino, mtime_ns, ctime_ns, size, mode_bits) =
-            extract_fields(&md).unwrap();
+        let (dev, ino, mtime_ns, ctime_ns, _size, mode_bits) = extract_fields(&md).unwrap();
         let entry = StatEntry {
             dev,
             ino,

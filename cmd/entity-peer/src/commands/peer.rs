@@ -214,8 +214,14 @@ pub async fn start(
         let pid = peer.peer_id().to_string();
 
         let mut fields = vec![
-            (entity_core::ecf::text("pattern"), entity_core::ecf::text(&pattern)),
-            (entity_core::ecf::text("enabled"), entity_core::ecf::bool_val(true)),
+            (
+                entity_core::ecf::text("pattern"),
+                entity_core::ecf::text(&pattern),
+            ),
+            (
+                entity_core::ecf::text("enabled"),
+                entity_core::ecf::bool_val(true),
+            ),
             (
                 entity_core::ecf::text("events"),
                 entity_core::ecf::Value::Array(vec![
@@ -232,17 +238,18 @@ pub async fn start(
             ));
         }
         let data = entity_core::ecf::to_ecf(&entity_core::ecf::Value::Map(fields));
-        let config_entity = entity_core::entity::Entity::new(
-            entity_core::types::TYPE_HISTORY_CONFIG,
-            data,
-        )?;
+        let config_entity =
+            entity_core::entity::Entity::new(entity_core::types::TYPE_HISTORY_CONFIG, data)?;
         let config_hash = peer.content_store().put(config_entity)?;
-        peer.location_index().set(
-            &format!("/{}/system/history/config/cli", pid),
-            config_hash,
+        peer.location_index()
+            .set(&format!("/{}/system/history/config/cli", pid), config_hash);
+        println!(
+            "  history: enabled for pattern {:?}{}",
+            pattern,
+            max_depth
+                .map(|d| format!(" (max_depth: {})", d))
+                .unwrap_or_default()
         );
-        println!("  history: enabled for pattern {:?}{}", pattern,
-            max_depth.map(|d| format!(" (max_depth: {})", d)).unwrap_or_default());
     }
 
     // --files: register a root mapping for the local/files handler. Matches
@@ -256,14 +263,19 @@ pub async fn start(
             publish_descriptors,
             ..Default::default()
         };
-        peer.local_files_handler().add_root(&root_name, cfg)
+        peer.local_files_handler()
+            .add_root(&root_name, cfg)
             .map_err(|e| anyhow::anyhow!("add files root: {e}"))?;
         println!(
             "  files:   {} → {} (tree prefix: {}{})",
             root_name,
             fs_path,
             prefix,
-            if publish_descriptors { ", descriptors" } else { "" }
+            if publish_descriptors {
+                ", descriptors"
+            } else {
+                ""
+            }
         );
     }
 
@@ -326,8 +338,10 @@ pub async fn start(
     // content namespace (path-bound). The same Arc is shared by both postures.
     let scope: Option<std::sync::Arc<dyn entity_core::peer::http_live::ScopePredicate>> =
         if publish_root || serve_closure_root {
-            Some(std::sync::Arc::new(entity_core::peer::http_live::ClosureScope::new())
-                as std::sync::Arc<dyn entity_core::peer::http_live::ScopePredicate>)
+            Some(
+                std::sync::Arc::new(entity_core::peer::http_live::ClosureScope::new())
+                    as std::sync::Arc<dyn entity_core::peer::http_live::ScopePredicate>,
+            )
         } else {
             serve_namespace.map(|ns| {
                 std::sync::Arc::new(entity_core::peer::http_live::NamespaceScope::new(ns))
@@ -345,8 +359,7 @@ pub async fn start(
     // listener also serves the http-poll routes under --http-poll-prefix.
     let http_handle = if let Some(http_addr) = http_listen_addr {
         let mut http_listener =
-            entity_core::peer::http_live::HttpLiveListener::bind(http_addr, http_url_path)
-                .await?;
+            entity_core::peer::http_live::HttpLiveListener::bind(http_addr, http_url_path).await?;
         if http_poll_mount_on_live {
             http_listener = http_listener.with_poll_prefix(http_poll_prefix);
             if let Some(s) = scope.clone() {
@@ -381,8 +394,7 @@ pub async fn start(
     // --http-poll-mount-on-live (clap-enforced + start-side checked).
     let http_poll_handle = if let Some(addr) = http_poll_addr {
         let mut poll_listener =
-            entity_core::peer::http_live::HttpLiveListener::bind_poll(addr, "")
-                .await?;
+            entity_core::peer::http_live::HttpLiveListener::bind_poll(addr, "").await?;
         if let Some(s) = scope.clone() {
             poll_listener = poll_listener.with_scope(s);
         }
@@ -390,7 +402,10 @@ pub async fn start(
         println!(
             "  http-poll: http://{}/{{content,tree}}/... (scope: {})",
             bound,
-            scope.as_ref().map(|s| s.describe()).unwrap_or_else(|| "(none)".to_string()),
+            scope
+                .as_ref()
+                .map(|s| s.describe())
+                .unwrap_or_else(|| "(none)".to_string()),
         );
         let shared = peer.shared();
         Some(tokio::spawn(async move {
@@ -439,11 +454,7 @@ pub fn list_peers() -> anyhow::Result<()> {
             continue;
         }
 
-        let name = entry
-            .file_name()
-            .to_str()
-            .unwrap_or("?")
-            .to_string();
+        let name = entry.file_name().to_str().unwrap_or("?").to_string();
 
         let key_path = entry.path().join("keypair");
         let pid = match IdentityKeypair::load_from_file(&key_path) {
@@ -523,9 +534,9 @@ fn parse_history_flag(spec: &str) -> anyhow::Result<(String, Option<u64>)> {
 /// Matches the Go peer's parser shape so cross-impl tooling carries over.
 fn parse_files_flag(value: &str) -> anyhow::Result<(String, String, String)> {
     // Find the first ':' (separates name) and the last ':' (separates prefix).
-    let first = value.find(':').ok_or_else(|| {
-        anyhow::anyhow!("--files expects name:/fs/path:tree/prefix/")
-    })?;
+    let first = value
+        .find(':')
+        .ok_or_else(|| anyhow::anyhow!("--files expects name:/fs/path:tree/prefix/"))?;
     let last = value.rfind(':').unwrap();
     if first == last {
         anyhow::bail!("--files expects name:/fs/path:tree/prefix/");
@@ -738,10 +749,7 @@ pub fn issue_binding(
         name: norm.clone(),
         kind: KIND_PEER_ISSUED.to_string(),
         target_peer_id: target_peer_id.to_string(),
-        transports: transports
-            .iter()
-            .map(|t| entity_core::ecf::text(t))
-            .collect(),
+        transports: transports.iter().map(entity_core::ecf::text).collect(),
         issued_at: now_ms,
         ttl: ttl_ms,
         supersedes: None,
@@ -777,8 +785,10 @@ pub fn issue_binding(
         .set(&binding_body_path(registry_id, &binding_hash), binding_hash);
     peer.location_index()
         .set(&by_name_pointer_path(registry_id, &norm), binding_hash);
-    peer.location_index()
-        .set(&signature_pointer_path(registry_id, &binding_hash), sig_hash);
+    peer.location_index().set(
+        &signature_pointer_path(registry_id, &binding_hash),
+        sig_hash,
+    );
 
     println!("issued peer-issued binding");
     println!("  registry : {registry_id}");

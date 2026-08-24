@@ -89,9 +89,20 @@ pub fn build_revision_entry(data: &RevisionEntryData) -> Result<Entity, String> 
     // But the vec above has "parents" first. Let's sort properly.
     let mut sorted_fields = fields;
     sorted_fields.sort_by(|(a, _), (b, _)| {
-        let a_text = if let entity_ecf::Value::Text(s) = a { s.as_str() } else { "" };
-        let b_text = if let entity_ecf::Value::Text(s) = b { s.as_str() } else { "" };
-        a_text.len().cmp(&b_text.len()).then_with(|| a_text.cmp(b_text))
+        let a_text = if let entity_ecf::Value::Text(s) = a {
+            s.as_str()
+        } else {
+            ""
+        };
+        let b_text = if let entity_ecf::Value::Text(s) = b {
+            s.as_str()
+        } else {
+            ""
+        };
+        a_text
+            .len()
+            .cmp(&b_text.len())
+            .then_with(|| a_text.cmp(b_text))
     });
 
     let ecf_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(sorted_fields));
@@ -258,11 +269,7 @@ impl Relationship {
 }
 
 /// Check the relationship between local and remote heads.
-pub fn check_relationship(
-    store: &dyn ContentStore,
-    local: Hash,
-    remote: Hash,
-) -> Relationship {
+pub fn check_relationship(store: &dyn ContentStore, local: Hash, remote: Hash) -> Relationship {
     if local == remote {
         return Relationship::InSync;
     }
@@ -303,23 +310,22 @@ pub fn detect_oscillation(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
     use entity_store::MemoryContentStore;
     use entity_tree::trie;
+    use std::collections::BTreeMap;
 
     fn make_store() -> MemoryContentStore {
         MemoryContentStore::new()
     }
 
     /// Create a revision entry with the given trie root and parents.
-    fn make_revision_entry(
-        store: &dyn ContentStore,
-        root: Hash,
-        parents: Vec<Hash>,
-    ) -> Hash {
+    fn make_revision_entry(store: &dyn ContentStore, root: Hash, parents: Vec<Hash>) -> Hash {
         let mut sorted = parents;
         trie::sorted_parents(&mut sorted);
-        let entry = RevisionEntryData { root, parents: sorted };
+        let entry = RevisionEntryData {
+            root,
+            parents: sorted,
+        };
         let entity = build_revision_entry(&entry).unwrap();
         store.put(entity).unwrap()
     }
@@ -364,7 +370,10 @@ mod tests {
         let mut parents = vec![parent2, parent1];
         trie::sorted_parents(&mut parents);
 
-        let entry = RevisionEntryData { root, parents: parents.clone() };
+        let entry = RevisionEntryData {
+            root,
+            parents: parents.clone(),
+        };
         let entity = build_revision_entry(&entry).unwrap();
         let decoded = decode_revision_entry(&entity).unwrap();
 
@@ -476,7 +485,10 @@ mod tests {
         assert_eq!(check_relationship(&store, root, root), Relationship::InSync);
         assert_eq!(check_relationship(&store, root, left), Relationship::Behind);
         assert_eq!(check_relationship(&store, left, root), Relationship::Ahead);
-        assert_eq!(check_relationship(&store, left, right), Relationship::Diverged);
+        assert_eq!(
+            check_relationship(&store, left, right),
+            Relationship::Diverged
+        );
     }
 
     #[test]
@@ -502,5 +514,4 @@ mod tests {
         let root_c = trie::build_trie(&store, &bindings3).unwrap();
         assert!(!detect_oscillation(&store, root_c, v2, 4));
     }
-
 }

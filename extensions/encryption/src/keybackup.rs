@@ -35,12 +35,30 @@ pub struct EncryptionKeyBackupData {
 /// `memory_cost` < `parallelism` < `argon2_version`).
 pub fn backup_aad(pubkey_ref: &Hash, params: KdfParams) -> Vec<u8> {
     let m = Value::Map(vec![
-        (Value::Text("pubkey_ref".into()), Value::Bytes(pubkey_ref.to_bytes())),
-        (Value::Text("argon2_version".into()), Value::Integer(params.argon2_version.into())),
-        (Value::Text("memory_cost".into()), Value::Integer(params.memory_cost.into())),
-        (Value::Text("time_cost".into()), Value::Integer(params.time_cost.into())),
-        (Value::Text("parallelism".into()), Value::Integer(params.parallelism.into())),
-        (Value::Text("output_len".into()), Value::Integer(params.output_len.into())),
+        (
+            Value::Text("pubkey_ref".into()),
+            Value::Bytes(pubkey_ref.to_bytes()),
+        ),
+        (
+            Value::Text("argon2_version".into()),
+            Value::Integer(params.argon2_version.into()),
+        ),
+        (
+            Value::Text("memory_cost".into()),
+            Value::Integer(params.memory_cost.into()),
+        ),
+        (
+            Value::Text("time_cost".into()),
+            Value::Integer(params.time_cost.into()),
+        ),
+        (
+            Value::Text("parallelism".into()),
+            Value::Integer(params.parallelism.into()),
+        ),
+        (
+            Value::Text("output_len".into()),
+            Value::Integer(params.output_len.into()),
+        ),
     ]);
     to_ecf(&m)
 }

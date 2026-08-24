@@ -112,7 +112,8 @@ impl RootTrackerEngine {
     /// root trie node's content hash — no wrapper entity
     /// (EXTENSION-TREE §3.4.1 + TREE-ROOT-PATH-AMBIGUITY.md direct-binding).
     fn load_tracked_root(&self, bare_prefix: &str) -> Option<Hash> {
-        self.location_index.get(&self.qualified_root_path(bare_prefix))
+        self.location_index
+            .get(&self.qualified_root_path(bare_prefix))
     }
 
     /// Bind the trie root hash directly at `system/tree/root/{prefix}`.
@@ -255,9 +256,11 @@ impl RootTrackerEngine {
 }
 
 impl SyncTreeHook for RootTrackerEngine {
-    fn on_tree_change(&self, event: &TreeChangeEvent, ctx: &mut ExecutionContext)
-        -> Result<(), entity_store::CascadeHalt>
-    {
+    fn on_tree_change(
+        &self,
+        event: &TreeChangeEvent,
+        ctx: &mut ExecutionContext,
+    ) -> Result<(), entity_store::CascadeHalt> {
         if event.path.starts_with(&self.root_path_prefix) {
             return Ok(());
         }
@@ -371,7 +374,11 @@ mod tests {
         hash
     }
 
-    fn synthetic_event(path: &str, new_hash: Option<Hash>, previous_hash: Option<Hash>) -> TreeChangeEvent {
+    fn synthetic_event(
+        path: &str,
+        new_hash: Option<Hash>,
+        previous_hash: Option<Hash>,
+    ) -> TreeChangeEvent {
         TreeChangeEvent {
             path: path.to_string(),
             hash: new_hash.or(previous_hash).unwrap_or(Hash::zero()),
@@ -412,7 +419,7 @@ mod tests {
             None,
         );
         // Should not panic or overwrite the root.
-        engine.on_tree_change(&event, &mut ctx);
+        let _ = engine.on_tree_change(&event, &mut ctx);
 
         // The existing tracked root (from bootstrap) must still decode.
         let tracked = engine.load_tracked_root("project/");
@@ -436,7 +443,7 @@ mod tests {
         let hash_a = cs.put(make_entity("t", "a")).unwrap();
         li.set(&format!("/{}/project/src/a.rs", peer_id()), hash_a);
         let mut ctx = ExecutionContext::default();
-        engine.on_tree_change(
+        let _ = engine.on_tree_change(
             &synthetic_event(
                 &format!("/{}/project/src/a.rs", peer_id()),
                 Some(hash_a),
@@ -468,7 +475,7 @@ mod tests {
         // Now remove the binding and emit a Deleted event.
         li.remove(&format!("/{}/project/src/a.rs", peer_id()));
         let mut ctx = ExecutionContext::default();
-        engine.on_tree_change(
+        let _ = engine.on_tree_change(
             &synthetic_event(
                 &format!("/{}/project/src/a.rs", peer_id()),
                 None,
@@ -497,7 +504,7 @@ mod tests {
         let new_hash = cs.put(disabled).unwrap();
         li.set(&cfg_path, new_hash);
         let mut ctx = ExecutionContext::default();
-        engine.on_tree_change(
+        let _ = engine.on_tree_change(
             &synthetic_event(&cfg_path, Some(new_hash), Some(old_hash)),
             &mut ctx,
         );
@@ -531,7 +538,7 @@ mod tests {
             let hash = cs.put(entity).unwrap();
             let abs = format!("/{}/project/{}", peer_id(), rel);
             li.set(&abs, hash);
-            engine.on_tree_change(&synthetic_event(&abs, Some(hash), None), &mut ctx);
+            let _ = engine.on_tree_change(&synthetic_event(&abs, Some(hash), None), &mut ctx);
             expected.insert(rel.to_string(), hash);
         }
 
@@ -539,17 +546,14 @@ mod tests {
         let abs_main = format!("/{}/project/src/main.rs", peer_id());
         let prev_main = li.get(&abs_main).unwrap();
         li.remove(&abs_main);
-        engine.on_tree_change(
-            &synthetic_event(&abs_main, None, Some(prev_main)),
-            &mut ctx,
-        );
+        let _ = engine.on_tree_change(&synthetic_event(&abs_main, None, Some(prev_main)), &mut ctx);
         expected.remove("src/main.rs");
 
         let extra_entity = make_entity("t", "new");
         let extra_hash = cs.put(extra_entity).unwrap();
         let abs_extra = format!("/{}/project/src/extra.rs", peer_id());
         li.set(&abs_extra, extra_hash);
-        engine.on_tree_change(
+        let _ = engine.on_tree_change(
             &synthetic_event(&abs_extra, Some(extra_hash), None),
             &mut ctx,
         );

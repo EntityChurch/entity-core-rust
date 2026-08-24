@@ -162,7 +162,11 @@ mod tests {
     use crate::PathScope;
 
     // Build a B→grantee root cap entity (no parent) for use as the anchor.
-    fn root_cap(b_keypair: &Keypair, b_hash: entity_hash::Hash, grantee: entity_hash::Hash) -> Entity {
+    fn root_cap(
+        b_keypair: &Keypair,
+        b_hash: entity_hash::Hash,
+        grantee: entity_hash::Hash,
+    ) -> Entity {
         let token = CapabilityToken {
             grants: vec![GrantEntry {
                 handlers: PathScope::new(vec!["system/tree".into()]),
@@ -293,7 +297,15 @@ mod tests {
             Entity::new("x", entity_ecf::to_ecf(&entity_ecf::Value::Null)).unwrap();
         zero_parent.content_hash = entity_hash::Hash::zero();
         assert!(matches!(
-            mint_reattenuated(&inst_kp, &inst_id, grantee, &zero_parent, g.clone(), 1, None),
+            mint_reattenuated(
+                &inst_kp,
+                &inst_id,
+                grantee,
+                &zero_parent,
+                g.clone(),
+                1,
+                None
+            ),
             Err(MintError::MissingParent)
         ));
 

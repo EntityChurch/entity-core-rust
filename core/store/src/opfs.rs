@@ -85,8 +85,8 @@ use web_sys::{
 };
 
 use crate::{
-    CasError, ContentStore, LocationEntry, LocationIndex, MemoryContentStore,
-    MemoryLocationIndex, StoreError,
+    CasError, ContentStore, LocationEntry, LocationIndex, MemoryContentStore, MemoryLocationIndex,
+    StoreError,
 };
 
 // ---------------------------------------------------------------------------
@@ -129,9 +129,7 @@ pub enum OpfsError {
 /// Resolve `root` to a `FileSystemDirectoryHandle`, walking slash-separated
 /// path components and creating any that don't exist. Empty/`"/"`/`"."`
 /// returns the OPFS root directly.
-async fn resolve_directory(
-    root: &str,
-) -> Result<web_sys::FileSystemDirectoryHandle, OpfsError> {
+async fn resolve_directory(root: &str) -> Result<web_sys::FileSystemDirectoryHandle, OpfsError> {
     // navigator.storage.getDirectory() works on both window + worker scopes;
     // we deliberately go through js_sys::global to avoid taking a hard
     // dep on a particular scope type.
@@ -209,7 +207,9 @@ impl JournalHandle {
             .dyn_into()
             .map_err(|_| OpfsError::Io("createSyncAccessHandle returned wrong type".into()))?;
 
-        let size = handle.get_size().map_err(|e| OpfsError::Io(format!("getSize: {e:?}")))? as u64;
+        let size = handle
+            .get_size()
+            .map_err(|e| OpfsError::Io(format!("getSize: {e:?}")))? as u64;
         Ok(Self { handle, size })
     }
 
@@ -504,12 +504,7 @@ impl LocationIndex for OpfsLocationIndex {
         self.memory.len_prefix(prefix)
     }
 
-    fn compare_and_swap(
-        &self,
-        path: &str,
-        expected: Hash,
-        new_hash: Hash,
-    ) -> Result<(), CasError> {
+    fn compare_and_swap(&self, path: &str, expected: Hash, new_hash: Hash) -> Result<(), CasError> {
         // Memory CAS first — single-threaded worker means no race window
         // between check and journal append.
         self.memory.compare_and_swap(path, expected, new_hash)?;
@@ -554,7 +549,8 @@ fn frame_record(payload: Vec<u8>) -> Vec<u8> {
 fn encode_entity_record(hash: &Hash, entity: &Entity) -> Vec<u8> {
     let hash_bytes = hash.to_bytes();
     let type_bytes = entity.entity_type.as_bytes();
-    let mut payload = Vec::with_capacity(hash_bytes.len() + 2 + type_bytes.len() + entity.data.len());
+    let mut payload =
+        Vec::with_capacity(hash_bytes.len() + 2 + type_bytes.len() + entity.data.len());
     payload.extend_from_slice(&hash_bytes);
     payload.extend_from_slice(&(type_bytes.len() as u16).to_be_bytes());
     payload.extend_from_slice(type_bytes);
@@ -594,7 +590,11 @@ fn replay_entities(bytes: &[u8], memory: &MemoryContentStore) -> Result<u64, Opf
     while cursor < bytes.len() {
         let record_start = cursor;
         let (version, length, payload_start) = match read_frame(bytes, cursor) {
-            FrameResult::Ok { version, length, payload_start } => (version, length, payload_start),
+            FrameResult::Ok {
+                version,
+                length,
+                payload_start,
+            } => (version, length, payload_start),
             FrameResult::Torn => return Ok(record_start as u64),
             FrameResult::Invalid(msg) => {
                 tracing::warn!(at = record_start, reason = %msg, "entities.log frame invalid, truncating");
@@ -625,7 +625,11 @@ fn replay_locations(bytes: &[u8], memory: &MemoryLocationIndex) -> Result<u64, O
     while cursor < bytes.len() {
         let record_start = cursor;
         let (version, length, payload_start) = match read_frame(bytes, cursor) {
-            FrameResult::Ok { version, length, payload_start } => (version, length, payload_start),
+            FrameResult::Ok {
+                version,
+                length,
+                payload_start,
+            } => (version, length, payload_start),
             FrameResult::Torn => return Ok(record_start as u64),
             FrameResult::Invalid(msg) => {
                 tracing::warn!(at = record_start, reason = %msg, "locations.log frame invalid, truncating");
@@ -649,7 +653,11 @@ fn replay_locations(bytes: &[u8], memory: &MemoryLocationIndex) -> Result<u64, O
 }
 
 enum FrameResult {
-    Ok { version: u8, length: usize, payload_start: usize },
+    Ok {
+        version: u8,
+        length: usize,
+        payload_start: usize,
+    },
     /// Frame header itself is truncated (< 5 bytes remaining).
     Torn,
     /// Frame header is present but corrupt (length absurdly large, etc.).
@@ -681,8 +689,8 @@ fn apply_entity_record(payload: &[u8], memory: &MemoryContentStore) -> Result<()
     if payload.len() < 33 + 2 {
         return Err(OpfsError::Decode("entity payload too short".into()));
     }
-    let hash = Hash::from_bytes(&payload[0..33])
-        .map_err(|e| OpfsError::Decode(format!("hash: {e}")))?;
+    let hash =
+        Hash::from_bytes(&payload[0..33]).map_err(|e| OpfsError::Decode(format!("hash: {e}")))?;
     let type_len = u16::from_be_bytes([payload[33], payload[34]]) as usize;
     let body_start = 35;
     let body_end = body_start + type_len;

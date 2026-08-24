@@ -176,9 +176,20 @@ impl LocalNameHandler {
                 "name already bound and allow_supersede is false",
             );
         }
-        let supersedes = if config.allow_supersede { existing } else { None };
+        let supersedes = if config.allow_supersede {
+            existing
+        } else {
+            None
+        };
 
-        self.write_binding(&key, target, transports, notes, supersedes, config.default_pinned)
+        self.write_binding(
+            &key,
+            target,
+            transports,
+            notes,
+            supersedes,
+            config.default_pinned,
+        )
     }
 
     // -------------------------------------------------------------------

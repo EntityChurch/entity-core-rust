@@ -312,10 +312,7 @@ pub trait PeerBinding {
     /// Export this peer's identity as a portable CBOR bundle. Returns
     /// the encoded bytes ready for hex-encoding by the verb. Default
     /// returns an error.
-    fn export_identity_bundle(
-        &self,
-        _peer_id: &str,
-    ) -> Result<Vec<u8>, String> {
+    fn export_identity_bundle(&self, _peer_id: &str) -> Result<Vec<u8>, String> {
         Err("bootstrap export: not supported by this binding".into())
     }
 

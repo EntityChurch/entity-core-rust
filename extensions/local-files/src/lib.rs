@@ -40,5 +40,5 @@ pub use reverse::start_reverse_write;
 pub use types::{
     DeletedData, DirectoryData, DirectoryEntryData, FileData, RootConfigData, WatchRequestData,
     WatcherConfigData, WriteRequestData, TYPE_DELETED, TYPE_DIRECTORY, TYPE_DIRECTORY_ENTRY,
-    TYPE_FILE, TYPE_ROOT_CONFIG, TYPE_WATCH_REQUEST, TYPE_WATCHER_CONFIG, TYPE_WRITE_REQUEST,
+    TYPE_FILE, TYPE_ROOT_CONFIG, TYPE_WATCHER_CONFIG, TYPE_WATCH_REQUEST, TYPE_WRITE_REQUEST,
 };

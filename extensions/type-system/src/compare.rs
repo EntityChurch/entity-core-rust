@@ -40,8 +40,7 @@ pub fn compare(
                 let a_type = type_ref(spec_a);
                 let b_type = type_ref(spec_b);
                 let type_match = a_type == b_type;
-                let constraint_match =
-                    to_ecf(&constraints(spec_a)) == to_ecf(&constraints(spec_b));
+                let constraint_match = to_ecf(&constraints(spec_a)) == to_ecf(&constraints(spec_b));
                 if type_match {
                     shared.push((
                         name.clone(),
@@ -230,7 +229,9 @@ fn type_ref(spec: &Value) -> String {
 }
 
 fn is_optional(spec: &Value) -> bool {
-    spec.get("optional").and_then(|v| v.as_bool()).unwrap_or(false)
+    spec.get("optional")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
 }
 
 fn constraints(spec: &Value) -> Value {
@@ -258,9 +259,6 @@ fn field_incompatibility(field_name: &str, a_type: &str, b_type: &str) -> Value 
         (text("field_name"), text(field_name)),
         (text("a_type"), text(a_type)),
         (text("b_type"), text(b_type)),
-        (
-            text("reason"),
-            text("different type_ref between A and B"),
-        ),
+        (text("reason"), text("different type_ref between A and B")),
     ])
 }

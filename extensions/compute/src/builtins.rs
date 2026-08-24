@@ -32,8 +32,7 @@ pub const ALL_BUILTINS: &[&str] = &[
 
 /// Check if a path is a builtin handler path.
 pub fn is_builtin_path(path: &str) -> bool {
-    path.starts_with(BUILTIN_PREFIX)
-        || path.contains("/system/compute/builtins/")
+    path.starts_with(BUILTIN_PREFIX) || path.contains("/system/compute/builtins/")
 }
 
 /// Spec-pinned input_type for a builtin handler's operation (§3.5 §912).
@@ -138,10 +137,7 @@ fn build_typed_args_entity(
         .collect();
     let data = Value::Map(fields);
     Entity::new(entity_type, entity_ecf::to_ecf(&data)).map_err(|e| {
-        ComputeError::InvalidExpression(format!(
-            "build {} args entity: {}",
-            entity_type, e
-        ))
+        ComputeError::InvalidExpression(format!("build {} args entity: {}", entity_type, e))
     })
 }
 
@@ -167,7 +163,10 @@ fn resolve_string_arg(
     v.as_str_val().map(|s| s.to_string()).unwrap_or_default()
 }
 
-fn args_hash<'a>(args: &'a [(String, entity_hash::Hash)], key: &str) -> Option<&'a entity_hash::Hash> {
+fn args_hash<'a>(
+    args: &'a [(String, entity_hash::Hash)],
+    key: &str,
+) -> Option<&'a entity_hash::Hash> {
     args.iter().find(|(k, _)| k == key).map(|(_, h)| h)
 }
 
@@ -180,11 +179,17 @@ fn alias_arithmetic(
     let op = resolve_string_arg(args, "op", scope, budget, ctx);
     let left = match args_hash(args, "left") {
         Some(h) => *h,
-        None => return ComputeError::InvalidExpression("arithmetic alias: missing 'left'".into()).to_value(),
+        None => {
+            return ComputeError::InvalidExpression("arithmetic alias: missing 'left'".into())
+                .to_value()
+        }
     };
     let right = match args_hash(args, "right") {
         Some(h) => *h,
-        None => return ComputeError::InvalidExpression("arithmetic alias: missing 'right'".into()).to_value(),
+        None => {
+            return ComputeError::InvalidExpression("arithmetic alias: missing 'right'".into())
+                .to_value()
+        }
     };
     let data = entity_ecf::cbor_map! {
         "left" => Value::Bytes(left.to_bytes().to_vec()),
@@ -193,7 +198,9 @@ fn alias_arithmetic(
     };
     let arith = match Entity::new(TYPE_ARITHMETIC, entity_ecf::to_ecf(&data)) {
         Ok(e) => e,
-        Err(_) => return ComputeError::InvalidExpression("arithmetic alias build".into()).to_value(),
+        Err(_) => {
+            return ComputeError::InvalidExpression("arithmetic alias build".into()).to_value()
+        }
     };
     eval::evaluate(&arith, scope, budget, ctx)
 }
@@ -207,11 +214,17 @@ fn alias_compare(
     let op = resolve_string_arg(args, "op", scope, budget, ctx);
     let left = match args_hash(args, "left") {
         Some(h) => *h,
-        None => return ComputeError::InvalidExpression("compare alias: missing 'left'".into()).to_value(),
+        None => {
+            return ComputeError::InvalidExpression("compare alias: missing 'left'".into())
+                .to_value()
+        }
     };
     let right = match args_hash(args, "right") {
         Some(h) => *h,
-        None => return ComputeError::InvalidExpression("compare alias: missing 'right'".into()).to_value(),
+        None => {
+            return ComputeError::InvalidExpression("compare alias: missing 'right'".into())
+                .to_value()
+        }
     };
     let data = entity_ecf::cbor_map! {
         "left" => Value::Bytes(left.to_bytes().to_vec()),
@@ -234,20 +247,31 @@ fn alias_logic(
     let op = resolve_string_arg(args, "op", scope, budget, ctx);
     let left = match args_hash(args, "left") {
         Some(h) => *h,
-        None => return ComputeError::InvalidExpression("logic alias: missing 'left'".into()).to_value(),
+        None => {
+            return ComputeError::InvalidExpression("logic alias: missing 'left'".into()).to_value()
+        }
     };
     let mut fields: Vec<(Value, Value)> = vec![
-        (Value::Text("left".into()), Value::Bytes(left.to_bytes().to_vec())),
+        (
+            Value::Text("left".into()),
+            Value::Bytes(left.to_bytes().to_vec()),
+        ),
         (Value::Text("op".into()), entity_ecf::text(&op)),
     ];
     if let Some(right) = args_hash(args, "right") {
-        fields.push((Value::Text("right".into()), Value::Bytes(right.to_bytes().to_vec())));
+        fields.push((
+            Value::Text("right".into()),
+            Value::Bytes(right.to_bytes().to_vec()),
+        ));
     }
     // ECF canonical sort.
     fields.sort_by(|(a, _), (b, _)| {
         let a_bytes = entity_ecf::to_ecf(a);
         let b_bytes = entity_ecf::to_ecf(b);
-        a_bytes.len().cmp(&b_bytes.len()).then(a_bytes.cmp(&b_bytes))
+        a_bytes
+            .len()
+            .cmp(&b_bytes.len())
+            .then(a_bytes.cmp(&b_bytes))
     });
     let logic = match Entity::new(TYPE_LOGIC, entity_ecf::to_ecf(&Value::Map(fields))) {
         Ok(e) => e,
@@ -265,7 +289,10 @@ fn alias_field(
     let name = resolve_string_arg(args, "name", scope, budget, ctx);
     let entity_h = match args_hash(args, "entity") {
         Some(h) => *h,
-        None => return ComputeError::InvalidExpression("field alias: missing 'entity'".into()).to_value(),
+        None => {
+            return ComputeError::InvalidExpression("field alias: missing 'entity'".into())
+                .to_value()
+        }
     };
     let data = entity_ecf::cbor_map! {
         "name" => entity_ecf::text(&name),
@@ -290,10 +317,8 @@ fn alias_store(
     //     store builtin's body evaluates it per SA-9
     let path = resolve_string_arg(args, "path", scope, budget, ctx);
     if path.is_empty() {
-        return ComputeError::InvalidExpression(
-            "store alias: missing or non-string 'path'".into(),
-        )
-        .to_value();
+        return ComputeError::InvalidExpression("store alias: missing or non-string 'path'".into())
+            .to_value();
     }
     let value = match args_hash(args, "value") {
         Some(h) => *h,
@@ -356,7 +381,9 @@ fn alias_construct(
     };
     let ctor = match Entity::new(TYPE_CONSTRUCT, entity_ecf::to_ecf(&data)) {
         Ok(e) => e,
-        Err(_) => return ComputeError::InvalidExpression("construct alias build".into()).to_value(),
+        Err(_) => {
+            return ComputeError::InvalidExpression("construct alias build".into()).to_value()
+        }
     };
     eval::evaluate(&ctor, scope, budget, ctx)
 }
@@ -374,7 +401,11 @@ pub fn dispatch_builtin(
 
     let data = match decode_data(params) {
         Some(d) => d,
-        None => return Some(ComputeError::InvalidExpression("Cannot decode builtin params".into()).to_value()),
+        None => {
+            return Some(
+                ComputeError::InvalidExpression("Cannot decode builtin params".into()).to_value(),
+            )
+        }
     };
 
     let result = match bare {
@@ -415,12 +446,18 @@ fn dispatch_arithmetic(
 ) -> ComputeValue {
     let op = match data_str(data, "op") {
         Some(o) => o,
-        None => return ComputeError::InvalidExpression("arithmetic: missing 'op'".into()).to_value(),
+        None => {
+            return ComputeError::InvalidExpression("arithmetic: missing 'op'".into()).to_value()
+        }
     };
     let left = eval_ref(data, "left", "arithmetic left", scope, budget, ctx);
-    if left.is_error() { return left; }
+    if left.is_error() {
+        return left;
+    }
     let right = eval_ref(data, "right", "arithmetic right", scope, budget, ctx);
-    if right.is_error() { return right; }
+    if right.is_error() {
+        return right;
+    }
     apply_arithmetic(&op, &left, &right)
 }
 
@@ -435,9 +472,13 @@ fn dispatch_compare(
         None => return ComputeError::InvalidExpression("compare: missing 'op'".into()).to_value(),
     };
     let left = eval_ref(data, "left", "compare left", scope, budget, ctx);
-    if left.is_error() { return left; }
+    if left.is_error() {
+        return left;
+    }
     let right = eval_ref(data, "right", "compare right", scope, budget, ctx);
-    if right.is_error() { return right; }
+    if right.is_error() {
+        return right;
+    }
     apply_compare(&op, &left, &right)
 }
 
@@ -452,18 +493,24 @@ fn dispatch_logic(
         None => return ComputeError::InvalidExpression("logic: missing 'op'".into()).to_value(),
     };
     let left = eval_ref(data, "left", "logic left", scope, budget, ctx);
-    if left.is_error() { return left; }
+    if left.is_error() {
+        return left;
+    }
 
     match op.as_str() {
         "not" => ComputeValue::Primitive(Value::Bool(!left.is_truthy())),
         "and" => {
             let right = eval_ref(data, "right", "logic right", scope, budget, ctx);
-            if right.is_error() { return right; }
+            if right.is_error() {
+                return right;
+            }
             ComputeValue::Primitive(Value::Bool(left.is_truthy() && right.is_truthy()))
         }
         "or" => {
             let right = eval_ref(data, "right", "logic right", scope, budget, ctx);
-            if right.is_error() { return right; }
+            if right.is_error() {
+                return right;
+            }
             ComputeValue::Primitive(Value::Bool(left.is_truthy() || right.is_truthy()))
         }
         _ => ComputeError::InvalidExpression(format!("Unknown logic op: {}", op)).to_value(),
@@ -481,25 +528,30 @@ fn dispatch_field(
         None => return ComputeError::InvalidExpression("field: missing 'name'".into()).to_value(),
     };
     let target = eval_ref(data, "entity", "field target", scope, budget, ctx);
-    if target.is_error() { return target; }
+    if target.is_error() {
+        return target;
+    }
 
     match &target {
         ComputeValue::Entity(e) => {
             let entity_data = match decode_data(e) {
                 Some(d) => d,
-                None => return ComputeError::TypeMismatch("Field access requires decodable entity data".into()).to_value(),
+                None => {
+                    return ComputeError::TypeMismatch(
+                        "Field access requires decodable entity data".into(),
+                    )
+                    .to_value()
+                }
             };
             match entity_data.get(&name) {
                 Some(v) => ComputeValue::Primitive(v.clone()),
                 None => ComputeError::NotFound(format!("Field not found: {}", name)).to_value(),
             }
         }
-        ComputeValue::Primitive(Value::Map(_)) => {
-            match target.as_primitive().unwrap().get(&name) {
-                Some(v) => ComputeValue::Primitive(v.clone()),
-                None => ComputeError::NotFound(format!("Field not found: {}", name)).to_value(),
-            }
-        }
+        ComputeValue::Primitive(Value::Map(_)) => match target.as_primitive().unwrap().get(&name) {
+            Some(v) => ComputeValue::Primitive(v.clone()),
+            None => ComputeError::NotFound(format!("Field not found: {}", name)).to_value(),
+        },
         _ => ComputeError::TypeMismatch("Field access requires entity or map".into()).to_value(),
     }
 }
@@ -512,12 +564,17 @@ fn dispatch_construct(
 ) -> ComputeValue {
     let entity_type = match data_str(data, "entity_type") {
         Some(t) => t,
-        None => return ComputeError::InvalidExpression("construct: missing 'entity_type'".into()).to_value(),
+        None => {
+            return ComputeError::InvalidExpression("construct: missing 'entity_type'".into())
+                .to_value()
+        }
     };
 
     let fields = match data_hash_map(data, "fields") {
         Some(f) => f,
-        None => return ComputeError::InvalidExpression("construct: missing 'fields'".into()).to_value(),
+        None => {
+            return ComputeError::InvalidExpression("construct: missing 'fields'".into()).to_value()
+        }
     };
 
     // §3.5 inline-vs-handler-form equivalence: the builtin handler form
@@ -540,16 +597,15 @@ fn dispatch_construct(
         "entity_type" => entity_ecf::text(&entity_type),
         "fields" => Value::Map(fields_map)
     };
-    let construct_entity =
-        match Entity::new(TYPE_CONSTRUCT, entity_ecf::to_ecf(&construct_data)) {
-            Ok(e) => e,
-            Err(_) => {
-                return ComputeError::InvalidExpression(
-                    "construct: failed to build construct entity".into(),
-                )
-                .to_value()
-            }
-        };
+    let construct_entity = match Entity::new(TYPE_CONSTRUCT, entity_ecf::to_ecf(&construct_data)) {
+        Ok(e) => e,
+        Err(_) => {
+            return ComputeError::InvalidExpression(
+                "construct: failed to build construct entity".into(),
+            )
+            .to_value()
+        }
+    };
     eval::evaluate(&construct_entity, scope, budget, ctx)
 }
 
@@ -564,13 +620,19 @@ fn dispatch_map(
     ctx: &mut EvalContext<'_>,
 ) -> ComputeValue {
     let collection = eval_ref(data, "collection", "map collection", scope, budget, ctx);
-    if collection.is_error() { return collection; }
+    if collection.is_error() {
+        return collection;
+    }
     let fn_val = eval_ref(data, "fn", "map fn", scope, budget, ctx);
-    if fn_val.is_error() { return fn_val; }
+    if fn_val.is_error() {
+        return fn_val;
+    }
 
     let items = match &collection {
         ComputeValue::Primitive(Value::Array(arr)) => arr.clone(),
-        _ => return ComputeError::TypeMismatch("map: collection must be an array".into()).to_value(),
+        _ => {
+            return ComputeError::TypeMismatch("map: collection must be an array".into()).to_value()
+        }
     };
 
     let closure = match extract_closure(&fn_val) {
@@ -581,7 +643,9 @@ fn dispatch_map(
     let mut results = Vec::new();
     for item in &items {
         let val = apply_closure_to_value(&closure, item, scope, budget, ctx);
-        if val.is_error() { return val; }
+        if val.is_error() {
+            return val;
+        }
         results.push(compute_value_to_cbor(&val));
     }
 
@@ -595,24 +659,35 @@ fn dispatch_filter(
     ctx: &mut EvalContext<'_>,
 ) -> ComputeValue {
     let collection = eval_ref(data, "collection", "filter collection", scope, budget, ctx);
-    if collection.is_error() { return collection; }
+    if collection.is_error() {
+        return collection;
+    }
     let fn_val = eval_ref(data, "fn", "filter fn", scope, budget, ctx);
-    if fn_val.is_error() { return fn_val; }
+    if fn_val.is_error() {
+        return fn_val;
+    }
 
     let items = match &collection {
         ComputeValue::Primitive(Value::Array(arr)) => arr.clone(),
-        _ => return ComputeError::TypeMismatch("filter: collection must be an array".into()).to_value(),
+        _ => {
+            return ComputeError::TypeMismatch("filter: collection must be an array".into())
+                .to_value()
+        }
     };
 
     let closure = match extract_closure(&fn_val) {
         Some(c) => c,
-        None => return ComputeError::TypeMismatch("filter: fn must be a closure".into()).to_value(),
+        None => {
+            return ComputeError::TypeMismatch("filter: fn must be a closure".into()).to_value()
+        }
     };
 
     let mut results = Vec::new();
     for item in &items {
         let val = apply_closure_to_value(&closure, item, scope, budget, ctx);
-        if val.is_error() { return val; }
+        if val.is_error() {
+            return val;
+        }
         if val.is_truthy() {
             results.push(item.clone());
         }
@@ -628,15 +703,24 @@ fn dispatch_fold(
     ctx: &mut EvalContext<'_>,
 ) -> ComputeValue {
     let collection = eval_ref(data, "collection", "fold collection", scope, budget, ctx);
-    if collection.is_error() { return collection; }
+    if collection.is_error() {
+        return collection;
+    }
     let fn_val = eval_ref(data, "fn", "fold fn", scope, budget, ctx);
-    if fn_val.is_error() { return fn_val; }
+    if fn_val.is_error() {
+        return fn_val;
+    }
     let initial = eval_ref(data, "initial", "fold initial", scope, budget, ctx);
-    if initial.is_error() { return initial; }
+    if initial.is_error() {
+        return initial;
+    }
 
     let items = match &collection {
         ComputeValue::Primitive(Value::Array(arr)) => arr.clone(),
-        _ => return ComputeError::TypeMismatch("fold: collection must be an array".into()).to_value(),
+        _ => {
+            return ComputeError::TypeMismatch("fold: collection must be an array".into())
+                .to_value()
+        }
     };
 
     let closure = match extract_closure(&fn_val) {
@@ -645,14 +729,19 @@ fn dispatch_fold(
     };
 
     if closure.params.len() != 2 {
-        return ComputeError::InvalidExpression("fold: fn must take 2 parameters (acc, item)".into()).to_value();
+        return ComputeError::InvalidExpression(
+            "fold: fn must take 2 parameters (acc, item)".into(),
+        )
+        .to_value();
     }
 
     let mut acc = initial;
     for item in &items {
         let item_val = ComputeValue::Primitive(item.clone());
         acc = apply_closure_to_two_values(&closure, &acc, &item_val, scope, budget, ctx);
-        if acc.is_error() { return acc; }
+        if acc.is_error() {
+            return acc;
+        }
     }
 
     acc
@@ -698,9 +787,11 @@ fn dispatch_store(
             cap,
             ctx.local_peer_id,
         ) {
-            return ComputeError::PermissionDenied(
-                format!("Capability does not cover write: {}", path),
-            ).to_value();
+            return ComputeError::PermissionDenied(format!(
+                "Capability does not cover write: {}",
+                path
+            ))
+            .to_value();
         }
     }
 
@@ -730,18 +821,24 @@ fn dispatch_store(
             let data_bytes = entity_ecf::to_ecf(&v);
             match Entity::new("primitive/any", data_bytes) {
                 Ok(e) => e,
-                Err(_) => return ComputeError::InvalidExpression(
-                    "store: failed to wrap primitive result".into()
-                ).to_value(),
+                Err(_) => {
+                    return ComputeError::InvalidExpression(
+                        "store: failed to wrap primitive result".into(),
+                    )
+                    .to_value()
+                }
             }
         }
         ComputeValue::Uint(u) => {
             let data_bytes = entity_ecf::to_ecf(&Value::Integer(ciborium::value::Integer::from(u)));
             match Entity::new("primitive/any", data_bytes) {
                 Ok(e) => e,
-                Err(_) => return ComputeError::InvalidExpression(
-                    "store: failed to wrap uint result".into()
-                ).to_value(),
+                Err(_) => {
+                    return ComputeError::InvalidExpression(
+                        "store: failed to wrap uint result".into(),
+                    )
+                    .to_value()
+                }
             }
         }
         ComputeValue::Error(err) => return err.to_value(),
@@ -751,7 +848,10 @@ fn dispatch_store(
 
     let hash = match ctx.content_store.put(to_store) {
         Ok(h) => h,
-        Err(_) => return ComputeError::InvalidExpression("store: failed to store entity".into()).to_value(),
+        Err(_) => {
+            return ComputeError::InvalidExpression("store: failed to store entity".into())
+                .to_value()
+        }
     };
 
     ctx.location_index.set(&qualified, hash);
@@ -773,7 +873,10 @@ fn eval_ref(
 ) -> ComputeValue {
     let hash = match data_hash(data, key) {
         Some(h) => h,
-        None => return ComputeError::InvalidExpression(format!("Missing hash field '{}'", key)).to_value(),
+        None => {
+            return ComputeError::InvalidExpression(format!("Missing hash field '{}'", key))
+                .to_value()
+        }
     };
 
     let target = match ctx.resolve_or_error(&hash, label) {
@@ -789,7 +892,9 @@ fn canonical_sorted_pairs(pairs: &[(String, Hash)]) -> Vec<(String, Hash)> {
     sorted.sort_by(|(a, _), (b, _)| {
         let a_len = entity_ecf::to_ecf(&Value::Text(a.clone())).len();
         let b_len = entity_ecf::to_ecf(&Value::Text(b.clone())).len();
-        a_len.cmp(&b_len).then_with(|| a.as_bytes().cmp(b.as_bytes()))
+        a_len
+            .cmp(&b_len)
+            .then_with(|| a.as_bytes().cmp(b.as_bytes()))
     });
     sorted
 }
@@ -826,7 +931,8 @@ fn apply_closure_to_value(
     ctx: &mut EvalContext<'_>,
 ) -> ComputeValue {
     if closure.params.is_empty() {
-        return ComputeError::InvalidExpression("Closure must have at least one parameter".into()).to_value();
+        return ComputeError::InvalidExpression("Closure must have at least one parameter".into())
+            .to_value();
     }
 
     // v3.19b: use the shared kind-tagged eager load_scope. The prior duplicate
@@ -836,7 +942,10 @@ fn apply_closure_to_value(
         Ok(s) => s,
         Err(err) => return err.to_value(),
     };
-    scope.set(closure.params[0].clone(), ComputeValue::Primitive(item.clone()));
+    scope.set(
+        closure.params[0].clone(),
+        ComputeValue::Primitive(item.clone()),
+    );
 
     let body = match ctx.resolve(&closure.body) {
         Some(e) => e,
@@ -855,7 +964,8 @@ fn apply_closure_to_two_values(
     ctx: &mut EvalContext<'_>,
 ) -> ComputeValue {
     if closure.params.len() < 2 {
-        return ComputeError::InvalidExpression("Closure must have at least two parameters".into()).to_value();
+        return ComputeError::InvalidExpression("Closure must have at least two parameters".into())
+            .to_value();
     }
 
     let mut scope = match crate::eval::load_scope_kind_tagged(&closure.env, ctx) {
@@ -913,7 +1023,12 @@ mod tests {
         let mut budget = Budget::default_budget();
         let mut ctx = EvalContext::new(&cs, &li, &included, TEST_PID);
         let result = dispatch_builtin(
-            BUILTIN_ARITHMETIC, "eval", &params, &Scope::new(), &mut budget, &mut ctx,
+            BUILTIN_ARITHMETIC,
+            "eval",
+            &params,
+            &Scope::new(),
+            &mut budget,
+            &mut ctx,
         );
 
         assert!(result.is_some());
@@ -942,8 +1057,14 @@ mod tests {
         let mut budget = Budget::default_budget();
         let mut ctx = EvalContext::new(&cs, &li, &included, TEST_PID);
         let result = dispatch_builtin(
-            BUILTIN_COMPARE, "eval", &params, &Scope::new(), &mut budget, &mut ctx,
-        ).unwrap();
+            BUILTIN_COMPARE,
+            "eval",
+            &params,
+            &Scope::new(),
+            &mut budget,
+            &mut ctx,
+        )
+        .unwrap();
 
         match result {
             ComputeValue::Primitive(Value::Bool(b)) => assert!(b),
@@ -964,9 +1085,13 @@ mod tests {
         let included = HashMap::new();
 
         // The actual data entity we want stored at the target path.
-        let target_entity = Entity::new("app/data", entity_ecf::to_ecf(&entity_ecf::cbor_map! {
-            "x" => entity_ecf::integer(42)
-        })).unwrap();
+        let target_entity = Entity::new(
+            "app/data",
+            entity_ecf::to_ecf(&entity_ecf::cbor_map! {
+                "x" => entity_ecf::integer(42)
+            }),
+        )
+        .unwrap();
         let target_hash = cs.put(target_entity.clone()).unwrap();
 
         // Authorize the lookup_hash target via the sealed authorized set so
@@ -986,14 +1111,24 @@ mod tests {
             "path" => entity_ecf::text("app/test/stored"),
             "value" => Value::Bytes(lookup_hash.to_bytes().to_vec())
         };
-        let params = Entity::new("system/compute/store-args", entity_ecf::to_ecf(&params_data)).unwrap();
+        let params = Entity::new(
+            "system/compute/store-args",
+            entity_ecf::to_ecf(&params_data),
+        )
+        .unwrap();
 
         let mut budget = Budget::default_budget();
-        let mut ctx = EvalContext::new(&cs, &li, &included, TEST_PID)
-            .with_authorized_hashes(authorized);
+        let mut ctx =
+            EvalContext::new(&cs, &li, &included, TEST_PID).with_authorized_hashes(authorized);
         let result = dispatch_builtin(
-            BUILTIN_STORE, "eval", &params, &Scope::new(), &mut budget, &mut ctx,
-        ).unwrap();
+            BUILTIN_STORE,
+            "eval",
+            &params,
+            &Scope::new(),
+            &mut budget,
+            &mut ctx,
+        )
+        .unwrap();
 
         assert!(result.is_truthy());
         let stored_path = format!("/{}/app/test/stored", TEST_PID);
@@ -1018,13 +1153,23 @@ mod tests {
             "path" => entity_ecf::text("app/primitive/at"),
             "value" => Value::Bytes(lit_hash.to_bytes().to_vec())
         };
-        let params = Entity::new("system/compute/store-args", entity_ecf::to_ecf(&params_data)).unwrap();
+        let params = Entity::new(
+            "system/compute/store-args",
+            entity_ecf::to_ecf(&params_data),
+        )
+        .unwrap();
 
         let mut budget = Budget::default_budget();
         let mut ctx = EvalContext::new(&cs, &li, &included, TEST_PID);
         let result = dispatch_builtin(
-            BUILTIN_STORE, "eval", &params, &Scope::new(), &mut budget, &mut ctx,
-        ).unwrap();
+            BUILTIN_STORE,
+            "eval",
+            &params,
+            &Scope::new(),
+            &mut budget,
+            &mut ctx,
+        )
+        .unwrap();
 
         assert!(result.is_truthy());
         let stored_path = format!("/{}/app/primitive/at", TEST_PID);
@@ -1040,19 +1185,28 @@ mod tests {
         let li = MemoryLocationIndex::new();
         let included = HashMap::new();
 
-        let params = Entity::new("test", entity_ecf::to_ecf(&entity_ecf::cbor_map!{})).unwrap();
+        let params = Entity::new("test", entity_ecf::to_ecf(&entity_ecf::cbor_map! {})).unwrap();
         let mut budget = Budget::default_budget();
         let mut ctx = EvalContext::new(&cs, &li, &included, TEST_PID);
 
         assert!(dispatch_builtin(
-            "system/tree", "get", &params, &Scope::new(), &mut budget, &mut ctx,
-        ).is_none());
+            "system/tree",
+            "get",
+            &params,
+            &Scope::new(),
+            &mut budget,
+            &mut ctx,
+        )
+        .is_none());
     }
 
     #[test]
     fn test_is_builtin_path() {
         assert!(is_builtin_path("system/compute/builtins/arithmetic"));
-        assert!(is_builtin_path(&format!("/{}/system/compute/builtins/store", TEST_PID)));
+        assert!(is_builtin_path(&format!(
+            "/{}/system/compute/builtins/store",
+            TEST_PID
+        )));
         assert!(!is_builtin_path("system/tree"));
     }
 }

@@ -12,9 +12,9 @@
 use std::sync::Arc;
 
 use crate::connection::handle_connection;
+use crate::transport::Listener;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::transport::TcpTransportListener;
-use crate::transport::Listener;
 // Native `run` now matches on the accept error inline (log + continue);
 // only the wasm `run` still annotates the closure error type.
 #[cfg(target_arch = "wasm32")]
@@ -56,11 +56,10 @@ impl Drop for ConnectionGuard {
 /// WASM: spawns via `runtime::spawn` (no tracking); tasks live until
 /// Worker termination.
 #[cfg(not(target_arch = "wasm32"))]
-pub async fn run(
-    listener: impl Listener,
-    shared: Arc<PeerShared>,
-) -> Result<(), PeerError> {
-    let mut guard = ConnectionGuard { handles: Vec::new() };
+pub async fn run(listener: impl Listener, shared: Arc<PeerShared>) -> Result<(), PeerError> {
+    let mut guard = ConnectionGuard {
+        handles: Vec::new(),
+    };
 
     loop {
         // A single bad connection must NOT kill the listener. A non-WebSocket
@@ -103,10 +102,7 @@ pub async fn run(
 /// because `spawn_local` doesn't return one; connection-task lifetime
 /// is tied to the Worker.
 #[cfg(target_arch = "wasm32")]
-pub async fn run(
-    listener: impl Listener,
-    shared: Arc<PeerShared>,
-) -> Result<(), PeerError> {
+pub async fn run(listener: impl Listener, shared: Arc<PeerShared>) -> Result<(), PeerError> {
     loop {
         let conn = listener
             .accept()

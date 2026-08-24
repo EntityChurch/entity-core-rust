@@ -3,21 +3,20 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::durability;
+use crate::transport::Connection as TransportConnection;
+use crate::{PeerError, PeerShared};
 use entity_entity::{EntityUri, Envelope};
 use entity_handler::{
-    ExecuteFn, ExecuteOptions, HandlerContext, HandlerError,
-    STATUS_BAD_REQUEST, STATUS_FORBIDDEN, STATUS_INTERNAL_ERROR, STATUS_NOT_FOUND,
-    STATUS_NOT_SUPPORTED,
+    ExecuteFn, ExecuteOptions, HandlerContext, HandlerError, STATUS_BAD_REQUEST, STATUS_FORBIDDEN,
+    STATUS_INTERNAL_ERROR, STATUS_NOT_FOUND, STATUS_NOT_SUPPORTED,
 };
 use entity_protocol::{
     build_error_response, build_execute_response, build_execute_response_full, Connection,
 };
-use crate::durability;
 use entity_wire::{
     decode_envelope, encode_envelope, read_frame, write_frame, DEFAULT_MAX_FRAME_SIZE,
 };
-use crate::transport::Connection as TransportConnection;
-use crate::{PeerError, PeerShared};
 
 /// Handle a single connection: handshake then message loop.
 ///
@@ -60,8 +59,7 @@ pub async fn handle_connection(
     let hello_response = match build_hello_response_envelope(&hello_envelope, &mut conn) {
         Ok(env) => env,
         Err(e) => {
-            let err_env =
-                handshake_error_envelope(&hello_envelope, &e, "handshake_failed");
+            let err_env = handshake_error_envelope(&hello_envelope, &e, "handshake_failed");
             let frame = encode_envelope(&err_env);
             let _ = write_frame(&mut writer, &frame).await;
             return Err(PeerError::ConnectionError(format!("process hello: {}", e)));
@@ -84,8 +82,7 @@ pub async fn handle_connection(
         match build_authenticate_response_envelope(&auth_envelope, &mut conn, &shared) {
             Ok(env) => env,
             Err(e) => {
-                let err_env =
-                    handshake_error_envelope(&auth_envelope, &e, "authentication_failed");
+                let err_env = handshake_error_envelope(&auth_envelope, &e, "authentication_failed");
                 let frame = encode_envelope(&err_env);
                 let _ = write_frame(&mut writer, &frame).await;
                 return Err(PeerError::ConnectionError(format!(
@@ -115,8 +112,7 @@ pub async fn handle_connection(
     // Concurrency is bounded by a semaphore (MAY clause).
     tracing::debug!(remote_peer = %remote_peer_id, "entering message loop");
 
-    let (resp_tx, mut resp_rx) =
-        tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (resp_tx, mut resp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
     // Writer task: drains the response channel and writes frames serially.
     let writer_peer_id = remote_peer_id.clone();
@@ -218,9 +214,7 @@ pub async fn handle_connection(
     loop {
         let frame = match read_frame(&mut reader, DEFAULT_MAX_FRAME_SIZE).await {
             Ok(f) => f,
-            Err(entity_wire::WireError::Io(e))
-                if e.kind() == std::io::ErrorKind::UnexpectedEof =>
-            {
+            Err(entity_wire::WireError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 tracing::debug!(remote_peer = %remote_peer_id, "remote disconnected (EOF)");
                 return Ok(()); // Clean disconnect
             }
@@ -304,9 +298,12 @@ pub async fn handle_connection(
                 Ok(p) => p,
                 Err(_) => return, // semaphore closed → shutting down
             };
-            let response_envelope =
-                dispatch_request(&envelope, shared_task.clone(), Some(remote_peer_id_task.as_str()))
-                    .await;
+            let response_envelope = dispatch_request(
+                &envelope,
+                shared_task.clone(),
+                Some(remote_peer_id_task.as_str()),
+            )
+            .await;
             let response_frame = encode_envelope(&response_envelope);
             // §2.1 #5 wire-send hook. Fires before pushing the frame onto
             // the writer channel — the envelope is in scope so request_id
@@ -429,11 +426,9 @@ pub(crate) fn build_authenticate_response_envelope(
         .get(&format!("/{}/system/capability", shared.peer_id))
         .is_some()
     {
-        if let Some(extras) = lookup_capability_policy_grants(
-            shared,
-            &grantee_hash,
-            remote_peer_id.as_str(),
-        ) {
+        if let Some(extras) =
+            lookup_capability_policy_grants(shared, &grantee_hash, remote_peer_id.as_str())
+        {
             tracing::debug!(
                 added = extras.len(),
                 "§4.4 union: policy entry added grants to initial scope"
@@ -501,8 +496,7 @@ pub(crate) fn build_authenticate_response_envelope(
             );
             return None;
         }
-        let cached_token =
-            entity_capability::CapabilityToken::from_entity(&cap_entity).ok()?;
+        let cached_token = entity_capability::CapabilityToken::from_entity(&cap_entity).ok()?;
         // Grants-changed check (§9.1 R6-e — mint fresh + overwrite).
         if cached_token.grants != grants {
             tracing::debug!(
@@ -572,6 +566,22 @@ pub(crate) fn build_authenticate_response_envelope(
         }
         cap_entity
     };
+
+    // Amendment 12 §A3: `connected` on establish (§6.2), responder side —
+    // written as the connection capability is granted (cap-reuse and
+    // fresh-mint paths both land here). The dialer's mirror write is in
+    // remote.rs `get_or_connect` / lib.rs `connect_to`. No `connection`
+    // path ref: the responder records no system/connection entity (it
+    // holds no dialable address for the remote — ruling C establish
+    // writes are dialer-side).
+    crate::liveness::write_connected_status(
+        shared.content_store.as_ref(),
+        shared.location_index.as_ref(),
+        shared.peer_id.as_str(),
+        remote_peer_id.as_str(),
+        &grantee_hash,
+        None,
+    );
 
     let cap_sig_bytes = shared.keypair.sign(&cap_entity.content_hash.to_bytes());
     let cap_sig_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
@@ -719,11 +729,10 @@ pub(crate) async fn dispatch_request(
 
     // Trace-level dump of EXECUTE fields for debugging
     if tracing::enabled!(tracing::Level::TRACE) {
-        if let Ok(val) = ciborium::from_reader::<ciborium::Value, _>(envelope.root.data.as_slice()) {
+        if let Ok(val) = ciborium::from_reader::<ciborium::Value, _>(envelope.root.data.as_slice())
+        {
             if let Some(map) = val.as_map() {
-                let keys: Vec<&str> = map.iter()
-                    .filter_map(|(k, _)| k.as_text())
-                    .collect();
+                let keys: Vec<&str> = map.iter().filter_map(|(k, _)| k.as_text()).collect();
                 tracing::trace!(
                     request_id = %request_id,
                     fields = ?keys,
@@ -747,7 +756,9 @@ pub(crate) async fn dispatch_request(
     let resolve = |h: &entity_hash::Hash| {
         // Store-first then envelope `included` fallback per V7 §5.1
         // convention for revocation lookups.
-        store.get(h).or_else(|| included_for_resolve.get(h).cloned())
+        store
+            .get(h)
+            .or_else(|| included_for_resolve.get(h).cloned())
     };
     let locate = |path: &str| li.get(path);
     let li_for_scan = shared.location_index.clone();
@@ -847,6 +858,20 @@ pub(crate) async fn dispatch_request(
             &msg,
         )
         .unwrap_or_else(|_| Envelope::new(envelope.root.clone()));
+    }
+    // EXTENSION-NETWORK §5.1 keepalive: EXECUTE on the connect handler,
+    // operation "ping" → answer with system/network/pong. Handled here as
+    // the third protocol-level connect operation (beside hello/authenticate,
+    // which run pre-Established): the request is signature+capability
+    // VERIFIED above but exempt from the handler-scope grant check below —
+    // neither the V7 §4.4 default connection grants nor NETWORK §3.2 cover
+    // `system/protocol/connect`, yet §12.1 makes the ping/pong exchange
+    // MUST. Interim choice logged in docs/SPEC-AMBIGUITIES.md and routed
+    // upstream; do not silently widen the §4.4 grant set instead.
+    if handler_path == format!("/{}/{}", local_pid.as_str(), entity_protocol::CONNECT_PATH)
+        && verified.operation == "ping"
+    {
+        return build_pong_response(envelope, &verified.request_id);
     }
     let handler_authorized = verified.capability.grants.iter().any(|grant| {
         entity_capability::matches_scope(
@@ -1012,8 +1037,11 @@ pub(crate) async fn dispatch_request(
     let bounds = extract_bounds(&envelope.root);
 
     // Build context and dispatch
-    let included: HashMap<entity_hash::Hash, entity_entity::Entity> =
-        envelope.included.iter().map(|(h, e)| (*h, e.clone())).collect();
+    let included: HashMap<entity_hash::Hash, entity_entity::Entity> = envelope
+        .included
+        .iter()
+        .map(|(h, e)| (*h, e.clone()))
+        .collect();
     let execute_fn = make_execute_fn(
         shared.clone(),
         Some(verified.author_hash),
@@ -1032,7 +1060,7 @@ pub(crate) async fn dispatch_request(
     // transferred subtree.
     let bare_pattern = entity_entity::EntityUri::strip_peer_prefix(&resolved.pattern);
     let (handler_grant, handler_grant_hash) = load_local_handler_grant(
-        &bare_pattern,
+        bare_pattern,
         shared.location_index.as_ref(),
         shared.content_store.as_ref(),
         local_pid.as_str(),
@@ -1114,9 +1142,7 @@ pub(crate) async fn dispatch_request(
                         applied: "stored".to_string(),
                         committed: None,
                         max_available: None,
-                        reason: Some(
-                            durability::REASON_DUPLICATE_REQUEST_ID.to_string(),
-                        ),
+                        reason: Some(durability::REASON_DUPLICATE_REQUEST_ID.to_string()),
                         handle: Some(prior_handle.clone()),
                     };
                     let err_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
@@ -1132,11 +1158,8 @@ pub(crate) async fn dispatch_request(
                             )),
                         ),
                     ]));
-                    let err = entity_entity::Entity::new(
-                        entity_types::TYPE_ERROR,
-                        err_data,
-                    )
-                    .unwrap_or_else(|_| envelope.root.clone());
+                    let err = entity_entity::Entity::new(entity_types::TYPE_ERROR, err_data)
+                        .unwrap_or_else(|_| envelope.root.clone());
                     return build_execute_response_full(
                         &verified.request_id,
                         entity_handler::STATUS_CONFLICT,
@@ -1147,11 +1170,8 @@ pub(crate) async fn dispatch_request(
                     .unwrap_or_else(|_| Envelope::new(envelope.root.clone()));
                 }
 
-                let mut verdict = durability::reconcile(
-                    &dreq,
-                    &shared.config.durability_policy,
-                    has_deliver_to,
-                );
+                let mut verdict =
+                    durability::reconcile(&dreq, &shared.config.durability_policy, has_deliver_to);
                 if verdict.refused() {
                     // §5/§8 — a required durability precondition could
                     // not be met. The operation is **not performed**: refuse
@@ -1176,11 +1196,8 @@ pub(crate) async fn dispatch_request(
                             ),
                         ),
                     ]));
-                    let err = entity_entity::Entity::new(
-                        entity_types::TYPE_ERROR,
-                        err_data,
-                    )
-                    .unwrap_or_else(|_| envelope.root.clone());
+                    let err = entity_entity::Entity::new(entity_types::TYPE_ERROR, err_data)
+                        .unwrap_or_else(|_| envelope.root.clone());
                     return build_execute_response_full(
                         &verified.request_id,
                         verdict.status,
@@ -1197,11 +1214,7 @@ pub(crate) async fn dispatch_request(
                 // handler's own write-ahead (handle_receive at L99-104 of
                 // extensions/inbox/src/lib.rs) — don't double-preserve.
                 if verdict.preserve() && !has_deliver_to {
-                    match preserve_durable_request(
-                        &envelope.root,
-                        &verified.request_id,
-                        &shared,
-                    ) {
+                    match preserve_durable_request(&envelope.root, &verified.request_id, &shared) {
                         Some(path) => {
                             // §6 / Amendment 1 — the sender follows the handle.
                             // Also record in the dedup index so a replay of
@@ -1271,7 +1284,11 @@ pub(crate) async fn dispatch_request(
         };
 
         // deliver_token entity must be in included
-        if !envelope.included.iter().any(|(h, _)| *h == deliver_token_hash) {
+        if !envelope
+            .included
+            .iter()
+            .any(|(h, _)| *h == deliver_token_hash)
+        {
             tracing::warn!(
                 request_id = %verified.request_id,
                 deliver_token = %deliver_token_hash,
@@ -1464,11 +1481,8 @@ pub(crate) async fn dispatch_request(
                         (entity_ecf::text("code"), entity_ecf::text(code)),
                         (entity_ecf::text("message"), entity_ecf::text(e.to_string())),
                     ]));
-                    let err = entity_entity::Entity::new(
-                        entity_types::TYPE_ERROR,
-                        err_data,
-                    )
-                    .unwrap_or_else(|_| envelope.root.clone());
+                    let err = entity_entity::Entity::new(entity_types::TYPE_ERROR, err_data)
+                        .unwrap_or_else(|_| envelope.root.clone());
                     build_execute_response_full(
                         &verified.request_id,
                         status,
@@ -1613,41 +1627,41 @@ async fn process_async_delivery(
     // should be the inline entity or just data. Using inline entity because
     // downstream continuations need type+hash for entity operations (tree.put).
     let result_data_val: entity_ecf::Value =
-        ciborium::from_reader(result_entity.data.as_slice())
-            .unwrap_or(entity_ecf::Value::Null);
+        ciborium::from_reader(result_entity.data.as_slice()).unwrap_or(entity_ecf::Value::Null);
     let result_inline = entity_ecf::Value::Map(vec![
-        (entity_ecf::text("content_hash"), entity_ecf::Value::Bytes(result_entity.content_hash.to_bytes().to_vec())),
+        (
+            entity_ecf::text("content_hash"),
+            entity_ecf::Value::Bytes(result_entity.content_hash.to_bytes().to_vec()),
+        ),
         (entity_ecf::text("data"), result_data_val),
-        (entity_ecf::text("type"), entity_ecf::text(&result_entity.entity_type)),
+        (
+            entity_ecf::text("type"),
+            entity_ecf::text(&result_entity.entity_type),
+        ),
     ]);
     let delivery_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
         (
             entity_ecf::text("original_request_id"),
             entity_ecf::text(original_request_id),
         ),
-        (
-            entity_ecf::text("result"),
-            result_inline,
-        ),
+        (entity_ecf::text("result"), result_inline),
         (
             entity_ecf::text("status"),
             entity_ecf::integer(status as i64),
         ),
     ]));
-    let delivery_entity = match entity_entity::Entity::new(
-        entity_types::TYPE_INBOX_DELIVERY,
-        delivery_data,
-    ) {
-        Ok(e) => e,
-        Err(e) => {
-            tracing::warn!(
-                request_id = %original_request_id,
-                error = %e,
-                "async delivery: failed to build delivery entity"
-            );
-            return;
-        }
-    };
+    let delivery_entity =
+        match entity_entity::Entity::new(entity_types::TYPE_INBOX_DELIVERY, delivery_data) {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(
+                    request_id = %original_request_id,
+                    error = %e,
+                    "async delivery: failed to build delivery entity"
+                );
+                return;
+            }
+        };
 
     // Check if deliver_to targets a remote peer
     let local_pid = shared.keypair.peer_id();
@@ -1722,7 +1736,9 @@ async fn process_async_delivery(
                 shared.connector.as_ref(),
                 shared.config.home_hash_format,
                 Some(shared.clone()),
-            ).await {
+            )
+            .await
+            {
                 Ok(c) => c,
                 Err(e) => {
                     tracing::warn!(
@@ -1776,7 +1792,14 @@ async fn process_async_delivery(
                     error = %e,
                     "async delivery: remote delivery failed, removing pooled connection"
                 );
-                shared.remote.remove(&remote_peer_id);
+                // §8.2 direct-send seam: same §A1 demotion as the §10-step-1
+                // dispatch site (guarded eviction + suspect write).
+                crate::liveness::demote_peer_on_transport_error(
+                    &shared,
+                    &remote_peer_id,
+                    &conn,
+                    &e.to_string(),
+                );
             }
         }
     } else {
@@ -1873,7 +1896,13 @@ pub fn build_202_response(
         data: vec![0xf6], // CBOR null
         content_hash: entity_hash::Hash::compute("primitive/null", &[0xf6]),
     };
-    build_execute_response_full(request_id, 202, null_entity, HashMap::new(), durability_cbor)
+    build_execute_response_full(
+        request_id,
+        202,
+        null_entity,
+        HashMap::new(),
+        durability_cbor,
+    )
 }
 
 /// Build an ExecuteFn closure for handler-to-handler dispatch.
@@ -2001,8 +2030,7 @@ fn lookup_operation_output_type(
     local_peer_id: &str,
 ) -> Option<String> {
     use entity_ecf::ValueExt;
-    let data: ciborium::Value =
-        ciborium::from_reader(manifest.data.as_slice()).ok()?;
+    let data: ciborium::Value = ciborium::from_reader(manifest.data.as_slice()).ok()?;
     let interface_path = data.get("interface").and_then(|v| v.as_text())?;
     let qualified = if interface_path.starts_with('/') {
         interface_path.to_string()
@@ -2011,8 +2039,7 @@ fn lookup_operation_output_type(
     };
     let iface_hash = location_index.get(&qualified)?;
     let iface = content_store.get(&iface_hash)?;
-    let iface_data: ciborium::Value =
-        ciborium::from_reader(iface.data.as_slice()).ok()?;
+    let iface_data: ciborium::Value = ciborium::from_reader(iface.data.as_slice()).ok()?;
     let operations = iface_data.get("operations")?;
     let op_spec = operations.get(operation)?;
     op_spec
@@ -2028,8 +2055,7 @@ fn make_error_response_entity(code: &str, message: &str) -> entity_entity::Entit
         "code" => entity_ecf::text(code),
         "message" => entity_ecf::text(message)
     };
-    entity_entity::Entity::new("compute/error", entity_ecf::to_ecf(&data))
-        .expect("error entity")
+    entity_entity::Entity::new("compute/error", entity_ecf::to_ecf(&data)).expect("error entity")
 }
 
 /// Path under which `create_handler_grant` binds a handler grant in the tree
@@ -2217,526 +2243,616 @@ pub fn make_execute_fn(
     parent_bounds: Option<entity_handler::Bounds>,
     parent_caller_capability: Option<entity_capability::CapabilityToken>,
 ) -> ExecuteFn {
-    Arc::new(move |handler_path: String, operation: String, params: entity_entity::Entity, opts: ExecuteOptions| {
-        let shared = shared.clone();
-        let author = author;
-        let mut included = included.clone();
-        let parent_bounds = parent_bounds.clone();
-        // §6.13(b) seam: fold any explicit `opts.included` authority chain
-        // into the dispatch's included set at a single point so BOTH the
-        // remote branch (merged into the outbound envelope's `included` via
-        // `chain_bundle`) and the local branch (threaded into the child
-        // context's `included`) carry it. Used when the chain rides in-band
-        // (GUIDE-CONFORMANCE §7a.2a) rather than in the local store, where
-        // `collect_chain_bundle` cannot reach it. Content-addressed dedup —
-        // entries already present are not duplicated; empty for ordinary
-        // dispatch (no behavior change).
-        for ent in &opts.included {
-            included.entry(ent.content_hash).or_insert_with(|| ent.clone());
-        }
-        // V7 §6.8 / proposal §6.2: caller_capability propagates unchanged through
-        // sub-dispatch chains so history transitions record the original external
-        // caller, not the intermediate handler.
-        let parent_caller_capability = parent_caller_capability.clone();
-        Box::pin(async move {
-            let local_pid = shared.keypair.peer_id();
-            let is_remote = crate::remote::is_remote_uri(&handler_path, local_pid.as_str());
+    Arc::new(
+        move |handler_path: String,
+              operation: String,
+              params: entity_entity::Entity,
+              opts: ExecuteOptions| {
+            let shared = shared.clone();
+            let author = author;
+            let mut included = included.clone();
+            let parent_bounds = parent_bounds.clone();
+            // §6.13(b) seam: fold any explicit `opts.included` authority chain
+            // into the dispatch's included set at a single point so BOTH the
+            // remote branch (merged into the outbound envelope's `included` via
+            // `chain_bundle`) and the local branch (threaded into the child
+            // context's `included`) carry it. Used when the chain rides in-band
+            // (GUIDE-CONFORMANCE §7a.2a) rather than in the local store, where
+            // `collect_chain_bundle` cannot reach it. Content-addressed dedup —
+            // entries already present are not duplicated; empty for ordinary
+            // dispatch (no behavior change).
+            for ent in &opts.included {
+                included
+                    .entry(ent.content_hash)
+                    .or_insert_with(|| ent.clone());
+            }
+            // V7 §6.8 / proposal §6.2: caller_capability propagates unchanged through
+            // sub-dispatch chains so history transitions record the original external
+            // caller, not the intermediate handler.
+            let parent_caller_capability = parent_caller_capability.clone();
+            Box::pin(async move {
+                let local_pid = shared.keypair.peer_id();
+                let is_remote = crate::remote::is_remote_uri(&handler_path, local_pid.as_str());
 
-            tracing::debug!(
-                handler_path = %handler_path,
-                operation = %operation,
-                params_type = %params.entity_type,
-                remote = is_remote,
-                "internal dispatch"
-            );
+                tracing::debug!(
+                    handler_path = %handler_path,
+                    operation = %operation,
+                    params_type = %params.entity_type,
+                    remote = is_remote,
+                    "internal dispatch"
+                );
 
-            // --- Remote dispatch: send EXECUTE to remote peer ---
-            if is_remote {
-                let remote_peer_id = crate::remote::extract_peer_id_from_uri(&handler_path)
-                    .ok_or_else(|| HandlerError::Internal(format!(
-                        "cannot extract peer_id from remote URI: {}", handler_path
-                    )))?;
+                // --- Remote dispatch: send EXECUTE to remote peer ---
+                if is_remote {
+                    let remote_peer_id = crate::remote::extract_peer_id_from_uri(&handler_path)
+                        .ok_or_else(|| {
+                            HandlerError::Internal(format!(
+                                "cannot extract peer_id from remote URI: {}",
+                                handler_path
+                            ))
+                        })?;
 
-                let conn: std::sync::Arc<dyn crate::remote::RemoteEndpoint> =
-                    crate::remote::get_or_connect(
-                        &shared.remote,
-                        &remote_peer_id,
+                    let conn: std::sync::Arc<dyn crate::remote::RemoteEndpoint> =
+                        crate::remote::get_or_connect(
+                            &shared.remote,
+                            &remote_peer_id,
+                            &shared.keypair,
+                            shared.content_store.as_ref(),
+                            shared.location_index.as_ref(),
+                            local_pid.as_str(),
+                            shared.connector.as_ref(),
+                            shared.config.home_hash_format,
+                            // §6.11(b): if this connection has to be freshly
+                            // dialed, give its reader a reentry dispatch context
+                            // so deliveries the remote pushes back reach us.
+                            Some(shared.clone()),
+                        )
+                        .await
+                        .map_err(|e| {
+                            HandlerError::Internal(format!(
+                                "remote connection to {}: {}",
+                                remote_peer_id, e
+                            ))
+                        })?;
+
+                    // Class G / F-WB28: multiplexed connection — no per-conn lock.
+                    // Concurrent dispatches proceed via per-request oneshot demux.
+
+                    let resource = opts.resource.as_ref();
+
+                    // Per CONTINUATION §3.5 step 4 + INBOX §4.5: if deliver_to is set,
+                    // include it on the wire EXECUTE so the remote peer handles delivery
+                    // asynchronously (returns 202, delivers result to inbox directly).
+                    // generate_internal_deliver_token is implementation-defined (§8.4).
+                    // We generate a scoped token after handshake since INBOX §5.1
+                    // requires grantee = remote peer identity.
+                    let deliver_to_params = if let Some(ref dt) = opts.deliver_to {
+                        match crate::remote::generate_deliver_token(
+                            &shared.keypair,
+                            conn.remote_identity_hash(),
+                            &dt.uri,
+                            &dt.operation,
+                        ) {
+                            Ok(p) => Some(p),
+                            Err(e) => {
+                                tracing::warn!(
+                                    deliver_uri = %dt.uri,
+                                    error = %e,
+                                    "internal dispatch: failed to generate deliver_token, falling back to sync"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+
+                    // EXTENSION-CONTINUATION §3.6 step 5 / §4.2 case 3 / §4.3:
+                    // a continuation dispatch carries its scoped
+                    // `dispatch_capability` (opts.capability) as the EXECUTE
+                    // capability — never a silent fallback to the broad
+                    // connection grant (V7 §6.8 — the cross-peer silent-
+                    // escalation Amendment-2's recipe step 2 forbids). Its full
+                    // authority chain (persisted locally at install, §3.2 step 5)
+                    // is bundled into the dispatched envelope's `included` so the
+                    // verifying peer can validate it to a root it recognizes
+                    // (§4.3 chain transport — the general V7 §3.1/§3.2 rule
+                    // places only the leaf). Ordinary internal dispatch (no
+                    // opts.capability) is unchanged: None + empty bundle.
+                    let empty_bundle = std::collections::HashMap::new();
+                    let (dispatch_cap, mut chain_bundle) = match opts.capability.as_ref() {
+                        Some(cap) => match entity_protocol::collect_chain_bundle(
+                            &cap.content_hash,
+                            |h| shared.content_store.get(h),
+                            |p| shared.location_index.get(p),
+                        ) {
+                            Ok(bundle) => (Some(cap), bundle),
+                            Err(e) => {
+                                // Chain not fully resolvable locally (unexpected —
+                                // install persists it per §3.2 step 5). Send the
+                                // scoped leaf cap anyway; B fails closed on its
+                                // VerifyChain. That is safe and conformant — we
+                                // never substitute the connection grant, so this
+                                // is not a §6.8 escalation.
+                                tracing::warn!(
+                                    cap = %cap.content_hash,
+                                    error = %e,
+                                    "continuation dispatch: authority chain \
+                                     unresolvable; sending scoped leaf cap only"
+                                );
+                                (Some(cap), std::collections::HashMap::new())
+                            }
+                        },
+                        None => (None, empty_bundle),
+                    };
+
+                    // V7 §3.3 v7.51: request-side envelope-`included` preservation.
+                    // When an internal sub-dispatch is forwarded to a remote peer,
+                    // the parent envelope's `included` map MUST travel with the
+                    // forwarded EXECUTE — otherwise downstream continuations
+                    // (e.g. EXTENSION-CONTINUATION `deref_included` over an
+                    // `include_payload`-bundled entity) cannot resolve hash refs
+                    // the parent put there. Merge into the existing extra-included
+                    // bundle (envelope.include dedupes on hash, so capability-chain
+                    // entries already present are not duplicated).
+                    for (h, ent) in included.iter() {
+                        chain_bundle.entry(*h).or_insert_with(|| ent.clone());
+                    }
+
+                    let resp = match crate::remote::send_execute(
+                        conn.as_ref(),
                         &shared.keypair,
-                        shared.content_store.as_ref(),
-                        shared.location_index.as_ref(),
-                        local_pid.as_str(),
-                        shared.connector.as_ref(),
-                shared.config.home_hash_format,
-                        // §6.11(b): if this connection has to be freshly
-                        // dialed, give its reader a reentry dispatch context
-                        // so deliveries the remote pushes back reach us.
-                        Some(shared.clone()),
-                    ).await.map_err(|e| HandlerError::Internal(format!(
-                        "remote connection to {}: {}", remote_peer_id, e
-                    )))?;
-
-                // Class G / F-WB28: multiplexed connection — no per-conn lock.
-                // Concurrent dispatches proceed via per-request oneshot demux.
-
-                let resource = opts.resource.as_ref();
-
-                // Per CONTINUATION §3.5 step 4 + INBOX §4.5: if deliver_to is set,
-                // include it on the wire EXECUTE so the remote peer handles delivery
-                // asynchronously (returns 202, delivers result to inbox directly).
-                // generate_internal_deliver_token is implementation-defined (§8.4).
-                // We generate a scoped token after handshake since INBOX §5.1
-                // requires grantee = remote peer identity.
-                let deliver_to_params = if let Some(ref dt) = opts.deliver_to {
-                    match crate::remote::generate_deliver_token(
-                        &shared.keypair,
-                        conn.remote_identity_hash(),
-                        &dt.uri,
-                        &dt.operation,
-                    ) {
-                        Ok(p) => Some(p),
+                        &handler_path,
+                        &operation,
+                        &params,
+                        resource,
+                        deliver_to_params.as_ref(),
+                        dispatch_cap,
+                        &chain_bundle,
+                    )
+                    .await
+                    {
+                        Ok(r) => r,
                         Err(e) => {
-                            tracing::warn!(
-                                deliver_uri = %dt.uri,
-                                error = %e,
-                                "internal dispatch: failed to generate deliver_token, falling back to sync"
+                            // Transport error on a connection we believed active
+                            // (§10 step 1): evict the dead conn from the pool AND
+                            // demote peer liveness to suspect (Amendment 12 §A1),
+                            // idempotently under the no-clobber guard.
+                            crate::liveness::demote_peer_on_transport_error(
+                                &shared,
+                                &remote_peer_id,
+                                &conn,
+                                &e.to_string(),
                             );
-                            None
+                            return Err(HandlerError::Internal(format!(
+                                "remote execute to {}: {}",
+                                remote_peer_id, e
+                            )));
+                        }
+                    };
+
+                    tracing::debug!(
+                        handler_path = %handler_path,
+                        remote_peer = %remote_peer_id,
+                        status = resp.status,
+                        has_deliver_to = opts.deliver_to.is_some(),
+                        "internal dispatch: remote completed"
+                    );
+
+                    return Ok(entity_handler::HandlerResult {
+                        status: resp.status,
+                        result: resp.result,
+                        // PROPOSAL §2: thread envelope.included from the
+                        // remote response back into the HandlerResult so
+                        // internal callers see the same subtree an external
+                        // caller would have seen.
+                        included: resp.included,
+                    });
+                }
+
+                // --- Local dispatch ---
+                // V1: Normalize, validate, and qualify handler path (R12)
+                let bare = EntityUri::extract_handler_path(&handler_path);
+                EntityUri::validate_path_input(bare).map_err(HandlerError::InvalidParams)?;
+                let qualified = EntityUri::qualify_path(bare, local_pid.as_str());
+                EntityUri::validate_absolute_path(&qualified)
+                    .map_err(HandlerError::InvalidParams)?;
+
+                // Resolve handler
+                //
+                // R2 (INBOX §3.6 option 3): local-dispatch
+                // missing-handler returns the same shape as the wire-dispatch
+                // missing-handler path at `dispatch_envelope` (see line ~485) —
+                // 404 sync `HandlerResult` carrying a `system/protocol/error`
+                // entity with `code: "handler_not_found"`. Previously this site
+                // produced `Err(HandlerError::Internal("no handler for: <path>"))`,
+                // which the SDK boundary flattened to `SdkError::HandlerError(_)`
+                // — losing both the 404 status and the substrate code. The
+                // VERIFICATION-R2 memo confirmed the wire path was conformant;
+                // this aligns the local path so internal callers (SDK
+                // `dispatch_execute`, recursive sub-dispatch) see the same
+                // 4xx-bearing HandlerResult an external caller would.
+                let resolved = match entity_handler::resolve_handler(
+                    &qualified,
+                    shared.content_store.as_ref(),
+                    shared.location_index.as_ref(),
+                    &shared.handler_registry,
+                ) {
+                    Some(r) => r,
+                    None => {
+                        tracing::warn!(handler_path = %handler_path, "internal dispatch: no handler found");
+                        return Ok(entity_handler::HandlerResult::error(
+                            entity_handler::STATUS_NOT_FOUND,
+                            entity_handler::error_entity(
+                                "handler_not_found",
+                                &format!("no handler for path: {}", handler_path),
+                            ),
+                        ));
+                    }
+                };
+
+                tracing::debug!(
+                    handler = %resolved_handler_name(&resolved),
+                    pattern = %resolved.pattern,
+                    operation = %operation,
+                    compiled = resolved.handler.is_some(),
+                    "internal dispatch: handler resolved"
+                );
+
+                // Build a synthetic EXECUTE entity for the child context.
+                // Per spec §3.4, params is an inline entity {content_hash, data, type}.
+                let params_data_val: entity_ecf::Value =
+                    ciborium::from_reader(params.data.as_slice())
+                        .unwrap_or(entity_ecf::Value::Null);
+                let params_entity_val = entity_ecf::Value::Map(vec![
+                    (
+                        entity_ecf::text("content_hash"),
+                        entity_ecf::Value::Bytes(params.content_hash.to_bytes().to_vec()),
+                    ),
+                    (entity_ecf::text("data"), params_data_val),
+                    (
+                        entity_ecf::text("type"),
+                        entity_ecf::text(&params.entity_type),
+                    ),
+                ]);
+                let execute_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+                    (entity_ecf::text("operation"), entity_ecf::text(&operation)),
+                    (entity_ecf::text("params"), params_entity_val),
+                    (entity_ecf::text("request_id"), entity_ecf::text("internal")),
+                    (entity_ecf::text("uri"), entity_ecf::text(&handler_path)),
+                ]));
+                let execute = entity_entity::Entity::new(entity_types::TYPE_EXECUTE, execute_data)
+                    .map_err(|e| HandlerError::Internal(e.to_string()))?;
+
+                // V2: Qualify and validate resource targets (R12)
+                let resource_target = match opts.resource {
+                    Some(mut rt) => {
+                        let pid = shared.keypair.peer_id();
+                        let mut qualified = Vec::with_capacity(rt.targets.len());
+                        for t in &rt.targets {
+                            EntityUri::validate_path_input(t)
+                                .map_err(HandlerError::InvalidParams)?;
+                            let q = EntityUri::qualify_path(t, pid.as_str());
+                            if !q.contains('*') {
+                                EntityUri::validate_absolute_path(&q)
+                                    .map_err(HandlerError::InvalidParams)?;
+                            }
+                            qualified.push(q);
+                        }
+                        rt.targets = qualified;
+                        Some(rt)
+                    }
+                    None => None,
+                };
+                let request_id = opts.request_id.unwrap_or_else(|| "internal".to_string());
+
+                // Bounds: explicit override from opts, or decrement parent bounds (§5.9)
+                let child_bounds = if let Some(b) = opts.bounds {
+                    Some(b)
+                } else if let Some(ref pb) = parent_bounds {
+                    match pb.decrement() {
+                        Ok(b) => Some(b),
+                        Err(_) => {
+                            return Err(HandlerError::Internal("ttl_exhausted".to_string()));
                         }
                     }
                 } else {
                     None
                 };
 
-                // EXTENSION-CONTINUATION §3.6 step 5 / §4.2 case 3 / §4.3:
-                // a continuation dispatch carries its scoped
-                // `dispatch_capability` (opts.capability) as the EXECUTE
-                // capability — never a silent fallback to the broad
-                // connection grant (V7 §6.8 — the cross-peer silent-
-                // escalation Amendment-2's recipe step 2 forbids). Its full
-                // authority chain (persisted locally at install, §3.2 step 5)
-                // is bundled into the dispatched envelope's `included` so the
-                // verifying peer can validate it to a root it recognizes
-                // (§4.3 chain transport — the general V7 §3.1/§3.2 rule
-                // places only the leaf). Ordinary internal dispatch (no
-                // opts.capability) is unchanged: None + empty bundle.
-                let empty_bundle = std::collections::HashMap::new();
-                let (dispatch_cap, mut chain_bundle) = match opts.capability.as_ref() {
-                    Some(cap) => match entity_protocol::collect_chain_bundle(
-                        &cap.content_hash,
-                        |h| shared.content_store.get(h),
-                        |p| shared.location_index.get(p),
-                    ) {
-                        Ok(bundle) => (Some(cap), bundle),
-                        Err(e) => {
-                            // Chain not fully resolvable locally (unexpected —
-                            // install persists it per §3.2 step 5). Send the
-                            // scoped leaf cap anyway; B fails closed on its
-                            // VerifyChain. That is safe and conformant — we
-                            // never substitute the connection grant, so this
-                            // is not a §6.8 escalation.
-                            tracing::warn!(
-                                cap = %cap.content_hash,
-                                error = %e,
-                                "continuation dispatch: authority chain \
-                                 unresolvable; sending scoped leaf cap only"
-                            );
-                            (Some(cap), std::collections::HashMap::new())
-                        }
-                    },
-                    None => (None, empty_bundle),
-                };
-
-                // V7 §3.3 v7.51: request-side envelope-`included` preservation.
-                // When an internal sub-dispatch is forwarded to a remote peer,
-                // the parent envelope's `included` map MUST travel with the
-                // forwarded EXECUTE — otherwise downstream continuations
-                // (e.g. EXTENSION-CONTINUATION `deref_included` over an
-                // `include_payload`-bundled entity) cannot resolve hash refs
-                // the parent put there. Merge into the existing extra-included
-                // bundle (envelope.include dedupes on hash, so capability-chain
-                // entries already present are not duplicated).
-                for (h, ent) in included.iter() {
-                    chain_bundle.entry(*h).or_insert_with(|| ent.clone());
-                }
-
-                let resp = match crate::remote::send_execute(
-                    conn.as_ref(),
-                    &shared.keypair,
-                    &handler_path,
-                    &operation,
-                    &params,
-                    resource,
-                    deliver_to_params.as_ref(),
-                    dispatch_cap,
-                    &chain_bundle,
-                ).await {
-                    Ok(r) => r,
-                    Err(e) => {
-                        // Connection is likely broken — remove from pool
-                        shared.remote.remove(&remote_peer_id);
-                        return Err(HandlerError::Internal(format!(
-                            "remote execute to {}: {}", remote_peer_id, e
-                        )));
-                    }
-                };
-
-                tracing::debug!(
-                    handler_path = %handler_path,
-                    remote_peer = %remote_peer_id,
-                    status = resp.status,
-                    has_deliver_to = opts.deliver_to.is_some(),
-                    "internal dispatch: remote completed"
-                );
-
-                return Ok(entity_handler::HandlerResult {
-                    status: resp.status,
-                    result: resp.result,
-                    // PROPOSAL §2: thread envelope.included from the
-                    // remote response back into the HandlerResult so
-                    // internal callers see the same subtree an external
-                    // caller would have seen.
-                    included: resp.included,
-                });
-            }
-
-            // --- Local dispatch ---
-            // V1: Normalize, validate, and qualify handler path (R12)
-            let bare = EntityUri::extract_handler_path(&handler_path);
-            EntityUri::validate_path_input(bare)
-                .map_err(|msg| HandlerError::InvalidParams(msg))?;
-            let qualified = EntityUri::qualify_path(bare, local_pid.as_str());
-            EntityUri::validate_absolute_path(&qualified)
-                .map_err(|msg| HandlerError::InvalidParams(msg))?;
-
-            // Resolve handler
-            //
-            // R2 (INBOX §3.6 option 3): local-dispatch
-            // missing-handler returns the same shape as the wire-dispatch
-            // missing-handler path at `dispatch_envelope` (see line ~485) —
-            // 404 sync `HandlerResult` carrying a `system/protocol/error`
-            // entity with `code: "handler_not_found"`. Previously this site
-            // produced `Err(HandlerError::Internal("no handler for: <path>"))`,
-            // which the SDK boundary flattened to `SdkError::HandlerError(_)`
-            // — losing both the 404 status and the substrate code. The
-            // VERIFICATION-R2 memo confirmed the wire path was conformant;
-            // this aligns the local path so internal callers (SDK
-            // `dispatch_execute`, recursive sub-dispatch) see the same
-            // 4xx-bearing HandlerResult an external caller would.
-            let resolved = match entity_handler::resolve_handler(
-                &qualified,
-                shared.content_store.as_ref(),
-                shared.location_index.as_ref(),
-                &shared.handler_registry,
-            ) {
-                Some(r) => r,
-                None => {
-                    tracing::warn!(handler_path = %handler_path, "internal dispatch: no handler found");
-                    return Ok(entity_handler::HandlerResult::error(
-                        entity_handler::STATUS_NOT_FOUND,
-                        entity_handler::error_entity(
-                            "handler_not_found",
-                            &format!("no handler for path: {}", handler_path),
-                        ),
-                    ));
-                }
-            };
-
-            tracing::debug!(
-                handler = %resolved_handler_name(&resolved),
-                pattern = %resolved.pattern,
-                operation = %operation,
-                compiled = resolved.handler.is_some(),
-                "internal dispatch: handler resolved"
-            );
-
-            // Build a synthetic EXECUTE entity for the child context.
-            // Per spec §3.4, params is an inline entity {content_hash, data, type}.
-            let params_data_val: entity_ecf::Value =
-                ciborium::from_reader(params.data.as_slice())
-                    .unwrap_or(entity_ecf::Value::Null);
-            let params_entity_val = entity_ecf::Value::Map(vec![
-                (entity_ecf::text("content_hash"), entity_ecf::Value::Bytes(params.content_hash.to_bytes().to_vec())),
-                (entity_ecf::text("data"), params_data_val),
-                (entity_ecf::text("type"), entity_ecf::text(&params.entity_type)),
-            ]);
-            let execute_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-                (entity_ecf::text("operation"), entity_ecf::text(&operation)),
-                (entity_ecf::text("params"), params_entity_val),
-                (entity_ecf::text("request_id"), entity_ecf::text("internal")),
-                (entity_ecf::text("uri"), entity_ecf::text(&handler_path)),
-            ]));
-            let execute = entity_entity::Entity::new(entity_types::TYPE_EXECUTE, execute_data)
-                .map_err(|e| HandlerError::Internal(e.to_string()))?;
-
-            // V2: Qualify and validate resource targets (R12)
-            let resource_target = match opts.resource {
-                Some(mut rt) => {
-                    let pid = shared.keypair.peer_id();
-                    let mut qualified = Vec::with_capacity(rt.targets.len());
-                    for t in &rt.targets {
-                        EntityUri::validate_path_input(t)
-                            .map_err(|msg| HandlerError::InvalidParams(msg))?;
-                        let q = EntityUri::qualify_path(t, pid.as_str());
-                        if !q.contains('*') {
-                            EntityUri::validate_absolute_path(&q)
-                                .map_err(|msg| HandlerError::InvalidParams(msg))?;
-                        }
-                        qualified.push(q);
-                    }
-                    rt.targets = qualified;
-                    Some(rt)
-                }
-                None => None,
-            };
-            let request_id = opts.request_id.unwrap_or_else(|| "internal".to_string());
-
-            // Bounds: explicit override from opts, or decrement parent bounds (§5.9)
-            let child_bounds = if let Some(b) = opts.bounds {
-                Some(b)
-            } else if let Some(ref pb) = parent_bounds {
-                match pb.decrement() {
-                    Ok(b) => Some(b),
-                    Err(_) => {
-                        return Err(HandlerError::Internal("ttl_exhausted".to_string()));
-                    }
-                }
-            } else {
-                None
-            };
-
-            // Build child context — params entity passed directly (already parsed)
-            let child_execute_fn = make_execute_fn(
-                shared.clone(),
-                author,
-                included.clone(),
-                child_bounds.clone(),
-                parent_caller_capability.clone(),
-            );
-
-            // Load + validate child handler's grant from tree (§6.8, §S2/§S3).
-            // Same check ladder as the wire dispatch path —
-            // see load_local_handler_grant.
-            let child_bare = entity_entity::EntityUri::strip_peer_prefix(&resolved.pattern);
-            let (child_handler_grant, child_grant_hash) = load_local_handler_grant(
-                &child_bare,
-                shared.location_index.as_ref(),
-                shared.content_store.as_ref(),
-                local_pid.as_str(),
-                shared.identity_hash,
-                shared.keypair.key_type(),
-                &shared.keypair.public_key_bytes(),
-            );
-
-            let log_name = resolved_handler_name(&resolved).to_string();
-
-            // V7 §6.8 / proposal §6.2: caller_capability propagates from the
-            // outer dispatch context so history records the original external
-            // caller. Internal dispatch — matching_grant intentionally absent
-            // (no capability constraints); capability_hash intentionally
-            // absent (this is sub-dispatch, not a fresh caller-attributable
-            // request).
-            let mut builder = HandlerContext::builder(execute, params)
-                .pattern(resolved.pattern.clone())
-                .suffix(resolved.suffix.clone())
-                .request_id(request_id.clone())
-                .operation(operation.clone())
-                .execute_fn(child_execute_fn)
-                .included(included.clone());
-            if let Some(g) = child_handler_grant {
-                builder = builder.handler_grant(g);
-            }
-            if let Some(c) = parent_caller_capability.clone() {
-                builder = builder.caller_capability(c);
-            }
-            if let Some(rt) = resource_target {
-                builder = builder.resource_target(rt);
-            }
-            if let Some(a) = author {
-                builder = builder.author(a);
-            }
-            if let Some(hgh) = child_grant_hash {
-                builder = builder.handler_grant_hash(hgh);
-            }
-            if let Some(b) = child_bounds {
-                builder = builder.bounds(b);
-            }
-            let ctx = builder.build();
-
-            // EXTENSION-INBOX §4.3 (v5.6, PROPOSAL-CONTENT-INGEST-PASS-THROUGH
-            // D1): handler-initiated sub-dispatch with deliver_to
-            // MUST follow the same async-spawning semantics as a wire-entry
-            // EXECUTE with deliver_to, regardless of whether the target URI is
-            // local or remote. Prior to this codification, the local-local
-            // case silently dropped deliver_to, breaking any continuation
-            // chain whose middle step targeted a local URI.
-            //
-            // The remote branch above (`if is_remote`) already packs
-            // deliver_to into the wire EXECUTE; the wire-entry path on the
-            // far side spawns async. The local-local case is what this
-            // branch handles.
-            if let Some(ref dt) = opts.deliver_to {
-                // ExecuteOptions carries entity_handler::DeliverySpec;
-                // process_async_delivery expects connection::DeliverySpec.
-                // Same shape, distinct types — bridge by field-wise copy.
-                let dt = DeliverySpec {
-                    uri: dt.uri.clone(),
-                    operation: dt.operation.clone(),
-                };
-                let request_id_for_delivery = request_id.clone();
-                let log_name_for_delivery = log_name.clone();
-                let shared_for_delivery = shared.clone();
-                // Build a fresh execute_fn for the spawned task —
-                // process_async_delivery re-dispatches via it. The ctx already
-                // owns its own execute_fn for any sub-dispatch the handler
-                // initiates; this one is for the delivery routing.
-                let delivery_execute_fn = make_execute_fn(
+                // Build child context — params entity passed directly (already parsed)
+                let child_execute_fn = make_execute_fn(
                     shared.clone(),
                     author,
                     included.clone(),
-                    None, // bounds reset for the spawned re-dispatch
+                    child_bounds.clone(),
                     parent_caller_capability.clone(),
                 );
 
-                tracing::debug!(
-                    handler = %log_name,
-                    operation = %operation,
-                    request_id = %request_id,
-                    deliver_uri = %dt.uri,
-                    deliver_operation = %dt.operation,
-                    "internal dispatch: deliver_to set, spawning async delivery (D1)"
+                // Load + validate child handler's grant from tree (§6.8, §S2/§S3).
+                // Same check ladder as the wire dispatch path —
+                // see load_local_handler_grant.
+                let child_bare = entity_entity::EntityUri::strip_peer_prefix(&resolved.pattern);
+                let (child_handler_grant, child_grant_hash) = load_local_handler_grant(
+                    child_bare,
+                    shared.location_index.as_ref(),
+                    shared.content_store.as_ref(),
+                    local_pid.as_str(),
+                    shared.identity_hash,
+                    shared.keypair.key_type(),
+                    &shared.keypair.public_key_bytes(),
                 );
 
-                crate::runtime::spawn(async move {
-                    process_async_delivery(
-                        ctx,
-                        &dt,
-                        &delivery_execute_fn,
-                        &request_id_for_delivery,
-                        &log_name_for_delivery,
-                        shared_for_delivery,
-                    )
-                    .await;
-                });
+                let log_name = resolved_handler_name(&resolved).to_string();
 
-                // Return 202 Accepted synchronously. The handler runs in the
-                // spawned task; its result routes to deliver_to.uri via inbox.
-                let accepted = entity_entity::Entity::new(
-                    "primitive/null",
-                    vec![0xf6], // CBOR null
-                )
-                .map_err(|e| HandlerError::Internal(e.to_string()))?;
-                return Ok(entity_handler::HandlerResult {
-                    status: 202,
-                    result: accepted,
-                    included: std::collections::HashMap::new(),
-                });
-            }
-
-            // GUIDE-INSPECTABILITY v1.2 §2.1 #3 — internal dispatch is its own
-            // dispatcher↔handler-body boundary (peer.execute() / handler-to-
-            // handler dispatch). Fire entry + exit hooks symmetric to the wire
-            // dispatch site in dispatch_request.
-            let internal_target_uri = if ctx.suffix.is_empty() {
-                ctx.pattern.clone()
-            } else if ctx.pattern.ends_with('/') || ctx.suffix.starts_with('/') {
-                format!("{}{}", ctx.pattern, ctx.suffix)
-            } else {
-                format!("{}/{}", ctx.pattern, ctx.suffix)
-            };
-            if !shared.dispatch_hooks.is_empty() {
-                fire_dispatch_hooks(
-                    &shared,
-                    &crate::DispatchEvent {
-                        target_uri: internal_target_uri.clone(),
-                        operation: ctx.operation.clone(),
-                        params_hash: ctx.params.content_hash,
-                        request_id: ctx.request_id.clone(),
-                        timestamp_ms: dispatch_event_timestamp_ms(),
-                        phase: crate::DispatchPhase::Entry,
-                    },
-                );
-            }
-
-            // V7 §6.5: compiled handlers take priority; tree-only manifests fall
-            // back to entity-native dispatch through the compute evaluator.
-            let result = match &resolved.handler {
-                Some(handler) => handler.handle(&ctx).await,
-                None => {
-                    #[cfg(feature = "compute")]
-                    {
-                        dispatch_tree_only_handler(&resolved, &ctx, shared.clone()).await
-                    }
-                    #[cfg(not(feature = "compute"))]
-                    {
-                        Err(HandlerError::Internal(
-                            "tree-only handler requires the compute feature".to_string(),
-                        ))
-                    }
+                // V7 §6.8 / proposal §6.2: caller_capability propagates from the
+                // outer dispatch context so history records the original external
+                // caller. Internal dispatch — matching_grant intentionally absent
+                // (no capability constraints); capability_hash intentionally
+                // absent (this is sub-dispatch, not a fresh caller-attributable
+                // request).
+                let mut builder = HandlerContext::builder(execute, params)
+                    .pattern(resolved.pattern.clone())
+                    .suffix(resolved.suffix.clone())
+                    .request_id(request_id.clone())
+                    .operation(operation.clone())
+                    .execute_fn(child_execute_fn)
+                    .included(included.clone());
+                if let Some(g) = child_handler_grant {
+                    builder = builder.handler_grant(g);
                 }
-            };
+                if let Some(c) = parent_caller_capability.clone() {
+                    builder = builder.caller_capability(c);
+                }
+                if let Some(rt) = resource_target {
+                    builder = builder.resource_target(rt);
+                }
+                if let Some(a) = author {
+                    builder = builder.author(a);
+                }
+                if let Some(hgh) = child_grant_hash {
+                    builder = builder.handler_grant_hash(hgh);
+                }
+                if let Some(b) = child_bounds {
+                    builder = builder.bounds(b);
+                }
+                let ctx = builder.build();
 
-            let (internal_status, internal_response_hash) = match &result {
-                Ok(r) => (r.status, r.result.content_hash),
-                Err(e) => (
-                    match e {
-                        HandlerError::InvalidParams(_) => STATUS_BAD_REQUEST,
-                        HandlerError::NotSupported(_) => STATUS_NOT_SUPPORTED,
-                        HandlerError::Internal(_) => STATUS_INTERNAL_ERROR,
-                    },
-                    entity_hash::Hash::zero(),
-                ),
-            };
-            if !shared.dispatch_hooks.is_empty() {
-                fire_dispatch_hooks(
-                    &shared,
-                    &crate::DispatchEvent {
-                        target_uri: internal_target_uri,
-                        operation: ctx.operation.clone(),
-                        params_hash: ctx.params.content_hash,
-                        request_id: ctx.request_id.clone(),
-                        timestamp_ms: dispatch_event_timestamp_ms(),
-                        phase: crate::DispatchPhase::Exit {
-                            status: internal_status,
-                            response_hash: internal_response_hash,
+                // EXTENSION-INBOX §4.3 (v5.6, PROPOSAL-CONTENT-INGEST-PASS-THROUGH
+                // D1): handler-initiated sub-dispatch with deliver_to
+                // MUST follow the same async-spawning semantics as a wire-entry
+                // EXECUTE with deliver_to, regardless of whether the target URI is
+                // local or remote. Prior to this codification, the local-local
+                // case silently dropped deliver_to, breaking any continuation
+                // chain whose middle step targeted a local URI.
+                //
+                // The remote branch above (`if is_remote`) already packs
+                // deliver_to into the wire EXECUTE; the wire-entry path on the
+                // far side spawns async. The local-local case is what this
+                // branch handles.
+                if let Some(ref dt) = opts.deliver_to {
+                    // ExecuteOptions carries entity_handler::DeliverySpec;
+                    // process_async_delivery expects connection::DeliverySpec.
+                    // Same shape, distinct types — bridge by field-wise copy.
+                    let dt = DeliverySpec {
+                        uri: dt.uri.clone(),
+                        operation: dt.operation.clone(),
+                    };
+                    let request_id_for_delivery = request_id.clone();
+                    let log_name_for_delivery = log_name.clone();
+                    let shared_for_delivery = shared.clone();
+                    // Build a fresh execute_fn for the spawned task —
+                    // process_async_delivery re-dispatches via it. The ctx already
+                    // owns its own execute_fn for any sub-dispatch the handler
+                    // initiates; this one is for the delivery routing.
+                    let delivery_execute_fn = make_execute_fn(
+                        shared.clone(),
+                        author,
+                        included.clone(),
+                        None, // bounds reset for the spawned re-dispatch
+                        parent_caller_capability.clone(),
+                    );
+
+                    tracing::debug!(
+                        handler = %log_name,
+                        operation = %operation,
+                        request_id = %request_id,
+                        deliver_uri = %dt.uri,
+                        deliver_operation = %dt.operation,
+                        "internal dispatch: deliver_to set, spawning async delivery (D1)"
+                    );
+
+                    crate::runtime::spawn(async move {
+                        process_async_delivery(
+                            ctx,
+                            &dt,
+                            &delivery_execute_fn,
+                            &request_id_for_delivery,
+                            &log_name_for_delivery,
+                            shared_for_delivery,
+                        )
+                        .await;
+                    });
+
+                    // Return 202 Accepted synchronously. The handler runs in the
+                    // spawned task; its result routes to deliver_to.uri via inbox.
+                    let accepted = entity_entity::Entity::new(
+                        "primitive/null",
+                        vec![0xf6], // CBOR null
+                    )
+                    .map_err(|e| HandlerError::Internal(e.to_string()))?;
+                    return Ok(entity_handler::HandlerResult {
+                        status: 202,
+                        result: accepted,
+                        included: std::collections::HashMap::new(),
+                    });
+                }
+
+                // GUIDE-INSPECTABILITY v1.2 §2.1 #3 — internal dispatch is its own
+                // dispatcher↔handler-body boundary (peer.execute() / handler-to-
+                // handler dispatch). Fire entry + exit hooks symmetric to the wire
+                // dispatch site in dispatch_request.
+                let internal_target_uri = if ctx.suffix.is_empty() {
+                    ctx.pattern.clone()
+                } else if ctx.pattern.ends_with('/') || ctx.suffix.starts_with('/') {
+                    format!("{}{}", ctx.pattern, ctx.suffix)
+                } else {
+                    format!("{}/{}", ctx.pattern, ctx.suffix)
+                };
+                if !shared.dispatch_hooks.is_empty() {
+                    fire_dispatch_hooks(
+                        &shared,
+                        &crate::DispatchEvent {
+                            target_uri: internal_target_uri.clone(),
+                            operation: ctx.operation.clone(),
+                            params_hash: ctx.params.content_hash,
+                            request_id: ctx.request_id.clone(),
+                            timestamp_ms: dispatch_event_timestamp_ms(),
+                            phase: crate::DispatchPhase::Entry,
                         },
-                    },
-                );
-            }
+                    );
+                }
 
-            match &result {
-                Ok(r) => tracing::debug!(
-                    handler = %log_name,
-                    operation = %operation,
-                    request_id = %request_id,
-                    status = r.status,
-                    result_type = %r.result.entity_type,
-                    "internal dispatch: completed"
-                ),
-                Err(e) => tracing::warn!(
-                    handler = %log_name,
-                    operation = %operation,
-                    request_id = %request_id,
-                    error = %e,
-                    "internal dispatch: handler error"
-                ),
-            }
-            result
-        })
-    })
+                // V7 §6.5: compiled handlers take priority; tree-only manifests fall
+                // back to entity-native dispatch through the compute evaluator.
+                let result = match &resolved.handler {
+                    Some(handler) => handler.handle(&ctx).await,
+                    None => {
+                        #[cfg(feature = "compute")]
+                        {
+                            dispatch_tree_only_handler(&resolved, &ctx, shared.clone()).await
+                        }
+                        #[cfg(not(feature = "compute"))]
+                        {
+                            Err(HandlerError::Internal(
+                                "tree-only handler requires the compute feature".to_string(),
+                            ))
+                        }
+                    }
+                };
+
+                let (internal_status, internal_response_hash) = match &result {
+                    Ok(r) => (r.status, r.result.content_hash),
+                    Err(e) => (
+                        match e {
+                            HandlerError::InvalidParams(_) => STATUS_BAD_REQUEST,
+                            HandlerError::NotSupported(_) => STATUS_NOT_SUPPORTED,
+                            HandlerError::Internal(_) => STATUS_INTERNAL_ERROR,
+                        },
+                        entity_hash::Hash::zero(),
+                    ),
+                };
+                if !shared.dispatch_hooks.is_empty() {
+                    fire_dispatch_hooks(
+                        &shared,
+                        &crate::DispatchEvent {
+                            target_uri: internal_target_uri,
+                            operation: ctx.operation.clone(),
+                            params_hash: ctx.params.content_hash,
+                            request_id: ctx.request_id.clone(),
+                            timestamp_ms: dispatch_event_timestamp_ms(),
+                            phase: crate::DispatchPhase::Exit {
+                                status: internal_status,
+                                response_hash: internal_response_hash,
+                            },
+                        },
+                    );
+                }
+
+                match &result {
+                    Ok(r) => tracing::debug!(
+                        handler = %log_name,
+                        operation = %operation,
+                        request_id = %request_id,
+                        status = r.status,
+                        result_type = %r.result.entity_type,
+                        "internal dispatch: completed"
+                    ),
+                    Err(e) => tracing::warn!(
+                        handler = %log_name,
+                        operation = %operation,
+                        request_id = %request_id,
+                        error = %e,
+                        "internal dispatch: handler error"
+                    ),
+                }
+                result
+            })
+        },
+    )
 }
 
 /// Extract the params entity from an EXECUTE entity's data (§3.4).
 /// Params is an inline entity map {content_hash, data, type}.
-fn extract_params_entity(
-    execute: &entity_entity::Entity,
-) -> entity_entity::Entity {
-    let default = || {
-        entity_entity::Entity::new("primitive/null", entity_ecf::to_ecf(&entity_ecf::Value::Null))
-            .unwrap_or_else(|_| entity_entity::Entity {
-                entity_type: "primitive/null".to_string(),
-                data: vec![0xf6], // CBOR null
-                content_hash: entity_hash::Hash::zero(),
+/// Answer a §5.1 keepalive ping with a `system/network/pong` (§5.3):
+/// echo the ping's `timestamp`/`sequence`, add the responder's clock as
+/// `server_time`. Malformed params (missing/non-uint fields) get 400 —
+/// a conforming pinger always sends both §5.2 fields.
+fn build_pong_response(envelope: &Envelope, request_id: &str) -> Envelope {
+    let params = extract_params_entity(&envelope.root);
+    let decoded: Option<(u64, u64)> = (|| {
+        let value: ciborium::Value = ciborium::from_reader(params.data.as_slice()).ok()?;
+        let map = value.into_map().ok()?;
+        let field = |key: &str| -> Option<u64> {
+            map.iter().find_map(|(k, v)| match (k, v) {
+                (ciborium::Value::Text(t), ciborium::Value::Integer(i)) if t == key => {
+                    u64::try_from(*i).ok()
+                }
+                _ => None,
             })
+        };
+        Some((field("timestamp")?, field("sequence")?))
+    })();
+    let Some((timestamp, sequence)) = decoded else {
+        return build_error_response(
+            request_id,
+            STATUS_BAD_REQUEST,
+            "invalid_params",
+            "ping params must carry uint timestamp + sequence (§5.2)",
+        )
+        .unwrap_or_else(|_| Envelope::new(envelope.root.clone()));
+    };
+    let server_time = crate::liveness::now_ms();
+    // Alphabetic key order (ECF determinism): sequence, server_time,
+    // timestamp.
+    let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+        (
+            entity_ecf::text("sequence"),
+            entity_ecf::Value::Integer(sequence.into()),
+        ),
+        (
+            entity_ecf::text("server_time"),
+            entity_ecf::Value::Integer(server_time.into()),
+        ),
+        (
+            entity_ecf::text("timestamp"),
+            entity_ecf::Value::Integer(timestamp.into()),
+        ),
+    ]));
+    match entity_entity::Entity::new("system/network/pong", data) {
+        Ok(pong) => build_execute_response(request_id, 200, pong)
+            .unwrap_or_else(|_| Envelope::new(envelope.root.clone())),
+        Err(e) => build_error_response(
+            request_id,
+            500,
+            "internal_error",
+            &format!("pong construction: {}", e),
+        )
+        .unwrap_or_else(|_| Envelope::new(envelope.root.clone())),
+    }
+}
+
+fn extract_params_entity(execute: &entity_entity::Entity) -> entity_entity::Entity {
+    let default = || {
+        entity_entity::Entity::new(
+            "primitive/null",
+            entity_ecf::to_ecf(&entity_ecf::Value::Null),
+        )
+        .unwrap_or_else(|_| entity_entity::Entity {
+            entity_type: "primitive/null".to_string(),
+            data: vec![0xf6], // CBOR null
+            content_hash: entity_hash::Hash::zero(),
+        })
     };
 
     let value: ciborium::Value = match ciborium::from_reader(execute.data.as_slice()) {
@@ -2847,7 +2963,8 @@ fn build_capability_denied_response(
     handler_path: &str,
     message: &str,
 ) -> Envelope {
-    let marker_hash = try_bind_rejected_marker(shared, envelope, request_id, author_hash, handler_path);
+    let marker_hash =
+        try_bind_rejected_marker(shared, envelope, request_id, author_hash, handler_path);
     entity_protocol::build_error_response_with_marker(
         request_id,
         STATUS_FORBIDDEN,
@@ -2887,14 +3004,23 @@ fn try_bind_rejected_marker(
     // §3.10.6 body fields (rejected kind): reason, timestamp, chain_id,
     // step_index, requesting_peer_id, attempted_uri.
     let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-        (entity_ecf::text("attempted_uri"), entity_ecf::text(handler_path)),
+        (
+            entity_ecf::text("attempted_uri"),
+            entity_ecf::text(handler_path),
+        ),
         (entity_ecf::text("chain_id"), entity_ecf::text(&chain_id)),
-        (entity_ecf::text("reason"), entity_ecf::text("capability_denied")),
+        (
+            entity_ecf::text("reason"),
+            entity_ecf::text("capability_denied"),
+        ),
         (
             entity_ecf::text("requesting_peer_id"),
             entity_ecf::text(&requesting_peer_id),
         ),
-        (entity_ecf::text("step_index"), entity_ecf::text(&step_index)),
+        (
+            entity_ecf::text("step_index"),
+            entity_ecf::text(&step_index),
+        ),
         (
             entity_ecf::text("timestamp"),
             entity_ecf::integer(timestamp as i64),
@@ -3156,11 +3282,7 @@ fn decode_policy_grants_at(
 /// surface 6) rather than collapsing to the generic `default_code`
 /// catch-all. `default_code` is used when the error has no registry
 /// entry (e.g., decode failures during hello → `"handshake_failed"`).
-fn handshake_error_envelope(
-    inbound: &Envelope,
-    err: &PeerError,
-    default_code: &str,
-) -> Envelope {
+fn handshake_error_envelope(inbound: &Envelope, err: &PeerError, default_code: &str) -> Envelope {
     let request_id = extract_request_id(inbound).unwrap_or_else(|| "unknown".to_string());
     let (status, code, message) = match err {
         PeerError::Protocol(pe) => (

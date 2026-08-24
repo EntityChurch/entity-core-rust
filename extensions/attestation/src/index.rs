@@ -72,8 +72,16 @@ impl AttestationIndex {
         if inner.by_hash.contains_key(&hash) {
             return;
         }
-        inner.by_attesting.entry(att.attesting).or_default().insert(hash);
-        inner.by_attested.entry(att.attested).or_default().insert(hash);
+        inner
+            .by_attesting
+            .entry(att.attesting)
+            .or_default()
+            .insert(hash);
+        inner
+            .by_attested
+            .entry(att.attested)
+            .or_default()
+            .insert(hash);
         if let Some(kind) = att.kind() {
             inner
                 .by_kind
@@ -216,10 +224,6 @@ impl AttestationIndex {
             self.insert(entry.hash, att);
             loaded += 1;
         }
-        tracing::debug!(
-            local_peer_id,
-            loaded,
-            "AttestationIndex rebuilt from tree"
-        );
+        tracing::debug!(local_peer_id, loaded, "AttestationIndex rebuilt from tree");
     }
 }

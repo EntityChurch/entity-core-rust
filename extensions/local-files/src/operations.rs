@@ -16,16 +16,14 @@ use entity_hash::Hash;
 use entity_types::CONTENT_MIN_CHUNK_SIZE;
 
 use crate::config::{matches_exclude, matches_include, resolve_fs_path};
-use crate::handler::{
-    bad_request, forbidden, not_found, resource_bare_path, LocalFilesHandler,
-};
+use crate::handler::{bad_request, forbidden, not_found, resource_bare_path, LocalFilesHandler};
 use crate::types::{
     DeletedData, DirectoryData, DirectoryEntryData, FileData, WatchRequestData, WatcherConfigData,
     WriteRequestData,
 };
 
 /// v3.6 §3.5 — 1 MiB default per A2 cutover (was 4 MiB in v3.5).
-const DEFAULT_CHUNK_SIZE: usize = 1 * 1024 * 1024;
+const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
 /// L4 streaming-vs-buffered cutoff per DOMAIN-LOCAL-FILES v1.3 §4.3 /
 /// §5.3 (RECOMMENDED 64 MiB). Files above this size use the streaming
 /// chunker / reassembler to keep memory bounded; below, the buffered
@@ -43,7 +41,12 @@ pub(crate) async fn handle_read(h: &LocalFilesHandler, ctx: &HandlerContext) -> 
     };
     let root = match h.find_root_mapping(&tree_path) {
         Some(r) => r,
-        None => return not_found("no_root_mapping", &format!("no root mapping for {tree_path}")),
+        None => {
+            return not_found(
+                "no_root_mapping",
+                &format!("no root mapping for {tree_path}"),
+            )
+        }
     };
     let (fs_path, relative) = match resolve_fs_path(&root, &tree_path) {
         Ok(v) => v,
@@ -57,36 +60,56 @@ pub(crate) async fn handle_read(h: &LocalFilesHandler, ctx: &HandlerContext) -> 
     // stays available; the heavy work runs on a blocking thread."
     let cs = h.content_store.clone();
     let fs_path_for_blocking = fs_path.clone();
-    let blob_and_metadata = tokio::task::spawn_blocking(move || -> Result<(entity_hash::Hash, std::fs::Metadata, u64), (u32, String, String)> {
-        let metadata = match std::fs::symlink_metadata(&fs_path_for_blocking) {
-            Ok(m) => m,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err((404, "file_not_found".into(), format!("file not found: {}", fs_path_for_blocking.display())))
+    let blob_and_metadata = tokio::task::spawn_blocking(
+        move || -> Result<(entity_hash::Hash, std::fs::Metadata, u64), (u32, String, String)> {
+            let metadata = match std::fs::symlink_metadata(&fs_path_for_blocking) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err((
+                        404,
+                        "file_not_found".into(),
+                        format!("file not found: {}", fs_path_for_blocking.display()),
+                    ))
+                }
+                Err(e) => return Err((400, "io_error".into(), format!("stat: {e}"))),
+            };
+            if metadata.is_dir() {
+                return Err((
+                    400,
+                    "use_list_for_directories".into(),
+                    "use list operation for directories".into(),
+                ));
             }
-            Err(e) => return Err((400, "io_error".into(), format!("stat: {e}"))),
-        };
-        if metadata.is_dir() {
-            return Err((400, "use_list_for_directories".into(), "use list operation for directories".into()));
-        }
-        let size = metadata.len();
-        // L4 SHOULD: stream chunks for large files to keep memory bounded.
-        // Cross-impl gate (CONTENT v3.5 §3.6.5): the streaming and
-        // buffered chunkers produce byte-identical chunks (verified by
-        // `fastcdc_stream_produces_byte_identical_chunks_to_buffered`).
-        let blob_hash = if size >= STREAMING_THRESHOLD {
-            let file = std::fs::File::open(&fs_path_for_blocking)
-                .map_err(|e| (400, "io_error".to_string(), format!("open: {e}")))?;
-            let reader = std::io::BufReader::with_capacity(1 << 20, file);
-            create_blob_fastcdc_stream(&cs, reader, DEFAULT_CHUNK_SIZE)
-                .map_err(|e| (400, "internal_error".to_string(), format!("build blob (stream): {e}")))?
-        } else {
-            let raw = std::fs::read(&fs_path_for_blocking)
-                .map_err(|e| (400, "io_error".to_string(), format!("read: {e}")))?;
-            create_blob_fastcdc(&cs, &raw, DEFAULT_CHUNK_SIZE)
-                .map_err(|e| (400, "internal_error".to_string(), format!("build blob: {e}")))?
-        };
-        Ok((blob_hash, metadata, size))
-    })
+            let size = metadata.len();
+            // L4 SHOULD: stream chunks for large files to keep memory bounded.
+            // Cross-impl gate (CONTENT v3.5 §3.6.5): the streaming and
+            // buffered chunkers produce byte-identical chunks (verified by
+            // `fastcdc_stream_produces_byte_identical_chunks_to_buffered`).
+            let blob_hash = if size >= STREAMING_THRESHOLD {
+                let file = std::fs::File::open(&fs_path_for_blocking)
+                    .map_err(|e| (400, "io_error".to_string(), format!("open: {e}")))?;
+                let reader = std::io::BufReader::with_capacity(1 << 20, file);
+                create_blob_fastcdc_stream(&cs, reader, DEFAULT_CHUNK_SIZE).map_err(|e| {
+                    (
+                        400,
+                        "internal_error".to_string(),
+                        format!("build blob (stream): {e}"),
+                    )
+                })?
+            } else {
+                let raw = std::fs::read(&fs_path_for_blocking)
+                    .map_err(|e| (400, "io_error".to_string(), format!("read: {e}")))?;
+                create_blob_fastcdc(&cs, &raw, DEFAULT_CHUNK_SIZE).map_err(|e| {
+                    (
+                        400,
+                        "internal_error".to_string(),
+                        format!("build blob: {e}"),
+                    )
+                })?
+            };
+            Ok((blob_hash, metadata, size))
+        },
+    )
     .await
     .map_err(|e| (500, "join_error".to_string(), format!("blocking task: {e}")));
 
@@ -150,7 +173,12 @@ pub(crate) async fn handle_write(h: &LocalFilesHandler, ctx: &HandlerContext) ->
     };
     let root = match h.find_root_mapping(&tree_path) {
         Some(r) => r,
-        None => return not_found("no_root_mapping", &format!("no root mapping for {tree_path}")),
+        None => {
+            return not_found(
+                "no_root_mapping",
+                &format!("no root mapping for {tree_path}"),
+            )
+        }
     };
     if root.read_only {
         return forbidden("read_only_root", "root mapping is read-only");
@@ -171,8 +199,18 @@ pub(crate) async fn handle_write(h: &LocalFilesHandler, ctx: &HandlerContext) ->
     let has_bytes = params.bytes.is_some();
     let has_content = params.content.is_some();
     match (has_bytes, has_content) {
-        (true, true) => return bad_request("invalid_params", "ambiguous_input: exactly one of bytes / content must be set"),
-        (false, false) => return bad_request("invalid_params", "missing_input: exactly one of bytes / content must be set"),
+        (true, true) => {
+            return bad_request(
+                "invalid_params",
+                "ambiguous_input: exactly one of bytes / content must be set",
+            )
+        }
+        (false, false) => {
+            return bad_request(
+                "invalid_params",
+                "missing_input: exactly one of bytes / content must be set",
+            )
+        }
         _ => {}
     }
 
@@ -187,57 +225,79 @@ pub(crate) async fn handle_write(h: &LocalFilesHandler, ctx: &HandlerContext) ->
     let bytes = params.bytes.clone();
     let content_hash = params.content;
 
-    let result = tokio::task::spawn_blocking(move || -> Result<(entity_hash::Hash, u64), (u32, String, String)> {
-        if let Some(raw) = bytes {
-            // Bytes-mode: caller already materialized the payload in
-            // memory (bounded by transport frame max per spec L1, ~16
-            // MiB default). No streaming benefit on chunker side; the
-            // disk write goes through atomic_write either way.
-            let bh = create_blob_fastcdc(&cs, &raw, DEFAULT_CHUNK_SIZE)
-                .map_err(|e| (400, "internal_error".to_string(), format!("build blob: {e}")))?;
-            write_bytes_to_disk(&fs_path_for_blocking, &raw, create_dirs)
-                .map_err(|e| (400, "io_error".to_string(), e))?;
-            let len = raw.len() as u64;
-            Ok((bh, len))
-        } else {
-            let bh = content_hash.unwrap();
-            if cs.get(&bh).is_none() {
-                return Err((404, "content_not_found".into(), "blob not found in content store".into()));
-            }
-            // Decode total_size from the blob manifest WITHOUT
-            // materializing chunks — pays one blob-decode upfront to
-            // route between streaming and buffered reassembly.
-            let (total_size, _chunk_hashes) =
-                entity_content::blob_chunk_hashes(&cs, &bh)
-                    .map_err(|e| (400, "internal_error".to_string(), format!("decode blob: {e}")))?;
-            // L4: stream reassembly + write for blobs above the
-            // threshold. The streaming reassembler pulls one chunk at
-            // a time and writes through, never materializing the full
-            // payload. Combined with atomic_write_stream (below), the
-            // dedup-mode write path stays bounded at one-chunk-resident
-            // for arbitrarily large files.
-            if total_size >= STREAMING_THRESHOLD {
-                if create_dirs {
-                    if let Some(parent) = fs_path_for_blocking.parent() {
-                        std::fs::create_dir_all(parent)
-                            .map_err(|e| (400, "io_error".to_string(), format!("mkdir: {e}")))?;
-                    }
-                }
-                crate::atomic::atomic_write_stream(&fs_path_for_blocking, |w| {
-                    reassemble_stream(&cs, &bh, w)
-                        .map(|_| ())
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-                })
-                .map_err(|e| (400, "io_error".to_string(), format!("write (stream): {e}")))?;
-            } else {
-                let raw = reassemble(&cs, &bh)
-                    .map_err(|e| (400, "internal_error".to_string(), format!("reassemble: {e}")))?;
+    let result = tokio::task::spawn_blocking(
+        move || -> Result<(entity_hash::Hash, u64), (u32, String, String)> {
+            if let Some(raw) = bytes {
+                // Bytes-mode: caller already materialized the payload in
+                // memory (bounded by transport frame max per spec L1, ~16
+                // MiB default). No streaming benefit on chunker side; the
+                // disk write goes through atomic_write either way.
+                let bh = create_blob_fastcdc(&cs, &raw, DEFAULT_CHUNK_SIZE).map_err(|e| {
+                    (
+                        400,
+                        "internal_error".to_string(),
+                        format!("build blob: {e}"),
+                    )
+                })?;
                 write_bytes_to_disk(&fs_path_for_blocking, &raw, create_dirs)
                     .map_err(|e| (400, "io_error".to_string(), e))?;
+                let len = raw.len() as u64;
+                Ok((bh, len))
+            } else {
+                let bh = content_hash.unwrap();
+                if cs.get(&bh).is_none() {
+                    return Err((
+                        404,
+                        "content_not_found".into(),
+                        "blob not found in content store".into(),
+                    ));
+                }
+                // Decode total_size from the blob manifest WITHOUT
+                // materializing chunks — pays one blob-decode upfront to
+                // route between streaming and buffered reassembly.
+                let (total_size, _chunk_hashes) = entity_content::blob_chunk_hashes(&cs, &bh)
+                    .map_err(|e| {
+                        (
+                            400,
+                            "internal_error".to_string(),
+                            format!("decode blob: {e}"),
+                        )
+                    })?;
+                // L4: stream reassembly + write for blobs above the
+                // threshold. The streaming reassembler pulls one chunk at
+                // a time and writes through, never materializing the full
+                // payload. Combined with atomic_write_stream (below), the
+                // dedup-mode write path stays bounded at one-chunk-resident
+                // for arbitrarily large files.
+                if total_size >= STREAMING_THRESHOLD {
+                    if create_dirs {
+                        if let Some(parent) = fs_path_for_blocking.parent() {
+                            std::fs::create_dir_all(parent).map_err(|e| {
+                                (400, "io_error".to_string(), format!("mkdir: {e}"))
+                            })?;
+                        }
+                    }
+                    crate::atomic::atomic_write_stream(&fs_path_for_blocking, |w| {
+                        reassemble_stream(&cs, &bh, w)
+                            .map(|_| ())
+                            .map_err(|e| std::io::Error::other(e.to_string()))
+                    })
+                    .map_err(|e| (400, "io_error".to_string(), format!("write (stream): {e}")))?;
+                } else {
+                    let raw = reassemble(&cs, &bh).map_err(|e| {
+                        (
+                            400,
+                            "internal_error".to_string(),
+                            format!("reassemble: {e}"),
+                        )
+                    })?;
+                    write_bytes_to_disk(&fs_path_for_blocking, &raw, create_dirs)
+                        .map_err(|e| (400, "io_error".to_string(), e))?;
+                }
+                Ok((bh, total_size))
             }
-            Ok((bh, total_size))
-        }
-    })
+        },
+    )
     .await;
     let (blob_hash, raw_bytes_len) = match result {
         Ok(Ok(v)) => v,
@@ -253,7 +313,10 @@ pub(crate) async fn handle_write(h: &LocalFilesHandler, ctx: &HandlerContext) ->
         Some(m) => (m.len(), file_mtime_ms(m)),
         None => (raw_bytes_len, None),
     };
-    let media_type = params.media_type.clone().or_else(|| guess_media_type(&relative));
+    let media_type = params
+        .media_type
+        .clone()
+        .or_else(|| guess_media_type(&relative));
     let file_data = FileData {
         path: relative,
         size,
@@ -300,7 +363,12 @@ pub(crate) async fn handle_list(h: &LocalFilesHandler, ctx: &HandlerContext) -> 
     }
     let root = match h.find_root_mapping(&tree_path) {
         Some(r) => r,
-        None => return not_found("no_root_mapping", &format!("no root mapping for {tree_path}")),
+        None => {
+            return not_found(
+                "no_root_mapping",
+                &format!("no root mapping for {tree_path}"),
+            )
+        }
     };
     let (fs_path, relative) = match resolve_fs_path(&root, &tree_path) {
         Ok(v) => v,
@@ -313,51 +381,57 @@ pub(crate) async fn handle_list(h: &LocalFilesHandler, ctx: &HandlerContext) -> 
     let tree_path_for_blocking = tree_path.clone();
     let exclude = root.exclude.clone();
     let include = root.include.clone();
-    let listing = tokio::task::spawn_blocking(move || -> Result<Vec<DirectoryEntryData>, (u32, String, String)> {
-        let read_dir = std::fs::read_dir(&fs_path_for_blocking).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                (404, "directory_not_found".to_string(), format!("directory not found: {}", fs_path_for_blocking.display()))
-            } else {
-                (400, "io_error".to_string(), format!("readdir: {e}"))
+    let listing = tokio::task::spawn_blocking(
+        move || -> Result<Vec<DirectoryEntryData>, (u32, String, String)> {
+            let read_dir = std::fs::read_dir(&fs_path_for_blocking).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    (
+                        404,
+                        "directory_not_found".to_string(),
+                        format!("directory not found: {}", fs_path_for_blocking.display()),
+                    )
+                } else {
+                    (400, "io_error".to_string(), format!("readdir: {e}"))
+                }
+            })?;
+            let mut children: Vec<DirectoryEntryData> = Vec::new();
+            for entry in read_dir.flatten() {
+                let name = match entry.file_name().into_string() {
+                    Ok(n) => n,
+                    Err(_) => continue,
+                };
+                if matches_exclude(&name, &exclude) {
+                    continue;
+                }
+                let file_type = match entry.file_type() {
+                    Ok(ft) => ft,
+                    Err(_) => continue,
+                };
+                let is_dir = file_type.is_dir();
+                if !is_dir && !matches_include(&name, &include) {
+                    continue;
+                }
+                let metadata = entry.metadata().ok();
+                let size = metadata.as_ref().filter(|_| !is_dir).map(|m| m.len());
+                let modified_at = metadata.as_ref().and_then(file_mtime_ms);
+                let entry_type = if is_dir {
+                    "directory"
+                } else if file_type.is_symlink() {
+                    "symlink"
+                } else {
+                    "file"
+                };
+                children.push(DirectoryEntryData {
+                    name: name.clone(),
+                    entity_path: format!("{tree_path_for_blocking}{name}"),
+                    entry_type: entry_type.to_string(),
+                    size,
+                    modified_at,
+                });
             }
-        })?;
-        let mut children: Vec<DirectoryEntryData> = Vec::new();
-        for entry in read_dir.flatten() {
-            let name = match entry.file_name().into_string() {
-                Ok(n) => n,
-                Err(_) => continue,
-            };
-            if matches_exclude(&name, &exclude) {
-                continue;
-            }
-            let file_type = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => continue,
-            };
-            let is_dir = file_type.is_dir();
-            if !is_dir && !matches_include(&name, &include) {
-                continue;
-            }
-            let metadata = entry.metadata().ok();
-            let size = metadata.as_ref().filter(|_| !is_dir).map(|m| m.len());
-            let modified_at = metadata.as_ref().and_then(file_mtime_ms);
-            let entry_type = if is_dir {
-                "directory"
-            } else if file_type.is_symlink() {
-                "symlink"
-            } else {
-                "file"
-            };
-            children.push(DirectoryEntryData {
-                name: name.clone(),
-                entity_path: format!("{tree_path_for_blocking}{name}"),
-                entry_type: entry_type.to_string(),
-                size,
-                modified_at,
-            });
-        }
-        Ok(children)
-    })
+            Ok(children)
+        },
+    )
     .await;
     let children = match listing {
         Ok(Ok(c)) => c,
@@ -389,7 +463,12 @@ pub(crate) fn handle_delete(h: &LocalFilesHandler, ctx: &HandlerContext) -> Hand
     };
     let root = match h.find_root_mapping(&tree_path) {
         Some(r) => r,
-        None => return not_found("no_root_mapping", &format!("no root mapping for {tree_path}")),
+        None => {
+            return not_found(
+                "no_root_mapping",
+                &format!("no root mapping for {tree_path}"),
+            )
+        }
     };
     if root.read_only {
         return forbidden("read_only_root", "root mapping is read-only");
@@ -647,4 +726,3 @@ fn build_included(
     }
     Ok(included)
 }
-

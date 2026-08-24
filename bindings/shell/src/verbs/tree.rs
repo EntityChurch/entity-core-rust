@@ -72,20 +72,14 @@ fn parse_args<'a>(args: &'a [&'a str]) -> Result<(Option<&'a str>, Option<usize>
                     return Err(ShellError::usage("tree: --depth requires a number"));
                 }
                 let n: usize = args[i + 1].parse().map_err(|_| {
-                    ShellError::usage(format!(
-                        "tree: --depth: invalid number '{}'",
-                        args[i + 1]
-                    ))
+                    ShellError::usage(format!("tree: --depth: invalid number '{}'", args[i + 1]))
                 })?;
                 depth = Some(n);
                 i += 2;
             }
             arg if !arg.starts_with("--") => {
                 if path.is_some() {
-                    return Err(ShellError::usage(format!(
-                        "tree: unexpected arg '{}'",
-                        arg
-                    )));
+                    return Err(ShellError::usage(format!("tree: unexpected arg '{}'", arg)));
                 }
                 path = Some(arg);
                 i += 1;
@@ -139,11 +133,21 @@ mod tests {
     }
 
     impl PeerBinding for StubBinding {
-        fn peer_id(&self) -> &str { &self.bound }
-        fn primary_peer_id(&self) -> String { self.bound.clone() }
-        fn peer_ids(&self) -> Vec<String> { vec![self.bound.clone()] }
-        fn connected_peers(&self) -> Vec<String> { Vec::new() }
-        fn peer_label(&self, _pid: &str) -> Option<String> { None }
+        fn peer_id(&self) -> &str {
+            &self.bound
+        }
+        fn primary_peer_id(&self) -> String {
+            self.bound.clone()
+        }
+        fn peer_ids(&self) -> Vec<String> {
+            vec![self.bound.clone()]
+        }
+        fn connected_peers(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn peer_label(&self, _pid: &str) -> Option<String> {
+            None
+        }
         fn tree_listing(&self, _pid: &str, prefix: &str) -> Vec<TreeListingEntry> {
             self.listing
                 .iter()
@@ -151,7 +155,9 @@ mod tests {
                 .map(|(_, v)| v.clone())
                 .unwrap_or_default()
         }
-        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> { None }
+        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> {
+            None
+        }
     }
 
     fn entry(path: &str) -> TreeListingEntry {
@@ -166,8 +172,14 @@ mod tests {
         StubBinding {
             bound: "alice".into(),
             listing: vec![
-                ("/alice/".into(), vec![entry("/alice/system"), entry("/alice/app")]),
-                ("/alice/system/".into(), vec![entry("/alice/system/identity")]),
+                (
+                    "/alice/".into(),
+                    vec![entry("/alice/system"), entry("/alice/app")],
+                ),
+                (
+                    "/alice/system/".into(),
+                    vec![entry("/alice/system/identity")],
+                ),
                 ("/alice/app/".into(), vec![entry("/alice/app/foo")]),
             ],
         }

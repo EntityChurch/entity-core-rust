@@ -85,7 +85,10 @@ impl Mode {
             "public" => Ok(Self::Public),
             "per-relationship" => Ok(Self::PerRelationship),
             "embedded" => Ok(Self::Embedded),
-            other => Err(IdentityError::InvalidParam(format!("unknown mode: {}", other))),
+            other => Err(IdentityError::InvalidParam(format!(
+                "unknown mode: {}",
+                other
+            ))),
         }
     }
 }

@@ -25,7 +25,10 @@ pub(crate) fn error(status: u32, code: &str, message: &str) -> HandlerResult {
 /// carrying `included` entities (e.g. the stored store-entry + inner envelope
 /// so a co-located caller can fetch them; content-addressed, so over-inclusion
 /// is free).
-pub(crate) fn ok_result(result: Entity, included: HashMap<entity_hash::Hash, Entity>) -> HandlerResult {
+pub(crate) fn ok_result(
+    result: Entity,
+    included: HashMap<entity_hash::Hash, Entity>,
+) -> HandlerResult {
     HandlerResult {
         status: STATUS_OK,
         result,

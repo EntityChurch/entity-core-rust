@@ -20,12 +20,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use entity_entity::{Entity, TYPE_DELETION_MARKER};
 use entity_handler::{
-    Handler, HandlerContext, HandlerError, HandlerResult,
-    STATUS_BAD_REQUEST, STATUS_CONFLICT, STATUS_FORBIDDEN, STATUS_MULTI_STATUS, STATUS_NOT_FOUND,
-    STATUS_NOT_SUPPORTED,
+    Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST, STATUS_CONFLICT,
+    STATUS_FORBIDDEN, STATUS_MULTI_STATUS, STATUS_NOT_FOUND, STATUS_NOT_SUPPORTED,
 };
 use entity_hash::Hash;
-use entity_store::{CascadeResult, CasError, ContentStore, ExecutionContext, LocationEntry, LocationIndex};
+use entity_store::{
+    CasError, CascadeResult, ContentStore, ExecutionContext, LocationEntry, LocationIndex,
+};
 use thiserror::Error;
 
 /// The tree handler implementing get, put, snapshot, diff, merge, extract.
@@ -142,12 +143,10 @@ impl TreeHandler {
                     .has_children = true;
             } else {
                 // Direct child
-                let info = children
-                    .entry(rel.to_string())
-                    .or_insert(ChildInfo {
-                        hash: None,
-                        has_children: false,
-                    });
+                let info = children.entry(rel.to_string()).or_insert(ChildInfo {
+                    hash: None,
+                    has_children: false,
+                });
                 info.hash = Some(entry.hash);
             }
         }
@@ -183,7 +182,10 @@ impl TreeHandler {
                     None => entity_ecf::Value::Null,
                 };
                 let entry_map = entity_ecf::Value::Map(vec![
-                    (entity_ecf::text("has_children"), entity_ecf::bool_val(info.has_children)),
+                    (
+                        entity_ecf::text("has_children"),
+                        entity_ecf::bool_val(info.has_children),
+                    ),
                     (entity_ecf::text("hash"), hash_val),
                 ]);
                 (entity_ecf::text(name), entry_map)
@@ -200,9 +202,8 @@ impl TreeHandler {
             (entity_ecf::text("path"), entity_ecf::text(prefix)),
         ]));
 
-        let listing_entity =
-            Entity::new(entity_types::TYPE_TREE_LISTING, listing_data)
-                .map_err(|e| HandlerError::Internal(e.to_string()))?;
+        let listing_entity = Entity::new(entity_types::TYPE_TREE_LISTING, listing_data)
+            .map_err(|e| HandlerError::Internal(e.to_string()))?;
         Ok(HandlerResult::ok(listing_entity))
     }
 
@@ -229,7 +230,10 @@ fn decode_params(ctx: &HandlerContext) -> Option<ciborium::Value> {
 
 /// Get a string field from a CBOR map value.
 /// Get a value by key from a CBOR map.
-fn cbor_map_get<'a>(map: &'a [(ciborium::Value, ciborium::Value)], key: &str) -> Option<&'a ciborium::Value> {
+fn cbor_map_get<'a>(
+    map: &'a [(ciborium::Value, ciborium::Value)],
+    key: &str,
+) -> Option<&'a ciborium::Value> {
     map.iter()
         .find(|(k, _)| k.as_text() == Some(key))
         .map(|(_, v)| v)
@@ -279,8 +283,7 @@ fn error_entity(code: &str, message: &str) -> Result<Entity, HandlerError> {
         (entity_ecf::text("code"), entity_ecf::text(code)),
         (entity_ecf::text("message"), entity_ecf::text(message)),
     ]));
-    Entity::new(entity_types::TYPE_ERROR, data)
-        .map_err(|e| HandlerError::Internal(e.to_string()))
+    Entity::new(entity_types::TYPE_ERROR, data).map_err(|e| HandlerError::Internal(e.to_string()))
 }
 
 /// Build a HandlerResult with an error status.
@@ -304,26 +307,38 @@ fn first_illegal_path_byte(path: &str) -> Option<u8> {
 // that have prefix context for correct capability checking.)
 
 fn build_partial_result(cr: CascadeResult) -> HandlerResult {
-    use entity_ecf::{text, bool_val, Value};
-    let halted_entries: Vec<Value> = cr.consumers_halted.iter().map(|h| {
-        Value::Map(vec![
-            (text("name"), text(&h.consumer_name)),
-            (text("error"), Value::Map(vec![
-                (text("code"), text(&h.error_message)),
-                (text("status"), Value::Integer(h.error_code.into())),
-            ])),
-        ])
-    }).collect();
+    use entity_ecf::{bool_val, text, Value};
+    let halted_entries: Vec<Value> = cr
+        .consumers_halted
+        .iter()
+        .map(|h| {
+            Value::Map(vec![
+                (text("name"), text(&h.consumer_name)),
+                (
+                    text("error"),
+                    Value::Map(vec![
+                        (text("code"), text(&h.error_message)),
+                        (text("status"), Value::Integer(h.error_code.into())),
+                    ]),
+                ),
+            ])
+        })
+        .collect();
     let data = entity_ecf::to_ecf(&Value::Map(vec![
         (text("binding_committed"), bool_val(cr.binding_committed)),
-        (text("cascade_depth"), Value::Integer(cr.cascade_depth.into())),
-        (text("consumers_completed"), Value::Array(
-            cr.consumers_completed.iter().map(|s| text(s)).collect(),
-        )),
+        (
+            text("cascade_depth"),
+            Value::Integer(cr.cascade_depth.into()),
+        ),
+        (
+            text("consumers_completed"),
+            Value::Array(cr.consumers_completed.iter().map(text).collect()),
+        ),
         (text("consumers_halted"), Value::Array(halted_entries)),
-        (text("consumers_skipped"), Value::Array(
-            cr.consumers_skipped.iter().map(|s| text(s)).collect(),
-        )),
+        (
+            text("consumers_skipped"),
+            Value::Array(cr.consumers_skipped.iter().map(text).collect()),
+        ),
     ]));
     let entity = Entity::new(entity_types::TYPE_TREE_PARTIAL_RESULT, data)
         .expect("partial-result entity construction cannot fail");
@@ -347,8 +362,7 @@ fn decode_entity_from_cbor(raw: &[u8]) -> Result<Entity, String> {
             Some("data") => {
                 // data is raw CBOR — re-encode it
                 let mut buf = Vec::new();
-                ciborium::into_writer(v, &mut buf)
-                    .map_err(|e| format!("re-encode data: {}", e))?;
+                ciborium::into_writer(v, &mut buf).map_err(|e| format!("re-encode data: {}", e))?;
                 entity_data = Some(buf);
             }
             _ => {}
@@ -439,7 +453,9 @@ impl Handler for TreeHandler {
     }
 
     fn operations(&self) -> &[&str] {
-        &["get", "put", "snapshot", "diff", "merge", "extract", "create", "destroy"]
+        &[
+            "get", "put", "snapshot", "diff", "merge", "extract", "create", "destroy",
+        ]
     }
 }
 
@@ -496,7 +512,9 @@ impl TreeHandler {
             .resource_target
             .as_ref()
             .and_then(|rt| rt.targets.first().cloned())
-            .ok_or_else(|| HandlerError::InvalidParams("resource target path is required".into()))?;
+            .ok_or_else(|| {
+                HandlerError::InvalidParams("resource target path is required".into())
+            })?;
 
         if path.is_empty() {
             return error_result(
@@ -530,27 +548,28 @@ impl TreeHandler {
         });
 
         // Decode optional expected_hash (ENTITY-CORE-PROTOCOL §3.9).
-        let expected_hash = match params.as_ref().and_then(|p| {
-            let map = p.as_map()?;
-            map.iter()
-                .find(|(k, _)| k.as_text() == Some("expected_hash"))
-                .map(|(_, v)| v)
-        }) {
-            None => None,
-            Some(v) if v.is_null() => None,
-            Some(v) => match v.as_bytes() {
-                Some(bytes) => Some(Hash::from_bytes(bytes).map_err(|e| {
-                    HandlerError::InvalidParams(format!("expected_hash: {}", e))
-                })?),
-                None => {
-                    return error_result(
-                        STATUS_BAD_REQUEST,
-                        "invalid_params",
-                        "expected_hash must be bytes",
-                    );
-                }
-            },
-        };
+        let expected_hash =
+            match params.as_ref().and_then(|p| {
+                let map = p.as_map()?;
+                map.iter()
+                    .find(|(k, _)| k.as_text() == Some("expected_hash"))
+                    .map(|(_, v)| v)
+            }) {
+                None => None,
+                Some(v) if v.is_null() => None,
+                Some(v) => match v.as_bytes() {
+                    Some(bytes) => Some(Hash::from_bytes(bytes).map_err(|e| {
+                        HandlerError::InvalidParams(format!("expected_hash: {}", e))
+                    })?),
+                    None => {
+                        return error_result(
+                            STATUS_BAD_REQUEST,
+                            "invalid_params",
+                            "expected_hash must be bytes",
+                        );
+                    }
+                },
+            };
 
         let is_remove = match entity_value {
             None => true,
@@ -594,7 +613,8 @@ impl TreeHandler {
                     .compare_and_remove_with_context(&path, expected, emit_ctx)
                     .map(|(h, c)| (Some(h), c)),
                 None => {
-                    let (removed, cascade) = self.location_index.remove_with_context(&path, emit_ctx);
+                    let (removed, cascade) =
+                        self.location_index.remove_with_context(&path, emit_ctx);
                     Ok((removed, cascade))
                 }
             };
@@ -661,8 +681,11 @@ impl TreeHandler {
                 // only if the path is currently unbound; non-zero retains the
                 // existing compare-and-swap semantics.
                 let cas_result = if expected.is_zero() {
-                    self.location_index
-                        .compare_and_create_with_context(&path, stored_hash, emit_ctx)
+                    self.location_index.compare_and_create_with_context(
+                        &path,
+                        stored_hash,
+                        emit_ctx,
+                    )
                 } else {
                     self.location_index.compare_and_swap_with_context(
                         &path,
@@ -689,7 +712,8 @@ impl TreeHandler {
                     }
                 }
             } else {
-                self.location_index.set_with_context(&path, stored_hash, emit_ctx)
+                self.location_index
+                    .set_with_context(&path, stored_hash, emit_ctx)
             };
 
             if !cascade.is_complete() {
@@ -800,21 +824,18 @@ impl TreeHandler {
         tracing::debug!(prefix = %prefix, root = %root_hash, bindings = bindings.len(), "tree snapshot: built");
 
         // Return {root} per spec (I3 amendment: prefix removed from snapshot)
-        let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-            (
-                entity_ecf::text("root"),
-                entity_ecf::Value::Bytes(root_hash.to_bytes().to_vec()),
-            ),
-        ]));
+        let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+            entity_ecf::text("root"),
+            entity_ecf::Value::Bytes(root_hash.to_bytes().to_vec()),
+        )]));
         let snapshot = Entity::new(entity_types::TYPE_TREE_SNAPSHOT, data)
             .map_err(|e| HandlerError::Internal(e.to_string()))?;
         Ok(HandlerResult::ok(snapshot))
     }
 
     fn handle_diff(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
-        let params = decode_params(ctx).ok_or_else(|| {
-            HandlerError::InvalidParams("params required for diff".into())
-        })?;
+        let params = decode_params(ctx)
+            .ok_or_else(|| HandlerError::InvalidParams("params required for diff".into()))?;
         let params_map = params
             .as_map()
             .ok_or_else(|| HandlerError::InvalidParams("params must be a map".into()))?;
@@ -836,7 +857,13 @@ impl TreeHandler {
             .or_else(|| ctx.included.get(&base_hash).cloned())
         {
             Some(e) => e,
-            None => return error_result(STATUS_NOT_FOUND, "snapshot_not_found", "base snapshot not found"),
+            None => {
+                return error_result(
+                    STATUS_NOT_FOUND,
+                    "snapshot_not_found",
+                    "base snapshot not found",
+                )
+            }
         };
         let target_entity = match self
             .content_store
@@ -844,14 +871,23 @@ impl TreeHandler {
             .or_else(|| ctx.included.get(&target_hash).cloned())
         {
             Some(e) => e,
-            None => return error_result(STATUS_NOT_FOUND, "snapshot_not_found", "target snapshot not found"),
+            None => {
+                return error_result(
+                    STATUS_NOT_FOUND,
+                    "snapshot_not_found",
+                    "target snapshot not found",
+                )
+            }
         };
 
-        let base_bindings = decode_snapshot_bindings_with_store(&base_entity.data, self.content_store.as_ref()).ok_or_else(|| {
-            HandlerError::InvalidParams("failed to decode base snapshot bindings".into())
-        })?;
+        let base_bindings =
+            decode_snapshot_bindings_with_store(&base_entity.data, self.content_store.as_ref())
+                .ok_or_else(|| {
+                    HandlerError::InvalidParams("failed to decode base snapshot bindings".into())
+                })?;
         let target_bindings =
-            decode_snapshot_bindings_with_store(&target_entity.data, self.content_store.as_ref()).ok_or_else(|| {
+            decode_snapshot_bindings_with_store(&target_entity.data, self.content_store.as_ref())
+                .ok_or_else(|| {
                 HandlerError::InvalidParams("failed to decode target snapshot bindings".into())
             })?;
 
@@ -955,9 +991,8 @@ impl TreeHandler {
     }
 
     fn handle_merge(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
-        let params = decode_params(ctx).ok_or_else(|| {
-            HandlerError::InvalidParams("params required for merge".into())
-        })?;
+        let params = decode_params(ctx)
+            .ok_or_else(|| HandlerError::InvalidParams("params required for merge".into()))?;
         let params_map = params
             .as_map()
             .ok_or_else(|| HandlerError::InvalidParams("params must be a map".into()))?;
@@ -970,7 +1005,11 @@ impl TreeHandler {
             let h = Hash::from_bytes(source_bytes)
                 .map_err(|e| HandlerError::InvalidParams(e.to_string()))?;
             // Skip zero hashes — fall through to source_envelope if present.
-            if h.is_zero() { None } else { Some(h) }
+            if h.is_zero() {
+                None
+            } else {
+                Some(h)
+            }
         } else {
             None
         };
@@ -1045,7 +1084,9 @@ impl TreeHandler {
             };
             let root_entity = Entity::new(&root_type, root_data)
                 .map_err(|e| HandlerError::Internal(format!("build root entity: {}", e)))?;
-            let root_hash = self.content_store.put(root_entity)
+            let root_hash = self
+                .content_store
+                .put(root_entity)
                 .map_err(|e| HandlerError::Internal(format!("store root entity: {}", e)))?;
             root_hash
         } else {
@@ -1054,8 +1095,8 @@ impl TreeHandler {
             ));
         };
 
-        let strategy = map_get_text(params_map, "strategy")
-            .unwrap_or_else(|| "no-overwrite".to_string());
+        let strategy =
+            map_get_text(params_map, "strategy").unwrap_or_else(|| "no-overwrite".to_string());
 
         // Validate strategy
         match strategy.as_str() {
@@ -1088,11 +1129,18 @@ impl TreeHandler {
             .or_else(|| ctx.included.get(&source_hash).cloned())
         {
             Some(e) => e,
-            None => return error_result(STATUS_NOT_FOUND, "snapshot_not_found", "source snapshot not found"),
+            None => {
+                return error_result(
+                    STATUS_NOT_FOUND,
+                    "snapshot_not_found",
+                    "source snapshot not found",
+                )
+            }
         };
 
         let source_bindings =
-            decode_snapshot_bindings_with_store(&source_entity.data, self.content_store.as_ref()).ok_or_else(|| {
+            decode_snapshot_bindings_with_store(&source_entity.data, self.content_store.as_ref())
+                .ok_or_else(|| {
                 HandlerError::InvalidParams("failed to decode source snapshot".into())
             })?;
 
@@ -1141,7 +1189,11 @@ impl TreeHandler {
             match existing {
                 None => {
                     if !dry_run {
-                        let _cascade = self.location_index.set_with_context(&target_path, *source_h, merge_emit_ctx.clone());
+                        let _cascade = self.location_index.set_with_context(
+                            &target_path,
+                            *source_h,
+                            merge_emit_ctx.clone(),
+                        );
                     }
                     applied += 1;
                 }
@@ -1152,7 +1204,11 @@ impl TreeHandler {
                     match strategy.as_str() {
                         "source-wins" => {
                             if !dry_run {
-                                let _cascade = self.location_index.set_with_context(&target_path, *source_h, merge_emit_ctx.clone());
+                                let _cascade = self.location_index.set_with_context(
+                                    &target_path,
+                                    *source_h,
+                                    merge_emit_ctx.clone(),
+                                );
                             }
                             conflicts.insert(
                                 target_path,
@@ -1195,10 +1251,7 @@ impl TreeHandler {
                             entity_ecf::text("incoming_hash"),
                             entity_ecf::Value::Bytes(incoming_h.to_bytes().to_vec()),
                         ),
-                        (
-                            entity_ecf::text("resolution"),
-                            entity_ecf::text(resolution),
-                        ),
+                        (entity_ecf::text("resolution"), entity_ecf::text(resolution)),
                     ]),
                 )
             })
@@ -1217,10 +1270,7 @@ impl TreeHandler {
                 entity_ecf::text("skipped"),
                 entity_ecf::integer(skipped as i64),
             ),
-            (
-                entity_ecf::text("strategy"),
-                entity_ecf::text(&strategy),
-            ),
+            (entity_ecf::text("strategy"), entity_ecf::text(&strategy)),
         ]));
 
         let result_entity = Entity::new(entity_types::TYPE_TREE_MERGE_RESULT, result_data)
@@ -1264,8 +1314,15 @@ impl TreeHandler {
         let paths_filter: Option<Vec<String>> = params.as_ref().and_then(|p| {
             let map = p.as_map()?;
             let arr = map_get_array(map, "paths")?;
-            let paths: Vec<String> = arr.iter().filter_map(|v| v.as_text().map(String::from)).collect();
-            if paths.is_empty() { None } else { Some(paths) }
+            let paths: Vec<String> = arr
+                .iter()
+                .filter_map(|v| v.as_text().map(String::from))
+                .collect();
+            if paths.is_empty() {
+                None
+            } else {
+                Some(paths)
+            }
         });
 
         // Collect bindings
@@ -1294,12 +1351,10 @@ impl TreeHandler {
         // Build trie and snapshot entity as root
         let root_hash = trie::build_trie(self.content_store.as_ref(), &bindings)
             .map_err(|e| HandlerError::Internal(format!("trie build: {}", e)))?;
-        let snap_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-            (
-                entity_ecf::text("root"),
-                entity_ecf::Value::Bytes(root_hash.to_bytes().to_vec()),
-            ),
-        ]));
+        let snap_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+            entity_ecf::text("root"),
+            entity_ecf::Value::Bytes(root_hash.to_bytes().to_vec()),
+        )]));
         let snapshot = Entity::new(entity_types::TYPE_TREE_SNAPSHOT, snap_data)
             .map_err(|e| HandlerError::Internal(e.to_string()))?;
 
@@ -1314,10 +1369,7 @@ impl TreeHandler {
                     entity_ecf::text("content_hash"),
                     entity_ecf::Value::Bytes(snapshot.content_hash.to_bytes().to_vec()),
                 ),
-                (
-                    entity_ecf::text("data"),
-                    raw_cbor_value(&snapshot.data),
-                ),
+                (entity_ecf::text("data"), raw_cbor_value(&snapshot.data)),
                 (
                     entity_ecf::text("type"),
                     entity_ecf::text(&snapshot.entity_type),
@@ -1340,10 +1392,7 @@ impl TreeHandler {
                             entity_ecf::text("content_hash"),
                             entity_ecf::Value::Bytes(h.to_bytes().to_vec()),
                         ),
-                        (
-                            entity_ecf::text("data"),
-                            raw_cbor_value(&entity.data),
-                        ),
+                        (entity_ecf::text("data"), raw_cbor_value(&entity.data)),
                         (
                             entity_ecf::text("type"),
                             entity_ecf::text(&entity.entity_type),
@@ -1363,10 +1412,7 @@ impl TreeHandler {
                             entity_ecf::text("content_hash"),
                             entity_ecf::Value::Bytes(hash.to_bytes().to_vec()),
                         ),
-                        (
-                            entity_ecf::text("data"),
-                            raw_cbor_value(&entity.data),
-                        ),
+                        (entity_ecf::text("data"), raw_cbor_value(&entity.data)),
                         (
                             entity_ecf::text("type"),
                             entity_ecf::text(&entity.entity_type),
@@ -1389,10 +1435,7 @@ impl TreeHandler {
                         entity_ecf::text("content_hash"),
                         entity_ecf::Value::Bytes(snapshot.content_hash.to_bytes().to_vec()),
                     ),
-                    (
-                        entity_ecf::text("data"),
-                        raw_cbor_value(&snapshot.data),
-                    ),
+                    (entity_ecf::text("data"), raw_cbor_value(&snapshot.data)),
                     (
                         entity_ecf::text("type"),
                         entity_ecf::text(&snapshot.entity_type),
@@ -1404,17 +1447,15 @@ impl TreeHandler {
         // EXTENSION-TREE §6 + PROPOSAL-CONTINUATION-TRANSFORM-AND-ENVELOPE-AMENDMENTS S3:
         // extract returns `system/envelope` (data bundle), NOT
         // `system/protocol/envelope` (a distinct protocol-message type).
-        let envelope_entity =
-            Entity::new(entity_types::TYPE_ENVELOPE, envelope_data)
-                .map_err(|e| HandlerError::Internal(e.to_string()))?;
+        let envelope_entity = Entity::new(entity_types::TYPE_ENVELOPE, envelope_data)
+            .map_err(|e| HandlerError::Internal(e.to_string()))?;
         Ok(HandlerResult::ok(envelope_entity))
     }
 }
 
 /// Parse raw CBOR bytes back into a ciborium::Value for embedding in ECF output.
 fn raw_cbor_value(data: &[u8]) -> entity_ecf::Value {
-    ciborium::from_reader::<ciborium::Value, _>(data)
-        .unwrap_or(entity_ecf::Value::Null)
+    ciborium::from_reader::<ciborium::Value, _>(data).unwrap_or(entity_ecf::Value::Null)
 }
 
 #[derive(Debug, Error)]
@@ -1431,7 +1472,9 @@ mod tests {
     use entity_store::{MemoryContentStore, MemoryLocationIndex};
 
     fn test_peer_id() -> String {
-        entity_crypto::Keypair::from_seed([42u8; 32]).peer_id().to_string()
+        entity_crypto::Keypair::from_seed([42u8; 32])
+            .peer_id()
+            .to_string()
     }
 
     fn make_tree() -> TreeHandler {
@@ -1462,7 +1505,10 @@ mod tests {
         // Build EXECUTE entity (still needed for ctx.execute)
         let execute_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
             (entity_ecf::text("operation"), entity_ecf::text(operation)),
-            (entity_ecf::text("request_id"), entity_ecf::text("test-req-1")),
+            (
+                entity_ecf::text("request_id"),
+                entity_ecf::text("test-req-1"),
+            ),
             (entity_ecf::text("uri"), entity_ecf::text("system/tree")),
         ]));
         let execute = Entity::new(entity_types::TYPE_EXECUTE, execute_data).unwrap();
@@ -1565,8 +1611,10 @@ mod tests {
     #[test]
     fn test_list() {
         let tree = make_tree();
-        tree.put("system/handler/a", make_entity("test", "a")).unwrap();
-        tree.put("system/handler/b", make_entity("test", "b")).unwrap();
+        tree.put("system/handler/a", make_entity("test", "a"))
+            .unwrap();
+        tree.put("system/handler/b", make_entity("test", "b"))
+            .unwrap();
         tree.put("system/tree", make_entity("test", "c")).unwrap();
 
         let entries = tree.list("system/handler/");
@@ -1604,8 +1652,10 @@ mod tests {
     #[test]
     fn test_listing_basic() {
         let tree = make_tree();
-        tree.put("local/files/a.txt", make_entity("test", "a")).unwrap();
-        tree.put("local/files/b.txt", make_entity("test", "b")).unwrap();
+        tree.put("local/files/a.txt", make_entity("test", "a"))
+            .unwrap();
+        tree.put("local/files/b.txt", make_entity("test", "b"))
+            .unwrap();
 
         let result = tree.handle_listing("local/files/").unwrap();
         assert_eq!(result.status, 200);
@@ -1706,8 +1756,7 @@ mod tests {
 
         // Build an inline entity in params
         let inner = make_entity("test/doc", "my document");
-        let inner_data_val: ciborium::Value =
-            ciborium::from_reader(inner.data.as_slice()).unwrap();
+        let inner_data_val: ciborium::Value = ciborium::from_reader(inner.data.as_slice()).unwrap();
 
         let params = entity_ecf::Value::Map(vec![(
             entity_ecf::text("entity"),
@@ -1723,7 +1772,10 @@ mod tests {
         let ctx = make_handler_context("put", Some(params), Some(vec!["docs/readme".into()]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
-        assert_eq!(result.result.entity_type, entity_types::TYPE_TREE_PUT_RESULT);
+        assert_eq!(
+            result.result.entity_type,
+            entity_types::TYPE_TREE_PUT_RESULT
+        );
 
         // Verify entity was stored
         let stored = tree.get("docs/readme").unwrap();
@@ -1740,13 +1792,12 @@ mod tests {
     #[tokio::test]
     async fn test_handler_put_remove_binding() {
         let tree = make_tree();
-        tree.put("docs/readme", make_entity("test", "data")).unwrap();
+        tree.put("docs/readme", make_entity("test", "data"))
+            .unwrap();
 
         // Put with null entity → remove
-        let params = entity_ecf::Value::Map(vec![(
-            entity_ecf::text("entity"),
-            entity_ecf::Value::Null,
-        )]);
+        let params =
+            entity_ecf::Value::Map(vec![(entity_ecf::text("entity"), entity_ecf::Value::Null)]);
 
         let ctx = make_handler_context("put", Some(params), Some(vec!["docs/readme".into()]));
         let result = tree.handle(&ctx).await.unwrap();
@@ -1764,10 +1815,8 @@ mod tests {
     async fn test_handler_put_remove_not_found() {
         let tree = make_tree();
 
-        let params = entity_ecf::Value::Map(vec![(
-            entity_ecf::text("entity"),
-            entity_ecf::Value::Null,
-        )]);
+        let params =
+            entity_ecf::Value::Map(vec![(entity_ecf::text("entity"), entity_ecf::Value::Null)]);
 
         let ctx = make_handler_context("put", Some(params), Some(vec!["missing/path".into()]));
         let result = tree.handle(&ctx).await.unwrap();
@@ -1793,8 +1842,7 @@ mod tests {
     ) -> entity_ecf::Value {
         let mut fields: Vec<(entity_ecf::Value, entity_ecf::Value)> = Vec::new();
         if let Some(e) = entity {
-            let inner_data_val: ciborium::Value =
-                ciborium::from_reader(e.data.as_slice()).unwrap();
+            let inner_data_val: ciborium::Value = ciborium::from_reader(e.data.as_slice()).unwrap();
             fields.push((
                 entity_ecf::text("entity"),
                 entity_ecf::Value::Map(vec![
@@ -1983,11 +2031,7 @@ mod tests {
         tree.put(&format!("/{}/project/a", pid), make_entity("t", "a"))
             .unwrap();
 
-        let ctx = make_handler_context(
-            "snapshot",
-            None,
-            Some(vec![format!("/{}/project/", pid)]),
-        );
+        let ctx = make_handler_context("snapshot", None, Some(vec![format!("/{}/project/", pid)]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
         let val = decode_cbor(&result.result.data);
@@ -2156,10 +2200,8 @@ mod tests {
         tree.put("b", make_entity("test", "b")).unwrap();
 
         // Empty prefix = full tree
-        let params = entity_ecf::Value::Map(vec![(
-            entity_ecf::text("prefix"),
-            entity_ecf::text(""),
-        )]);
+        let params =
+            entity_ecf::Value::Map(vec![(entity_ecf::text("prefix"), entity_ecf::text(""))]);
         let ctx = make_handler_context("snapshot", Some(params), None);
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
@@ -2277,14 +2319,8 @@ mod tests {
                 entity_ecf::text("source"),
                 entity_ecf::Value::Bytes(snap_hash.to_bytes().to_vec()),
             ),
-            (
-                entity_ecf::text("source_prefix"),
-                entity_ecf::text("src/"),
-            ),
-            (
-                entity_ecf::text("target_prefix"),
-                entity_ecf::text("dest/"),
-            ),
+            (entity_ecf::text("source_prefix"), entity_ecf::text("src/")),
+            (entity_ecf::text("target_prefix"), entity_ecf::text("dest/")),
         ]);
 
         let ctx = make_handler_context("merge", Some(params), None);
@@ -2323,14 +2359,8 @@ mod tests {
                 entity_ecf::text("source"),
                 entity_ecf::Value::Bytes(snap_hash.to_bytes().to_vec()),
             ),
-            (
-                entity_ecf::text("source_prefix"),
-                entity_ecf::text("snap/"),
-            ),
-            (
-                entity_ecf::text("target_prefix"),
-                entity_ecf::text("data/"),
-            ),
+            (entity_ecf::text("source_prefix"), entity_ecf::text("snap/")),
+            (entity_ecf::text("target_prefix"), entity_ecf::text("data/")),
             (
                 entity_ecf::text("strategy"),
                 entity_ecf::text("no-overwrite"),
@@ -2369,14 +2399,8 @@ mod tests {
                 entity_ecf::text("source"),
                 entity_ecf::Value::Bytes(snap_hash.to_bytes().to_vec()),
             ),
-            (
-                entity_ecf::text("source_prefix"),
-                entity_ecf::text("snap/"),
-            ),
-            (
-                entity_ecf::text("target_prefix"),
-                entity_ecf::text("data/"),
-            ),
+            (entity_ecf::text("source_prefix"), entity_ecf::text("snap/")),
+            (entity_ecf::text("target_prefix"), entity_ecf::text("data/")),
             (
                 entity_ecf::text("strategy"),
                 entity_ecf::text("source-wins"),
@@ -2420,14 +2444,8 @@ mod tests {
                 entity_ecf::text("source"),
                 entity_ecf::Value::Bytes(snap_hash.to_bytes().to_vec()),
             ),
-            (
-                entity_ecf::text("source_prefix"),
-                entity_ecf::text("snap/"),
-            ),
-            (
-                entity_ecf::text("target_prefix"),
-                entity_ecf::text("data/"),
-            ),
+            (entity_ecf::text("source_prefix"), entity_ecf::text("snap/")),
+            (entity_ecf::text("target_prefix"), entity_ecf::text("data/")),
             (
                 entity_ecf::text("strategy"),
                 entity_ecf::text("target-wins"),
@@ -2462,18 +2480,9 @@ mod tests {
                 entity_ecf::text("source"),
                 entity_ecf::Value::Bytes(snap_hash.to_bytes().to_vec()),
             ),
-            (
-                entity_ecf::text("source_prefix"),
-                entity_ecf::text("src/"),
-            ),
-            (
-                entity_ecf::text("target_prefix"),
-                entity_ecf::text("dest/"),
-            ),
-            (
-                entity_ecf::text("dry_run"),
-                entity_ecf::bool_val(true),
-            ),
+            (entity_ecf::text("source_prefix"), entity_ecf::text("src/")),
+            (entity_ecf::text("target_prefix"), entity_ecf::text("dest/")),
+            (entity_ecf::text("dry_run"), entity_ecf::bool_val(true)),
         ]);
 
         let ctx = make_handler_context("merge", Some(params), None);
@@ -2519,7 +2528,11 @@ mod tests {
         // (snapshot + root trie node + 2 leaf trie nodes + 2 data entities = 6,
         // or fewer if trie compresses paths)
         let included = cbor_map_get(map, "included").as_map().unwrap();
-        assert!(included.len() >= 3, "expected at least 3 included entities, got {}", included.len());
+        assert!(
+            included.len() >= 3,
+            "expected at least 3 included entities, got {}",
+            included.len()
+        );
     }
 
     #[tokio::test]
@@ -2571,8 +2584,10 @@ mod tests {
         let tree = make_tree();
 
         // Set up initial data
-        tree.put("app/config", make_entity("test", "config-v1")).unwrap();
-        tree.put("app/data", make_entity("test", "data-v1")).unwrap();
+        tree.put("app/config", make_entity("test", "config-v1"))
+            .unwrap();
+        tree.put("app/data", make_entity("test", "data-v1"))
+            .unwrap();
 
         // Snapshot before
         let snap1_ctx = make_handler_context("snapshot", None, Some(vec!["app/".into()]));
@@ -2580,8 +2595,10 @@ mod tests {
         let snap1_hash = tree.content_store.put(snap1.result).unwrap();
 
         // Modify
-        tree.put("app/data", make_entity("test", "data-v2")).unwrap();
-        tree.put("app/new", make_entity("test", "new-entry")).unwrap();
+        tree.put("app/data", make_entity("test", "data-v2"))
+            .unwrap();
+        tree.put("app/new", make_entity("test", "new-entry"))
+            .unwrap();
 
         // Snapshot after
         let snap2_ctx = make_handler_context("snapshot", None, Some(vec!["app/".into()]));
@@ -2618,5 +2635,4 @@ mod tests {
         assert_eq!(extract.status, STATUS_OK);
         assert_eq!(extract.result.entity_type, entity_types::TYPE_ENVELOPE);
     }
-
 }

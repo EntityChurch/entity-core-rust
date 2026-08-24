@@ -15,7 +15,7 @@ use entity_types::SignatureData;
 
 use crate::data::{hex_segment, AttestationData};
 use crate::index::AttestationIndex;
-use crate::{KIND_REVOCATION, DEFAULT_MAX_DEPTH};
+use crate::{DEFAULT_MAX_DEPTH, KIND_REVOCATION};
 
 /// Context for attestation helpers (§4 / §5 `ctx` parameter).
 ///
@@ -75,11 +75,7 @@ pub fn verify_specific_signer(
 /// (1) `included` map (in-flight via envelope, per EXTENSION-IDENTITY §6.2);
 /// (2) tree-resident at the V7 invariant pointer path
 /// `{signer_peer_id}/system/signature/{target_hex}`.
-fn find_signature_for(
-    target: &Hash,
-    signer: &Hash,
-    ctx: &AttestationCtx,
-) -> Option<SignatureData> {
+fn find_signature_for(target: &Hash, signer: &Hash, ctx: &AttestationCtx) -> Option<SignatureData> {
     if let Some(entity) = find_signature_by_signer(ctx.included.values(), target, signer) {
         if let Ok(sig) = SignatureData::from_entity(entity) {
             return Some(sig);
@@ -119,10 +115,7 @@ fn find_signature_for(
 /// Spec contract `resolve_peer(peer_hash, ctx) → peer_entity` is at the
 /// substrate level (EXTENSION-ATTESTATION §4.0). This is a private helper
 /// that fuses entity lookup + pubkey extraction.
-fn resolve_peer(
-    peer_hash: &Hash,
-    content_store: &Arc<dyn ContentStore>,
-) -> Option<[u8; 32]> {
+fn resolve_peer(peer_hash: &Hash, content_store: &Arc<dyn ContentStore>) -> Option<[u8; 32]> {
     let entity = content_store.get(peer_hash)?;
     if entity.entity_type != entity_crypto::TYPE_PEER {
         return None;
@@ -214,8 +207,7 @@ fn has_valid_descendant(att_hash: &Hash, ctx: &AttestationCtx, now: u64) -> bool
             if is_self_valid_basic(&d, now) {
                 let revs = find_revocations_for(&dh, ctx);
                 let revoked = revs.iter().any(|(rh, r)| {
-                    r.attesting == d.attesting
-                        && is_attestation_live(rh, r, ctx, Some(now))
+                    r.attesting == d.attesting && is_attestation_live(rh, r, ctx, Some(now))
                 });
                 if !revoked {
                     return true;
@@ -345,11 +337,7 @@ pub fn find_revocations_for(
     attestation_hash: &Hash,
     ctx: &AttestationCtx,
 ) -> Vec<(Hash, AttestationData)> {
-    find_attestations_targeting(
-        attestation_hash,
-        |a| a.kind() == Some(KIND_REVOCATION),
-        ctx,
-    )
+    find_attestations_targeting(attestation_hash, |a| a.kind() == Some(KIND_REVOCATION), ctx)
 }
 
 /// §5.6a — All attestations whose `supersedes` field equals `predecessor`.

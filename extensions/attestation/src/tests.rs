@@ -342,14 +342,38 @@ fn tv_a3_three_distinct_chains_lowest_content_hash() {
     h.add_peer("bob");
     h.add_peer("carol");
     h.add_peer("target");
-    let (a, _) = h.add_attestation("alice", "target", vec![("kind", "x"), ("salt", "1")], None, None, None);
-    let (b, _) = h.add_attestation("bob", "target", vec![("kind", "x"), ("salt", "2")], None, None, None);
-    let (c, _) = h.add_attestation("carol", "target", vec![("kind", "x"), ("salt", "3")], None, None, None);
+    let (a, _) = h.add_attestation(
+        "alice",
+        "target",
+        vec![("kind", "x"), ("salt", "1")],
+        None,
+        None,
+        None,
+    );
+    let (b, _) = h.add_attestation(
+        "bob",
+        "target",
+        vec![("kind", "x"), ("salt", "2")],
+        None,
+        None,
+        None,
+    );
+    let (c, _) = h.add_attestation(
+        "carol",
+        "target",
+        vec![("kind", "x"), ("salt", "3")],
+        None,
+        None,
+        None,
+    );
     let target = h.peer("target");
     let found = default_find_authorizing(&target, &h.ctx()).unwrap();
-    let mut sorted = vec![a, b, c];
+    let mut sorted = [a, b, c];
     sorted.sort();
-    assert_eq!(found.0, sorted[0], "deterministic tie-break: lowest content_hash");
+    assert_eq!(
+        found.0, sorted[0],
+        "deterministic tie-break: lowest content_hash"
+    );
 }
 
 #[test]
@@ -357,9 +381,22 @@ fn tv_a4_supersedes_chain_returns_live_head() {
     let mut h = Harness::new();
     h.add_peer("alice");
     h.add_peer("bob");
-    let (a, _) = h.add_attestation("alice", "bob", vec![("kind", "x"), ("v", "1")], None, None, None);
-    let (a_prime, _) =
-        h.add_attestation("alice", "bob", vec![("kind", "x"), ("v", "2")], Some(a), None, None);
+    let (a, _) = h.add_attestation(
+        "alice",
+        "bob",
+        vec![("kind", "x"), ("v", "1")],
+        None,
+        None,
+        None,
+    );
+    let (a_prime, _) = h.add_attestation(
+        "alice",
+        "bob",
+        vec![("kind", "x"), ("v", "2")],
+        Some(a),
+        None,
+        None,
+    );
     let (a_pp, _) = h.add_attestation(
         "alice",
         "bob",
@@ -379,7 +416,14 @@ fn tv_a5_two_distinct_chains_lowest_content_hash() {
     h.add_peer("alice");
     h.add_peer("bob");
     h.add_peer("target");
-    let (a, _) = h.add_attestation("alice", "target", vec![("kind", "x"), ("salt", "1")], None, None, None);
+    let (a, _) = h.add_attestation(
+        "alice",
+        "target",
+        vec![("kind", "x"), ("salt", "1")],
+        None,
+        None,
+        None,
+    );
     let (a_prime, _) = h.add_attestation(
         "alice",
         "target",
@@ -388,10 +432,17 @@ fn tv_a5_two_distinct_chains_lowest_content_hash() {
         None,
         None,
     );
-    let (b, _) = h.add_attestation("bob", "target", vec![("kind", "x"), ("salt", "2")], None, None, None);
+    let (b, _) = h.add_attestation(
+        "bob",
+        "target",
+        vec![("kind", "x"), ("salt", "2")],
+        None,
+        None,
+        None,
+    );
     let target = h.peer("target");
     let found = default_find_authorizing(&target, &h.ctx()).unwrap();
-    let mut heads = vec![a_prime, b];
+    let mut heads = [a_prime, b];
     heads.sort();
     assert_eq!(found.0, heads[0]);
 }
@@ -480,8 +531,7 @@ fn tv_a8_helper_explicitly_validates_signature() {
     let mut h = Harness::new();
     h.add_peer("alice");
     h.add_peer("bob");
-    let (a_hash, a_data) =
-        h.add_attestation_unsigned("alice", "bob", vec![("kind", "x")]);
+    let (a_hash, a_data) = h.add_attestation_unsigned("alice", "bob", vec![("kind", "x")]);
     assert!(!verify_attestation_signature(&a_hash, &a_data, &h.ctx()));
 }
 
@@ -528,11 +578,8 @@ fn invariant_i1_hook_populates_index_on_external_tree_put() {
 
     // Fire the hook directly with a synthesized TreeChangeEvent (the
     // dispatcher fires this on every tree mutation in production).
-    let hook = AttestationIndexHook::new(
-        h.index.clone(),
-        h.content_store.clone(),
-        "test".to_string(),
-    );
+    let hook =
+        AttestationIndexHook::new(h.index.clone(), h.content_store.clone(), "test".to_string());
     let event = TreeChangeEvent {
         path: path.clone(),
         hash: att_hash,
@@ -563,17 +610,45 @@ fn tv_a4a_chain_of_three_a2_live_a1_dead_a0_dead() {
     let mut h = Harness::new();
     h.add_peer("alice");
     h.add_peer("bob");
-    let (a0, _) = h.add_attestation("alice", "bob", vec![("kind", "x"), ("v", "0")], None, None, None);
-    let (a1, _) =
-        h.add_attestation("alice", "bob", vec![("kind", "x"), ("v", "1")], Some(a0), None, None);
-    let (a2, _) =
-        h.add_attestation("alice", "bob", vec![("kind", "x"), ("v", "2")], Some(a1), None, None);
+    let (a0, _) = h.add_attestation(
+        "alice",
+        "bob",
+        vec![("kind", "x"), ("v", "0")],
+        None,
+        None,
+        None,
+    );
+    let (a1, _) = h.add_attestation(
+        "alice",
+        "bob",
+        vec![("kind", "x"), ("v", "1")],
+        Some(a0),
+        None,
+        None,
+    );
+    let (a2, _) = h.add_attestation(
+        "alice",
+        "bob",
+        vec![("kind", "x"), ("v", "2")],
+        Some(a1),
+        None,
+        None,
+    );
     let a0_data = h.index.get(&a0).unwrap();
     let a1_data = h.index.get(&a1).unwrap();
     let a2_data = h.index.get(&a2).unwrap();
-    assert!(is_attestation_live(&a2, &a2_data, &h.ctx(), None), "a2 live");
-    assert!(!is_attestation_live(&a1, &a1_data, &h.ctx(), None), "a1 dead (superseded)");
-    assert!(!is_attestation_live(&a0, &a0_data, &h.ctx(), None), "a0 dead (transitive)");
+    assert!(
+        is_attestation_live(&a2, &a2_data, &h.ctx(), None),
+        "a2 live"
+    );
+    assert!(
+        !is_attestation_live(&a1, &a1_data, &h.ctx(), None),
+        "a1 dead (superseded)"
+    );
+    assert!(
+        !is_attestation_live(&a0, &a0_data, &h.ctx(), None),
+        "a0 dead (transitive)"
+    );
 }
 
 #[test]
@@ -583,9 +658,22 @@ fn tv_a4b_a2_expired_a1_revives_to_live() {
     let mut h = Harness::new();
     h.add_peer("alice");
     h.add_peer("bob");
-    let (a0, _) = h.add_attestation("alice", "bob", vec![("kind", "x"), ("v", "0")], None, None, None);
-    let (a1, _) =
-        h.add_attestation("alice", "bob", vec![("kind", "x"), ("v", "1")], Some(a0), None, None);
+    let (a0, _) = h.add_attestation(
+        "alice",
+        "bob",
+        vec![("kind", "x"), ("v", "0")],
+        None,
+        None,
+        None,
+    );
+    let (a1, _) = h.add_attestation(
+        "alice",
+        "bob",
+        vec![("kind", "x"), ("v", "1")],
+        Some(a0),
+        None,
+        None,
+    );
     let (a2, _) = h.add_attestation(
         "alice",
         "bob",
@@ -597,9 +685,18 @@ fn tv_a4b_a2_expired_a1_revives_to_live() {
     let a0_data = h.index.get(&a0).unwrap();
     let a1_data = h.index.get(&a1).unwrap();
     let a2_data = h.index.get(&a2).unwrap();
-    assert!(!is_attestation_live(&a2, &a2_data, &h.ctx(), None), "a2 dead (expired)");
-    assert!(is_attestation_live(&a1, &a1_data, &h.ctx(), None), "a1 live (no live descendant)");
-    assert!(!is_attestation_live(&a0, &a0_data, &h.ctx(), None), "a0 dead (a1 lives between)");
+    assert!(
+        !is_attestation_live(&a2, &a2_data, &h.ctx(), None),
+        "a2 dead (expired)"
+    );
+    assert!(
+        is_attestation_live(&a1, &a1_data, &h.ctx(), None),
+        "a1 live (no live descendant)"
+    );
+    assert!(
+        !is_attestation_live(&a0, &a0_data, &h.ctx(), None),
+        "a0 dead (a1 lives between)"
+    );
 }
 
 #[test]
@@ -608,9 +705,22 @@ fn tv_a4c_a1_revoked_a0_revives() {
     let mut h = Harness::new();
     h.add_peer("alice");
     h.add_peer("bob");
-    let (a0, _) = h.add_attestation("alice", "bob", vec![("kind", "x"), ("v", "0")], None, None, None);
-    let (a1, _) =
-        h.add_attestation("alice", "bob", vec![("kind", "x"), ("v", "1")], Some(a0), None, None);
+    let (a0, _) = h.add_attestation(
+        "alice",
+        "bob",
+        vec![("kind", "x"), ("v", "0")],
+        None,
+        None,
+        None,
+    );
+    let (a1, _) = h.add_attestation(
+        "alice",
+        "bob",
+        vec![("kind", "x"), ("v", "1")],
+        Some(a0),
+        None,
+        None,
+    );
     // Self-revoke a1.
     let alice = h.peer("alice");
     let rev = AttestationData {
@@ -645,8 +755,14 @@ fn tv_a4c_a1_revoked_a0_revives() {
     h.index.insert(rev_hash, rev);
     let a0_data = h.index.get(&a0).unwrap();
     let a1_data = h.index.get(&a1).unwrap();
-    assert!(!is_attestation_live(&a1, &a1_data, &h.ctx(), None), "a1 dead (revoked)");
-    assert!(is_attestation_live(&a0, &a0_data, &h.ctx(), None), "a0 live (revival)");
+    assert!(
+        !is_attestation_live(&a1, &a1_data, &h.ctx(), None),
+        "a1 dead (revoked)"
+    );
+    assert!(
+        is_attestation_live(&a0, &a0_data, &h.ctx(), None),
+        "a0 live (revival)"
+    );
 }
 
 #[test]
@@ -656,11 +772,30 @@ fn tv_a4d_a1_revoked_but_a2_lives_a0_stays_dead() {
     let mut h = Harness::new();
     h.add_peer("alice");
     h.add_peer("bob");
-    let (a0, _) = h.add_attestation("alice", "bob", vec![("kind", "x"), ("v", "0")], None, None, None);
-    let (a1, _) =
-        h.add_attestation("alice", "bob", vec![("kind", "x"), ("v", "1")], Some(a0), None, None);
-    let (a2, _) =
-        h.add_attestation("alice", "bob", vec![("kind", "x"), ("v", "2")], Some(a1), None, None);
+    let (a0, _) = h.add_attestation(
+        "alice",
+        "bob",
+        vec![("kind", "x"), ("v", "0")],
+        None,
+        None,
+        None,
+    );
+    let (a1, _) = h.add_attestation(
+        "alice",
+        "bob",
+        vec![("kind", "x"), ("v", "1")],
+        Some(a0),
+        None,
+        None,
+    );
+    let (a2, _) = h.add_attestation(
+        "alice",
+        "bob",
+        vec![("kind", "x"), ("v", "2")],
+        Some(a1),
+        None,
+        None,
+    );
     // Self-revoke a1.
     let alice = h.peer("alice");
     let rev = AttestationData {
@@ -696,9 +831,18 @@ fn tv_a4d_a1_revoked_but_a2_lives_a0_stays_dead() {
     let a0_data = h.index.get(&a0).unwrap();
     let a1_data = h.index.get(&a1).unwrap();
     let a2_data = h.index.get(&a2).unwrap();
-    assert!(is_attestation_live(&a2, &a2_data, &h.ctx(), None), "a2 live");
-    assert!(!is_attestation_live(&a1, &a1_data, &h.ctx(), None), "a1 dead (revoked)");
-    assert!(!is_attestation_live(&a0, &a0_data, &h.ctx(), None), "a0 dead (a2 transitive)");
+    assert!(
+        is_attestation_live(&a2, &a2_data, &h.ctx(), None),
+        "a2 live"
+    );
+    assert!(
+        !is_attestation_live(&a1, &a1_data, &h.ctx(), None),
+        "a1 dead (revoked)"
+    );
+    assert!(
+        !is_attestation_live(&a0, &a0_data, &h.ctx(), None),
+        "a0 dead (a2 transitive)"
+    );
 }
 
 #[test]
@@ -734,10 +878,20 @@ fn tv_a10_kind_agnostic_default_returns_any() {
     let mut h = Harness::new();
     h.add_peer("alice");
     h.add_peer("bob");
-    let (a, _) = h.add_attestation("alice", "bob", vec![("kind", "reputation")], None, None, None);
+    let (a, _) = h.add_attestation(
+        "alice",
+        "bob",
+        vec![("kind", "reputation")],
+        None,
+        None,
+        None,
+    );
     let bob = h.peer("bob");
     let found = default_find_authorizing(&bob, &h.ctx()).unwrap();
-    assert_eq!(found.0, a, "kind-agnostic default returns reputation-kind att");
+    assert_eq!(
+        found.0, a,
+        "kind-agnostic default returns reputation-kind att"
+    );
 }
 
 #[test]
@@ -767,7 +921,7 @@ fn tv_a11_multi_context_peer_default_picks_lowest_hash() {
     );
     let p = h.peer("p");
     let found = default_find_authorizing(&p, &h.ctx()).unwrap();
-    let mut both = vec![a1, b1];
+    let mut both = [a1, b1];
     both.sort();
     assert_eq!(found.0, both[0]);
 }

@@ -98,8 +98,13 @@ fn decoded_data(data: &[u8]) -> Vec<(Value, Value)> {
 }
 
 fn field<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
-    map.iter()
-        .find_map(|(k, v)| if k.as_text() == Some(key) { Some(v) } else { None })
+    map.iter().find_map(|(k, v)| {
+        if k.as_text() == Some(key) {
+            Some(v)
+        } else {
+            None
+        }
+    })
 }
 
 #[test]
@@ -117,7 +122,10 @@ fn tofu_candidate_omits_peer_id_key() {
         supersedes: None,
     };
     let map = decoded_data(&c.to_entity().unwrap().data);
-    assert!(field(&map, "peer_id").is_none(), "peer_id must be absent, not null");
+    assert!(
+        field(&map, "peer_id").is_none(),
+        "peer_id must be absent, not null"
+    );
     assert!(field(&map, "identity_hint").is_none());
     assert!(field(&map, "supersedes").is_none());
 }
@@ -456,7 +464,9 @@ mod handler_tests {
         let found = browser.scan(None).await.expect("scan");
 
         assert!(
-            found.iter().any(|o| o.peer_id.as_deref() == Some("z6MkLivePeer")),
+            found
+                .iter()
+                .any(|o| o.peer_id.as_deref() == Some("z6MkLivePeer")),
             "browser must discover the announced peer; found: {found:?}"
         );
 

@@ -43,7 +43,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use entity_crypto::{verify_for_key_type, Keypair, KeyType};
+use entity_crypto::{verify_for_key_type, KeyType, Keypair};
 use entity_entity::Entity;
 use entity_hash::Hash;
 use entity_peer::http_live::{ClosureScope, HttpLiveListener};
@@ -294,7 +294,10 @@ async fn v1_publish_manifest_served() {
         data.root_hash.to_bytes().iter().any(|b| *b != 0),
         "published-root.root_hash is non-zero"
     );
-    assert_eq!(data.peer_id, h.peer_id, "manifest peer_id == publisher peer_id");
+    assert_eq!(
+        data.peer_id, h.peer_id,
+        "manifest peer_id == publisher peer_id"
+    );
 }
 
 /// v2 — a consumer with the publisher's pinned identity walks the V7 §5.2
@@ -314,11 +317,7 @@ async fn v2_manifest_signature_verified() {
 
     // Discover the signature at the invariant pointer: TREE_GET → pointer →
     // CONTENT_GET → re-hash → SignatureData.
-    let (s2, ptr_body) = get(
-        &client,
-        &signature_url(&h.base, &h.peer_id, &head, ".bin"),
-    )
-    .await;
+    let (s2, ptr_body) = get(&client, &signature_url(&h.base, &h.peer_id, &head, ".bin")).await;
     assert_eq!(s2, 200, "signature invariant-pointer served (V7 §5.2)");
     let sig_hash = parse_pointer(&ptr_body);
 
@@ -428,7 +427,10 @@ async fn v6_host_bytes_distrust() {
 
     let client = reqwest::Client::new();
     let (status, body) = get(&client, &content_url(&url, &requested)).await;
-    assert_eq!(status, 200, "hostile origin returns 200 with imposter bytes");
+    assert_eq!(
+        status, 200,
+        "hostile origin returns 200 with imposter bytes"
+    );
 
     match fetch_and_rehash(&body, &requested) {
         Ok(_) => panic!("§1.1 gate broken: imposter bytes accepted for blog-entity shape"),

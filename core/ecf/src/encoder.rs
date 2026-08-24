@@ -314,8 +314,8 @@ fn encode_map(output: &mut Vec<u8>, map: &[(Value, Value)]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::{array, bool_val, integer, null, text};
     use crate::cbor_map;
+    use crate::value::{array, bool_val, integer, null, text};
 
     fn to_hex(bytes: &[u8]) -> String {
         bytes
@@ -387,11 +387,8 @@ mod tests {
             "aaa" => integer(4)
         });
         let expected = vec![
-            0xA4,
-            0x61, b'a', 0x02,
-            0x61, b'z', 0x01,
-            0x62, b'b', b'b', 0x03,
-            0x63, b'a', b'a', b'a', 0x04,
+            0xA4, 0x61, b'a', 0x02, 0x61, b'z', 0x01, 0x62, b'b', b'b', 0x03, 0x63, b'a', b'a',
+            b'a', 0x04,
         ];
         assert_eq!(ecf, expected);
     }
@@ -471,9 +468,6 @@ mod tests {
             }
         });
         // A1 = map(1), 65 "outer", A1 = map(1), 65 "inner", 01
-        assert_eq!(
-            to_hex(&ecf),
-            "A1 65 6F 75 74 65 72 A1 65 69 6E 6E 65 72 01"
-        );
+        assert_eq!(to_hex(&ecf), "A1 65 6F 75 74 65 72 A1 65 69 6E 6E 65 72 01");
     }
 }

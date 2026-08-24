@@ -34,6 +34,7 @@ members = [
     "extensions/discovery",
     "extensions/relay",
     "extensions/route",
+    "extensions/network",
     "extensions/durability",
     "extensions/encryption",
     "extensions/conformance",
@@ -90,6 +91,7 @@ default-members = [
     "extensions/discovery",
     "extensions/relay",
     "extensions/route",
+    "extensions/network",
     "extensions/encryption",
     "extensions/conformance",
     "extensions/type-system",
@@ -170,6 +172,7 @@ entity-role = { path = "extensions/role" }
 entity-registry = { path = "extensions/registry" }
 entity-discovery = { path = "extensions/discovery" }
 entity-relay = { path = "extensions/relay" }
+entity-network = { path = "extensions/network" }
 entity-route = { path = "extensions/route" }
 entity-encryption = { path = "extensions/encryption" }
 entity-durability = { path = "extensions/durability" }

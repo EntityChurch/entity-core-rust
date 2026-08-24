@@ -30,10 +30,13 @@ use entity_entity::Entity;
 use entity_hash::Hash;
 use entity_peer::{DispatchEvent, Peer, PeerBuilder, PeerConfig, PeerShared, WireEvent};
 // Re-export tree change types for subscribers.
-pub use entity_store::{TreeChangeEvent, ChangeType, LocationEntry};
+pub use entity_store::{ChangeType, LocationEntry, TreeChangeEvent};
 // Re-export inspectability event types so SDK consumers don't reach
 // into `entity_peer` (GUIDE-INSPECTABILITY v1.2 §2.1).
-pub use entity_peer::{DispatchEvent as InspectDispatchEvent, WireEvent as InspectWireEvent, WireDirection as InspectWireDirection};
+pub use entity_peer::{
+    DispatchEvent as InspectDispatchEvent, WireDirection as InspectWireDirection,
+    WireEvent as InspectWireEvent,
+};
 
 /// Entry from a dispatched tree listing (L1).
 ///
@@ -110,7 +113,11 @@ impl HandlerInfo {
         }
 
         operations.sort();
-        Some(HandlerInfo { pattern, name, operations })
+        Some(HandlerInfo {
+            pattern,
+            name,
+            operations,
+        })
     }
 }
 
@@ -189,15 +196,15 @@ impl TypeInfo {
         }
 
         fields.sort_by(|a, b| a.name.cmp(&b.name));
-        Some(TypeInfo { type_path: name, fields })
+        Some(TypeInfo {
+            type_path: name,
+            fields,
+        })
     }
 }
 
 impl FieldInfo {
-    fn from_spec_map(
-        name: String,
-        spec: &Vec<(ciborium::Value, ciborium::Value)>,
-    ) -> Self {
+    fn from_spec_map(name: String, spec: &Vec<(ciborium::Value, ciborium::Value)>) -> Self {
         let mut type_ref = String::new();
         let mut optional = false;
         let mut array_inner: Option<String> = None;
@@ -249,7 +256,11 @@ impl FieldInfo {
             }
         }
 
-        FieldInfo { name, type_ref, optional }
+        FieldInfo {
+            name,
+            type_ref,
+            optional,
+        }
     }
 }
 
@@ -327,9 +338,8 @@ fn parse_query_result(result: &Entity) -> Result<QueryResults, SdkError> {
                 _ => {}
             }
         }
-        let root = root.ok_or_else(|| {
-            SdkError::HandlerError("envelope: missing `root` field".into())
-        })?;
+        let root =
+            root.ok_or_else(|| SdkError::HandlerError("envelope: missing `root` field".into()))?;
         let root_decoded = decode_inline_entity_data(&root)?;
         (root_decoded, included)
     } else {
@@ -388,7 +398,12 @@ fn parse_query_result(result: &Entity) -> Result<QueryResults, SdkError> {
         }
     }
 
-    Ok(QueryResults { matches, has_more, total, cursor })
+    Ok(QueryResults {
+        matches,
+        has_more,
+        total,
+        cursor,
+    })
 }
 
 fn parse_query_match(
@@ -430,7 +445,12 @@ fn parse_query_match(
 
     let entity = lookup_included_entity(&content_hash, included);
 
-    Some(QueryMatch { path, content_hash, entity_type, entity })
+    Some(QueryMatch {
+        path,
+        content_hash,
+        entity_type,
+        entity,
+    })
 }
 
 fn lookup_included_entity(
@@ -558,7 +578,11 @@ fn parse_history_query_result(result: &Entity) -> Result<HistoryQueryResult, Sdk
     let root_value = if result.entity_type == entity_types::TYPE_ENVELOPE {
         let map = match &value {
             ciborium::Value::Map(m) => m,
-            _ => return Err(SdkError::HandlerError("history envelope: expected map".into())),
+            _ => {
+                return Err(SdkError::HandlerError(
+                    "history envelope: expected map".into(),
+                ))
+            }
         };
         let mut root: Option<ciborium::Value> = None;
         for (k, v) in map {
@@ -569,9 +593,8 @@ fn parse_history_query_result(result: &Entity) -> Result<HistoryQueryResult, Sdk
                 }
             }
         }
-        let root = root.ok_or_else(|| {
-            SdkError::HandlerError("history envelope: missing `root`".into())
-        })?;
+        let root =
+            root.ok_or_else(|| SdkError::HandlerError("history envelope: missing `root`".into()))?;
         decode_inline_entity_data(&root)?
     } else {
         value
@@ -579,7 +602,11 @@ fn parse_history_query_result(result: &Entity) -> Result<HistoryQueryResult, Sdk
 
     let map = match &root_value {
         ciborium::Value::Map(m) => m,
-        _ => return Err(SdkError::HandlerError("history result: expected map".into())),
+        _ => {
+            return Err(SdkError::HandlerError(
+                "history result: expected map".into(),
+            ))
+        }
     };
 
     let mut path = String::new();
@@ -621,7 +648,12 @@ fn parse_history_query_result(result: &Entity) -> Result<HistoryQueryResult, Sdk
         }
     }
 
-    Ok(HistoryQueryResult { path, head, transitions, has_more })
+    Ok(HistoryQueryResult {
+        path,
+        head,
+        transitions,
+        has_more,
+    })
 }
 
 fn parse_history_transition(v: &ciborium::Value) -> Option<HistoryTransition> {
@@ -667,17 +699,20 @@ fn parse_history_transition(v: &ciborium::Value) -> Option<HistoryTransition> {
         }
     }
 
-    Some(HistoryTransition { hash, previous_hash, event, timestamp })
+    Some(HistoryTransition {
+        hash,
+        previous_hash,
+        event,
+        timestamp,
+    })
 }
 
 fn build_history_query_params(
     path: String,
     options: &HistoryQueryOptions,
 ) -> Result<Entity, SdkError> {
-    let mut fields: Vec<(ciborium::Value, ciborium::Value)> = vec![(
-        entity_ecf::text("path"),
-        entity_ecf::text(&path),
-    )];
+    let mut fields: Vec<(ciborium::Value, ciborium::Value)> =
+        vec![(entity_ecf::text("path"), entity_ecf::text(&path))];
     if let Some(n) = options.limit {
         fields.push((entity_ecf::text("limit"), entity_ecf::integer(n as i64)));
     }
@@ -688,7 +723,10 @@ fn build_history_query_params(
         ));
     }
     if let Some(before) = options.before {
-        fields.push((entity_ecf::text("before"), entity_ecf::integer(before as i64)));
+        fields.push((
+            entity_ecf::text("before"),
+            entity_ecf::integer(before as i64),
+        ));
     }
     if let Some(ref events) = options.events {
         let arr: Vec<ciborium::Value> = events.iter().map(|s| entity_ecf::text(s)).collect();
@@ -781,7 +819,9 @@ fn decode_inline_entity_data(v: &ciborium::Value) -> Result<ciborium::Value, Sdk
             }
         }
     }
-    Err(SdkError::HandlerError("inline entity: missing `data`".into()))
+    Err(SdkError::HandlerError(
+        "inline entity: missing `data`".into(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -830,17 +870,41 @@ pub enum SdkError {
     #[error("handler dispatch failed: {0}")]
     HandlerError(String),
     #[error("bad request ({status}{}): {message}", code.as_deref().map(|c| format!(", {}", c)).unwrap_or_default())]
-    BadRequest { status: u32, code: Option<String>, message: String },
+    BadRequest {
+        status: u32,
+        code: Option<String>,
+        message: String,
+    },
     #[error("forbidden ({status}{}): {message}", code.as_deref().map(|c| format!(", {}", c)).unwrap_or_default())]
-    Forbidden { status: u32, code: Option<String>, message: String },
+    Forbidden {
+        status: u32,
+        code: Option<String>,
+        message: String,
+    },
     #[error("not found ({status}{}): {message}", code.as_deref().map(|c| format!(", {}", c)).unwrap_or_default())]
-    NotFound { status: u32, code: Option<String>, message: String },
+    NotFound {
+        status: u32,
+        code: Option<String>,
+        message: String,
+    },
     #[error("conflict ({status}{}): {message}", code.as_deref().map(|c| format!(", {}", c)).unwrap_or_default())]
-    Conflict { status: u32, code: Option<String>, message: String },
+    Conflict {
+        status: u32,
+        code: Option<String>,
+        message: String,
+    },
     #[error("internal error ({status}{}): {message}", code.as_deref().map(|c| format!(", {}", c)).unwrap_or_default())]
-    Internal { status: u32, code: Option<String>, message: String },
+    Internal {
+        status: u32,
+        code: Option<String>,
+        message: String,
+    },
     #[error("not supported ({status}{}): {message}", code.as_deref().map(|c| format!(", {}", c)).unwrap_or_default())]
-    NotSupported { status: u32, code: Option<String>, message: String },
+    NotSupported {
+        status: u32,
+        code: Option<String>,
+        message: String,
+    },
 }
 
 impl SdkError {
@@ -859,14 +923,46 @@ impl SdkError {
         let message = message.into();
         match status {
             0..=399 => None, // Success / redirect — not an error.
-            400 => Some(SdkError::BadRequest { status, code, message }),
-            403 => Some(SdkError::Forbidden { status, code, message }),
-            404 => Some(SdkError::NotFound { status, code, message }),
-            409 => Some(SdkError::Conflict { status, code, message }),
-            429 => Some(SdkError::BadRequest { status, code, message }),
-            500 => Some(SdkError::Internal { status, code, message }),
-            501 => Some(SdkError::NotSupported { status, code, message }),
-            _ => Some(SdkError::Internal { status, code, message }),
+            400 => Some(SdkError::BadRequest {
+                status,
+                code,
+                message,
+            }),
+            403 => Some(SdkError::Forbidden {
+                status,
+                code,
+                message,
+            }),
+            404 => Some(SdkError::NotFound {
+                status,
+                code,
+                message,
+            }),
+            409 => Some(SdkError::Conflict {
+                status,
+                code,
+                message,
+            }),
+            429 => Some(SdkError::BadRequest {
+                status,
+                code,
+                message,
+            }),
+            500 => Some(SdkError::Internal {
+                status,
+                code,
+                message,
+            }),
+            501 => Some(SdkError::NotSupported {
+                status,
+                code,
+                message,
+            }),
+            _ => Some(SdkError::Internal {
+                status,
+                code,
+                message,
+            }),
         }
     }
 
@@ -1080,11 +1176,7 @@ impl PeerContextBuilder {
     /// enforces audit §2's no-retain invariant on `&DispatchEvent`.
     ///
     /// Multiple hooks fire in registration order.
-    pub fn with_dispatch_hook<F>(
-        mut self,
-        name: impl Into<String>,
-        f: F,
-    ) -> Self
+    pub fn with_dispatch_hook<F>(mut self, name: impl Into<String>, f: F) -> Self
     where
         F: Fn(&DispatchEvent) + Send + Sync + 'static,
     {
@@ -1101,11 +1193,7 @@ impl PeerContextBuilder {
     /// material. Hooks retaining `frame_bytes` maintain a cap-token
     /// corpus and MUST be operator-controlled. Production consumers
     /// SHOULD enforce a retention-volume cap-scope axis (audit §4).
-    pub fn with_wire_hook<F>(
-        mut self,
-        name: impl Into<String>,
-        f: F,
-    ) -> Self
+    pub fn with_wire_hook<F>(mut self, name: impl Into<String>, f: F) -> Self
     where
         F: Fn(&WireEvent) + Send + Sync + 'static,
     {
@@ -1120,11 +1208,7 @@ impl PeerContextBuilder {
     /// Fires on every path bind / rebind / unbind, with
     /// `kind ∈ {Created, Modified, Deleted}` and optional
     /// `cascade_depth`. Observer-only — cannot halt cascades.
-    pub fn with_binding_hook<F>(
-        mut self,
-        name: impl Into<String>,
-        f: F,
-    ) -> Self
+    pub fn with_binding_hook<F>(mut self, name: impl Into<String>, f: F) -> Self
     where
         F: Fn(&TreeChangeEvent) + Send + Sync + 'static,
     {
@@ -1687,7 +1771,6 @@ impl Drop for SubscriptionHandle {
 // live in `src/subscription.rs`. `PeerContext::subscribe(pattern, cb)` is
 // implemented there via an additional impl block.
 
-
 // ---------------------------------------------------------------------------
 // ChangeStream — pull-based watch API (SDK-OPERATIONS.md §6.1)
 // ---------------------------------------------------------------------------
@@ -1816,7 +1899,10 @@ pub struct GrantScope {
 impl GrantScope {
     /// A wildcard grant scope that matches everything (development/debug).
     pub fn wildcard() -> Self {
-        let star = ScopeFilter { include: vec!["*".into()], exclude: vec![] };
+        let star = ScopeFilter {
+            include: vec!["*".into()],
+            exclude: vec![],
+        };
         Self {
             handlers: star.clone(),
             operations: star.clone(),
@@ -2081,7 +2167,8 @@ impl EntitySDK {
 
     /// The default (first-created) peer.
     pub fn default_peer(&self) -> &PeerContext {
-        self.peers.get(&self.default_peer_id)
+        self.peers
+            .get(&self.default_peer_id)
             .map(Arc::as_ref)
             .expect("default peer must exist")
     }
@@ -2102,7 +2189,10 @@ impl EntitySDK {
 
     /// Aggregated generation counter across all peers.
     pub fn generation(&self) -> u64 {
-        self.peers.values().map(|ctx| ctx.store().generation()).sum()
+        self.peers
+            .values()
+            .map(|ctx| ctx.store().generation())
+            .sum()
     }
 
     // -- Flat per-peer surface (mirrors WorkerProxy's shape) --
@@ -2323,16 +2413,14 @@ impl EntitySDK {
         entity: Entity,
         expected: Option<Hash>,
     ) -> Result<Hash, SdkError> {
-        self.peer_or_err(peer_id)?.put_cas(path, entity, expected).await
+        self.peer_or_err(peer_id)?
+            .put_cas(path, entity, expected)
+            .await
     }
 
     /// List immediate children under `prefix` on `peer_id`'s tree.
     /// Borrows `&self`.
-    pub async fn list(
-        &self,
-        peer_id: &str,
-        prefix: &str,
-    ) -> Result<Vec<ListingEntry>, SdkError> {
+    pub async fn list(&self, peer_id: &str, prefix: &str) -> Result<Vec<ListingEntry>, SdkError> {
         self.peer_or_err(peer_id)?.list(prefix).await
     }
 
@@ -2720,7 +2808,10 @@ impl PeerContext {
     /// First sink attached / last sink detached are no-ops on the
     /// Direct arm (the demuxer hooks are always installed when routing
     /// is enabled); they're cheap because an empty registry early-returns.
-    pub fn install_inspect_sink<F>(&self, sink: F) -> Result<crate::inspect::InspectSinkHandle, SdkError>
+    pub fn install_inspect_sink<F>(
+        &self,
+        sink: F,
+    ) -> Result<crate::inspect::InspectSinkHandle, SdkError>
     where
         F: Fn(&crate::inspect::InspectFact) + Send + Sync + 'static,
     {
@@ -2803,7 +2894,10 @@ impl PeerContext {
         // Sign the cap's content hash and persist the signature so
         // chain-walk validators (V7 §5.5) can resolve the sibling
         // signature reference.
-        let sig_bytes = self.shared.keypair.sign(&cap_entity.content_hash.to_bytes());
+        let sig_bytes = self
+            .shared
+            .keypair
+            .sign(&cap_entity.content_hash.to_bytes());
         let sig_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
             (entity_ecf::text("algorithm"), entity_ecf::text("ed25519")),
             (
@@ -2982,8 +3076,9 @@ impl PeerContext {
         operation: impl Into<String>,
         params: Entity,
         opts: entity_handler::ExecuteOptions,
-    ) -> impl std::future::Future<Output = Result<entity_handler::HandlerResult, SdkError>> + Send + 'static
-    {
+    ) -> impl std::future::Future<Output = Result<entity_handler::HandlerResult, SdkError>>
+           + Send
+           + 'static {
         let shared = self.shared.clone();
         let owner_cap = self.owner_self_cap.clone();
         let handler = handler.into();
@@ -3058,7 +3153,6 @@ impl entity_handler::Dispatcher for PeerContext {
 }
 
 impl PeerContext {
-
     /// Whether `cap_hash` is operator-class for `target_pattern` per
     /// `GUIDE-CAPABILITIES.md` §10 (v1.2.1 Ruling 1). A capability chain
     /// is operator-class iff (1) it roots at this peer's L0 bootstrap
@@ -3103,11 +3197,20 @@ impl PeerContext {
             ..Default::default()
         };
         let params = empty_params();
-        match self.peer.execute_with_options("system/tree", "get", params, opts).await {
+        match self
+            .peer
+            .execute_with_options("system/tree", "get", params, opts)
+            .await
+        {
             Ok(result) if result.status == 200 => Ok(Some(result.result)),
             Ok(result) if result.status == 404 => Ok(None),
-            Ok(result) => Err(SdkError::from_handler_result(&result, format!("tree get: {}", path))
-                .unwrap_or_else(|| SdkError::TreeError(format!("unexpected status {}", result.status)))),
+            Ok(result) => Err(SdkError::from_handler_result(
+                &result,
+                format!("tree get: {}", path),
+            )
+            .unwrap_or_else(|| {
+                SdkError::TreeError(format!("unexpected status {}", result.status))
+            })),
             Err(e) => Err(SdkError::TreeError(e.to_string())),
         }
     }
@@ -3139,15 +3242,24 @@ impl PeerContext {
             let params = build_put_params(&entity)?;
             let local_identity = shared.identity_hash;
             let execute_fn = entity_peer::connection::make_execute_fn(
-                shared, Some(local_identity), std::collections::HashMap::new(), None, None,
+                shared,
+                Some(local_identity),
+                std::collections::HashMap::new(),
+                None,
+                None,
             );
             match execute_fn("system/tree".into(), "put".into(), params, opts).await {
                 Ok(result) if result.status == 200 => {
                     generation.fetch_add(1, Ordering::Relaxed);
                     parse_content_hash(&result.result)
                 }
-                Ok(result) => Err(SdkError::from_handler_result(&result, format!("tree put: {}", path))
-                    .unwrap_or_else(|| SdkError::TreeError(format!("unexpected status {}", result.status)))),
+                Ok(result) => Err(SdkError::from_handler_result(
+                    &result,
+                    format!("tree put: {}", path),
+                )
+                .unwrap_or_else(|| {
+                    SdkError::TreeError(format!("unexpected status {}", result.status))
+                })),
                 Err(e) => Err(SdkError::TreeError(e.to_string())),
             }
         }
@@ -3173,10 +3285,14 @@ impl PeerContext {
         async move {
             let result = exec.await?;
             if result.status != 200 {
-                return Err(SdkError::from_handler_result(&result, "query")
-                    .unwrap_or_else(|| {
-                        SdkError::HandlerError(format!("query: unexpected status {}", result.status))
-                    }));
+                return Err(
+                    SdkError::from_handler_result(&result, "query").unwrap_or_else(|| {
+                        SdkError::HandlerError(format!(
+                            "query: unexpected status {}",
+                            result.status
+                        ))
+                    }),
+                );
             }
             parse_query_result(&result.result)
         }
@@ -3197,10 +3313,14 @@ impl PeerContext {
         async move {
             let result = exec.await?;
             if result.status != 200 {
-                return Err(SdkError::from_handler_result(&result, "query")
-                    .unwrap_or_else(|| {
-                        SdkError::HandlerError(format!("query: unexpected status {}", result.status))
-                    }));
+                return Err(
+                    SdkError::from_handler_result(&result, "query").unwrap_or_else(|| {
+                        SdkError::HandlerError(format!(
+                            "query: unexpected status {}",
+                            result.status
+                        ))
+                    }),
+                );
             }
             parse_query_result(&result.result)
         }
@@ -3225,10 +3345,14 @@ impl PeerContext {
         async move {
             let result = exec.await?;
             if result.status != 200 {
-                return Err(SdkError::from_handler_result(&result, "count")
-                    .unwrap_or_else(|| {
-                        SdkError::HandlerError(format!("count: unexpected status {}", result.status))
-                    }));
+                return Err(
+                    SdkError::from_handler_result(&result, "count").unwrap_or_else(|| {
+                        SdkError::HandlerError(format!(
+                            "count: unexpected status {}",
+                            result.status
+                        ))
+                    }),
+                );
             }
             parse_count_result(&result.result)
         }
@@ -3249,10 +3373,14 @@ impl PeerContext {
         async move {
             let result = exec.await?;
             if result.status != 200 {
-                return Err(SdkError::from_handler_result(&result, "count")
-                    .unwrap_or_else(|| {
-                        SdkError::HandlerError(format!("count: unexpected status {}", result.status))
-                    }));
+                return Err(
+                    SdkError::from_handler_result(&result, "count").unwrap_or_else(|| {
+                        SdkError::HandlerError(format!(
+                            "count: unexpected status {}",
+                            result.status
+                        ))
+                    }),
+                );
             }
             parse_count_result(&result.result)
         }
@@ -3278,7 +3406,10 @@ impl PeerContext {
             if result.status != 200 {
                 return Err(SdkError::from_handler_result(&result, "history query")
                     .unwrap_or_else(|| {
-                        SdkError::HandlerError(format!("history query: unexpected status {}", result.status))
+                        SdkError::HandlerError(format!(
+                            "history query: unexpected status {}",
+                            result.status
+                        ))
                     }));
             }
             parse_history_query_result(&result.result)
@@ -3300,7 +3431,10 @@ impl PeerContext {
             if result.status != 200 {
                 return Err(SdkError::from_handler_result(&result, "history query")
                     .unwrap_or_else(|| {
-                        SdkError::HandlerError(format!("history query: unexpected status {}", result.status))
+                        SdkError::HandlerError(format!(
+                            "history query: unexpected status {}",
+                            result.status
+                        ))
                     }));
             }
             parse_history_query_result(&result.result)
@@ -3324,10 +3458,16 @@ impl PeerContext {
             if result.status == 200 {
                 Ok(())
             } else {
-                Err(SdkError::from_handler_result(&result, "history rollback")
-                    .unwrap_or_else(|| {
-                        SdkError::HandlerError(format!("history rollback: unexpected status {}", result.status))
-                    }))
+                Err(
+                    SdkError::from_handler_result(&result, "history rollback").unwrap_or_else(
+                        || {
+                            SdkError::HandlerError(format!(
+                                "history rollback: unexpected status {}",
+                                result.status
+                            ))
+                        },
+                    ),
+                )
             }
         }
     }
@@ -3347,10 +3487,16 @@ impl PeerContext {
             if result.status == 200 {
                 Ok(())
             } else {
-                Err(SdkError::from_handler_result(&result, "history rollback")
-                    .unwrap_or_else(|| {
-                        SdkError::HandlerError(format!("history rollback: unexpected status {}", result.status))
-                    }))
+                Err(
+                    SdkError::from_handler_result(&result, "history rollback").unwrap_or_else(
+                        || {
+                            SdkError::HandlerError(format!(
+                                "history rollback: unexpected status {}",
+                                result.status
+                            ))
+                        },
+                    ),
+                )
             }
         }
     }
@@ -3376,15 +3522,24 @@ impl PeerContext {
             let params = build_put_params(&entity)?;
             let local_identity = shared.identity_hash;
             let execute_fn = entity_peer::connection::make_execute_fn(
-                shared, Some(local_identity), std::collections::HashMap::new(), None, None,
+                shared,
+                Some(local_identity),
+                std::collections::HashMap::new(),
+                None,
+                None,
             );
             match execute_fn("system/tree".into(), "put".into(), params, opts).await {
                 Ok(result) if result.status == 200 => {
                     generation.fetch_add(1, Ordering::Relaxed);
                     parse_content_hash(&result.result)
                 }
-                Ok(result) => Err(SdkError::from_handler_result(&result, format!("tree put: {}", path))
-                    .unwrap_or_else(|| SdkError::TreeError(format!("unexpected status {}", result.status)))),
+                Ok(result) => Err(SdkError::from_handler_result(
+                    &result,
+                    format!("tree put: {}", path),
+                )
+                .unwrap_or_else(|| {
+                    SdkError::TreeError(format!("unexpected status {}", result.status))
+                })),
                 Err(e) => Err(SdkError::TreeError(e.to_string())),
             }
         }
@@ -3418,10 +3573,7 @@ impl PeerContext {
             return Err(SdkError::Conflict {
                 status: status::CONFLICT,
                 code: Some("cas_mismatch".into()),
-                message: format!(
-                    "tree put_cas: expected {:?}, found {:?}",
-                    expected, current
-                ),
+                message: format!("tree put_cas: expected {:?}, found {:?}", expected, current),
             });
         }
         self.put(path, entity).await
@@ -3444,10 +3596,19 @@ impl PeerContext {
             ..Default::default()
         };
         let params = empty_params();
-        match self.peer.execute_with_options("system/tree", "get", params, opts).await {
+        match self
+            .peer
+            .execute_with_options("system/tree", "get", params, opts)
+            .await
+        {
             Ok(result) if result.status == 200 => parse_listing_result(&result.result),
-            Ok(result) => Err(SdkError::from_handler_result(&result, format!("tree list: {}", prefix))
-                .unwrap_or_else(|| SdkError::TreeError(format!("unexpected status {}", result.status)))),
+            Ok(result) => Err(SdkError::from_handler_result(
+                &result,
+                format!("tree list: {}", prefix),
+            )
+            .unwrap_or_else(|| {
+                SdkError::TreeError(format!("unexpected status {}", result.status))
+            })),
             Err(e) => Err(SdkError::TreeError(e.to_string())),
         }
     }
@@ -3464,14 +3625,23 @@ impl PeerContext {
             ..Default::default()
         };
         let params = build_remove_params()?;
-        match self.peer.execute_with_options("system/tree", "put", params, opts).await {
+        match self
+            .peer
+            .execute_with_options("system/tree", "put", params, opts)
+            .await
+        {
             Ok(result) if result.status == 200 => {
                 self.generation.fetch_add(1, Ordering::Relaxed);
                 Ok(true)
             }
             Ok(result) if result.status == 404 => Ok(false),
-            Ok(result) => Err(SdkError::from_handler_result(&result, format!("tree remove: {}", path))
-                .unwrap_or_else(|| SdkError::TreeError(format!("unexpected status {}", result.status)))),
+            Ok(result) => Err(SdkError::from_handler_result(
+                &result,
+                format!("tree remove: {}", path),
+            )
+            .unwrap_or_else(|| {
+                SdkError::TreeError(format!("unexpected status {}", result.status))
+            })),
             Err(e) => Err(SdkError::TreeError(e.to_string())),
         }
     }
@@ -3702,7 +3872,6 @@ impl PeerContext {
         types
     }
 
-
     // -- Wake signal --
 
     /// Set the wake function called when tree state changes.
@@ -3728,7 +3897,9 @@ impl PeerContext {
                     Ok(_evt) => {
                         tracing::trace!("event_bridge: tree change, requesting repaint");
                         if let Ok(guard) = wake_fn.lock() {
-                            if let Some(f) = guard.as_ref() { f(); }
+                            if let Some(f) = guard.as_ref() {
+                                f();
+                            }
                         }
                     }
                     Err(e) if e.to_string().contains("closed") => {
@@ -3795,11 +3966,17 @@ impl PeerContext {
                             last_burst_log = now;
                         }
                         if let Ok(guard) = wake_fn.lock() {
-                            if let Some(f) = guard.as_ref() { f(); }
+                            if let Some(f) = guard.as_ref() {
+                                f();
+                            }
                         }
                     }
                     Err(e) if e.to_string().contains("closed") => {
-                        tracing::info!("event_bridge: channel closed after {} events, {} errors", event_count, error_count);
+                        tracing::info!(
+                            "event_bridge: channel closed after {} events, {} errors",
+                            event_count,
+                            error_count
+                        );
                         break;
                     }
                     Err(e) => {
@@ -3811,7 +3988,9 @@ impl PeerContext {
                         );
                         // Yield to prevent busy-loop on WASM's single-threaded runtime.
                         wasm_bindgen_futures::JsFuture::from(js_sys::Promise::new(
-                            &mut |resolve, _| { let _ = resolve.call0(&wasm_bindgen::JsValue::NULL); },
+                            &mut |resolve, _| {
+                                let _ = resolve.call0(&wasm_bindgen::JsValue::NULL);
+                            },
                         ))
                         .await
                         .ok();
@@ -3871,7 +4050,7 @@ impl PeerContext {
             // §6.11(b): receive deliveries the remote pushes back over
             // this connection (we may run no listener it could dial).
             Some(self.shared.clone()),
-            )
+        )
         .await
         .map_err(|e| SdkError::HandlerError(format!("connect_to({addr}): handshake: {e}")))?;
         let remote_pid = remote.remote_peer_id.clone();
@@ -3896,7 +4075,7 @@ impl PeerContext {
             // §6.11(b): receive deliveries the remote pushes back over
             // this connection (we may run no listener it could dial).
             Some(self.shared.clone()),
-            )
+        )
         .await
         .map_err(|e| SdkError::HandlerError(format!("connect_to({addr}): handshake: {e}")))?;
         let remote_pid = remote.remote_peer_id.clone();
@@ -3918,8 +4097,15 @@ impl PeerContext {
     /// let e = ws.get("windows/1/state");   // relative lookup
     /// ```
     pub fn scope(&self, prefix: &str) -> Scope<'_> {
-        let canonical = format!("/{}/{}", self.peer_id_string, prefix.trim_start_matches('/'));
-        Scope { peer_ctx: self, prefix: canonical }
+        let canonical = format!(
+            "/{}/{}",
+            self.peer_id_string,
+            prefix.trim_start_matches('/')
+        );
+        Scope {
+            peer_ctx: self,
+            prefix: canonical,
+        }
     }
 }
 
@@ -4010,7 +4196,11 @@ fn mint_inbox_nonce(peer_id: &str) -> String {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     let n = INBOX_SEND_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let short = if peer_id.len() >= 8 { &peer_id[..8] } else { peer_id };
+    let short = if peer_id.len() >= 8 {
+        &peer_id[..8]
+    } else {
+        peer_id
+    };
     format!("inbox-{}-{}-{}", short, ts, n)
 }
 
@@ -4030,21 +4220,21 @@ fn build_put_params(entity: &Entity) -> Result<Entity, SdkError> {
     let data_value: entity_ecf::Value = ciborium::from_reader(entity.data.as_slice())
         .map_err(|e| SdkError::TreeError(format!("decode entity.data for put: {}", e)))?;
     let entity_cbor = entity_ecf::Value::Map(vec![
-        (entity_ecf::text("type"), entity_ecf::text(&entity.entity_type)),
+        (
+            entity_ecf::text("type"),
+            entity_ecf::text(&entity.entity_type),
+        ),
         (entity_ecf::text("data"), data_value),
     ]);
-    let params_map = entity_ecf::Value::Map(vec![
-        (entity_ecf::text("entity"), entity_cbor),
-    ]);
+    let params_map = entity_ecf::Value::Map(vec![(entity_ecf::text("entity"), entity_cbor)]);
     Entity::new("system/tree/put/params", entity_ecf::to_ecf(&params_map))
         .map_err(|e| SdkError::TreeError(format!("build put params: {}", e)))
 }
 
 /// Build remove params: `{"entity": null}` (null entity signals removal).
 fn build_remove_params() -> Result<Entity, SdkError> {
-    let params_map = entity_ecf::Value::Map(vec![
-        (entity_ecf::text("entity"), entity_ecf::Value::Null),
-    ]);
+    let params_map =
+        entity_ecf::Value::Map(vec![(entity_ecf::text("entity"), entity_ecf::Value::Null)]);
     Entity::new("system/tree/put/params", entity_ecf::to_ecf(&params_map))
         .map_err(|e| SdkError::TreeError(format!("build remove params: {}", e)))
 }
@@ -4067,7 +4257,9 @@ fn parse_content_hash(result: &Entity) -> Result<Hash, SdkError> {
             }
         }
     }
-    Err(SdkError::TreeError("put result missing content_hash".into()))
+    Err(SdkError::TreeError(
+        "put result missing content_hash".into(),
+    ))
 }
 
 /// Parse a tree listing result into ListingEntry items.
@@ -4079,7 +4271,8 @@ fn parse_listing_result(result: &Entity) -> Result<Vec<ListingEntry>, SdkError> 
         _ => return Err(SdkError::TreeError("listing result is not a map".into())),
     };
 
-    let entries_value = map.iter()
+    let entries_value = map
+        .iter()
         .find(|(k, _)| matches!(k, ciborium::Value::Text(s) if s == "entries"))
         .map(|(_, v)| v);
 
@@ -4096,13 +4289,15 @@ fn parse_listing_result(result: &Entity) -> Result<Vec<ListingEntry>, SdkError> 
         };
         let (hash, has_children) = match v {
             ciborium::Value::Map(m) => {
-                let h = m.iter()
+                let h = m
+                    .iter()
                     .find(|(k, _)| matches!(k, ciborium::Value::Text(s) if s == "hash"))
                     .and_then(|(_, v)| match v {
                         ciborium::Value::Bytes(b) => Hash::from_bytes(b).ok(),
                         _ => None,
                     });
-                let hc = m.iter()
+                let hc = m
+                    .iter()
                     .find(|(k, _)| matches!(k, ciborium::Value::Text(s) if s == "has_children"))
                     .and_then(|(_, v)| match v {
                         ciborium::Value::Bool(b) => Some(*b),
@@ -4113,7 +4308,11 @@ fn parse_listing_result(result: &Entity) -> Result<Vec<ListingEntry>, SdkError> 
             }
             _ => (None, false),
         };
-        entries.push(ListingEntry { name, hash, has_children });
+        entries.push(ListingEntry {
+            name,
+            hash,
+            has_children,
+        });
     }
     Ok(entries)
 }
@@ -4197,7 +4396,11 @@ impl<'a> StoreAccess<'a> {
 
     /// Store an entity at an absolute path.
     pub fn put(&self, path: &str, entity: Entity) -> Result<Hash, SdkError> {
-        let hash = self.peer_ctx.peer.tree().put(path, entity)
+        let hash = self
+            .peer_ctx
+            .peer
+            .tree()
+            .put(path, entity)
             .map_err(|e| SdkError::TreeError(e.to_string()))?;
         self.peer_ctx.generation.fetch_add(1, Ordering::Relaxed);
         Ok(hash)
@@ -4288,11 +4491,7 @@ impl<'a> StoreAccess<'a> {
     /// Cross-impl convention: mirrors `OnPrefixChange` in the Go
     /// reference.
     #[allow(dead_code)]
-    pub fn on_prefix_change<F>(
-        &self,
-        prefix: impl Into<String>,
-        callback: F,
-    ) -> SubscriptionHandle
+    pub fn on_prefix_change<F>(&self, prefix: impl Into<String>, callback: F) -> SubscriptionHandle
     where
         F: Fn(&TreeChangeEvent) + Send + Sync + 'static,
     {
@@ -4472,7 +4671,10 @@ impl<'a> StoreAccess<'a> {
             tracing::debug!("watch: no tokio runtime, stream will not deliver events");
         }
 
-        ChangeStream { rx, _cancel: cancelled }
+        ChangeStream {
+            rx,
+            _cancel: cancelled,
+        }
     }
 }
 
@@ -4564,7 +4766,10 @@ mod tests {
             .expect("insert_peer of a fresh peer should succeed");
         assert_eq!(id, expected_id);
         assert!(sdk.peer(&id).is_some(), "registry lookup works");
-        assert!(sdk.peer_metadata(&id).is_some(), "default metadata installed");
+        assert!(
+            sdk.peer_metadata(&id).is_some(),
+            "default metadata installed"
+        );
         assert_eq!(
             sdk.peer_metadata(&id).unwrap().label,
             None,
@@ -4635,10 +4840,7 @@ mod tests {
         let pid = sdk.default_peer_id().to_string();
         let ent = make_entity("test/doc", "body");
         let path = format!("/{pid}/app/state");
-        let _ = sdk
-            .put(&pid, &path, ent)
-            .await
-            .expect("put should succeed");
+        let _ = sdk.put(&pid, &path, ent).await.expect("put should succeed");
 
         assert!(
             dispatch_count.load(O::SeqCst) >= 2,
@@ -4697,15 +4899,21 @@ mod tests {
         let boxed: Vec<Pin<Box<dyn Future<Output = ()> + 'static>>> = vec![
             Box::pin({
                 let f = sdk.put(&pid, "/x", ent.clone());
-                async move { let _ = f.await; }
+                async move {
+                    let _ = f.await;
+                }
             }),
             Box::pin({
                 let f = sdk.query(&pid, expr.clone());
-                async move { let _ = f.await; }
+                async move {
+                    let _ = f.await;
+                }
             }),
             Box::pin({
                 let f = sdk.count(&pid, expr.clone());
-                async move { let _ = f.await; }
+                async move {
+                    let _ = f.await;
+                }
             }),
             Box::pin({
                 let f = sdk.execute(
@@ -4715,15 +4923,21 @@ mod tests {
                     ent.clone(),
                     entity_handler::ExecuteOptions::default(),
                 );
-                async move { let _ = f.await; }
+                async move {
+                    let _ = f.await;
+                }
             }),
             Box::pin({
                 let f = sdk.discover_handlers(&pid);
-                async move { let _ = f.await; }
+                async move {
+                    let _ = f.await;
+                }
             }),
             Box::pin({
                 let f = sdk.path_count(&pid);
-                async move { let _ = f.await; }
+                async move {
+                    let _ = f.await;
+                }
             }),
         ];
         // The futures outlive the borrow used to build them.
@@ -4762,7 +4976,9 @@ mod tests {
     fn tree_list_returns_qualified_paths() {
         let ctx = make_peer_context();
         let path = format!("/{}/docs/readme", ctx.peer_id());
-        ctx.store().put(&path, make_entity("test/t", "hello")).unwrap();
+        ctx.store()
+            .put(&path, make_entity("test/t", "hello"))
+            .unwrap();
         let entries = ctx.store().list(&format!("/{}/docs/", ctx.peer_id()));
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, path);
@@ -4773,7 +4989,10 @@ mod tests {
         let ctx = make_peer_context();
         let prefix = format!("/{}/system/", ctx.peer_id());
         let entries = ctx.store().list(&prefix);
-        assert!(!entries.is_empty(), "should have bootstrapped system entries");
+        assert!(
+            !entries.is_empty(),
+            "should have bootstrapped system entries"
+        );
     }
 
     #[test]
@@ -4861,7 +5080,10 @@ mod tests {
     fn discover_handlers_finds_system_tree() {
         let ctx = make_peer_context();
         let handlers = ctx.discover_handlers();
-        assert!(!handlers.is_empty(), "should discover bootstrapped handlers");
+        assert!(
+            !handlers.is_empty(),
+            "should discover bootstrapped handlers"
+        );
         let tree = handlers.iter().find(|h| h.pattern == "system/tree");
         assert!(tree.is_some(), "system/tree handler should be found");
         let tree = tree.unwrap();
@@ -4874,7 +5096,10 @@ mod tests {
         let ctx = make_peer_context();
         let handlers = ctx.discover_handlers();
         for pair in handlers.windows(2) {
-            assert!(pair[0].pattern <= pair[1].pattern, "handlers should be sorted");
+            assert!(
+                pair[0].pattern <= pair[1].pattern,
+                "handlers should be sorted"
+            );
         }
     }
 
@@ -4882,7 +5107,10 @@ mod tests {
     fn discover_types_finds_bootstrapped() {
         let ctx = make_peer_context();
         let types = ctx.discover_types();
-        assert!(!types.is_empty(), "should discover bootstrapped type definitions");
+        assert!(
+            !types.is_empty(),
+            "should discover bootstrapped type definitions"
+        );
     }
 
     #[test]
@@ -4890,7 +5118,10 @@ mod tests {
         let ctx = make_peer_context();
         let types = ctx.discover_types();
         for pair in types.windows(2) {
-            assert!(pair[0].type_path <= pair[1].type_path, "types should be sorted by type_path");
+            assert!(
+                pair[0].type_path <= pair[1].type_path,
+                "types should be sorted by type_path"
+            );
         }
     }
 
@@ -4904,14 +5135,18 @@ mod tests {
             "system/query/result",
             to_ecf(&Value::Map(vec![
                 (text("has_more"), entity_ecf::bool_val(false)),
-                (text("matches"), Value::Array(vec![Value::Map(vec![
-                    (text("hash"), Value::Bytes(hash_bytes.clone())),
-                    (text("path"), text("/peer/x/foo")),
-                    (text("type"), text("test/foo")),
-                ])])),
+                (
+                    text("matches"),
+                    Value::Array(vec![Value::Map(vec![
+                        (text("hash"), Value::Bytes(hash_bytes.clone())),
+                        (text("path"), text("/peer/x/foo")),
+                        (text("type"), text("test/foo")),
+                    ])]),
+                ),
                 (text("total"), entity_ecf::integer(1)),
             ])),
-        ).unwrap();
+        )
+        .unwrap();
 
         let parsed = parse_query_result(&result_entity).expect("should parse");
         assert!(!parsed.has_more);
@@ -4935,26 +5170,36 @@ mod tests {
         // Build the inner query-result map (root payload of the envelope).
         let result_inner = to_ecf(&Value::Map(vec![
             (text("has_more"), entity_ecf::bool_val(false)),
-            (text("matches"), Value::Array(vec![Value::Map(vec![
-                (text("hash"), Value::Bytes(inner_hash_bytes.clone())),
-                (text("path"), text("/peer/x/foo")),
-                (text("type"), text("test/inner")),
-            ])])),
+            (
+                text("matches"),
+                Value::Array(vec![Value::Map(vec![
+                    (text("hash"), Value::Bytes(inner_hash_bytes.clone())),
+                    (text("path"), text("/peer/x/foo")),
+                    (text("type"), text("test/inner")),
+                ])]),
+            ),
             (text("total"), entity_ecf::integer(1)),
         ]));
 
         // Build the envelope: { root: {type, data}, included: {hash → {type, data}} }.
         let envelope_data = to_ecf(&Value::Map(vec![
-            (text("root"), Value::Map(vec![
-                (text("type"), text("system/query/result")),
-                (text("data"), Value::Bytes(result_inner)),
-            ])),
-            (text("included"), Value::Map(vec![
-                (Value::Bytes(inner_hash_bytes), Value::Map(vec![
-                    (text("type"), text(&inner.entity_type)),
-                    (text("data"), Value::Bytes(inner.data.clone())),
-                ])),
-            ])),
+            (
+                text("root"),
+                Value::Map(vec![
+                    (text("type"), text("system/query/result")),
+                    (text("data"), Value::Bytes(result_inner)),
+                ]),
+            ),
+            (
+                text("included"),
+                Value::Map(vec![(
+                    Value::Bytes(inner_hash_bytes),
+                    Value::Map(vec![
+                        (text("type"), text(&inner.entity_type)),
+                        (text("data"), Value::Bytes(inner.data.clone())),
+                    ]),
+                )]),
+            ),
         ]));
         let envelope = Entity::new("system/envelope", envelope_data).unwrap();
 
@@ -4962,7 +5207,10 @@ mod tests {
         assert_eq!(parsed.matches.len(), 1);
         let m = &parsed.matches[0];
         assert_eq!(m.path, "/peer/x/foo");
-        let included = m.entity.as_ref().expect("envelope: included entity attached");
+        let included = m
+            .entity
+            .as_ref()
+            .expect("envelope: included entity attached");
         assert_eq!(included.entity_type, "test/inner");
         assert_eq!(included.data, inner.data);
     }
@@ -5082,7 +5330,9 @@ mod tests {
                 .sqlite(&db_path)
                 .build()
                 .expect("first-session sqlite build");
-            ctx.store().put(&target, make_entity("test/v", "hello")).unwrap();
+            ctx.store()
+                .put(&target, make_entity("test/v", "hello"))
+                .unwrap();
         }
 
         let kp2 = Keypair::from_seed(seed);
@@ -5091,7 +5341,10 @@ mod tests {
             .sqlite(&db_path)
             .build()
             .expect("second-session sqlite build");
-        let restored = ctx2.store().get(&target).expect("entity should persist across restarts");
+        let restored = ctx2
+            .store()
+            .get(&target)
+            .expect("entity should persist across restarts");
         assert_eq!(restored.entity_type, "test/v");
     }
 
@@ -5117,7 +5370,10 @@ mod tests {
     #[test]
     fn inbox_list_empty_on_fresh_peer() {
         let ctx = make_peer_context();
-        assert!(ctx.inbox_list().is_empty(), "fresh peer's inbox should be empty");
+        assert!(
+            ctx.inbox_list().is_empty(),
+            "fresh peer's inbox should be empty"
+        );
     }
 
     #[test]
@@ -5125,7 +5381,9 @@ mod tests {
         let ctx = make_peer_context();
         let pid = ctx.peer_id().to_string();
         let path = format!("/{}/system/inbox/test-delivery", pid);
-        ctx.store().put(&path, make_entity("test/delivery", "payload")).unwrap();
+        ctx.store()
+            .put(&path, make_entity("test/delivery", "payload"))
+            .unwrap();
 
         let entries = ctx.inbox_list();
         assert_eq!(entries.len(), 1);
@@ -5184,9 +5442,13 @@ mod tests {
         let ctx = make_peer_context();
         let pid = ctx.peer_id().to_string();
         let path = format!("/{}/system/inbox/sub-1/event-42", pid);
-        ctx.store().put(&path, make_entity("test/delivery", "hello")).unwrap();
+        ctx.store()
+            .put(&path, make_entity("test/delivery", "hello"))
+            .unwrap();
 
-        let got = ctx.inbox_get("sub-1/event-42").expect("delivery should be found");
+        let got = ctx
+            .inbox_get("sub-1/event-42")
+            .expect("delivery should be found");
         assert_eq!(got.entity_type, "test/delivery");
 
         // Leading-slash form also resolves correctly.
@@ -5246,7 +5508,10 @@ mod tests {
 
         // Reads from MY store with the universal foreign path (resolver §2 fix).
         assert!(
-            ctx.get(&manifest_path).await.expect("get manifest").is_some(),
+            ctx.get(&manifest_path)
+                .await
+                .expect("get manifest")
+                .is_some(),
             "cached foreign manifest must read back from my store"
         );
         assert!(
@@ -5269,7 +5534,10 @@ mod tests {
         ctx.put(&path, make_entity("test/v", "v1")).await.unwrap();
         ctx.put(&path, make_entity("test/v", "v2")).await.unwrap();
 
-        let result = ctx.history_query(&path, HistoryQueryOptions::default()).await.expect("history query should succeed");
+        let result = ctx
+            .history_query(&path, HistoryQueryOptions::default())
+            .await
+            .expect("history query should succeed");
         assert_eq!(result.path, path);
         assert!(
             result.transitions.len() >= 2,
@@ -5278,11 +5546,16 @@ mod tests {
         );
         assert!(result.head.is_some(), "head should be set after writes");
         assert!(
-            result.transitions
+            result
+                .transitions
                 .iter()
                 .any(|t| matches!(t.event.as_str(), "created" | "updated")),
             "transitions should include at least one create/update event, got: {:?}",
-            result.transitions.iter().map(|t| t.event.as_str()).collect::<Vec<_>>()
+            result
+                .transitions
+                .iter()
+                .map(|t| t.event.as_str())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -5326,9 +5599,15 @@ mod tests {
             )
             .await
             .expect("filtered query");
-        assert!(!filtered.transitions.is_empty(), "expected ≥1 deleted transition");
+        assert!(
+            !filtered.transitions.is_empty(),
+            "expected ≥1 deleted transition"
+        );
         for t in &filtered.transitions {
-            assert_eq!(t.event, "deleted", "events filter must drop non-matching transitions");
+            assert_eq!(
+                t.event, "deleted",
+                "events filter must drop non-matching transitions"
+            );
         }
     }
 
@@ -5341,7 +5620,9 @@ mod tests {
 
         seed_history_config(&ctx, &format!("/{}/app/test/*", pid));
 
-        ctx.put(&path, make_entity("test/v", "early")).await.unwrap();
+        ctx.put(&path, make_entity("test/v", "early"))
+            .await
+            .unwrap();
         // Capture a timestamp between the two writes.
         let cutoff_ms = web_time::SystemTime::now()
             .duration_since(web_time::UNIX_EPOCH)
@@ -5467,7 +5748,10 @@ mod tests {
         let pid = ctx.peer_id().to_string();
         let path = format!("/{}/app/test/never-written", pid);
 
-        let result = ctx.history_query(&path, HistoryQueryOptions::default()).await.expect("history query should succeed");
+        let result = ctx
+            .history_query(&path, HistoryQueryOptions::default())
+            .await
+            .expect("history query should succeed");
         assert!(result.transitions.is_empty());
         assert!(result.head.is_none());
         assert!(!result.has_more);
@@ -5492,7 +5776,10 @@ mod tests {
             .await
             .expect("rollback should succeed");
 
-        let restored = ctx.store().get(&path).expect("path should still resolve after rollback");
+        let restored = ctx
+            .store()
+            .get(&path)
+            .expect("path should still resolve after rollback");
         assert_eq!(restored.content_hash, v1_hash);
     }
 
@@ -5518,20 +5805,28 @@ mod tests {
         let pid = ctx.peer_id().to_string();
 
         for i in 0..3 {
-            ctx.store().put(
-                &format!("/{}/app/test/article-{}", pid, i),
-                Entity::new("test/article", to_ecf(&text("body"))).unwrap(),
-            ).unwrap();
+            ctx.store()
+                .put(
+                    &format!("/{}/app/test/article-{}", pid, i),
+                    Entity::new("test/article", to_ecf(&text("body"))).unwrap(),
+                )
+                .unwrap();
         }
-        ctx.store().put(
-            &format!("/{}/app/test/note-1", pid),
-            Entity::new("test/note", to_ecf(&text("note"))).unwrap(),
-        ).unwrap();
+        ctx.store()
+            .put(
+                &format!("/{}/app/test/note-1", pid),
+                Entity::new("test/note", to_ecf(&text("note"))).unwrap(),
+            )
+            .unwrap();
 
         let expr = Entity::new(
             "system/query/expression",
-            to_ecf(&Value::Map(vec![(text("type_filter"), text("test/article"))])),
-        ).unwrap();
+            to_ecf(&Value::Map(vec![(
+                text("type_filter"),
+                text("test/article"),
+            )])),
+        )
+        .unwrap();
         let n = ctx.count(expr).await.expect("count should succeed");
         assert_eq!(n, 3);
     }
@@ -5546,22 +5841,40 @@ mod tests {
         let pid = ctx.peer_id().to_string();
 
         let target = format!("/{}/app/test/article-1", pid);
-        ctx.store().put(&target, Entity::new("test/article", to_ecf(&text("hi"))).unwrap()).unwrap();
-        ctx.store().put(
-            &format!("/{}/app/test/note-1", pid),
-            Entity::new("test/note", to_ecf(&text("hello"))).unwrap(),
-        ).unwrap();
+        ctx.store()
+            .put(
+                &target,
+                Entity::new("test/article", to_ecf(&text("hi"))).unwrap(),
+            )
+            .unwrap();
+        ctx.store()
+            .put(
+                &format!("/{}/app/test/note-1", pid),
+                Entity::new("test/note", to_ecf(&text("hello"))).unwrap(),
+            )
+            .unwrap();
 
         let expr = Entity::new(
             "system/query/expression",
-            to_ecf(&Value::Map(vec![(text("type_filter"), text("test/article"))])),
-        ).unwrap();
+            to_ecf(&Value::Map(vec![(
+                text("type_filter"),
+                text("test/article"),
+            )])),
+        )
+        .unwrap();
 
         let results = ctx.query(expr).await.expect("query should succeed");
         assert!(
-            results.matches.iter().any(|m| m.path == target && m.entity_type == "test/article"),
+            results
+                .matches
+                .iter()
+                .any(|m| m.path == target && m.entity_type == "test/article"),
             "query should find seeded test/article entity, got: {:?}",
-            results.matches.iter().map(|m| (m.path.as_str(), m.entity_type.as_str())).collect::<Vec<_>>()
+            results
+                .matches
+                .iter()
+                .map(|m| (m.path.as_str(), m.entity_type.as_str()))
+                .collect::<Vec<_>>()
         );
         assert!(
             !results.matches.iter().any(|m| m.entity_type == "test/note"),
@@ -5577,7 +5890,9 @@ mod tests {
         let types = ctx.discover_types();
         let names: Vec<&str> = types.iter().map(|t| t.type_path.as_str()).collect();
         assert!(
-            names.iter().any(|n| *n == "system/handler" || *n == "system/type"),
+            names
+                .iter()
+                .any(|n| *n == "system/handler" || *n == "system/type"),
             "expected core type definitions in discover_types output, got {:?}",
             names
         );
@@ -5611,9 +5926,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn connect_to_populates_persistent_remote_pool() {
-        use entity_peer::transport::{
-            MemoryConnector, MemoryListener, MemoryTransportRegistry,
-        };
+        use entity_peer::transport::{MemoryConnector, MemoryListener, MemoryTransportRegistry};
         use std::sync::Arc;
 
         let reg = MemoryTransportRegistry::new();
@@ -5633,8 +5946,8 @@ mod tests {
             .build()
             .expect("ctx_b build");
         let b_pid = ctx_b.peer_id().to_string();
-        let listener = MemoryListener::bind(b_pid.clone(), reg.clone())
-            .expect("bind MemoryListener");
+        let listener =
+            MemoryListener::bind(b_pid.clone(), reg.clone()).expect("bind MemoryListener");
 
         // Spawn B's accept loop (multi_thread flavor → tokio::spawn).
         // Drop the JoinHandle at test end to abort cleanly.
@@ -5725,9 +6038,16 @@ mod tests {
         let peer2_id = sdk.create_peer(kp, PeerConfig::default(), None).unwrap();
 
         assert_eq!(sdk.generation(), 0);
-        sdk.default_peer().store().put("/{}/test/a", make_entity("t", "1")).ok();
+        sdk.default_peer()
+            .store()
+            .put("/{}/test/a", make_entity("t", "1"))
+            .ok();
         assert_eq!(sdk.generation(), 1);
-        sdk.peer(&peer2_id).unwrap().store().put("/{}/test/b", make_entity("t", "2")).ok();
+        sdk.peer(&peer2_id)
+            .unwrap()
+            .store()
+            .put("/{}/test/b", make_entity("t", "2"))
+            .ok();
         assert_eq!(sdk.generation(), 2);
     }
 
@@ -5740,11 +6060,14 @@ mod tests {
         assert_eq!(sdk.peer_ids().len(), 1);
 
         let backend_pid = "2KBackendPeerFakeId12345".to_string();
-        let ok = sdk.register_backend_peer(backend_pid.clone(), PeerMetadata {
-            label: Some("test-backend".into()),
-            listen_addresses: vec!["ws://127.0.0.1:4042".into()],
-            ..PeerMetadata::default()
-        });
+        let ok = sdk.register_backend_peer(
+            backend_pid.clone(),
+            PeerMetadata {
+                label: Some("test-backend".into()),
+                listen_addresses: vec!["ws://127.0.0.1:4042".into()],
+                ..PeerMetadata::default()
+            },
+        );
         assert!(ok);
         assert_eq!(sdk.peer_ids().len(), 2);
         assert!(sdk.peer_ids().contains(&backend_pid.as_str()));
@@ -5801,7 +6124,9 @@ mod tests {
         );
 
         sdk.set_peer_label(&backend_pid, Some("backend-renamed".into()));
-        let meta = sdk.peer_metadata(&backend_pid).expect("backend metadata present");
+        let meta = sdk
+            .peer_metadata(&backend_pid)
+            .expect("backend metadata present");
         assert_eq!(meta.label.as_deref(), Some("backend-renamed"));
         assert_eq!(
             meta.listen_addresses,
@@ -5847,11 +6172,14 @@ mod tests {
     fn backend_peer_metadata_accessible() {
         let mut sdk = make_sdk();
         let backend_pid = "2KBackendMeta123".to_string();
-        sdk.register_backend_peer(backend_pid.clone(), PeerMetadata {
-            label: Some("my-backend".into()),
-            listen_addresses: vec!["ws://127.0.0.1:9999".into(), "tcp://0.0.0.0:4040".into()],
-            ..PeerMetadata::default()
-        });
+        sdk.register_backend_peer(
+            backend_pid.clone(),
+            PeerMetadata {
+                label: Some("my-backend".into()),
+                listen_addresses: vec!["ws://127.0.0.1:9999".into(), "tcp://0.0.0.0:4040".into()],
+                ..PeerMetadata::default()
+            },
+        );
 
         let meta = sdk.peer_metadata(&backend_pid).unwrap();
         assert_eq!(meta.label.as_deref(), Some("my-backend"));
@@ -5919,7 +6247,9 @@ mod tests {
         let pid = ctx.peer_id().to_string();
         let store = ctx.store();
         assert_eq!(ctx.store().generation(), 0);
-        store.put(&format!("/{}/test/gen", pid), make_entity("t", "1")).unwrap();
+        store
+            .put(&format!("/{}/test/gen", pid), make_entity("t", "1"))
+            .unwrap();
         assert_eq!(ctx.store().generation(), 1);
     }
 
@@ -5929,7 +6259,9 @@ mod tests {
         let pid = ctx.peer_id().to_string();
         let store = ctx.store();
         let entity = make_entity("app/state/test", "payload");
-        let hash = store.put(&format!("/{}/test/by_hash", pid), entity.clone()).unwrap();
+        let hash = store
+            .put(&format!("/{}/test/by_hash", pid), entity.clone())
+            .unwrap();
         let looked_up = store.get_by_hash(&hash).expect("entity resolvable by hash");
         assert_eq!(looked_up.entity_type, entity.entity_type);
         assert_eq!(looked_up.data, entity.data);
@@ -5966,7 +6298,10 @@ mod tests {
         let ctx = make_peer_context();
         let pid = ctx.peer_id().to_string();
         let scope = ctx.scope("app/browser/workspace");
-        assert_eq!(scope.resolve("windows/1/state"), format!("/{}/app/browser/workspace/windows/1/state", pid));
+        assert_eq!(
+            scope.resolve("windows/1/state"),
+            format!("/{}/app/browser/workspace/windows/1/state", pid)
+        );
     }
 
     #[test]
@@ -5981,7 +6316,9 @@ mod tests {
     fn scope_put_and_get() {
         let ctx = make_peer_context();
         let scope = ctx.scope("app/test");
-        scope.put("settings", make_entity("app/state/setting", "dark")).unwrap();
+        scope
+            .put("settings", make_entity("app/state/setting", "dark"))
+            .unwrap();
         let entity = scope.get("settings");
         assert!(entity.is_some());
         assert_eq!(entity.unwrap().entity_type, "app/state/setting");
@@ -6013,7 +6350,10 @@ mod tests {
         let pid = ctx.peer_id().to_string();
         let ws = ctx.scope("app/browser/workspace");
         let win = ws.scope("windows/1");
-        assert_eq!(win.resolve("state"), format!("/{}/app/browser/workspace/windows/1/state", pid));
+        assert_eq!(
+            win.resolve("state"),
+            format!("/{}/app/browser/workspace/windows/1/state", pid)
+        );
 
         // Put via sub-scope, read via parent scope.
         win.put("state", make_entity("t", "hello")).unwrap();
@@ -6084,11 +6424,12 @@ mod tests {
     // opportunistic refactor of `from_handler_result` could silently
     // re-introduce the flattening that Dom's validation pass caught.
 
-    fn sample_error_result(status: u32, code: &str, message: &str) -> entity_handler::HandlerResult {
-        entity_handler::HandlerResult::error(
-            status,
-            entity_handler::error_entity(code, message),
-        )
+    fn sample_error_result(
+        status: u32,
+        code: &str,
+        message: &str,
+    ) -> entity_handler::HandlerResult {
+        entity_handler::HandlerResult::error(status, entity_handler::error_entity(code, message))
     }
 
     #[test]
@@ -6101,7 +6442,11 @@ mod tests {
         let err = SdkError::from_handler_result(&result, "subscribe: system/capability/grants/*")
             .expect("403 must map to Some(SdkError)");
         match err {
-            SdkError::Forbidden { status, code, message } => {
+            SdkError::Forbidden {
+                status,
+                code,
+                message,
+            } => {
                 assert_eq!(status, 403);
                 assert_eq!(
                     code.as_deref(),
@@ -6127,9 +6472,17 @@ mod tests {
         let err = SdkError::from_handler_result(&result, "execute: definitely/no/handler/here")
             .expect("404 must map to Some(SdkError)");
         match err {
-            SdkError::NotFound { status, code, message } => {
+            SdkError::NotFound {
+                status,
+                code,
+                message,
+            } => {
                 assert_eq!(status, 404);
-                assert_eq!(code.as_deref(), Some("handler_not_found"), "R2 must surface handler_not_found code");
+                assert_eq!(
+                    code.as_deref(),
+                    Some("handler_not_found"),
+                    "R2 must surface handler_not_found code"
+                );
                 assert!(message.contains("definitely/no/handler/here"));
             }
             other => panic!("expected NotFound, got {other:?}"),
@@ -6150,9 +6503,16 @@ mod tests {
         let err = SdkError::from_handler_result(&result, "internal: catastrophic decode failure")
             .expect("500 must map to Some(SdkError)");
         match err {
-            SdkError::Internal { status, code, message } => {
+            SdkError::Internal {
+                status,
+                code,
+                message,
+            } => {
                 assert_eq!(status, 500);
-                assert!(code.is_none(), "code MUST be None when result isn't system/protocol/error");
+                assert!(
+                    code.is_none(),
+                    "code MUST be None when result isn't system/protocol/error"
+                );
                 assert_eq!(message, "internal: catastrophic decode failure");
             }
             other => panic!("expected Internal, got {other:?}"),
@@ -6354,16 +6714,16 @@ mod tests {
         let mut stream = ctx.store().watch(format!("/{}/app/test/*", pid));
 
         // Write a matching path.
-        ctx.store().put(
-            &format!("/{}/app/test/item", pid),
-            make_entity("t", "hello"),
-        ).unwrap();
+        ctx.store()
+            .put(
+                &format!("/{}/app/test/item", pid),
+                make_entity("t", "hello"),
+            )
+            .unwrap();
 
         // Should receive the event.
-        let event = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            stream.recv(),
-        ).await;
+        let event =
+            tokio::time::timeout(std::time::Duration::from_millis(500), stream.recv()).await;
         assert!(event.is_ok(), "should receive event within timeout");
         let event = event.unwrap().unwrap();
         assert!(event.path.contains("app/test/item"));
@@ -6377,22 +6737,23 @@ mod tests {
         let mut stream = ctx.store().watch(format!("/{}/app/test/*", pid));
 
         // Write to a non-matching path.
-        ctx.store().put(
-            &format!("/{}/other/path", pid),
-            make_entity("t", "hello"),
-        ).unwrap();
+        ctx.store()
+            .put(&format!("/{}/other/path", pid), make_entity("t", "hello"))
+            .unwrap();
 
         // Write to a matching path.
-        ctx.store().put(
-            &format!("/{}/app/test/item", pid),
-            make_entity("t", "world"),
-        ).unwrap();
+        ctx.store()
+            .put(
+                &format!("/{}/app/test/item", pid),
+                make_entity("t", "world"),
+            )
+            .unwrap();
 
         // First received event should be the matching one.
-        let event = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            stream.recv(),
-        ).await.unwrap().unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_millis(500), stream.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(event.path.contains("app/test/item"));
     }
 
@@ -6406,10 +6767,12 @@ mod tests {
             // Stream dropped here — task should cancel.
         }
         // Ensure no panic and cleanup happened.
-        ctx.store().put(
-            &format!("/{}/app/test/after_drop", pid),
-            make_entity("t", "ok"),
-        ).unwrap();
+        ctx.store()
+            .put(
+                &format!("/{}/app/test/after_drop", pid),
+                make_entity("t", "ok"),
+            )
+            .unwrap();
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -6423,10 +6786,9 @@ mod tests {
         assert!(stream.try_recv().is_none());
 
         // Write and give the background task a moment to process.
-        ctx.store().put(
-            &format!("/{}/app/test/item", pid),
-            make_entity("t", "x"),
-        ).unwrap();
+        ctx.store()
+            .put(&format!("/{}/app/test/item", pid), make_entity("t", "x"))
+            .unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let event = stream.try_recv();
@@ -6441,8 +6803,13 @@ mod tests {
         let ctx = make_peer_context();
         let pid = ctx.peer_id().to_string();
         let path = format!("/{}/app/test/cas_new", pid);
-        let hash = ctx.put_cas(&path, make_entity("test/t", "first"), None).await;
-        assert!(hash.is_ok(), "put_cas with None should succeed when path empty");
+        let hash = ctx
+            .put_cas(&path, make_entity("test/t", "first"), None)
+            .await;
+        assert!(
+            hash.is_ok(),
+            "put_cas with None should succeed when path empty"
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -6451,8 +6818,12 @@ mod tests {
         let ctx = make_peer_context();
         let pid = ctx.peer_id().to_string();
         let path = format!("/{}/app/test/cas_exists", pid);
-        ctx.put(&path, make_entity("test/t", "first")).await.unwrap();
-        let err = ctx.put_cas(&path, make_entity("test/t", "second"), None).await;
+        ctx.put(&path, make_entity("test/t", "first"))
+            .await
+            .unwrap();
+        let err = ctx
+            .put_cas(&path, make_entity("test/t", "second"), None)
+            .await;
         assert!(
             matches!(err, Err(SdkError::Conflict { .. })),
             "put_cas with None should conflict when path has a binding"
@@ -6466,8 +6837,13 @@ mod tests {
         let pid = ctx.peer_id().to_string();
         let path = format!("/{}/app/test/cas_match", pid);
         let first_hash = ctx.put(&path, make_entity("test/t", "v1")).await.unwrap();
-        let result = ctx.put_cas(&path, make_entity("test/t", "v2"), Some(first_hash)).await;
-        assert!(result.is_ok(), "put_cas with matching expected hash should succeed");
+        let result = ctx
+            .put_cas(&path, make_entity("test/t", "v2"), Some(first_hash))
+            .await;
+        assert!(
+            result.is_ok(),
+            "put_cas with matching expected hash should succeed"
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -6478,7 +6854,9 @@ mod tests {
         let path = format!("/{}/app/test/cas_mismatch", pid);
         ctx.put(&path, make_entity("test/t", "v1")).await.unwrap();
         let bogus = Hash::compute("test/t", b"bogus");
-        let err = ctx.put_cas(&path, make_entity("test/t", "v2"), Some(bogus)).await;
+        let err = ctx
+            .put_cas(&path, make_entity("test/t", "v2"), Some(bogus))
+            .await;
         assert!(
             matches!(err, Err(SdkError::Conflict { .. })),
             "put_cas with wrong expected hash should conflict"
@@ -6535,7 +6913,11 @@ mod tests {
             _ => panic!("chain cap should be single-sig"),
         }
         assert_eq!(token.grantee, me, "self-cap: grantee == granter");
-        assert_eq!(token.grants.len(), 1, "exactly the grant the caller supplied");
+        assert_eq!(
+            token.grants.len(),
+            1,
+            "exactly the grant the caller supplied"
+        );
         assert!(token.parent.is_none(), "self-cap has no parent");
     }
 

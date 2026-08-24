@@ -45,33 +45,25 @@ pub unsafe extern "C" fn ecf_value_bytes(ptr: *const u8, len: usize) -> Handle {
 /// Create a CBOR integer value.
 #[no_mangle]
 pub extern "C" fn ecf_value_integer(val: i64) -> Handle {
-    ffi_fn!({
-        ECF_VALUES.insert(entity_ecf::integer(val))
-    })
+    ffi_fn!({ ECF_VALUES.insert(entity_ecf::integer(val)) })
 }
 
 /// Create a CBOR boolean value.
 #[no_mangle]
 pub extern "C" fn ecf_value_bool(val: bool) -> Handle {
-    ffi_fn!({
-        ECF_VALUES.insert(entity_ecf::bool_val(val))
-    })
+    ffi_fn!({ ECF_VALUES.insert(entity_ecf::bool_val(val)) })
 }
 
 /// Create a CBOR null value.
 #[no_mangle]
 pub extern "C" fn ecf_value_null() -> Handle {
-    ffi_fn!({
-        ECF_VALUES.insert(entity_ecf::null())
-    })
+    ffi_fn!({ ECF_VALUES.insert(entity_ecf::null()) })
 }
 
 /// Create a CBOR float value.
 #[no_mangle]
 pub extern "C" fn ecf_value_float(val: f64) -> Handle {
-    ffi_fn!({
-        ECF_VALUES.insert(entity_ecf::Value::Float(val))
-    })
+    ffi_fn!({ ECF_VALUES.insert(entity_ecf::Value::Float(val)) })
 }
 
 /// Create a CBOR array from an array of value handles.
@@ -99,9 +91,7 @@ pub unsafe extern "C" fn ecf_value_array(handles: *const Handle, count: usize) -
 /// Create an empty CBOR map value.
 #[no_mangle]
 pub extern "C" fn ecf_value_map_new() -> Handle {
-    ffi_fn!({
-        ECF_VALUES.insert(entity_ecf::Value::Map(vec![]))
-    })
+    ffi_fn!({ ECF_VALUES.insert(entity_ecf::Value::Map(vec![])) })
 }
 
 /// Insert a key-value pair into a map. Consumes the key and value handles.
@@ -111,40 +101,43 @@ pub extern "C" fn ecf_value_map_insert(
     key_handle: Handle,
     value_handle: Handle,
 ) -> EntityCoreError {
-    ffi_fn!({
-        let key = match ECF_VALUES.remove(key_handle) {
-            Some(v) => v,
-            None => {
-                set_last_error("invalid key handle");
-                return EntityCoreError::InvalidArgument;
+    ffi_fn!(
+        {
+            let key = match ECF_VALUES.remove(key_handle) {
+                Some(v) => v,
+                None => {
+                    set_last_error("invalid key handle");
+                    return EntityCoreError::InvalidArgument;
+                }
+            };
+            let value = match ECF_VALUES.remove(value_handle) {
+                Some(v) => v,
+                None => {
+                    set_last_error("invalid value handle");
+                    return EntityCoreError::InvalidArgument;
+                }
+            };
+            match ECF_VALUES.with_mut(map_handle, |map| {
+                if let entity_ecf::Value::Map(ref mut entries) = map {
+                    entries.push((key.clone(), value.clone()));
+                    true
+                } else {
+                    false
+                }
+            }) {
+                Some(true) => EntityCoreError::Ok,
+                Some(false) => {
+                    set_last_error("handle is not a map");
+                    EntityCoreError::InvalidArgument
+                }
+                None => {
+                    set_last_error("invalid map handle");
+                    EntityCoreError::InvalidArgument
+                }
             }
-        };
-        let value = match ECF_VALUES.remove(value_handle) {
-            Some(v) => v,
-            None => {
-                set_last_error("invalid value handle");
-                return EntityCoreError::InvalidArgument;
-            }
-        };
-        match ECF_VALUES.with_mut(map_handle, |map| {
-            if let entity_ecf::Value::Map(ref mut entries) = map {
-                entries.push((key.clone(), value.clone()));
-                true
-            } else {
-                false
-            }
-        }) {
-            Some(true) => EntityCoreError::Ok,
-            Some(false) => {
-                set_last_error("handle is not a map");
-                EntityCoreError::InvalidArgument
-            }
-            None => {
-                set_last_error("invalid map handle");
-                EntityCoreError::InvalidArgument
-            }
-        }
-    }, EntityCoreError::InternalError)
+        },
+        EntityCoreError::InternalError
+    )
 }
 
 /// Free a value handle.

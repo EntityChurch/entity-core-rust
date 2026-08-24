@@ -34,12 +34,12 @@ macro_rules! ffi_fn {
     };
 }
 
-pub mod types;
+pub mod crypto;
+pub mod ecf;
+pub mod entity;
 pub mod error;
 pub mod handles;
-pub mod ecf;
 pub mod hash;
-pub mod crypto;
-pub mod entity;
-pub mod wire;
 pub mod peer;
+pub mod types;
+pub mod wire;

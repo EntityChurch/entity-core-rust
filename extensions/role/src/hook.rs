@@ -25,8 +25,7 @@
 use std::sync::Arc;
 
 use entity_store::{
-    CascadeHalt, ContentStore, ExecutionContext, LocationIndex, SyncTreeHook,
-    TreeChangeEvent,
+    CascadeHalt, ContentStore, ExecutionContext, LocationIndex, SyncTreeHook, TreeChangeEvent,
 };
 use entity_types::TYPE_ROLE_EXCLUSION;
 
@@ -202,7 +201,10 @@ mod tests {
             pid,
             prefix_role_derived_peer("group/team-alpha", "dave")
         );
-        assert!(li.list(&dave_prefix).is_empty(), "dave's tokens must be swept");
+        assert!(
+            li.list(&dave_prefix).is_empty(),
+            "dave's tokens must be swept"
+        );
         let alice_prefix = format!(
             "/{}/{}",
             pid,

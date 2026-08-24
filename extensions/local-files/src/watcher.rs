@@ -25,7 +25,7 @@ use crate::config::{file_skipped, matches_exclude, RootMapping};
 use crate::types::FileData;
 
 /// v3.6 §3.5 — 1 MiB default per A2 cutover (was 4 MiB in v3.5).
-const DEFAULT_CHUNK_SIZE: usize = 1 * 1024 * 1024;
+const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum WatcherError {
@@ -73,8 +73,7 @@ impl Watcher {
         // events under a pruned subtree.
         walk_and_watch(&mut notify_watcher, &root.fs_root, &root.exclude)?;
 
-        let pending: Arc<Mutex<HashMap<PathBuf, FsEvent>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let pending: Arc<Mutex<HashMap<PathBuf, FsEvent>>> = Arc::new(Mutex::new(HashMap::new()));
         let debounce = Duration::from_millis(debounce_ms.max(1));
 
         // Initial scan: seed `Created` events for every existing regular
@@ -93,7 +92,9 @@ impl Watcher {
             let mut flush_timer: Option<tokio::time::Instant> = None;
             loop {
                 let sleep_for = match flush_timer {
-                    Some(deadline) => deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    Some(deadline) => {
+                        deadline.saturating_duration_since(tokio::time::Instant::now())
+                    }
                     None => Duration::from_secs(3600),
                 };
                 tokio::select! {
@@ -215,10 +216,8 @@ fn walk_and_watch(
                 Ok(ft) => ft,
                 Err(_) => continue,
             };
-            if file_type.is_dir() {
-                if watcher.watch(&path, RecursiveMode::NonRecursive).is_ok() {
-                    stack.push(path);
-                }
+            if file_type.is_dir() && watcher.watch(&path, RecursiveMode::NonRecursive).is_ok() {
+                stack.push(path);
             }
         }
     }
@@ -233,10 +232,7 @@ fn walk_and_watch(
 /// common case (file unchanged) is a single stat per file with no
 /// rechunk. Without the cache, every file is re-read and re-chunked —
 /// expensive, but still better than silent desync.
-fn rescan_after_overflow(
-    root: &RootMapping,
-    pending: &Arc<Mutex<HashMap<PathBuf, FsEvent>>>,
-) {
+fn rescan_after_overflow(root: &RootMapping, pending: &Arc<Mutex<HashMap<PathBuf, FsEvent>>>) {
     let mut stack = vec![root.fs_root.clone()];
     let mut seeded = 0usize;
     while let Some(dir) = stack.pop() {
@@ -449,9 +445,7 @@ fn flush_pending(
         // reflect the cached hash if the bind hasn't landed — but
         // since the cached entry came from a successful prior
         // ingest/write, the binding will be (or already is) correct.
-        if let crate::stat_cache::ProbeResult::Hit(_) =
-            stat_cache.probe(&fs_path, &metadata)
-        {
+        if let crate::stat_cache::ProbeResult::Hit(_) = stat_cache.probe(&fs_path, &metadata) {
             continue;
         }
         let raw = match std::fs::read(&fs_path) {

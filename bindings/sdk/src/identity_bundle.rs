@@ -73,9 +73,7 @@ use crate::sdk::SdkError;
 use ciborium::Value;
 use entity_entity::Entity;
 use entity_hash::Hash;
-use entity_types::{
-    TYPE_ATTESTATION, TYPE_IDENTITY_PEER_CONFIG, TYPE_QUORUM, TYPE_SIGNATURE,
-};
+use entity_types::{TYPE_ATTESTATION, TYPE_IDENTITY_PEER_CONFIG, TYPE_QUORUM, TYPE_SIGNATURE};
 
 /// Current Bundle CBOR schema version. Bump on incompatible wire
 /// changes; readers reject unknown versions.
@@ -294,7 +292,10 @@ impl IdentityBundle {
 fn entity_to_value(entity: &Entity) -> Value {
     Value::Map(vec![
         (entity_ecf::text("data"), Value::Bytes(entity.data.clone())),
-        (entity_ecf::text("type"), entity_ecf::text(&entity.entity_type)),
+        (
+            entity_ecf::text("type"),
+            entity_ecf::text(&entity.entity_type),
+        ),
     ])
 }
 
@@ -317,8 +318,10 @@ fn value_to_entity(value: &Value) -> Result<Entity, SdkError> {
             _ => {}
         }
     }
-    let etype = etype.ok_or_else(|| SdkError::HandlerError("bundle entity: missing type".into()))?;
-    let edata = edata.ok_or_else(|| SdkError::HandlerError("bundle entity: missing data".into()))?;
+    let etype =
+        etype.ok_or_else(|| SdkError::HandlerError("bundle entity: missing type".into()))?;
+    let edata =
+        edata.ok_or_else(|| SdkError::HandlerError("bundle entity: missing data".into()))?;
     Entity::new(&etype, edata)
         .map_err(|e| SdkError::HandlerError(format!("bundle entity rebuild: {}", e)))
 }
@@ -362,17 +365,13 @@ impl<'a> IdentityOps<'a> {
                 // Same content hash since the entity is deterministic.
                 kp.peer_entity().ok()
             })
-            .ok_or_else(|| SdkError::HandlerError(
-                "export_bundle: local peer entity unavailable".into(),
-            ))?;
+            .ok_or_else(|| {
+                SdkError::HandlerError("export_bundle: local peer entity unavailable".into())
+            })?;
 
         // Walk subtrees. Each list returns paths; we resolve via
         // store.list_entities for path + entity pairs.
-        let quorums = list_typed(
-            &store,
-            &format!("/{}/system/quorum/", pid),
-            TYPE_QUORUM,
-        );
+        let quorums = list_typed(&store, &format!("/{}/system/quorum/", pid), TYPE_QUORUM);
         let mut attestations: Vec<Entity> = Vec::new();
         for sub in &[
             "system/identity/internal/cert/",
@@ -437,8 +436,7 @@ impl<'a> IdentityOps<'a> {
     pub fn restore_from_bundle(
         &self,
         bundle: &IdentityBundle,
-    ) -> impl std::future::Future<Output = Result<BootstrapResult, SdkError>> + Send + 'static
-    {
+    ) -> impl std::future::Future<Output = Result<BootstrapResult, SdkError>> + Send + 'static {
         let inputs = BootstrapInputs::from_ctx(self.ctx_ref());
         let bundle = bundle.clone();
         future_boxed(run_restore_from_bundle(inputs, bundle))
@@ -478,12 +476,9 @@ async fn run_restore_from_bundle(
     // public_key field (set by `Keypair::peer_entity` —
     // core/crypto/src/lib.rs §peer_entity) and compare to the
     // local keypair's public bytes. No private material involved.
-    let bundle_public_key =
-        extract_peer_public_key(&bundle.identity_entity).ok_or_else(|| {
-            SdkError::HandlerError(
-                "bundle: identity_entity missing public_key field".into(),
-            )
-        })?;
+    let bundle_public_key = extract_peer_public_key(&bundle.identity_entity).ok_or_else(|| {
+        SdkError::HandlerError("bundle: identity_entity missing public_key field".into())
+    })?;
     if bundle_public_key != keypair.public_key_bytes() {
         return Err(SdkError::HandlerError(
             "bundle_keypair_mismatch: local peer's keypair does not match identity_entity public_key"
@@ -551,8 +546,7 @@ async fn run_restore_from_bundle(
         let h = cs
             .put(s.clone())
             .map_err(|e| SdkError::HandlerError(format!("restore signature store: {}", e)))?;
-        let sig_path =
-            format!("/{}/system/signature/{}", pid, hex_segment(&target_hash));
+        let sig_path = format!("/{}/system/signature/{}", pid, hex_segment(&target_hash));
         li.set(&sig_path, h);
     }
 
@@ -576,16 +570,12 @@ async fn run_restore_from_bundle(
         li.set(&full, a.content_hash);
         // First controller-function attestation is the one configure
         // will use; we surface it in the result.
-        if controller_cert.is_none()
-            && extract_function(&props).as_deref() == Some("controller")
-        {
+        if controller_cert.is_none() && extract_function(&props).as_deref() == Some("controller") {
             controller_cert = Some(a.content_hash);
         }
     }
     let controller_cert = controller_cert.ok_or_else(|| {
-        SdkError::HandlerError(
-            "restore: bundle has no controller-cert attestation".into(),
-        )
+        SdkError::HandlerError("restore: bundle has no controller-cert attestation".into())
     })?;
 
     // 6. Dispatch configure to mint the local peer→controller cap.
@@ -982,10 +972,7 @@ mod tests {
             } => {
                 assert_eq!(identity_hash, ctx_b.identity_hash());
                 assert_eq!(identity_hash, ctx_a.identity_hash());
-                assert_eq!(
-                    quorum_id, qid_a,
-                    "restored quorum_id matches original"
-                );
+                assert_eq!(quorum_id, qid_a, "restored quorum_id matches original");
                 assert_eq!(
                     controller_cert, cert_a,
                     "restored controller_cert matches original"

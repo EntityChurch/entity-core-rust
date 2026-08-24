@@ -44,7 +44,10 @@ where
     S: FnOnce(BoxFuture<'static, ()>),
 {
     let (tx, rx) = mpsc::channel::<StreamChunk>(4);
-    let _ = tx.try_send(StreamChunk::Dispatched(format!("→ connecting to {}", address)));
+    let _ = tx.try_send(StreamChunk::Dispatched(format!(
+        "→ connecting to {}",
+        address
+    )));
 
     let address_clone = address.clone();
     let connect_fut = binding.connect_peer(from_peer, address);
@@ -79,9 +82,7 @@ where
 {
     let addr = args
         .first()
-        .ok_or_else(|| {
-            ShellError::usage("connect: usage: connect <ws://addr | memory://peer-id>")
-        })?
+        .ok_or_else(|| ShellError::usage("connect: usage: connect <ws://addr | memory://peer-id>"))?
         .to_string();
     Ok(connect_op(binding, shell.peer_id(), addr, spawn))
 }
@@ -97,15 +98,27 @@ mod tests {
     }
 
     impl PeerBinding for StubBinding {
-        fn peer_id(&self) -> &str { &self.bound }
-        fn primary_peer_id(&self) -> String { self.bound.clone() }
-        fn peer_ids(&self) -> Vec<String> { vec![self.bound.clone()] }
-        fn connected_peers(&self) -> Vec<String> { Vec::new() }
-        fn peer_label(&self, _pid: &str) -> Option<String> { None }
+        fn peer_id(&self) -> &str {
+            &self.bound
+        }
+        fn primary_peer_id(&self) -> String {
+            self.bound.clone()
+        }
+        fn peer_ids(&self) -> Vec<String> {
+            vec![self.bound.clone()]
+        }
+        fn connected_peers(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn peer_label(&self, _pid: &str) -> Option<String> {
+            None
+        }
         fn tree_listing(&self, _pid: &str, _prefix: &str) -> Vec<TreeListingEntry> {
             Vec::new()
         }
-        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> { None }
+        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> {
+            None
+        }
         fn connect_peer(
             &self,
             _from_peer: &str,
@@ -118,7 +131,10 @@ mod tests {
 
     #[test]
     fn missing_address_returns_usage() {
-        let b = StubBinding { bound: "alice".into(), result: Ok("x".into()) };
+        let b = StubBinding {
+            bound: "alice".into(),
+            result: Ok("x".into()),
+        };
         let shell = Shell::with_wd("alice", "/alice/");
         let err = connect(&shell, &[], &b, |_| {}).unwrap_err();
         assert_eq!(err.code, crate::result::ErrorCode::Usage);
@@ -142,15 +158,22 @@ mod tests {
 
     #[test]
     fn success_path_drains_dispatched_then_complete() {
-        let b = StubBinding { bound: "alice".into(), result: Ok("remote_long_pid_abcdef".into()) };
+        let b = StubBinding {
+            bound: "alice".into(),
+            result: Ok("remote_long_pid_abcdef".into()),
+        };
         let shell = Shell::with_wd("alice", "/alice/");
         let result = connect(&shell, &["ws://localhost:9999"], &b, drive).unwrap();
         match result {
             VerbOutput::Lines(mut rx) => {
                 let dispatched = rx.try_recv().expect("dispatched chunk");
-                assert!(matches!(dispatched, StreamChunk::Dispatched(ref s) if s.contains("→ connecting")));
+                assert!(
+                    matches!(dispatched, StreamChunk::Dispatched(ref s) if s.contains("→ connecting"))
+                );
                 let complete = drive_recv(&mut rx).expect("complete chunk");
-                assert!(matches!(complete, StreamChunk::Complete(ref s) if s.contains("← connected")));
+                assert!(
+                    matches!(complete, StreamChunk::Complete(ref s) if s.contains("← connected"))
+                );
                 assert!(drive_recv(&mut rx).is_none());
             }
             other => panic!("unexpected variant: {:?}", other),
@@ -159,7 +182,10 @@ mod tests {
 
     #[test]
     fn failure_path_emits_failed_chunk() {
-        let b = StubBinding { bound: "alice".into(), result: Err("refused".into()) };
+        let b = StubBinding {
+            bound: "alice".into(),
+            result: Err("refused".into()),
+        };
         let shell = Shell::with_wd("alice", "/alice/");
         let result = connect(&shell, &["ws://nowhere"], &b, drive).unwrap();
         match result {

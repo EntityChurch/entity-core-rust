@@ -23,30 +23,28 @@ pub mod startup;
 mod tests;
 
 pub use data::{
-    decode_grant_array_value, hex_segment, RoleAssignmentData, RoleData,
-    RoleDerivedTokenLinkData, RoleExclusionData, RoleInitialGrantPolicyData,
-    MODE_ANONYMOUS_ALLOW, MODE_ANONYMOUS_DENY, MODE_RECOGNIZE_ON_ATTESTATION,
-    TYPE_ROLE, TYPE_ROLE_ASSIGNMENT, TYPE_ROLE_DERIVED_TOKEN_LINK,
+    decode_grant_array_value, hex_segment, RoleAssignmentData, RoleData, RoleDerivedTokenLinkData,
+    RoleExclusionData, RoleInitialGrantPolicyData, MODE_ANONYMOUS_ALLOW, MODE_ANONYMOUS_DENY,
+    MODE_RECOGNIZE_ON_ATTESTATION, TYPE_ROLE, TYPE_ROLE_ASSIGNMENT, TYPE_ROLE_DERIVED_TOKEN_LINK,
     TYPE_ROLE_EXCLUSION, TYPE_ROLE_INITIAL_GRANT_POLICY,
 };
 pub use handler::RoleHandler;
 pub use helpers::{is_excluded, resolve_grant_templates};
 pub use hook::RoleExclusionSweepHook;
+pub use paths::{
+    hash_from_peer_segment, parse_assignment_path, parse_exclusion_path,
+    parse_role_definition_path, path_role_assignment, path_role_definition, path_role_derived_link,
+    path_role_derived_token, path_role_exclusion, peer_segment_from_hash, prefix_role_assignment,
+    prefix_role_assignment_peer, prefix_role_derived_links_peer, prefix_role_derived_peer,
+    resolve_template_str, ParsedAssignmentPath, ParsedExclusionPath, ParsedRoleDefPath,
+    PATH_INITIAL_GRANT_POLICY, RESERVED_ROLE_NAMES, ROLE_DERIVED_PREFIX, ROLE_PREFIX,
+};
 pub use policy::{
-    build_policy_resolver, recognize_identity_cert, resolve_grants,
-    PolicyResolverDeps, DEFAULT_MAX_CHAIN_DEPTH,
+    build_policy_resolver, recognize_identity_cert, resolve_grants, PolicyResolverDeps,
+    DEFAULT_MAX_CHAIN_DEPTH,
 };
 pub use startup::{
     startup_role_assignment, startup_role_definition, StartupAssignmentResult, StartupError,
-};
-pub use paths::{
-    hash_from_peer_segment, parse_assignment_path, parse_exclusion_path,
-    parse_role_definition_path, path_role_assignment, path_role_definition,
-    path_role_derived_link, path_role_derived_token, path_role_exclusion,
-    peer_segment_from_hash, prefix_role_assignment, prefix_role_assignment_peer,
-    prefix_role_derived_links_peer, prefix_role_derived_peer, resolve_template_str,
-    ParsedAssignmentPath, ParsedExclusionPath, ParsedRoleDefPath,
-    PATH_INITIAL_GRANT_POLICY, RESERVED_ROLE_NAMES, ROLE_DERIVED_PREFIX, ROLE_PREFIX,
 };
 
 use thiserror::Error;

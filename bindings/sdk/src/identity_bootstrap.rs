@@ -208,8 +208,7 @@ impl<'a> IdentityOps<'a> {
     pub fn bootstrap(
         &self,
         opts: BootstrapOptions,
-    ) -> impl std::future::Future<Output = Result<BootstrapResult, SdkError>> + Send + 'static
-    {
+    ) -> impl std::future::Future<Output = Result<BootstrapResult, SdkError>> + Send + 'static {
         let inputs = BootstrapInputs::from_ctx(self.ctx_ref());
         future_boxed(run_bootstrap(inputs, opts))
     }
@@ -505,7 +504,10 @@ fn build_attestation_entity(
         Value::Bytes(attesting.to_bytes().to_vec()),
     ));
     if !properties.is_empty() {
-        fields.push((entity_ecf::text("properties"), Value::Map(properties.to_vec())));
+        fields.push((
+            entity_ecf::text("properties"),
+            Value::Map(properties.to_vec()),
+        ));
     }
     let data = entity_ecf::to_ecf(&Value::Map(fields));
     Entity::new(TYPE_ATTESTATION, data)
@@ -663,7 +665,9 @@ mod tests {
     /// callable in this position is the gate. No runtime exercise
     /// needed — successful compile is the assertion.
     #[allow(dead_code)]
-    fn bootstrap_future_is_static_send(ctx: &crate::sdk::PeerContext) -> std::pin::Pin<
+    fn bootstrap_future_is_static_send(
+        ctx: &crate::sdk::PeerContext,
+    ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<BootstrapResult, SdkError>> + Send + 'static>,
     > {
         Box::pin(ctx.identity().bootstrap(BootstrapOptions::default()))
@@ -708,7 +712,10 @@ mod tests {
                 assert!(quorum_id.to_bytes().iter().any(|&b| b != 0));
                 assert!(controller_cert.to_bytes().iter().any(|&b| b != 0));
                 assert!(peer_config_path.ends_with("system/identity/peer-config"));
-                assert!(!issued_caps.is_empty(), "configure must issue at least one local-peer cap");
+                assert!(
+                    !issued_caps.is_empty(),
+                    "configure must issue at least one local-peer cap"
+                );
             }
             other => panic!("expected Bootstrapped, got {:?}", other),
         }
@@ -815,11 +822,7 @@ mod tests {
             other => panic!("expected Bootstrapped, got {:?}", other),
         };
 
-        let qpath = format!(
-            "/{}/system/quorum/{}",
-            ctx.peer_id(),
-            hex_segment(&qid)
-        );
+        let qpath = format!("/{}/system/quorum/{}", ctx.peer_id(), hex_segment(&qid));
         let qe = ctx.store().get(&qpath).expect("quorum entity bound");
         let v: Value = ciborium::de::from_reader(qe.data.as_slice()).unwrap();
         let map = v.as_map().unwrap();

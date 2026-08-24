@@ -35,7 +35,10 @@ impl Shell {
     /// Construct a shell with an explicit initial wd. Used by the
     /// embedding when restoring persisted state.
     pub fn with_wd(peer_id: impl Into<String>, wd: impl Into<String>) -> Self {
-        Self { peer_id: peer_id.into(), wd: wd.into() }
+        Self {
+            peer_id: peer_id.into(),
+            wd: wd.into(),
+        }
     }
 
     pub fn peer_id(&self) -> &str {

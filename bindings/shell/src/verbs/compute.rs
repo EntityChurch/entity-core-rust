@@ -37,9 +37,7 @@ where
     S: FnOnce(BoxFuture<'static, ()>),
 {
     let (sub, rest) = args.split_first().ok_or_else(|| {
-        ShellError::usage(
-            "compute: usage: compute <eval|install|uninstall|list|show> [args...]",
-        )
+        ShellError::usage("compute: usage: compute <eval|install|uninstall|list|show> [args...]")
     })?;
     match *sub {
         "eval" => eval(shell, rest, binding, spawn),
@@ -109,9 +107,9 @@ where
     while i < args.len() {
         match args[i] {
             "--budget" => {
-                let v = args.get(i + 1).ok_or_else(|| {
-                    ShellError::usage("compute eval: --budget needs a number")
-                })?;
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| ShellError::usage("compute eval: --budget needs a number"))?;
                 budget = Some(v.parse::<u64>().map_err(|_| {
                     ShellError::usage(format!(
                         "compute eval: --budget value '{}' is not a non-negative integer",
@@ -227,11 +225,15 @@ where
         }
     }
     let path = path.ok_or_else(|| {
-        ShellError::usage(
-            "compute install: usage: compute install <root-path> [--result-path P]",
-        )
+        ShellError::usage("compute install: usage: compute install <root-path> [--result-path P]")
     })?;
-    Ok(install_op(binding, shell.peer_id(), path, result_path, spawn))
+    Ok(install_op(
+        binding,
+        shell.peer_id(),
+        path,
+        result_path,
+        spawn,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -381,9 +383,9 @@ fn show<S>(
 where
     S: FnOnce(BoxFuture<'static, ()>),
 {
-    let path = args.first().ok_or_else(|| {
-        ShellError::usage("compute show: usage: compute show <subgraph-path>")
-    })?;
+    let path = args
+        .first()
+        .ok_or_else(|| ShellError::usage("compute show: usage: compute show <subgraph-path>"))?;
     Ok(show_op(binding, shell.peer_id(), path.to_string(), spawn))
 }
 
@@ -414,15 +416,27 @@ mod tests {
     }
 
     impl PeerBinding for StubBinding {
-        fn peer_id(&self) -> &str { "p1" }
-        fn primary_peer_id(&self) -> String { "p1".into() }
-        fn peer_ids(&self) -> Vec<String> { vec!["p1".into()] }
-        fn connected_peers(&self) -> Vec<String> { Vec::new() }
-        fn peer_label(&self, _pid: &str) -> Option<String> { None }
+        fn peer_id(&self) -> &str {
+            "p1"
+        }
+        fn primary_peer_id(&self) -> String {
+            "p1".into()
+        }
+        fn peer_ids(&self) -> Vec<String> {
+            vec!["p1".into()]
+        }
+        fn connected_peers(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn peer_label(&self, _pid: &str) -> Option<String> {
+            None
+        }
         fn tree_listing(&self, _pid: &str, _prefix: &str) -> Vec<TreeListingEntry> {
             Vec::new()
         }
-        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> { None }
+        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> {
+            None
+        }
 
         fn compute_eval(
             &self,
@@ -520,12 +534,13 @@ mod tests {
         let b = StubBinding::empty();
         *b.eval_result.lock().unwrap() =
             Some(Ok("  value: Int(42)\n  entity type: compute/result".into()));
-        let result =
-            compute(&shell(), &["eval", "/p1/lit"], &b, drive).unwrap();
+        let result = compute(&shell(), &["eval", "/p1/lit"], &b, drive).unwrap();
         match result {
             VerbOutput::Dispatch(mut rx) => {
                 let d = rx.try_recv().unwrap();
-                assert!(matches!(d, DispatchChunk::Dispatched(ref s) if s.contains("compute eval")));
+                assert!(
+                    matches!(d, DispatchChunk::Dispatched(ref s) if s.contains("compute eval"))
+                );
                 let c = drive_recv(&mut rx).unwrap();
                 assert!(matches!(c, DispatchChunk::Complete(ref s) if s.contains("Int(42)")));
             }
@@ -537,8 +552,7 @@ mod tests {
     fn eval_failure_emits_dispatch_failed() {
         let b = StubBinding::empty();
         *b.eval_result.lock().unwrap() = Some(Err("budget_exhausted".into()));
-        let result =
-            compute(&shell(), &["eval", "/p1/lit"], &b, drive).unwrap();
+        let result = compute(&shell(), &["eval", "/p1/lit"], &b, drive).unwrap();
         match result {
             VerbOutput::Dispatch(mut rx) => {
                 let _ = rx.try_recv().unwrap();
@@ -560,12 +574,23 @@ mod tests {
         let b = StubBinding::empty();
         let err = compute(&shell(), &["eval", "/p1/lit", "--budget"], &b, |_| {}).unwrap_err();
         assert_eq!(err.code, crate::result::ErrorCode::Usage);
-        let err = compute(&shell(), &["eval", "/p1/lit", "--budget", "abc"], &b, |_| {}).unwrap_err();
+        let err = compute(
+            &shell(),
+            &["eval", "/p1/lit", "--budget", "abc"],
+            &b,
+            |_| {},
+        )
+        .unwrap_err();
         assert_eq!(err.code, crate::result::ErrorCode::Usage);
         // Happy path: budget parses, dispatch proceeds.
         *b.eval_result.lock().unwrap() = Some(Ok("  value: Int(1)".into()));
-        let result =
-            compute(&shell(), &["eval", "/p1/lit", "--budget", "1000"], &b, drive).unwrap();
+        let result = compute(
+            &shell(),
+            &["eval", "/p1/lit", "--budget", "1000"],
+            &b,
+            drive,
+        )
+        .unwrap();
         assert!(matches!(result, VerbOutput::Dispatch(_)));
     }
 
@@ -585,8 +610,7 @@ mod tests {
             "/p1/system/compute/processes/abc".into(),
             "/p1/app/x/result".into(),
         )));
-        let result =
-            compute(&shell(), &["install", "/p1/app/x"], &b, drive).unwrap();
+        let result = compute(&shell(), &["install", "/p1/app/x"], &b, drive).unwrap();
         match result {
             VerbOutput::Dispatch(mut rx) => {
                 let _ = rx.try_recv().unwrap();
@@ -721,10 +745,7 @@ mod tests {
     fn show_streams_rows_from_binding() {
         let b = StubBinding {
             show_result: Some(vec![
-                (
-                    "subgraph".into(),
-                    "/p1/system/compute/processes/abc".into(),
-                ),
+                ("subgraph".into(), "/p1/system/compute/processes/abc".into()),
                 ("root expression".into(), "/p1/app/x".into()),
                 ("status".into(), "active".into()),
             ]),

@@ -66,27 +66,43 @@ mod tests {
     }
 
     impl PeerBinding for StubBinding {
-        fn peer_id(&self) -> &str { &self.bound }
-        fn primary_peer_id(&self) -> String { self.bound.clone() }
-        fn peer_ids(&self) -> Vec<String> { vec![self.bound.clone()] }
-        fn connected_peers(&self) -> Vec<String> { Vec::new() }
+        fn peer_id(&self) -> &str {
+            &self.bound
+        }
+        fn primary_peer_id(&self) -> String {
+            self.bound.clone()
+        }
+        fn peer_ids(&self) -> Vec<String> {
+            vec![self.bound.clone()]
+        }
+        fn connected_peers(&self) -> Vec<String> {
+            Vec::new()
+        }
         fn peer_label(&self, pid: &str) -> Option<String> {
             self.labels.get(pid).cloned()
         }
         fn tree_listing(&self, _pid: &str, _prefix: &str) -> Vec<TreeListingEntry> {
             Vec::new()
         }
-        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> { None }
+        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> {
+            None
+        }
     }
 
     fn unlabeled() -> StubBinding {
-        StubBinding { bound: "alice".into(), labels: HashMap::new() }
+        StubBinding {
+            bound: "alice".into(),
+            labels: HashMap::new(),
+        }
     }
 
     fn labeled() -> StubBinding {
         let mut labels = HashMap::new();
         labels.insert("alice".into(), "Alice".into());
-        StubBinding { bound: "alice".into(), labels }
+        StubBinding {
+            bound: "alice".into(),
+            labels,
+        }
     }
 
     #[test]

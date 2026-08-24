@@ -113,7 +113,12 @@ impl PeerContext {
         // when CollectChainBundle needs it; making the entity
         // reachable from the store here is cheap and removes a
         // bundle-time precondition.
-        if self.shared.content_store.get(&parent_cap.content_hash).is_none() {
+        if self
+            .shared
+            .content_store
+            .get(&parent_cap.content_hash)
+            .is_none()
+        {
             self.shared
                 .content_store
                 .put(parent_cap.clone())
@@ -211,8 +216,7 @@ impl PeerContext {
         &self,
         leaf_cap: &Entity,
     ) -> Result<std::collections::HashMap<Hash, Entity>, SdkError> {
-        let mut bundle: std::collections::HashMap<Hash, Entity> =
-            std::collections::HashMap::new();
+        let mut bundle: std::collections::HashMap<Hash, Entity> = std::collections::HashMap::new();
 
         // Walk the chain leaf → parent → ... until we hit a cap with
         // no parent (root). Capping the depth prevents a malformed
@@ -241,7 +245,9 @@ impl PeerContext {
                     // Detached signature at the invariant path. V7 §1.5
                     // v7.65: derive canonical wire peer_id from
                     // (public_key, key_type) — entity no longer carries it.
-                    if let Ok(granter_peer_data) = entity_types::PeerData::from_entity(&identity_entity) {
+                    if let Ok(granter_peer_data) =
+                        entity_types::PeerData::from_entity(&identity_entity)
+                    {
                         if let Some(granter_peer_id) = granter_peer_data.canonical_peer_id() {
                             let sig_path = entity_hash::invariant_signature_path(
                                 &granter_peer_id,
@@ -325,11 +331,7 @@ mod tests {
     #[test]
     fn mint_cross_peer_chain_no_connection_returns_error() {
         let ctx = make_ctx();
-        let r = ctx.mint_cross_peer_chain_capability(
-            "unconnected-peer-id",
-            sample_grants(),
-            None,
-        );
+        let r = ctx.mint_cross_peer_chain_capability("unconnected-peer-id", sample_grants(), None);
         match r {
             Err(SdkError::HandlerError(msg)) if msg.contains("no connection-grant") => {}
             other => panic!("expected no connection-grant error, got {:?}", other),

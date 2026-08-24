@@ -23,8 +23,8 @@
 use std::sync::Arc;
 
 use entity_ecf::Value;
-use entity_store::{ContentStore, LocationIndex};
 use entity_hash::Hash;
+use entity_store::{ContentStore, LocationIndex};
 use entity_types::SignatureData;
 
 use crate::data::{
@@ -33,9 +33,7 @@ use crate::data::{
 };
 use crate::log::now_ms;
 use crate::resolver::resolve_peer_pubkey;
-use crate::{
-    by_name_pointer_path, revocation_prefix, signature_pointer_path, ResolverChainEntry,
-};
+use crate::{by_name_pointer_path, revocation_prefix, signature_pointer_path, ResolverChainEntry};
 
 /// Backend resolve (proposal §2.1) — invoked by the meta-resolver for
 /// `peer-issued` chain entries. `entry.backend_id` is the registry's Base58
@@ -65,7 +63,11 @@ pub fn resolve_one(
     //    the precede path).
     let binding_hash = match location_index.get(&by_name_pointer_path(registry, &norm)) {
         Some(h) => h,
-        None => return Some(ResolutionResult::not_found(neg_ttl_from_hints(&entry.hints))),
+        None => {
+            return Some(ResolutionResult::not_found(neg_ttl_from_hints(
+                &entry.hints,
+            )))
+        }
     };
 
     // 2. binding hash → binding body (content is self-verifying by hash).
@@ -161,7 +163,8 @@ fn is_revoked(
                 .and_then(|e| RevocationData::from_entity(&e).ok())
                 .map(|rev| &rev.revokes == binding_hash)
                 .unwrap_or(false);
-            targets && verify_signed_by_registry(content_store, location_index, registry, &entry.hash)
+            targets
+                && verify_signed_by_registry(content_store, location_index, registry, &entry.hash)
         })
 }
 

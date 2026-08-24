@@ -115,9 +115,12 @@ impl<'a> ClockOps<'a> {
     pub fn now(
         &self,
     ) -> impl std::future::Future<Output = Result<ClockState, SdkError>> + Send + 'static {
-        let fut = self
-            .ctx
-            .execute("system/clock", "now", empty_params(), ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/clock",
+            "now",
+            empty_params(),
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
             if let Some(err) = SdkError::from_handler_result(&result, "system/clock:now") {
@@ -129,12 +132,13 @@ impl<'a> ClockOps<'a> {
 
     /// WASM variant — no `Send` bound.
     #[cfg(target_arch = "wasm32")]
-    pub fn now(
-        &self,
-    ) -> impl std::future::Future<Output = Result<ClockState, SdkError>> + 'static {
-        let fut = self
-            .ctx
-            .execute("system/clock", "now", empty_params(), ExecuteOptions::default());
+    pub fn now(&self) -> impl std::future::Future<Output = Result<ClockState, SdkError>> + 'static {
+        let fut = self.ctx.execute(
+            "system/clock",
+            "now",
+            empty_params(),
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
             if let Some(err) = SdkError::from_handler_result(&result, "system/clock:now") {
@@ -376,7 +380,9 @@ fn decode_clock_order(entity: &Entity) -> Result<ClockOrder, SdkError> {
             };
         }
     }
-    Err(SdkError::HandlerError("compare result missing `order`".into()))
+    Err(SdkError::HandlerError(
+        "compare result missing `order`".into(),
+    ))
 }
 
 fn decode_u64(v: &ciborium::Value) -> Option<u64> {

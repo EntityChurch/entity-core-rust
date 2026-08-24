@@ -202,8 +202,7 @@ impl DurabilityVerdict {
     /// physically written into the inbox namespace at `(author, request_id)`
     /// for the claim to be honest (§5 invariant; §6 lookup).
     pub fn preserve(&self) -> bool {
-        DurabilityLevel::parse(&self.result.applied).rank()
-            >= DurabilityLevel::Stored.rank()
+        DurabilityLevel::parse(&self.result.applied).rank() >= DurabilityLevel::Stored.rank()
     }
 }
 
@@ -423,7 +422,11 @@ mod tests {
     // §5 row 1: receiver can do ≥ X (sync) → 200 {requested:X, applied:X}.
     #[test]
     fn row1_can_meet_sync() {
-        let v = reconcile(&req("stored", false), &policy(DurabilityLevel::Stored), false);
+        let v = reconcile(
+            &req("stored", false),
+            &policy(DurabilityLevel::Stored),
+            false,
+        );
         assert_eq!(v.status, 200);
         assert_eq!(v.result.applied, "stored");
         assert_eq!(v.result.requested, "stored");
@@ -488,7 +491,11 @@ mod tests {
     // 202 {applied:none, committed:X}.
     #[test]
     fn row5_async_committed() {
-        let v = reconcile(&req("stored", false), &policy(DurabilityLevel::Stored), true);
+        let v = reconcile(
+            &req("stored", false),
+            &policy(DurabilityLevel::Stored),
+            true,
+        );
         assert_eq!(v.status, 202);
         assert_eq!(v.result.applied, "none");
         assert_eq!(v.result.committed.as_deref(), Some("stored"));
@@ -606,7 +613,11 @@ mod tests {
     #[test]
     fn preserve_true_only_when_applied_at_least_stored() {
         // Row 1: sync, met, applied=stored → preserve.
-        let v = reconcile(&req("stored", false), &policy(DurabilityLevel::Stored), false);
+        let v = reconcile(
+            &req("stored", false),
+            &policy(DurabilityLevel::Stored),
+            false,
+        );
         assert!(v.preserve(), "applied=stored MUST preserve");
 
         // Row 3: no durable store, applied=none → no preservation.
@@ -616,7 +627,11 @@ mod tests {
         // Row 5 / async path: applied=none (committed promises stored, but the
         // write hasn't happened yet at response time) → dispatcher-level
         // preservation is the inbox handler's job, not this verdict's.
-        let v = reconcile(&req("stored", false), &policy(DurabilityLevel::Stored), true);
+        let v = reconcile(
+            &req("stored", false),
+            &policy(DurabilityLevel::Stored),
+            true,
+        );
         assert!(
             !v.preserve(),
             "async pathway: applied=none, dispatcher MUST NOT double-preserve"
@@ -696,7 +711,10 @@ mod tests {
         assert_eq!(field("requested").as_deref(), Some("replicated"));
         assert_eq!(field("applied").as_deref(), Some("none"));
         assert_eq!(field("max_available").as_deref(), Some("stored"));
-        assert_eq!(field("reason").as_deref(), Some("durability_required_unmet"));
+        assert_eq!(
+            field("reason").as_deref(),
+            Some("durability_required_unmet")
+        );
         assert!(
             m.iter().all(|(k, _)| k.as_text() != Some("committed")),
             "absent optionals must not be encoded"

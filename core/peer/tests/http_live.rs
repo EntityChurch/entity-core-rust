@@ -45,7 +45,10 @@ async fn spawn_listener(seed: u8) -> (String, tokio::task::JoinHandle<()>) {
         .await
         .expect("http listener binds");
     let addr = listener.bound_addr();
-    let path = listener.url_path().expect("listener has execute path").to_string();
+    let path = listener
+        .url_path()
+        .expect("listener has execute path")
+        .to_string();
     let url = format!("http://{}{}", addr, path);
 
     let shared_clone = shared.clone();
@@ -206,7 +209,12 @@ async fn hello_envelope_round_trips_and_allocates_session() {
     let body = body_from_envelope(&hello);
 
     let client = reqwest::Client::new();
-    let resp = client.post(&url).body(body).send().await.expect("POST sends");
+    let resp = client
+        .post(&url)
+        .body(body)
+        .send()
+        .await
+        .expect("POST sends");
 
     assert_eq!(resp.status().as_u16(), 200);
     let session_id = resp
@@ -372,10 +380,7 @@ fn publish_into_namespace(
     entity: Entity,
 ) -> Hash {
     let h = entity.content_hash;
-    shared
-        .content_store
-        .put(entity)
-        .expect("content store put");
+    shared.content_store.put(entity).expect("content store put");
     // 66-char wire-hash leaf per ruling §5 B.
     let hex_h = hex_encode(&h.to_bytes());
     let path = format!("/{}/{}/{}", peer_id, namespace, hex_h);
@@ -445,8 +450,7 @@ async fn poll_content_get_in_namespace_returns_200_with_entity_ecf_that_rehashes
     // Invariant 2 — verify-by-rehash. Validate that
     // SHA-256(body) reproduces the URL hash. This is THE
     // content-addressed contract; a hostile CDN can't substitute.
-    Hash::validate(&expected_type, &expected_data, &h)
-        .expect("entity validates locally against H");
+    Hash::validate(&expected_type, &expected_data, &h).expect("entity validates locally against H");
     let recomputed = entity_hash::Hash::compute(&expected_type, &expected_data);
     assert_eq!(
         recomputed, h,
@@ -482,7 +486,10 @@ async fn poll_closure_scope_serves_signed_root_closure() {
     let entity = Entity::new("test/blob", b"closure payload".to_vec()).expect("entity");
     let leaf_hash = entity.content_hash;
     shared.content_store.put(entity).expect("put leaf");
-    let key = format!("system/content/public/{}", hex_encode(&leaf_hash.to_bytes()));
+    let key = format!(
+        "system/content/public/{}",
+        hex_encode(&leaf_hash.to_bytes())
+    );
     shared
         .location_index
         .set(&format!("/{}/{}", peer_id, key), leaf_hash);
@@ -518,10 +525,17 @@ async fn poll_closure_scope_serves_signed_root_closure() {
 
     // v7 — CONTENT_GET(root_hash): the trie root node MUST be served.
     let r = content_get(&root).await.expect("GET root");
-    assert_eq!(r.status().as_u16(), 200, "trie root node must be in closure (v7)");
+    assert_eq!(
+        r.status().as_u16(),
+        200,
+        "trie root node must be in closure (v7)"
+    );
     // The leaf value, the published-root entity, and the signature are all in
     // the served closure.
-    assert_eq!(content_get(&leaf_hash).await.unwrap().status().as_u16(), 200);
+    assert_eq!(
+        content_get(&leaf_hash).await.unwrap().status().as_u16(),
+        200
+    );
     assert_eq!(content_get(&head).await.unwrap().status().as_u16(), 200);
     assert_eq!(content_get(&sig_hash).await.unwrap().status().as_u16(), 200);
 
@@ -540,7 +554,11 @@ async fn poll_closure_scope_serves_signed_root_closure() {
         .send()
         .await
         .expect("GET signature pointer");
-    assert_eq!(sig_leaf.status().as_u16(), 200, "signature pointer served (v5)");
+    assert_eq!(
+        sig_leaf.status().as_u16(),
+        200,
+        "signature pointer served (v5)"
+    );
 
     // A hash that is NOT in the closure → identical 404 (T4).
     let stray = Hash::compute("test/stray", b"not in closure");
@@ -709,10 +727,7 @@ async fn poll_tree_get_in_namespace_returns_200_with_entity_ecf() {
     // **Amendment 5 URL shape (§6.5.3.1).** `/{peer_id}/{path}.bin`.
     // No `/tree/` prefix; co-located demux uses the peer-id as the
     // first segment, and the `.bin` suffix selects entity-vs-listing.
-    let target = format!(
-        "{}/{}/system/content/public/named-doc.bin",
-        url, peer_id
-    );
+    let target = format!("{}/{}/system/content/public/named-doc.bin", url, peer_id);
     let client = reqwest::Client::new();
     let resp = client.get(&target).send().await.expect("GET sends");
 
@@ -846,10 +861,7 @@ async fn poll_tree_get_out_of_namespace_returns_404() {
     shared.location_index.set(&private_path, h);
 
     // Amendment 5: tree URL is `/{peer_id}/{path}.bin` (no `/tree/`).
-    let target = format!(
-        "{}/{}/system/content/private/secret.bin",
-        url, peer_id
-    );
+    let target = format!("{}/{}/system/content/private/secret.bin", url, peer_id);
     let client = reqwest::Client::new();
     let resp = client.get(&target).send().await.expect("GET sends");
     assert_eq!(
@@ -1161,9 +1173,7 @@ async fn ingest_writes_namespace_binding_then_namespacescope_hits() {
         .build();
 
     let registry = shared.handler_registry.clone();
-    let handler = registry
-        .get(&pattern)
-        .expect("content handler registered");
+    let handler = registry.get(&pattern).expect("content handler registered");
     let result = handler.handle(&ctx).await.expect("ingest dispatches");
     // Sanity: ingest returned status 200.
     assert_eq!(result.status, 200, "ingest must succeed");
@@ -1265,10 +1275,7 @@ async fn amendment5_list_suffix_returns_listing_at_path() {
         .set(&format!("/{}/system/content/public/dir/b", peer_id), h2);
 
     // GET the listing of `dir` via the `.list` suffix.
-    let target = format!(
-        "{}/{}/system/content/public/dir.list",
-        url, peer_id
-    );
+    let target = format!("{}/{}/system/content/public/dir.list", url, peer_id);
     let client = reqwest::Client::new();
     let resp = client.get(&target).send().await.expect("GET sends");
     assert_eq!(resp.status().as_u16(), 200, "in-scope listing → 200");
@@ -1308,10 +1315,7 @@ async fn amendment5_strip_one_bijection_foo_bin_bin_is_entity_at_foo_bin() {
     shared.location_index.set(&bound, h);
 
     // URL: append ONE more `.bin` → `foo.bin.bin`.
-    let target = format!(
-        "{}/{}/system/content/public/foo.bin.bin",
-        url, peer_id
-    );
+    let target = format!("{}/{}/system/content/public/foo.bin.bin", url, peer_id);
     let client = reqwest::Client::new();
     let resp = client.get(&target).send().await.expect("GET sends");
     assert_eq!(
@@ -1323,10 +1327,7 @@ async fn amendment5_strip_one_bijection_foo_bin_bin_is_entity_at_foo_bin() {
     // Confirm the listing of `foo.bin` is `foo.bin.list` (different URL).
     // No children, but `foo.bin` is in scope so the request should 200
     // with empty entries (in-scope-empty per §6.5.6).
-    let listing_url = format!(
-        "{}/{}/system/content/public/foo.bin.list",
-        url, peer_id
-    );
+    let listing_url = format!("{}/{}/system/content/public/foo.bin.list", url, peer_id);
     let r = client.get(&listing_url).send().await.expect("GET sends");
     assert_eq!(
         r.status().as_u16(),
@@ -1400,7 +1401,11 @@ async fn amendment5_peer_id_list_returns_peer_root_listing() {
     let target = format!("{}/{}.list", url, peer_id);
     let client = reqwest::Client::new();
     let r = client.get(&target).send().await.expect("GET sends");
-    assert_eq!(r.status().as_u16(), 200, "{{peer_id}}.list ⇒ peer-root listing");
+    assert_eq!(
+        r.status().as_u16(),
+        200,
+        "{{peer_id}}.list ⇒ peer-root listing"
+    );
     let body = r.bytes().await.expect("body").to_vec();
     let decoded = entity_wire::decode_entity(&body).expect("decodes");
     assert_eq!(decoded.entity_type, "system/tree/listing");
@@ -1417,7 +1422,11 @@ async fn amendment5_peers_bare_returns_404_and_peers_list_returns_all_peers_list
 
     let client = reqwest::Client::new();
 
-    let r = client.get(format!("{}/peers", url)).send().await.expect("GET");
+    let r = client
+        .get(format!("{}/peers", url))
+        .send()
+        .await
+        .expect("GET");
     assert_eq!(r.status().as_u16(), 404, "bare `peers` MUST 404");
 
     let r = client
@@ -1513,8 +1522,7 @@ async fn amendment5_listing_filters_out_of_scope_children_and_count_is_filtered_
     assert_eq!(r.status().as_u16(), 200);
     let body = r.bytes().await.expect("body").to_vec();
     let decoded = entity_wire::decode_entity(&body).expect("decodes");
-    let val: ciborium::Value =
-        ciborium::from_reader(decoded.data.as_slice()).expect("CBOR");
+    let val: ciborium::Value = ciborium::from_reader(decoded.data.as_slice()).expect("CBOR");
     let map = val.as_map().expect("map");
     let count: i128 = map
         .iter()
@@ -1522,21 +1530,21 @@ async fn amendment5_listing_filters_out_of_scope_children_and_count_is_filtered_
             (k.as_text() == Some("count")).then(|| v.as_integer().map(|i| i.into()))?
         })
         .expect("count present");
-    assert_eq!(count, 2, "count is filtered total (a + b); hidden NOT counted");
+    assert_eq!(
+        count, 2,
+        "count is filtered total (a + b); hidden NOT counted"
+    );
 
     let entries = map
         .iter()
         .find(|(k, _)| k.as_text() == Some("entries"))
         .and_then(|(_, v)| v.as_map())
         .expect("entries map");
-    let names: Vec<&str> = entries
-        .iter()
-        .filter_map(|(k, _)| k.as_text())
-        .collect();
-    assert!(names.iter().any(|n| *n == "a"), "a present");
-    assert!(names.iter().any(|n| *n == "b"), "b present");
+    let names: Vec<&str> = entries.iter().filter_map(|(k, _)| k.as_text()).collect();
+    assert!(names.contains(&"a"), "a present");
+    assert!(names.contains(&"b"), "b present");
     assert!(
-        !names.iter().any(|n| *n == "h"),
+        !names.contains(&"h"),
         "hidden child MUST be filtered out (presence-oracle mitigation, §6.5.6)"
     );
 
@@ -1701,10 +1709,7 @@ async fn amendment6_tree_leaf_is_two_hop_hash_pointer() {
     shared.location_index.set(&leaf_path, h);
 
     // ---- HOP 1: GET /{peer_id}/system/content/public/two-hop.bin
-    let leaf_url = format!(
-        "{}/{}/system/content/public/two-hop.bin",
-        url, peer_id
-    );
+    let leaf_url = format!("{}/{}/system/content/public/two-hop.bin", url, peer_id);
     let client = reqwest::Client::new();
     let r1 = client.get(&leaf_url).send().await.expect("hop 1 GET");
     assert_eq!(r1.status().as_u16(), 200);
@@ -1737,8 +1742,7 @@ async fn amendment6_tree_leaf_is_two_hop_hash_pointer() {
         body[0]
     );
     // Decode the map: extract `type` and `data` fields.
-    let val: ciborium::Value =
-        ciborium::from_reader(body.as_slice()).expect("body is CBOR");
+    let val: ciborium::Value = ciborium::from_reader(body.as_slice()).expect("body is CBOR");
     let map = val.as_map().expect("body is a CBOR map");
     let mut got_type: Option<&str> = None;
     let mut got_data: Option<&[u8]> = None;
@@ -1806,8 +1810,7 @@ async fn amendment6_tree_leaf_pointer_does_not_inline_entity_bytes() {
     let (url, peer_id, shared, handle) =
         spawn_poll_listener_with_namespace(151, "system/content/public").await;
 
-    let entity =
-        Entity::new("test/blob", b"shared by two paths".to_vec()).expect("entity");
+    let entity = Entity::new("test/blob", b"shared by two paths".to_vec()).expect("entity");
     let h = entity.content_hash;
     shared.content_store.put(entity).expect("put");
 
@@ -1832,7 +1835,10 @@ async fn amendment6_tree_leaf_pointer_does_not_inline_entity_bytes() {
     let b2 = r2.bytes().await.expect("b2").to_vec();
 
     // Both URLs MUST return byte-identical pointers (dedup preserved).
-    assert_eq!(b1, b2, "two paths to the same H MUST return identical pointers");
+    assert_eq!(
+        b1, b2,
+        "two paths to the same H MUST return identical pointers"
+    );
     // And the pointer body MUST be tiny — order of bytes (CBOR map +
     // type string + 33-byte bstr), not the entity payload size. The
     // entity itself is small here, so an upper bound is the only
@@ -1884,14 +1890,10 @@ async fn amendment5_multi_peer_publish_via_tree_put_surfaces_in_peers_list() {
 
     // Publish an in-scope binding under the FOREIGN peer-id. This is
     // exactly what a cross-peer `tree:put` would land in the store.
-    let e = Entity::new("test/blob", b"cross-peer publish".to_vec())
-        .expect("entity");
+    let e = Entity::new("test/blob", b"cross-peer publish".to_vec()).expect("entity");
     let h = e.content_hash;
     shared.content_store.put(e).expect("put");
-    let foreign_path = format!(
-        "/{}/system/content/public/cross-peer-blob",
-        foreign_pid
-    );
+    let foreign_path = format!("/{}/system/content/public/cross-peer-blob", foreign_pid);
     shared.location_index.set(&foreign_path, h);
 
     // GET /peers.list — MUST surface the foreign peer-id.
@@ -1904,20 +1906,16 @@ async fn amendment5_multi_peer_publish_via_tree_put_surfaces_in_peers_list() {
     assert_eq!(r.status().as_u16(), 200);
     let body = r.bytes().await.expect("body").to_vec();
     let decoded = entity_wire::decode_entity(&body).expect("decodes");
-    let val: ciborium::Value =
-        ciborium::from_reader(decoded.data.as_slice()).expect("CBOR");
+    let val: ciborium::Value = ciborium::from_reader(decoded.data.as_slice()).expect("CBOR");
     let map = val.as_map().expect("map");
     let entries = map
         .iter()
         .find(|(k, _)| k.as_text() == Some("entries"))
         .and_then(|(_, v)| v.as_map())
         .expect("entries map");
-    let names: Vec<&str> = entries
-        .iter()
-        .filter_map(|(k, _)| k.as_text())
-        .collect();
+    let names: Vec<&str> = entries.iter().filter_map(|(k, _)| k.as_text()).collect();
     assert!(
-        names.iter().any(|n| *n == foreign_pid.as_str()),
+        names.contains(&foreign_pid.as_str()),
         "peers.list MUST surface the foreign peer-id when it has in-scope \
          bindings; got entries = {:?}",
         names
@@ -1945,9 +1943,7 @@ async fn amendment5_cap_token_scope_is_drift_free_vs_check_permission() {
     // §6.5.6 Amendment 5: `serve_scope` as cap-token. Verify the
     // CapTokenScope routes both faces through the same evaluator the
     // live-EXECUTE surface uses — by construction, drift impossible.
-    use entity_capability::{
-        CapabilityToken, GrantEntry, Granter, IdScope, PathScope,
-    };
+    use entity_capability::{CapabilityToken, GrantEntry, Granter, IdScope, PathScope};
     use entity_peer::http_live::CapTokenScope;
 
     let server = PeerBuilder::new()
@@ -2018,7 +2014,10 @@ async fn amendment5_cap_token_scope_is_drift_free_vs_check_permission() {
 
     let c_in = scope.in_scope(&h_in, &shared).await.expect("in_scope");
     let c_out = scope.in_scope(&h_out, &shared).await.expect("in_scope");
-    assert!(c_in, "hash bound in cap-included namespace MUST be in scope");
+    assert!(
+        c_in,
+        "hash bound in cap-included namespace MUST be in scope"
+    );
     assert!(
         !c_out,
         "hash bound only in out-of-cap namespace MUST be out of scope"
@@ -2052,9 +2051,13 @@ async fn http_outbound_connect_completes_handshake() {
     let (url, handle) = spawn_listener(50).await;
 
     let client_kp = Keypair::from_seed([51u8; 32]);
-    let http = HttpConnection::connect(&url, &IdentityKeypair::Ed25519(client_kp.clone_inner()), entity_hash::HASH_ALGORITHM_SHA256)
-        .await
-        .expect("HTTP outbound handshake should complete");
+    let http = HttpConnection::connect(
+        &url,
+        &IdentityKeypair::Ed25519(client_kp.clone_inner()),
+        entity_hash::HASH_ALGORITHM_SHA256,
+    )
+    .await
+    .expect("HTTP outbound handshake should complete");
 
     // Remote peer_id is whatever the seed=50 peer derived.
     let expected_remote_pid = Keypair::from_seed([50u8; 32]).peer_id().to_string();
@@ -2077,9 +2080,13 @@ async fn http_outbound_execute_via_send_execute_round_trip() {
     let (url, handle) = spawn_listener(52).await;
 
     let client_kp = Keypair::from_seed([53u8; 32]);
-    let http = HttpConnection::connect(&url, &IdentityKeypair::Ed25519(client_kp.clone_inner()), entity_hash::HASH_ALGORITHM_SHA256)
-        .await
-        .expect("connect");
+    let http = HttpConnection::connect(
+        &url,
+        &IdentityKeypair::Ed25519(client_kp.clone_inner()),
+        entity_hash::HASH_ALGORITHM_SHA256,
+    )
+    .await
+    .expect("connect");
 
     // Build a tree:get params entity for the remote peer's `system/handler`
     // prefix (a path that always resolves on a freshly-built peer because
@@ -2091,7 +2098,7 @@ async fn http_outbound_execute_via_send_execute_round_trip() {
     let remote_pid = Keypair::from_seed([52u8; 32]).peer_id().to_string();
     let params_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
         entity_ecf::text("path"),
-        entity_ecf::text(&format!("/{}/system/handler", remote_pid)),
+        entity_ecf::text(format!("/{}/system/handler", remote_pid)),
     )]));
     let params = Entity::new("system/tree/get-params", params_data).unwrap();
 
@@ -2142,15 +2149,23 @@ async fn http_outbound_p2p_bidirectional() {
     let pid_b = kp_b.peer_id().to_string();
 
     // A dials B (A as client, B's listener).
-    let a_to_b = HttpConnection::connect(&url_b, &IdentityKeypair::Ed25519(kp_a.clone_inner()), entity_hash::HASH_ALGORITHM_SHA256)
-        .await
-        .expect("A→B HTTP connect");
+    let a_to_b = HttpConnection::connect(
+        &url_b,
+        &IdentityKeypair::Ed25519(kp_a.clone_inner()),
+        entity_hash::HASH_ALGORITHM_SHA256,
+    )
+    .await
+    .expect("A→B HTTP connect");
     assert_eq!(a_to_b.remote_peer_id(), &pid_b);
 
     // B dials A (B as client, A's listener). Mirror-direction.
-    let b_to_a = HttpConnection::connect(&url_a, &IdentityKeypair::Ed25519(kp_b.clone_inner()), entity_hash::HASH_ALGORITHM_SHA256)
-        .await
-        .expect("B→A HTTP connect");
+    let b_to_a = HttpConnection::connect(
+        &url_a,
+        &IdentityKeypair::Ed25519(kp_b.clone_inner()),
+        entity_hash::HASH_ALGORITHM_SHA256,
+    )
+    .await
+    .expect("B→A HTTP connect");
     assert_eq!(b_to_a.remote_peer_id(), &pid_a);
 
     // Both directions had successful handshakes. Class-G structural
@@ -2188,14 +2203,14 @@ async fn http_outbound_resolver_selects_http_profile_when_no_tcp() {
     // `primary-http` profile-id slot (G1 — distinct id avoids the
     // primary-vs-primary collision that would silently overwrite a
     // TCP profile at the same path).
-    let http_profile = HttpProfileData::for_local_listener(
-        &pid_b,
-        "http://127.0.0.1:9999/entity",
-        1_000,
-    )
-    .to_entity();
+    let http_profile =
+        HttpProfileData::for_local_listener(&pid_b, "http://127.0.0.1:9999/entity", 1_000)
+            .to_entity();
     let h = http_profile.content_hash;
-    shared_a.content_store.put(http_profile).expect("put profile");
+    shared_a
+        .content_store
+        .put(http_profile)
+        .expect("put profile");
     // v7.64 §1.4: path-segment is `{peer_id_hex}` (hex of remote's
     // `system/peer` content_hash), not Base58.
     let pid_b_hex = entity_crypto::PeerId::from(pid_b.as_str())

@@ -17,15 +17,14 @@ pub unsafe extern "C" fn entity_hash_compute(
     data_len: usize,
 ) -> EntityCoreBuffer {
     ffi_fn!({
-        let entity_type = match unsafe {
-            std::str::from_utf8(std::slice::from_raw_parts(type_ptr, type_len))
-        } {
-            Ok(s) => s,
-            Err(e) => {
-                set_last_error(&format!("invalid UTF-8 type: {}", e));
-                return EntityCoreBuffer::null();
-            }
-        };
+        let entity_type =
+            match unsafe { std::str::from_utf8(std::slice::from_raw_parts(type_ptr, type_len)) } {
+                Ok(s) => s,
+                Err(e) => {
+                    set_last_error(&format!("invalid UTF-8 type: {}", e));
+                    return EntityCoreBuffer::null();
+                }
+            };
         let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
         let hash = entity_hash::Hash::compute(entity_type, data);
         EntityCoreBuffer::from_vec(hash.to_bytes().to_vec())
@@ -44,33 +43,36 @@ pub unsafe extern "C" fn entity_hash_validate(
     data_len: usize,
     hash_ptr: *const u8,
 ) -> EntityCoreError {
-    ffi_fn!({
-        let entity_type = match unsafe {
-            std::str::from_utf8(std::slice::from_raw_parts(type_ptr, type_len))
-        } {
-            Ok(s) => s,
-            Err(e) => {
-                set_last_error(&format!("invalid UTF-8 type: {}", e));
-                return EntityCoreError::InvalidArgument;
+    ffi_fn!(
+        {
+            let entity_type = match unsafe {
+                std::str::from_utf8(std::slice::from_raw_parts(type_ptr, type_len))
+            } {
+                Ok(s) => s,
+                Err(e) => {
+                    set_last_error(&format!("invalid UTF-8 type: {}", e));
+                    return EntityCoreError::InvalidArgument;
+                }
+            };
+            let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
+            let hash_bytes = unsafe { std::slice::from_raw_parts(hash_ptr, 33) };
+            let claimed = match entity_hash::Hash::from_bytes(hash_bytes) {
+                Ok(h) => h,
+                Err(e) => {
+                    set_last_error(&format!("invalid hash: {}", e));
+                    return EntityCoreError::InvalidArgument;
+                }
+            };
+            match entity_hash::Hash::validate(entity_type, data, &claimed) {
+                Ok(()) => EntityCoreError::Ok,
+                Err(e) => {
+                    set_last_error(&format!("hash mismatch: {}", e));
+                    EntityCoreError::InvalidArgument
+                }
             }
-        };
-        let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) };
-        let hash_bytes = unsafe { std::slice::from_raw_parts(hash_ptr, 33) };
-        let claimed = match entity_hash::Hash::from_bytes(hash_bytes) {
-            Ok(h) => h,
-            Err(e) => {
-                set_last_error(&format!("invalid hash: {}", e));
-                return EntityCoreError::InvalidArgument;
-            }
-        };
-        match entity_hash::Hash::validate(entity_type, data, &claimed) {
-            Ok(()) => EntityCoreError::Ok,
-            Err(e) => {
-                set_last_error(&format!("hash mismatch: {}", e));
-                EntityCoreError::InvalidArgument
-            }
-        }
-    }, EntityCoreError::InternalError)
+        },
+        EntityCoreError::InternalError
+    )
 }
 
 /// Format a 33-byte hash as hex string.
@@ -96,9 +98,8 @@ pub unsafe extern "C" fn entity_hash_from_hex(
     hex_len: usize,
 ) -> EntityCoreBuffer {
     ffi_fn!({
-        let hex = match unsafe {
-            std::str::from_utf8(std::slice::from_raw_parts(hex_ptr, hex_len))
-        } {
+        let hex = match unsafe { std::str::from_utf8(std::slice::from_raw_parts(hex_ptr, hex_len)) }
+        {
             Ok(s) => s,
             Err(e) => {
                 set_last_error(&format!("invalid UTF-8: {}", e));

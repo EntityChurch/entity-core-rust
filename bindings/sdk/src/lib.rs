@@ -22,15 +22,15 @@
 //! See `bindings/sdk/README.md` for the discipline checklist and
 //! contributor guidance.
 
-pub mod sdk;
-pub mod register_handler;
-pub mod subscription;
-pub mod peer_manager;
 /// Inspect-sink routing (consumer side of the substrate's
 /// dispatch/wire/binding hooks). Direct-arm install_inspect_sink
 /// wiring. Worker-arm parallel lives on
 /// `entity_wasm_worker_proxy::WorkerProxy`.
 pub mod inspect;
+pub mod peer_manager;
+pub mod register_handler;
+pub mod sdk;
+pub mod subscription;
 
 /// Typed wrapper for `system/attestation` extension ops. Per
 /// `EXTENSION-ATTESTATION.md §6` and `SDK-IDENTITY-INFRASTRUCTURE.md
@@ -101,13 +101,18 @@ pub mod role;
 
 // Convenience re-exports of the most-used types so consumers can write
 // `entity_sdk::PeerContext` rather than `entity_sdk::sdk::PeerContext`.
-pub use sdk::{ChangeType, ContentRemoveOutcome, EntitySDK, FieldInfo, HandlerInfo, HistoryQueryOptions, HistoryQueryResult, HistoryTransition, InspectDispatchEvent, InspectWireDirection, InspectWireEvent, PeerContext, PeerContextBuilder, PeerMetadata, QueryMatch, QueryResults, SdkError, TreeChangeEvent, TypeInfo, content_remove_if_unbound};
-pub use subscription::{SubscribeLimits, SubscribeOptions, SubscriptionInfo, SubscriptionOps};
-pub use peer_manager::{PeerManager, PersistedPeer};
 pub use inspect::{
     InspectBindingKind, InspectFact, InspectSinkFn, InspectSinkHandle, InspectSinkRegistry,
     InspectWireFrameDirection,
 };
+pub use peer_manager::{PeerManager, PersistedPeer};
+pub use sdk::{
+    content_remove_if_unbound, ChangeType, ContentRemoveOutcome, EntitySDK, FieldInfo, HandlerInfo,
+    HistoryQueryOptions, HistoryQueryResult, HistoryTransition, InspectDispatchEvent,
+    InspectWireDirection, InspectWireEvent, PeerContext, PeerContextBuilder, PeerMetadata,
+    QueryMatch, QueryResults, SdkError, TreeChangeEvent, TypeInfo,
+};
+pub use subscription::{SubscribeLimits, SubscribeOptions, SubscriptionInfo, SubscriptionOps};
 
 #[cfg(feature = "attestation")]
 pub use attestation::{
@@ -120,8 +125,8 @@ pub use clock::{ClockOps, ClockOrder, ClockState, ClockValue, HlcState};
 
 #[cfg(feature = "compute")]
 pub use compute::{
-    ComputeEvalResult, ComputeInstallResult, ComputeOps, ComputeValue, EvalOptions,
-    InstallOptions, InstalledSubgraph,
+    ComputeEvalResult, ComputeInstallResult, ComputeOps, ComputeValue, EvalOptions, InstallOptions,
+    InstalledSubgraph,
 };
 
 #[cfg(feature = "continuation")]

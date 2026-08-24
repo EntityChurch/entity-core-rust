@@ -295,7 +295,11 @@ impl Keypair {
     }
 
     /// Verify a signature against a public key (static method).
-    pub fn verify(public_key: &[u8; 32], message: &[u8], signature: &[u8]) -> Result<(), CryptoError> {
+    pub fn verify(
+        public_key: &[u8; 32],
+        message: &[u8],
+        signature: &[u8],
+    ) -> Result<(), CryptoError> {
         let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(public_key)
             .map_err(|_| CryptoError::InvalidPublicKey)?;
         let sig_bytes: [u8; 64] = signature
@@ -505,7 +509,10 @@ pub fn peer_entity_from_components_with_format(
         return Err(CryptoError::InvalidPublicKey);
     }
     let data_value = entity_ecf::Value::Map(vec![
-        (entity_ecf::text("key_type"), entity_ecf::text(key_type.label())),
+        (
+            entity_ecf::text("key_type"),
+            entity_ecf::text(key_type.label()),
+        ),
         (
             entity_ecf::text("public_key"),
             entity_ecf::Value::Bytes(public_key.to_vec()),
@@ -914,7 +921,7 @@ impl Ed448Keypair {
         signature: &[u8],
     ) -> Result<(), CryptoError> {
         use ed448_goldilocks::signature::Verifier;
-        let pk = ed448_goldilocks::VerifyingKey::from_bytes(&(*public_key).into())
+        let pk = ed448_goldilocks::VerifyingKey::from_bytes(public_key)
             .map_err(|_| CryptoError::InvalidPublicKey)?;
         let sig_bytes: [u8; ED448_SIGNATURE_LEN] = signature
             .try_into()
@@ -927,7 +934,7 @@ impl Ed448Keypair {
 
     /// Get the raw 57-byte public key bytes.
     pub fn public_key_bytes(&self) -> [u8; ED448_PUBLIC_KEY_LEN] {
-        self.inner.verifying_key().to_bytes().into()
+        self.inner.verifying_key().to_bytes()
     }
 
     /// Get the raw 57-byte secret seed bytes. See [`Keypair::secret_key_bytes`]
@@ -1167,8 +1174,7 @@ impl IdentityKeypair {
                     self.public_key_base64(),
                     self.peer_id()
                 );
-                std::fs::write(pub_path, pub_line)
-                    .map_err(|e| CryptoError::IoError(e.to_string()))
+                std::fs::write(pub_path, pub_line).map_err(|e| CryptoError::IoError(e.to_string()))
             }
         }
     }
@@ -1247,8 +1253,8 @@ mod tests {
     }
 
     const TEST_SEED: [u8; 32] = [
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-        25, 26, 27, 28, 29, 30, 31, 32,
+        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+        26, 27, 28, 29, 30, 31, 32,
     ];
 
     #[test]
@@ -1386,8 +1392,7 @@ mod tests {
         // hashable field — invariance under wire-form peer_id choice.
         let kp = Keypair::from_seed(TEST_SEED);
         let entity = kp.peer_entity().unwrap();
-        let value: entity_ecf::Value =
-            ciborium::from_reader(entity.data.as_slice()).unwrap();
+        let value: entity_ecf::Value = ciborium::from_reader(entity.data.as_slice()).unwrap();
         let map = value.as_map().unwrap();
 
         let mut found_key_type = false;
@@ -1507,8 +1512,9 @@ mod tests {
         assert_eq!(dec.hash_type, HASH_TYPE_IDENTITY);
         assert_eq!(dec.digest.as_slice(), pk.as_slice());
 
-        let (recovered_pk, recovered_kt) =
-            pid.derive_public_key().expect("identity-form is self-resolving");
+        let (recovered_pk, recovered_kt) = pid
+            .derive_public_key()
+            .expect("identity-form is self-resolving");
         assert_eq!(recovered_kt, KEY_TYPE_ED25519);
         assert_eq!(recovered_pk.as_slice(), pk.as_slice());
 
@@ -1681,8 +1687,7 @@ mod tests {
         let sig = kp.sign(msg);
         assert_eq!(sig.len(), ED448_SIGNATURE_LEN);
         Ed448Keypair::verify(&pk, msg, &sig).expect("verify");
-        Ed448Keypair::verify(&pk, b"wrong-message", &sig)
-            .expect_err("wrong message must reject");
+        Ed448Keypair::verify(&pk, b"wrong-message", &sig).expect_err("wrong message must reject");
     }
 
     /// v7.67 §3.2: canonical Ed448 PeerID form is SHA-256-form
@@ -1709,8 +1714,7 @@ mod tests {
         let kp = Ed448Keypair::from_seed(&seed).unwrap();
         let entity = kp.peer_entity().unwrap();
         assert_eq!(entity.entity_type, TYPE_PEER);
-        let value: entity_ecf::Value =
-            ciborium::from_reader(entity.data.as_slice()).unwrap();
+        let value: entity_ecf::Value = ciborium::from_reader(entity.data.as_slice()).unwrap();
         let map = value.as_map().unwrap();
         let mut found_key_type = false;
         let mut found_public_key = false;
@@ -1745,10 +1749,7 @@ mod tests {
     fn ed448_key_type_label_roundtrip() {
         assert_eq!(KeyType::Ed448.label(), "ed448");
         assert_eq!(KeyType::Ed448.byte(), KEY_TYPE_ED448);
-        assert!(matches!(
-            KeyType::from_label("ed448"),
-            Ok(KeyType::Ed448)
-        ));
+        assert!(matches!(KeyType::from_label("ed448"), Ok(KeyType::Ed448)));
         assert!(matches!(
             KeyType::from_byte(KEY_TYPE_ED448),
             Ok(KeyType::Ed448)

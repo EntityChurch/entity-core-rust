@@ -11,9 +11,9 @@ use std::sync::Arc;
 use entity_crypto::Keypair;
 use entity_entity::Entity;
 use entity_hash::Hash;
-use entity_peer::{PeerConfig, PeerShared};
 #[cfg(feature = "native-ws")]
 use entity_peer::Peer;
+use entity_peer::{PeerConfig, PeerShared};
 use entity_store::LocationEntry;
 
 use crate::sdk::{EntitySDK, PeerContext, PeerMetadata, QueryResults, SdkError};
@@ -38,7 +38,10 @@ pub struct PersistedPeer {
 }
 
 // Re-export types so existing imports from peer_manager continue to work.
-pub use crate::sdk::{FieldInfo, HandlerInfo, HistoryQueryOptions, HistoryQueryResult, HistoryTransition, QueryMatch, TypeInfo};
+pub use crate::sdk::{
+    FieldInfo, HandlerInfo, HistoryQueryOptions, HistoryQueryResult, HistoryTransition, QueryMatch,
+    TypeInfo,
+};
 pub use crate::subscription::SubscriptionInfo;
 
 /// Default WebSocket listen address for native.
@@ -74,9 +77,7 @@ impl PeerManager {
     /// instead of the platform default. Use this when peers need an
     /// alternative transport — e.g., `MemoryConnector` for in-process
     /// multi-peer tests or single-process scenarios.
-    pub fn with_connector(
-        connector: Arc<dyn entity_peer::transport::Connector>,
-    ) -> Self {
+    pub fn with_connector(connector: Arc<dyn entity_peer::transport::Connector>) -> Self {
         Self::with_keypair_and_optional_connector(None, Some(connector))
     }
 
@@ -156,23 +157,25 @@ impl PeerManager {
             // On WASM, use browser WebSocket connector for outbound connections.
             #[cfg(target_arch = "wasm32")]
             {
-                builder = builder.connector(Arc::new(
-                    entity_peer::transport::BrowserWebSocketConnector,
-                ));
+                builder =
+                    builder.connector(Arc::new(entity_peer::transport::BrowserWebSocketConnector));
             }
 
             // On native with websocket feature, use WebSocket connector.
             #[cfg(feature = "native-ws")]
             {
-                builder = builder.connector(Arc::new(
-                    entity_peer::transport::WebSocketConnector,
-                ));
+                builder = builder.connector(Arc::new(entity_peer::transport::WebSocketConnector));
             }
         }
 
-        let sdk = builder.build().expect("SDK build should not fail with generated keypair");
+        let sdk = builder
+            .build()
+            .expect("SDK build should not fail with generated keypair");
 
-        Self { sdk, connector_override }
+        Self {
+            sdk,
+            connector_override,
+        }
     }
 
     /// Add peers recovered from app-tier persistent storage. Each peer is
@@ -197,24 +200,33 @@ impl PeerManager {
             #[cfg(all(not(target_arch = "wasm32"), feature = "sqlite"))]
             let create_result = match pp.sqlite_path {
                 Some(path) => self.sdk.create_peer_with_sqlite(
-                    pp.keypair, config, self.make_connector(), path,
+                    pp.keypair,
+                    config,
+                    self.make_connector(),
+                    path,
                 ),
-                None => self.sdk.create_peer(pp.keypair, config, self.make_connector()),
+                None => self
+                    .sdk
+                    .create_peer(pp.keypair, config, self.make_connector()),
             };
             #[cfg(any(target_arch = "wasm32", not(feature = "sqlite")))]
             let create_result = {
                 // Field intentionally ignored on WASM / non-sqlite builds.
                 let _ = &pp.sqlite_path;
-                self.sdk.create_peer(pp.keypair, config, self.make_connector())
+                self.sdk
+                    .create_peer(pp.keypair, config, self.make_connector())
             };
 
             match create_result {
                 Ok(pid) => {
-                    self.sdk.set_metadata(&pid, PeerMetadata {
-                        label: pp.label,
-                        persisted: true,
-                        ..PeerMetadata::default()
-                    });
+                    self.sdk.set_metadata(
+                        &pid,
+                        PeerMetadata {
+                            label: pp.label,
+                            persisted: true,
+                            ..PeerMetadata::default()
+                        },
+                    );
                     tracing::info!(peer_id = %pid, "loaded persisted peer");
                 }
                 Err(e) => {
@@ -262,12 +274,17 @@ impl PeerManager {
             debug_open_grants: true,
             ..PeerConfig::default()
         };
-        let peer_id = self.sdk.create_peer(keypair, config, self.make_connector())
+        let peer_id = self
+            .sdk
+            .create_peer(keypair, config, self.make_connector())
             .expect("peer creation should not fail with generated keypair");
-        self.sdk.set_metadata(&peer_id, PeerMetadata {
-            label,
-            ..PeerMetadata::default()
-        });
+        self.sdk.set_metadata(
+            &peer_id,
+            PeerMetadata {
+                label,
+                ..PeerMetadata::default()
+            },
+        );
         (peer_id, seed)
     }
 
@@ -284,11 +301,14 @@ impl PeerManager {
         label: Option<String>,
         listen_addresses: Vec<String>,
     ) -> bool {
-        self.sdk.register_backend_peer(peer_id, PeerMetadata {
-            listen_addresses,
-            label,
-            ..PeerMetadata::default()
-        })
+        self.sdk.register_backend_peer(
+            peer_id,
+            PeerMetadata {
+                listen_addresses,
+                label,
+                ..PeerMetadata::default()
+            },
+        )
     }
 
     /// Delete a peer by ID. Returns false if it's the default peer or doesn't exist.
@@ -323,7 +343,9 @@ impl PeerManager {
 
     /// Look up a PeerContext by peer ID, falling back to the default peer.
     pub fn peer_context_or_default(&self, peer_id: &str) -> &PeerContext {
-        self.sdk.peer(peer_id).unwrap_or_else(|| self.sdk.default_peer())
+        self.sdk
+            .peer(peer_id)
+            .unwrap_or_else(|| self.sdk.default_peer())
     }
 
     /// Direct access to a kernel Peer by ID.
@@ -352,7 +374,8 @@ impl PeerManager {
 
     /// List all entries in a peer's tree under a prefix.
     pub fn tree_listing(&self, peer_id: &str, prefix: &str) -> Vec<LocationEntry> {
-        self.sdk.peer(peer_id)
+        self.sdk
+            .peer(peer_id)
             .map(|ctx| ctx.store().list(prefix))
             .unwrap_or_default()
     }
@@ -361,7 +384,8 @@ impl PeerManager {
     /// `dom/tree.rs` (WASM-only render path).
     #[allow(dead_code)]
     pub fn entity_count(&self, peer_id: &str) -> usize {
-        self.sdk.peer(peer_id)
+        self.sdk
+            .peer(peer_id)
             .map(|ctx| ctx.entity_count())
             .unwrap_or(0)
     }
@@ -369,7 +393,8 @@ impl PeerManager {
     /// Total paths in a peer's tree. Called from `dom/tree.rs` (WASM-only).
     #[allow(dead_code)]
     pub fn path_count(&self, peer_id: &str) -> usize {
-        self.sdk.peer(peer_id)
+        self.sdk
+            .peer(peer_id)
             .map(|ctx| ctx.path_count())
             .unwrap_or(0)
     }
@@ -378,7 +403,8 @@ impl PeerManager {
     /// WASM-only `render_dom` paths (execute_console).
     #[allow(dead_code)]
     pub fn discover_handlers(&self, peer_id: &str) -> Vec<HandlerInfo> {
-        self.sdk.peer(peer_id)
+        self.sdk
+            .peer(peer_id)
             .map(|ctx| ctx.discover_handlers())
             .unwrap_or_default()
     }
@@ -387,7 +413,8 @@ impl PeerManager {
     /// Mirrors [`discover_handlers`].
     #[allow(dead_code)]
     pub fn discover_types(&self, peer_id: &str) -> Vec<TypeInfo> {
-        self.sdk.peer(peer_id)
+        self.sdk
+            .peer(peer_id)
             .map(|ctx| ctx.discover_types())
             .unwrap_or_default()
     }
@@ -395,7 +422,8 @@ impl PeerManager {
     /// List pending inbox entries on a peer (SDK-EXTENSION-OPERATIONS §7).
     #[allow(dead_code)]
     pub fn inbox_list(&self, peer_id: &str) -> Vec<LocationEntry> {
-        self.sdk.peer(peer_id)
+        self.sdk
+            .peer(peer_id)
             .map(|ctx| ctx.inbox_list())
             .unwrap_or_default()
     }
@@ -415,9 +443,13 @@ impl PeerManager {
         peer_id: &str,
         path: impl Into<String>,
         options: HistoryQueryOptions,
-    ) -> impl std::future::Future<Output = Result<HistoryQueryResult, SdkError>> + Send + 'static {
+    ) -> impl std::future::Future<Output = Result<HistoryQueryResult, SdkError>> + Send + 'static
+    {
         let path = path.into();
-        let ctx_fut = self.sdk.peer(peer_id).map(|ctx| ctx.history_query(path, options));
+        let ctx_fut = self
+            .sdk
+            .peer(peer_id)
+            .map(|ctx| ctx.history_query(path, options));
         async move {
             match ctx_fut {
                 Some(fut) => fut.await,
@@ -435,7 +467,10 @@ impl PeerManager {
         options: HistoryQueryOptions,
     ) -> impl std::future::Future<Output = Result<HistoryQueryResult, SdkError>> + 'static {
         let path = path.into();
-        let ctx_fut = self.sdk.peer(peer_id).map(|ctx| ctx.history_query(path, options));
+        let ctx_fut = self
+            .sdk
+            .peer(peer_id)
+            .map(|ctx| ctx.history_query(path, options));
         async move {
             match ctx_fut {
                 Some(fut) => fut.await,
@@ -454,7 +489,10 @@ impl PeerManager {
         target_hash: Hash,
     ) -> impl std::future::Future<Output = Result<(), SdkError>> + Send + 'static {
         let path = path.into();
-        let ctx_fut = self.sdk.peer(peer_id).map(|ctx| ctx.history_rollback(path, target_hash));
+        let ctx_fut = self
+            .sdk
+            .peer(peer_id)
+            .map(|ctx| ctx.history_rollback(path, target_hash));
         async move {
             match ctx_fut {
                 Some(fut) => fut.await,
@@ -472,7 +510,10 @@ impl PeerManager {
         target_hash: Hash,
     ) -> impl std::future::Future<Output = Result<(), SdkError>> + 'static {
         let path = path.into();
-        let ctx_fut = self.sdk.peer(peer_id).map(|ctx| ctx.history_rollback(path, target_hash));
+        let ctx_fut = self
+            .sdk
+            .peer(peer_id)
+            .map(|ctx| ctx.history_rollback(path, target_hash));
         async move {
             match ctx_fut {
                 Some(fut) => fut.await,
@@ -484,7 +525,8 @@ impl PeerManager {
     /// List active subscriptions on a peer (SDK-EXTENSION-OPERATIONS §3).
     #[allow(dead_code)]
     pub fn list_subscriptions(&self, peer_id: &str) -> Vec<SubscriptionInfo> {
-        self.sdk.peer(peer_id)
+        self.sdk
+            .peer(peer_id)
             .map(|ctx| ctx.list_subscriptions())
             .unwrap_or_default()
     }
@@ -684,7 +726,10 @@ mod tests {
         let pid = pm.primary_peer_id();
         let path = format!("/{}/system/tree", pid);
         let entity = pm.get_entity(pid, &path);
-        assert!(entity.is_some(), "system/tree handler should be bootstrapped");
+        assert!(
+            entity.is_some(),
+            "system/tree handler should be bootstrapped"
+        );
     }
 
     #[test]
@@ -704,7 +749,10 @@ mod tests {
         let pid = pm.primary_peer_id();
         let prefix = format!("/{}/system/", pid);
         let entries = pm.tree_listing(pid, &prefix);
-        assert!(!entries.is_empty(), "should have bootstrapped system entries");
+        assert!(
+            !entries.is_empty(),
+            "should have bootstrapped system entries"
+        );
     }
 
     #[test]
@@ -754,7 +802,12 @@ mod tests {
         let entries = pm.tree_listing(pid, "");
         assert!(!entries.is_empty());
         for entry in &entries {
-            assert!(entry.path.starts_with(&prefix), "path {} should start with /{}", entry.path, pid);
+            assert!(
+                entry.path.starts_with(&prefix),
+                "path {} should start with /{}",
+                entry.path,
+                pid
+            );
         }
     }
 
@@ -763,14 +816,23 @@ mod tests {
         let pm = PeerManager::new();
         let pid = pm.primary_peer_id();
         let handlers = pm.discover_handlers(pid);
-        assert!(!handlers.is_empty(), "should discover bootstrapped handlers");
+        assert!(
+            !handlers.is_empty(),
+            "should discover bootstrapped handlers"
+        );
 
         let tree_handler = handlers.iter().find(|h| h.pattern == "system/tree");
-        assert!(tree_handler.is_some(), "system/tree handler should be discovered");
+        assert!(
+            tree_handler.is_some(),
+            "system/tree handler should be discovered"
+        );
 
         let tree = tree_handler.unwrap();
         assert!(!tree.name.is_empty());
-        assert!(!tree.operations.is_empty(), "system/tree should have operations");
+        assert!(
+            !tree.operations.is_empty(),
+            "system/tree should have operations"
+        );
     }
 
     #[test]
@@ -779,7 +841,10 @@ mod tests {
         let pid = pm.primary_peer_id();
         let handlers = pm.discover_handlers(pid);
         for pair in handlers.windows(2) {
-            assert!(pair[0].pattern <= pair[1].pattern, "handlers should be sorted");
+            assert!(
+                pair[0].pattern <= pair[1].pattern,
+                "handlers should be sorted"
+            );
         }
     }
 
@@ -788,7 +853,10 @@ mod tests {
         let pm = PeerManager::new();
         let pid = pm.primary_peer_id();
         let types = pm.discover_types(pid);
-        assert!(!types.is_empty(), "should discover bootstrapped type definitions");
+        assert!(
+            !types.is_empty(),
+            "should discover bootstrapped type definitions"
+        );
     }
 
     #[test]
@@ -797,7 +865,10 @@ mod tests {
         let pid = pm.primary_peer_id();
         let types = pm.discover_types(pid);
         for pair in types.windows(2) {
-            assert!(pair[0].type_path <= pair[1].type_path, "types should be sorted");
+            assert!(
+                pair[0].type_path <= pair[1].type_path,
+                "types should be sorted"
+            );
         }
     }
 
@@ -843,23 +914,41 @@ mod tests {
                 (text("enabled"), bool_val(true)),
                 (text("pattern"), text(&format!("/{}/app/test/*", pid))),
             ])),
-        ).unwrap();
+        )
+        .unwrap();
         ctx.store().put(&cfg_path, cfg).unwrap();
 
         // L1 put through emit pathway so the history engine records.
-        ctx.put(&path, Entity::new("test/v", to_ecf(&text("a"))).unwrap()).await.unwrap();
-        ctx.put(&path, Entity::new("test/v", to_ecf(&text("b"))).unwrap()).await.unwrap();
+        ctx.put(&path, Entity::new("test/v", to_ecf(&text("a"))).unwrap())
+            .await
+            .unwrap();
+        ctx.put(&path, Entity::new("test/v", to_ecf(&text("b"))).unwrap())
+            .await
+            .unwrap();
 
-        let result = pm.history_query(&pid, &path, HistoryQueryOptions::default()).await.expect("history query should succeed");
+        let result = pm
+            .history_query(&pid, &path, HistoryQueryOptions::default())
+            .await
+            .expect("history query should succeed");
         assert_eq!(result.path, path);
-        assert!(result.transitions.len() >= 2, "got {} transitions", result.transitions.len());
+        assert!(
+            result.transitions.len() >= 2,
+            "got {} transitions",
+            result.transitions.len()
+        );
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test(flavor = "current_thread")]
     async fn history_unknown_peer_errors() {
         let pm = PeerManager::new();
-        let result = pm.history_query("nonexistent-peer-id", "/whatever", HistoryQueryOptions::default()).await;
+        let result = pm
+            .history_query(
+                "nonexistent-peer-id",
+                "/whatever",
+                HistoryQueryOptions::default(),
+            )
+            .await;
         assert!(result.is_err());
     }
 
@@ -867,7 +956,10 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn unsubscribe_unknown_peer_errors() {
         let pm = PeerManager::new();
-        assert!(pm.unsubscribe("nonexistent-peer-id", "sub-id").await.is_err());
+        assert!(pm
+            .unsubscribe("nonexistent-peer-id", "sub-id")
+            .await
+            .is_err());
     }
 
     #[test]
@@ -880,12 +972,15 @@ mod tests {
             &pid,
             &path,
             Entity::new("test/note", to_ecf(&text("hi"))).unwrap(),
-        ).expect("seed put");
+        )
+        .expect("seed put");
 
         let entries = pm.inbox_list(&pid);
         assert!(entries.iter().any(|e| e.path == path));
 
-        let got = pm.inbox_get(&pid, "sub-1/note").expect("get should resolve");
+        let got = pm
+            .inbox_get(&pid, "sub-1/note")
+            .expect("get should resolve");
         assert_eq!(got.entity_type, "test/note");
     }
 
@@ -901,12 +996,17 @@ mod tests {
             &pid,
             &target,
             Entity::new("test/article", to_ecf(&text("hi"))).unwrap(),
-        ).expect("put should succeed");
+        )
+        .expect("put should succeed");
 
         let expr = Entity::new(
             "system/query/expression",
-            to_ecf(&Value::Map(vec![(text("type_filter"), text("test/article"))])),
-        ).unwrap();
+            to_ecf(&Value::Map(vec![(
+                text("type_filter"),
+                text("test/article"),
+            )])),
+        )
+        .unwrap();
         let results = pm.query(&pid, expr).await.expect("query should succeed");
         assert!(
             results.matches.iter().any(|m| m.path == target),
@@ -926,13 +1026,18 @@ mod tests {
                 &pid,
                 &format!("/{}/app/test/widget-{}", pid, i),
                 Entity::new("test/widget", to_ecf(&text("x"))).unwrap(),
-            ).expect("put should succeed");
+            )
+            .expect("put should succeed");
         }
 
         let expr = Entity::new(
             "system/query/expression",
-            to_ecf(&Value::Map(vec![(text("type_filter"), text("test/widget"))])),
-        ).unwrap();
+            to_ecf(&Value::Map(vec![(
+                text("type_filter"),
+                text("test/widget"),
+            )])),
+        )
+        .unwrap();
         let n = pm.count(&pid, expr).await.expect("count should succeed");
         assert_eq!(n, 2);
     }
@@ -945,7 +1050,8 @@ mod tests {
         let expr = Entity::new(
             "system/query/expression",
             to_ecf(&Value::Map(vec![(text("type_filter"), text("anything"))])),
-        ).unwrap();
+        )
+        .unwrap();
         assert!(pm.count("nonexistent-peer-id", expr).await.is_err());
     }
 
@@ -957,7 +1063,8 @@ mod tests {
         let expr = Entity::new(
             "system/query/expression",
             to_ecf(&Value::Map(vec![(text("type_filter"), text("anything"))])),
-        ).unwrap();
+        )
+        .unwrap();
         let result = pm.query("nonexistent-peer-id", expr).await;
         assert!(result.is_err(), "unknown peer should yield Err");
     }
@@ -969,11 +1076,10 @@ mod tests {
 
         // Add a second peer.
         let kp2 = entity_crypto::Keypair::generate();
-        let pid2 = pm.sdk_mut().create_peer(
-            kp2,
-            entity_peer::PeerConfig::default(),
-            None,
-        ).unwrap();
+        let pid2 = pm
+            .sdk_mut()
+            .create_peer(kp2, entity_peer::PeerConfig::default(), None)
+            .unwrap();
 
         // Write to peer1's tree.
         let path1 = format!("/{}/test/data", pid1);

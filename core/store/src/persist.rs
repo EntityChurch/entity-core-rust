@@ -21,8 +21,7 @@ use entity_hash::Hash;
 use thiserror::Error;
 
 use crate::{
-    ContentStore, LocationEntry, LocationIndex, MemoryContentStore, MemoryLocationIndex,
-    StoreError,
+    ContentStore, LocationEntry, LocationIndex, MemoryContentStore, MemoryLocationIndex, StoreError,
 };
 
 // Record type tags
@@ -52,7 +51,10 @@ pub enum PersistError {
 /// **Deprecated:** Use `SqliteStore` for persistent storage. SQLite provides
 /// better crash resilience (WAL), concurrent access, and persistent query
 /// indexes. See `PeerBuilder::sqlite()`.
-#[deprecated(since = "0.2.0", note = "Use SqliteStore for persistence. See PeerBuilder::sqlite().")]
+#[deprecated(
+    since = "0.2.0",
+    note = "Use SqliteStore for persistence. See PeerBuilder::sqlite()."
+)]
 pub struct JournaledContentStore {
     memory: MemoryContentStore,
     journal: Mutex<BufWriter<File>>,
@@ -72,10 +74,7 @@ impl JournaledContentStore {
             replay_content_journal(&path, &memory)?;
         }
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let journal = Mutex::new(BufWriter::new(file));
 
         Ok(Self {
@@ -156,7 +155,10 @@ impl ContentStore for JournaledContentStore {
 /// Location index backed by memory with an append-only journal for durability.
 ///
 /// **Deprecated:** Use `SqliteStore` for persistent storage.
-#[deprecated(since = "0.2.0", note = "Use SqliteStore for persistence. See PeerBuilder::sqlite().")]
+#[deprecated(
+    since = "0.2.0",
+    note = "Use SqliteStore for persistence. See PeerBuilder::sqlite()."
+)]
 pub struct JournaledLocationIndex {
     memory: MemoryLocationIndex,
     journal: Mutex<BufWriter<File>>,
@@ -173,10 +175,7 @@ impl JournaledLocationIndex {
             replay_location_journal(&path, &memory)?;
         }
 
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let journal = Mutex::new(BufWriter::new(file));
 
         Ok(Self {
@@ -303,10 +302,7 @@ fn write_remove_location(writer: &mut impl Write, path: &str) -> Result<(), Pers
 // Journal replay
 // ---------------------------------------------------------------------------
 
-fn replay_content_journal(
-    path: &Path,
-    memory: &MemoryContentStore,
-) -> Result<(), PersistError> {
+fn replay_content_journal(path: &Path, memory: &MemoryContentStore) -> Result<(), PersistError> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
 
@@ -384,10 +380,7 @@ fn replay_content_journal(
     Ok(())
 }
 
-fn replay_location_journal(
-    path: &Path,
-    memory: &MemoryLocationIndex,
-) -> Result<(), PersistError> {
+fn replay_location_journal(path: &Path, memory: &MemoryLocationIndex) -> Result<(), PersistError> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
 

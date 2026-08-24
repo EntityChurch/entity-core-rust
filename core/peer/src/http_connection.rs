@@ -77,6 +77,9 @@ pub struct HttpConnection {
     /// Monotonic request counter — atomic so concurrent
     /// `dispatch_envelope` calls get distinct request ids.
     request_seq: AtomicU64,
+    /// Wall-clock ms of the last successful response (see
+    /// `RemoteEndpoint::last_activity_ms`). 0 = none yet.
+    last_activity_ms: AtomicU64,
     /// Closed flag — set when a POST returns a hard error that
     /// invalidates the session (e.g., server-side session eviction).
     /// Polled by [`is_closed`] (currently advisory only; pool prune
@@ -159,13 +162,10 @@ impl HttpConnection {
             )));
         }
 
-        let hello_resp_envelope = decode_envelope(&resp_bytes).map_err(|e| {
-            PeerError::ConnectionError(format!("decode hello response: {}", e))
-        })?;
-        let hello_resp =
-            entity_protocol::parse_execute_response(&hello_resp_envelope).map_err(|e| {
-                PeerError::ConnectionError(format!("parse hello response: {}", e))
-            })?;
+        let hello_resp_envelope = decode_envelope(&resp_bytes)
+            .map_err(|e| PeerError::ConnectionError(format!("decode hello response: {}", e)))?;
+        let hello_resp = entity_protocol::parse_execute_response(&hello_resp_envelope)
+            .map_err(|e| PeerError::ConnectionError(format!("parse hello response: {}", e)))?;
         if hello_resp.status != 200 {
             return Err(PeerError::ConnectionError(format!(
                 "hello envelope status: {}",
@@ -203,9 +203,10 @@ impl HttpConnection {
             .await
             .map_err(|e| PeerError::ConnectionError(format!("authenticate POST: {}", e)))?;
         let auth_status = auth_resp.status();
-        let auth_resp_bytes = auth_resp.bytes().await.map_err(|e| {
-            PeerError::ConnectionError(format!("authenticate body read: {}", e))
-        })?;
+        let auth_resp_bytes = auth_resp
+            .bytes()
+            .await
+            .map_err(|e| PeerError::ConnectionError(format!("authenticate body read: {}", e)))?;
         if !auth_status.is_success() {
             return Err(PeerError::ConnectionError(format!(
                 "authenticate POST returned HTTP {}: {}",
@@ -213,13 +214,10 @@ impl HttpConnection {
                 String::from_utf8_lossy(&auth_resp_bytes)
             )));
         }
-        let auth_resp_envelope = decode_envelope(&auth_resp_bytes).map_err(|e| {
-            PeerError::ConnectionError(format!("decode auth response: {}", e))
-        })?;
-        let auth_parsed =
-            entity_protocol::parse_execute_response(&auth_resp_envelope).map_err(|e| {
-                PeerError::ConnectionError(format!("parse auth response: {}", e))
-            })?;
+        let auth_resp_envelope = decode_envelope(&auth_resp_bytes)
+            .map_err(|e| PeerError::ConnectionError(format!("decode auth response: {}", e)))?;
+        let auth_parsed = entity_protocol::parse_execute_response(&auth_resp_envelope)
+            .map_err(|e| PeerError::ConnectionError(format!("parse auth response: {}", e)))?;
         if auth_parsed.status != 200 {
             return Err(PeerError::ConnectionError(format!(
                 "authenticate envelope status: {}",
@@ -229,10 +227,8 @@ impl HttpConnection {
 
         // Extract the capability token hash from the grant result and
         // resolve to the cap entity in the response's included map.
-        let grant_data: ciborium::Value =
-            ciborium::from_reader(auth_parsed.result.data.as_slice()).map_err(|e| {
-                PeerError::ConnectionError(format!("decode grant: {}", e))
-            })?;
+        let grant_data: ciborium::Value = ciborium::from_reader(auth_parsed.result.data.as_slice())
+            .map_err(|e| PeerError::ConnectionError(format!("decode grant: {}", e)))?;
         let grant_map = grant_data
             .as_map()
             .ok_or_else(|| PeerError::ConnectionError("grant data not a map".into()))?;
@@ -286,6 +282,7 @@ impl HttpConnection {
             remote_identity_hash,
             request_seq: AtomicU64::new(0),
             closed: Mutex::new(false),
+            last_activity_ms: AtomicU64::new(0),
         })
     }
 }
@@ -304,17 +301,16 @@ impl RemoteEndpoint for HttpConnection {
         &self.auth_included
     }
     fn next_request_id(&self) -> String {
-        let seq = self.request_seq.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let seq = self
+            .request_seq
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
         format!("http-req-{}", seq)
     }
     fn transport_type(&self) -> &'static str {
         "http"
     }
-    fn dispatch_raw<'a>(
-        &'a self,
-        _request_id: String,
-        frame: Vec<u8>,
-    ) -> DispatchFuture<'a> {
+    fn dispatch_raw<'a>(&'a self, _request_id: String, frame: Vec<u8>) -> DispatchFuture<'a> {
         Box::pin(async move {
             let body = frame;
             let resp = self
@@ -331,12 +327,9 @@ impl RemoteEndpoint for HttpConnection {
                 })?;
 
             let status = resp.status();
-            let resp_bytes = resp
-                .bytes()
-                .await
-                .map_err(|e| {
-                    PeerError::ConnectionError(format!("http EXECUTE body read: {}", e))
-                })?;
+            let resp_bytes = resp.bytes().await.map_err(|e| {
+                PeerError::ConnectionError(format!("http EXECUTE body read: {}", e))
+            })?;
             if !status.is_success() {
                 return Err(PeerError::ConnectionError(format!(
                     "http EXECUTE returned HTTP {}: {}",
@@ -348,11 +341,16 @@ impl RemoteEndpoint for HttpConnection {
             let resp_envelope = decode_envelope(&resp_bytes).map_err(|e| {
                 PeerError::ConnectionError(format!("decode EXECUTE response: {}", e))
             })?;
-            let parsed =
-                entity_protocol::parse_execute_response(&resp_envelope).map_err(|e| {
-                    PeerError::ConnectionError(format!("parse EXECUTE response: {}", e))
-                })?;
+            let parsed = entity_protocol::parse_execute_response(&resp_envelope).map_err(|e| {
+                PeerError::ConnectionError(format!("parse EXECUTE response: {}", e))
+            })?;
+            self.last_activity_ms
+                .store(crate::liveness::now_ms(), Ordering::Relaxed);
             Ok(parsed)
         })
+    }
+
+    fn last_activity_ms(&self) -> u64 {
+        self.last_activity_ms.load(Ordering::Relaxed)
     }
 }

@@ -264,7 +264,10 @@ impl IssuerPolicyData {
     pub fn to_entity(&self) -> Result<Entity, RegistryError> {
         let mut fields: Vec<(Value, Value)> = vec![(text("mode"), text(&self.mode))];
         if let Some(a) = &self.allowlist {
-            fields.push((text("allowlist"), Value::Array(a.iter().map(text).collect())));
+            fields.push((
+                text("allowlist"),
+                Value::Array(a.iter().map(text).collect()),
+            ));
         }
         if let Some(t) = self.default_ttl {
             fields.push((text("default_ttl"), integer(t as i64)));
@@ -367,9 +370,7 @@ impl ResolverConfigData {
                 if !e.accepted_trust_anchors.is_empty() {
                     m.push((
                         text("accepted_trust_anchors"),
-                        Value::Array(
-                            e.accepted_trust_anchors.iter().map(text).collect(),
-                        ),
+                        Value::Array(e.accepted_trust_anchors.iter().map(text).collect()),
                     ));
                 }
                 if let Some(h) = &e.hints {
@@ -503,10 +504,7 @@ impl LocalNameConfigData {
     pub fn to_entity(&self) -> Result<Entity, RegistryError> {
         let fields = vec![
             (text("allow_supersede"), Value::Bool(self.allow_supersede)),
-            (
-                text("case_normalization"),
-                text(&self.case_normalization),
-            ),
+            (text("case_normalization"), text(&self.case_normalization)),
             (text("default_pinned"), Value::Bool(self.default_pinned)),
         ];
         encode(TYPE_REGISTRY_LOCAL_NAME_CONFIG, fields)
@@ -546,8 +544,7 @@ impl ResolutionLogData {
             reason: field_text_opt(&map, "reason"),
             binding: field_hash_opt(&map, "binding")?,
             attempted_at: field_u64(&map, "attempted_at")?,
-            is_fallback_reresolve: field_bool_opt(&map, "is_fallback_reresolve")
-                .unwrap_or(false),
+            is_fallback_reresolve: field_bool_opt(&map, "is_fallback_reresolve").unwrap_or(false),
         })
     }
 
@@ -630,10 +627,7 @@ impl ResolutionResult {
     pub fn to_result_value(&self) -> Value {
         let mut fields: Vec<(Value, Value)> = vec![
             (text("status"), text(&self.status)),
-            (
-                text("transports"),
-                Value::Array(self.transports.clone()),
-            ),
+            (text("transports"), Value::Array(self.transports.clone())),
             (
                 text("attestations"),
                 Value::Array(self.attestations.iter().map(bytes).collect()),
@@ -738,8 +732,13 @@ pub(crate) fn decode_map(data: &[u8]) -> Result<Vec<(Value, Value)>, RegistryErr
 }
 
 pub(crate) fn get_field<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
-    map.iter()
-        .find_map(|(k, v)| if k.as_text() == Some(key) { Some(v) } else { None })
+    map.iter().find_map(|(k, v)| {
+        if k.as_text() == Some(key) {
+            Some(v)
+        } else {
+            None
+        }
+    })
 }
 
 fn field_text(map: &[(Value, Value)], key: &str) -> Result<String, RegistryError> {
@@ -750,7 +749,9 @@ fn field_text(map: &[(Value, Value)], key: &str) -> Result<String, RegistryError
 }
 
 fn field_text_opt(map: &[(Value, Value)], key: &str) -> Option<String> {
-    get_field(map, key).and_then(|v| v.as_text()).map(|s| s.to_string())
+    get_field(map, key)
+        .and_then(|v| v.as_text())
+        .map(|s| s.to_string())
 }
 
 fn field_u64(map: &[(Value, Value)], key: &str) -> Result<u64, RegistryError> {

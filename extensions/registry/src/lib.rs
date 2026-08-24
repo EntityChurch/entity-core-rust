@@ -20,8 +20,8 @@
 //! Spec: `../entity-core-architecture/docs/architecture/v7.0-core-revision/core-protocol-domain/specs/extensions/network-peer-extensions/EXTENSION-REGISTRY.md`
 
 pub mod data;
-pub mod log;
 pub mod local_name;
+pub mod log;
 pub mod peer_issued;
 pub mod registration;
 pub mod resolver;
@@ -35,8 +35,8 @@ pub use data::{
     LocalNameConfigData, PinnedBinding, RegisterRequestData, ResolutionLogData, ResolutionResult,
     ResolverChainEntry, ResolverConfigData, RevocationData,
 };
-pub use log::ResolutionLog;
 pub use local_name::LocalNameHandler;
+pub use log::ResolutionLog;
 pub use peer_issued::resolve_one as peer_issued_resolve_one;
 pub use registration::RegisterRequestHandler;
 pub use resolver::RegistryHandler;
@@ -168,7 +168,11 @@ pub fn issuer_policy_path(peer_id: &str) -> String {
 
 /// Per-requester seen-nonce marker `/{registry}/system/registry/register-nonce/{requester}/{hex}`
 /// (§6a.9 replay defense). Presence = the nonce was already consumed.
-pub fn register_nonce_path(registry_peer_id: &str, requester_peer_id: &str, nonce: &[u8]) -> String {
+pub fn register_nonce_path(
+    registry_peer_id: &str,
+    requester_peer_id: &str,
+    nonce: &[u8],
+) -> String {
     format!(
         "/{}/system/registry/register-nonce/{}/{}",
         registry_peer_id,

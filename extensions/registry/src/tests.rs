@@ -2,15 +2,15 @@
 
 use std::sync::Arc;
 
+use entity_ecf::{text, to_ecf, Value};
+use entity_entity::Entity;
 use entity_handler::{Handler, HandlerContext};
 use entity_hash::Hash;
 use entity_store::{ContentStore, LocationIndex, MemoryContentStore, MemoryLocationIndex};
-use entity_ecf::{text, to_ecf, Value};
-use entity_entity::Entity;
 
 use crate::data::*;
-use crate::log::ResolutionLog;
 use crate::local_name::LocalNameHandler;
+use crate::log::ResolutionLog;
 use crate::resolver::{glob_match, RegistryHandler};
 
 const PEER: &str = "z6MkTestPeerIdForRegistry";
@@ -23,8 +23,11 @@ fn stores() -> (Arc<dyn ContentStore>, Arc<dyn LocationIndex>) {
 }
 
 fn ctx(op: &str, params_fields: Vec<(Value, Value)>) -> HandlerContext {
-    let params = Entity::new(entity_types::TYPE_PROTOCOL_STATUS, to_ecf(&Value::Map(params_fields)))
-        .unwrap();
+    let params = Entity::new(
+        entity_types::TYPE_PROTOCOL_STATUS,
+        to_ecf(&Value::Map(params_fields)),
+    )
+    .unwrap();
     let execute = Entity::new(entity_types::TYPE_EXECUTE, to_ecf(&Value::Map(vec![]))).unwrap();
     HandlerContext::builder(execute, params)
         .operation(op.to_string())
@@ -32,7 +35,12 @@ fn ctx(op: &str, params_fields: Vec<(Value, Value)>) -> HandlerContext {
 }
 
 fn registry(cs: &Arc<dyn ContentStore>, li: &Arc<dyn LocationIndex>) -> RegistryHandler {
-    let log = Arc::new(ResolutionLog::new(cs.clone(), li.clone(), PEER.into(), 1024));
+    let log = Arc::new(ResolutionLog::new(
+        cs.clone(),
+        li.clone(),
+        PEER.into(),
+        1024,
+    ));
     RegistryHandler::new(cs.clone(), li.clone(), PEER.into(), log)
 }
 
@@ -42,7 +50,13 @@ fn decode_result(r: &entity_handler::HandlerResult) -> Vec<(Value, Value)> {
 }
 
 fn result_field<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
-    map.iter().find_map(|(k, v)| if k.as_text() == Some(key) { Some(v) } else { None })
+    map.iter().find_map(|(k, v)| {
+        if k.as_text() == Some(key) {
+            Some(v)
+        } else {
+            None
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -160,8 +174,14 @@ async fn local_name_bind_resolve_roundtrip() {
     // §2.1 Ruling-3: resolve returns the flat `system/registry/resolution-result`.
     assert_eq!(r.result.entity_type, crate::TYPE_REGISTRY_RESOLUTION_RESULT);
     let res = decode_result(&r);
-    assert_eq!(result_field(&res, "status").unwrap().as_text(), Some("resolved"));
-    assert_eq!(result_field(&res, "peer_id").unwrap().as_text(), Some("z6MkAlice"));
+    assert_eq!(
+        result_field(&res, "status").unwrap().as_text(),
+        Some("resolved")
+    );
+    assert_eq!(
+        result_field(&res, "peer_id").unwrap().as_text(),
+        Some("z6MkAlice")
+    );
     assert_eq!(
         result_field(&res, "trust_anchor").unwrap().as_text(),
         Some("local_name")
@@ -176,13 +196,19 @@ async fn local_name_bind_invalid_name() {
         let r = pet
             .handle(&ctx(
                 "bind",
-                vec![(text("name"), text(bad)), (text("target_peer_id"), text("z6Mk"))],
+                vec![
+                    (text("name"), text(bad)),
+                    (text("target_peer_id"), text("z6Mk")),
+                ],
             ))
             .await
             .unwrap();
         assert_eq!(r.status, 400, "name {:?} should be rejected", bad);
         let m = decode_result(&r);
-        assert_eq!(result_field(&m, "code").unwrap().as_text(), Some("bind_invalid_name"));
+        assert_eq!(
+            result_field(&m, "code").unwrap().as_text(),
+            Some("bind_invalid_name")
+        );
     }
 }
 
@@ -203,14 +229,20 @@ async fn local_name_bind_already_exists() {
     let bind = |n: &str| {
         ctx(
             "bind",
-            vec![(text("name"), text(n)), (text("target_peer_id"), text("z6MkX"))],
+            vec![
+                (text("name"), text(n)),
+                (text("target_peer_id"), text("z6MkX")),
+            ],
         )
     };
     assert_eq!(pet.handle(&bind("bob")).await.unwrap().status, 200);
     let r = pet.handle(&bind("bob")).await.unwrap();
     assert_eq!(r.status, 409);
     let m = decode_result(&r);
-    assert_eq!(result_field(&m, "code").unwrap().as_text(), Some("bind_already_exists"));
+    assert_eq!(
+        result_field(&m, "code").unwrap().as_text(),
+        Some("bind_already_exists")
+    );
 }
 
 #[tokio::test]
@@ -220,7 +252,10 @@ async fn local_name_supersede_on_rebind() {
     let bind = |t: &str| {
         ctx(
             "bind",
-            vec![(text("name"), text("carol")), (text("target_peer_id"), text(t))],
+            vec![
+                (text("name"), text("carol")),
+                (text("target_peer_id"), text(t)),
+            ],
         )
     };
     let h1 = pet.handle(&bind("z6MkFirst")).await.unwrap();
@@ -233,12 +268,19 @@ async fn local_name_supersede_on_rebind() {
 
     // resolve returns the new target; supersedes chain walks back to the first.
     let reg = registry(&cs, &li);
-    let r = reg.handle(&ctx("resolve", vec![(text("name"), text("carol"))])).await.unwrap();
+    let r = reg
+        .handle(&ctx("resolve", vec![(text("name"), text("carol"))]))
+        .await
+        .unwrap();
     // §2.1 Ruling-3: resolve returns the flat `system/registry/resolution-result`.
     let res = decode_result(&r);
-    assert_eq!(result_field(&res, "peer_id").unwrap().as_text(), Some("z6MkSecond"));
+    assert_eq!(
+        result_field(&res, "peer_id").unwrap().as_text(),
+        Some("z6MkSecond")
+    );
     let head_hash = result_field(&res, "binding").unwrap().as_bytes().unwrap();
-    let head = BindingData::from_entity(&cs.get(&Hash::from_bytes(head_hash).unwrap()).unwrap()).unwrap();
+    let head =
+        BindingData::from_entity(&cs.get(&Hash::from_bytes(head_hash).unwrap()).unwrap()).unwrap();
     assert_eq!(head.supersedes.unwrap().to_bytes().to_vec(), first_hash);
 }
 
@@ -247,9 +289,12 @@ async fn local_name_list_and_unbind() {
     let (cs, li) = stores();
     let pet = LocalNameHandler::new(cs.clone(), li.clone(), PEER.into());
     for (n, t) in [("a", "z6MkA"), ("b", "z6MkB")] {
-        pet.handle(&ctx("bind", vec![(text("name"), text(n)), (text("target_peer_id"), text(t))]))
-            .await
-            .unwrap();
+        pet.handle(&ctx(
+            "bind",
+            vec![(text("name"), text(n)), (text("target_peer_id"), text(t))],
+        ))
+        .await
+        .unwrap();
     }
     let r = pet.handle(&ctx("list", vec![])).await.unwrap();
     let m = decode_result(&r);
@@ -257,20 +302,36 @@ async fn local_name_list_and_unbind() {
     assert_eq!(entries.len(), 2);
 
     // unbind one
-    let r = pet.handle(&ctx("unbind", vec![(text("name"), text("a"))])).await.unwrap();
+    let r = pet
+        .handle(&ctx("unbind", vec![(text("name"), text("a"))]))
+        .await
+        .unwrap();
     assert_eq!(r.status, 200);
     let r = pet.handle(&ctx("list", vec![])).await.unwrap();
     let m = decode_result(&r);
-    assert_eq!(result_field(&m, "entries").unwrap().as_array().unwrap().len(), 1);
+    assert_eq!(
+        result_field(&m, "entries")
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
 
     // resolve of unbound name → chain_exhausted (§4.1.4: a backend miss folds
     // into fail-closed chain exhaustion; the meta-resolver does not surface a
     // top-level not_found).
     let reg = registry(&cs, &li);
-    let r = reg.handle(&ctx("resolve", vec![(text("name"), text("a"))])).await.unwrap();
+    let r = reg
+        .handle(&ctx("resolve", vec![(text("name"), text("a"))]))
+        .await
+        .unwrap();
     // §2.1 Ruling-3: resolve returns the flat `system/registry/resolution-result`.
     let res = decode_result(&r);
-    assert_eq!(result_field(&res, "status").unwrap().as_text(), Some("chain_exhausted"));
+    assert_eq!(
+        result_field(&res, "status").unwrap().as_text(),
+        Some("chain_exhausted")
+    );
 }
 
 #[tokio::test]
@@ -279,24 +340,43 @@ async fn local_name_resolve_nfc_symmetry() {
     let pet = LocalNameHandler::new(cs.clone(), li.clone(), PEER.into());
     // Bind NFC "Café" (precomposed é = U+00E9).
     let nfc = "Caf\u{00e9}";
-    pet.handle(&ctx("bind", vec![(text("name"), text(nfc)), (text("target_peer_id"), text("z6MkCafe"))]))
-        .await
-        .unwrap();
+    pet.handle(&ctx(
+        "bind",
+        vec![
+            (text("name"), text(nfc)),
+            (text("target_peer_id"), text("z6MkCafe")),
+        ],
+    ))
+    .await
+    .unwrap();
     // Resolve with NFD "Café" (e + combining acute U+0301) → normalizes to same key.
     let nfd = "Cafe\u{0301}";
     let reg = registry(&cs, &li);
-    let r = reg.handle(&ctx("resolve", vec![(text("name"), text(nfd))])).await.unwrap();
+    let r = reg
+        .handle(&ctx("resolve", vec![(text("name"), text(nfd))]))
+        .await
+        .unwrap();
     // §2.1 Ruling-3: resolve returns the flat `system/registry/resolution-result`.
     let res = decode_result(&r);
-    assert_eq!(result_field(&res, "status").unwrap().as_text(), Some("resolved"));
-    assert_eq!(result_field(&res, "peer_id").unwrap().as_text(), Some("z6MkCafe"));
+    assert_eq!(
+        result_field(&res, "status").unwrap().as_text(),
+        Some("resolved")
+    );
+    assert_eq!(
+        result_field(&res, "peer_id").unwrap().as_text(),
+        Some("z6MkCafe")
+    );
 }
 
 // ---------------------------------------------------------------------------
 // Meta-resolver: pins, dispatch, chain exhaustion, revocation
 // ---------------------------------------------------------------------------
 
-fn install_config(cs: &Arc<dyn ContentStore>, li: &Arc<dyn LocationIndex>, cfg: &ResolverConfigData) {
+fn install_config(
+    cs: &Arc<dyn ContentStore>,
+    li: &Arc<dyn LocationIndex>,
+    cfg: &ResolverConfigData,
+) {
     let h = cs.put(cfg.to_entity().unwrap()).unwrap();
     li.set(&crate::resolver_config_path(PEER), h);
 }
@@ -306,9 +386,15 @@ async fn meta_resolver_pin_precedence() {
     let (cs, li) = stores();
     // bind a local-name for "nad" that should be overridden by a pin.
     let pet = LocalNameHandler::new(cs.clone(), li.clone(), PEER.into());
-    pet.handle(&ctx("bind", vec![(text("name"), text("nad")), (text("target_peer_id"), text("z6MkLocalName"))]))
-        .await
-        .unwrap();
+    pet.handle(&ctx(
+        "bind",
+        vec![
+            (text("name"), text("nad")),
+            (text("target_peer_id"), text("z6MkLocalName")),
+        ],
+    ))
+    .await
+    .unwrap();
     let cfg = ResolverConfigData {
         resolver_chain: vec![ResolverChainEntry {
             backend_kind: "local-name".into(),
@@ -328,12 +414,24 @@ async fn meta_resolver_pin_precedence() {
     };
     install_config(&cs, &li, &cfg);
     let reg = registry(&cs, &li);
-    let r = reg.handle(&ctx("resolve", vec![(text("name"), text("nad"))])).await.unwrap();
+    let r = reg
+        .handle(&ctx("resolve", vec![(text("name"), text("nad"))]))
+        .await
+        .unwrap();
     // §2.1 Ruling-3: resolve returns the flat `system/registry/resolution-result`.
     let res = decode_result(&r);
-    assert_eq!(result_field(&res, "peer_id").unwrap().as_text(), Some("z6MkPinned"));
-    assert_eq!(result_field(&res, "trust_anchor").unwrap().as_text(), Some("out_of_band"));
-    assert_eq!(result_field(&res, "backend_id").unwrap().as_text(), Some("pinned"));
+    assert_eq!(
+        result_field(&res, "peer_id").unwrap().as_text(),
+        Some("z6MkPinned")
+    );
+    assert_eq!(
+        result_field(&res, "trust_anchor").unwrap().as_text(),
+        Some("out_of_band")
+    );
+    assert_eq!(
+        result_field(&res, "backend_id").unwrap().as_text(),
+        Some("pinned")
+    );
 }
 
 #[tokio::test]
@@ -343,19 +441,31 @@ async fn meta_resolver_chain_exhaustion() {
     let cfg = ResolverConfigData::default();
     install_config(&cs, &li, &cfg);
     let reg = registry(&cs, &li);
-    let r = reg.handle(&ctx("resolve", vec![(text("name"), text("ghost"))])).await.unwrap();
+    let r = reg
+        .handle(&ctx("resolve", vec![(text("name"), text("ghost"))]))
+        .await
+        .unwrap();
     // §2.1 Ruling-3: resolve returns the flat `system/registry/resolution-result`.
     let res = decode_result(&r);
-    assert_eq!(result_field(&res, "status").unwrap().as_text(), Some("chain_exhausted"));
+    assert_eq!(
+        result_field(&res, "status").unwrap().as_text(),
+        Some("chain_exhausted")
+    );
 }
 
 #[tokio::test]
 async fn meta_resolver_dispatch_filter_excludes_local_name() {
     let (cs, li) = stores();
     let pet = LocalNameHandler::new(cs.clone(), li.clone(), PEER.into());
-    pet.handle(&ctx("bind", vec![(text("name"), text("alice")), (text("target_peer_id"), text("z6MkAlice"))]))
-        .await
-        .unwrap();
+    pet.handle(&ctx(
+        "bind",
+        vec![
+            (text("name"), text("alice")),
+            (text("target_peer_id"), text("z6MkAlice")),
+        ],
+    ))
+    .await
+    .unwrap();
     // Restrict local-name to names matching "*.local" — "alice" won't match.
     let cfg = ResolverConfigData {
         resolver_chain: vec![ResolverChainEntry {
@@ -376,14 +486,26 @@ async fn meta_resolver_dispatch_filter_excludes_local_name() {
     install_config(&cs, &li, &cfg);
     let reg = registry(&cs, &li);
     // "alice" excluded by dispatch → chain_exhausted
-    let r = reg.handle(&ctx("resolve", vec![(text("name"), text("alice"))])).await.unwrap();
+    let r = reg
+        .handle(&ctx("resolve", vec![(text("name"), text("alice"))]))
+        .await
+        .unwrap();
     let res = decode_result(&r);
-    assert_eq!(result_field(&res, "status").unwrap().as_text(), Some("chain_exhausted"));
+    assert_eq!(
+        result_field(&res, "status").unwrap().as_text(),
+        Some("chain_exhausted")
+    );
     // "alice.local" matches dispatch → local-name consulted, no such name →
     // chain_exhausted (the backend miss folds into fail-closed exhaustion).
-    let r = reg.handle(&ctx("resolve", vec![(text("name"), text("alice.local"))])).await.unwrap();
+    let r = reg
+        .handle(&ctx("resolve", vec![(text("name"), text("alice.local"))]))
+        .await
+        .unwrap();
     let res = decode_result(&r);
-    assert_eq!(result_field(&res, "status").unwrap().as_text(), Some("chain_exhausted"));
+    assert_eq!(
+        result_field(&res, "status").unwrap().as_text(),
+        Some("chain_exhausted")
+    );
 }
 
 #[tokio::test]
@@ -391,11 +513,20 @@ async fn meta_resolver_revocation_honored() {
     let (cs, li) = stores();
     let pet = LocalNameHandler::new(cs.clone(), li.clone(), PEER.into());
     let h = pet
-        .handle(&ctx("bind", vec![(text("name"), text("dave")), (text("target_peer_id"), text("z6MkDave"))]))
+        .handle(&ctx(
+            "bind",
+            vec![
+                (text("name"), text("dave")),
+                (text("target_peer_id"), text("z6MkDave")),
+            ],
+        ))
         .await
         .unwrap();
     let binding_hash = Hash::from_bytes(
-        result_field(&decode_result(&h), "binding_hash").unwrap().as_bytes().unwrap(),
+        result_field(&decode_result(&h), "binding_hash")
+            .unwrap()
+            .as_bytes()
+            .unwrap(),
     )
     .unwrap();
     // Install a revocation under the cohort convention: keyed by the
@@ -413,10 +544,16 @@ async fn meta_resolver_revocation_honored() {
         rev_hash,
     );
     let reg = registry(&cs, &li);
-    let r = reg.handle(&ctx("resolve", vec![(text("name"), text("dave"))])).await.unwrap();
+    let r = reg
+        .handle(&ctx("resolve", vec![(text("name"), text("dave"))]))
+        .await
+        .unwrap();
     let res = decode_result(&r);
     // revoked → excluded → chain_exhausted (no other backend)
-    assert_eq!(result_field(&res, "status").unwrap().as_text(), Some("chain_exhausted"));
+    assert_eq!(
+        result_field(&res, "status").unwrap().as_text(),
+        Some("chain_exhausted")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -427,12 +564,20 @@ async fn meta_resolver_revocation_honored() {
 async fn resolution_log_writes_and_recovers_seq() {
     let (cs, li) = stores();
     let pet = LocalNameHandler::new(cs.clone(), li.clone(), PEER.into());
-    pet.handle(&ctx("bind", vec![(text("name"), text("e")), (text("target_peer_id"), text("z6MkE"))]))
-        .await
-        .unwrap();
+    pet.handle(&ctx(
+        "bind",
+        vec![
+            (text("name"), text("e")),
+            (text("target_peer_id"), text("z6MkE")),
+        ],
+    ))
+    .await
+    .unwrap();
     let reg = registry(&cs, &li);
     for _ in 0..3 {
-        reg.handle(&ctx("resolve", vec![(text("name"), text("e"))])).await.unwrap();
+        reg.handle(&ctx("resolve", vec![(text("name"), text("e"))]))
+            .await
+            .unwrap();
     }
     // 3 log entries written at seq 0,1,2.
     let entries = li.list(&crate::resolution_log_prefix(PEER));
@@ -446,13 +591,22 @@ async fn resolution_log_writes_and_recovers_seq() {
 async fn resolution_log_skips_fallback_reresolve() {
     let (cs, li) = stores();
     let pet = LocalNameHandler::new(cs.clone(), li.clone(), PEER.into());
-    pet.handle(&ctx("bind", vec![(text("name"), text("f")), (text("target_peer_id"), text("z6MkF"))]))
-        .await
-        .unwrap();
+    pet.handle(&ctx(
+        "bind",
+        vec![
+            (text("name"), text("f")),
+            (text("target_peer_id"), text("z6MkF")),
+        ],
+    ))
+    .await
+    .unwrap();
     let reg = registry(&cs, &li);
     reg.handle(&ctx(
         "resolve",
-        vec![(text("name"), text("f")), (text("is_fallback_reresolve"), Value::Bool(true))],
+        vec![
+            (text("name"), text("f")),
+            (text("is_fallback_reresolve"), Value::Bool(true)),
+        ],
     ))
     .await
     .unwrap();
@@ -498,7 +652,9 @@ fn glob_matcher() {
 fn self_certifying_binding_verifies_without_signature() {
     use crate::resolver::verify_binding_signature;
     let kp = entity_crypto::Keypair::generate();
-    let peer_id = entity_crypto::PeerId::from_keypair(&kp).as_str().to_string();
+    let peer_id = entity_crypto::PeerId::from_keypair(&kp)
+        .as_str()
+        .to_string();
     let b = BindingData {
         name: peer_id.clone(),
         kind: KIND_SELF_CERTIFYING.into(),
@@ -528,10 +684,10 @@ fn self_certifying_binding_verifies_without_signature() {
 // which is byte-identical to a live fetch's verify (precedes are a warm cache).
 // ===========================================================================
 
+use crate::peer_issued;
 use crate::{
     by_name_pointer_path, revocation_prefix, signature_pointer_path, BACKEND_KIND_PEER_ISSUED,
 };
-use crate::peer_issued;
 use entity_crypto::Keypair;
 
 fn pi_entry(registry_id: &str, hints: Option<Value>) -> ResolverChainEntry {
@@ -606,14 +762,26 @@ fn peer_issued_resolve_happy_path() {
     let registry = Keypair::generate();
     let rid = registry.peer_id().as_str().to_string();
     let target = Keypair::generate().peer_id().as_str().to_string();
-    let bh = publish_binding(&cs, &li, &rid, &registry, "billslab.com", &target, 1000, None);
+    let bh = publish_binding(
+        &cs,
+        &li,
+        &rid,
+        &registry,
+        "billslab.com",
+        &target,
+        1000,
+        None,
+    );
 
     let r = peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com")
         .expect("backend returned a result");
     assert!(r.is_resolved(), "expected resolved, got {}", r.status);
     assert_eq!(r.peer_id.as_deref(), Some(target.as_str()));
     assert_eq!(r.binding, Some(bh));
-    assert_eq!(r.trust_anchor.as_deref(), Some(format!("peer_issued:{rid}").as_str()));
+    assert_eq!(
+        r.trust_anchor.as_deref(),
+        Some(format!("peer_issued:{rid}").as_str())
+    );
     assert_eq!(r.backend_id.as_deref(), Some(rid.as_str()));
     assert_eq!(r.transports.len(), 1);
 }
@@ -628,10 +796,22 @@ fn peer_issued_verify_fail_rejected() {
     let rid = registry.peer_id().as_str().to_string();
     let target = Keypair::generate().peer_id().as_str().to_string();
     // Signed by the attacker, but the chain entry pins the real registry id.
-    publish_binding(&cs, &li, &rid, &attacker, "billslab.com", &target, 1000, None);
+    publish_binding(
+        &cs,
+        &li,
+        &rid,
+        &attacker,
+        "billslab.com",
+        &target,
+        1000,
+        None,
+    );
 
     let r = peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com");
-    assert!(r.is_none(), "non-pinned signer must reject (chain advances), got {r:?}");
+    assert!(
+        r.is_none(),
+        "non-pinned signer must reject (chain advances), got {r:?}"
+    );
 }
 
 // REG-PEERISSUED-REVOKED-1 — valid binding + a verifying revocation → excluded.
@@ -643,14 +823,30 @@ fn peer_issued_revoked_excluded() {
     let registry = Keypair::generate();
     let rid = registry.peer_id().as_str().to_string();
     let target = Keypair::generate().peer_id().as_str().to_string();
-    let bh = publish_binding(&cs, &li, &rid, &registry, "billslab.com", &target, 1000, None);
+    let bh = publish_binding(
+        &cs,
+        &li,
+        &rid,
+        &registry,
+        "billslab.com",
+        &target,
+        1000,
+        None,
+    );
 
     // Unsigned revocation present → still resolves (signature is required).
-    let rev = RevocationData { revokes: bh, revoked_at: 2000, reason: None };
+    let rev = RevocationData {
+        revokes: bh,
+        revoked_at: 2000,
+        reason: None,
+    };
     let rev_entity = rev.to_entity().unwrap();
     let rev_hash = rev_entity.content_hash;
     cs.put(rev_entity).unwrap();
-    li.set(&format!("{}{}", revocation_prefix(&rid), rev_hash.to_hex()), rev_hash);
+    li.set(
+        &format!("{}{}", revocation_prefix(&rid), rev_hash.to_hex()),
+        rev_hash,
+    );
     assert!(
         peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com")
             .map(|r| r.is_resolved())
@@ -672,7 +868,16 @@ fn peer_issued_expired_excluded() {
     let rid = registry.peer_id().as_str().to_string();
     let target = Keypair::generate().peer_id().as_str().to_string();
     // issued_at=1ms, ttl=1ms → expired long ago.
-    publish_binding(&cs, &li, &rid, &registry, "billslab.com", &target, 1, Some(1));
+    publish_binding(
+        &cs,
+        &li,
+        &rid,
+        &registry,
+        "billslab.com",
+        &target,
+        1,
+        Some(1),
+    );
 
     let r = peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com");
     assert!(r.is_none(), "expired binding must be excluded, got {r:?}");
@@ -688,11 +893,23 @@ fn peer_issued_precede_identical_to_live() {
     let registry = Keypair::generate();
     let rid = registry.peer_id().as_str().to_string();
     let target = Keypair::generate().peer_id().as_str().to_string();
-    publish_binding(&cs, &li, &rid, &registry, "billslab.com", &target, 1000, None);
+    publish_binding(
+        &cs,
+        &li,
+        &rid,
+        &registry,
+        "billslab.com",
+        &target,
+        1000,
+        None,
+    );
 
     let r = peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com").unwrap();
     assert!(r.is_resolved());
-    assert_eq!(r.trust_anchor.as_deref(), Some(format!("peer_issued:{rid}").as_str()));
+    assert_eq!(
+        r.trust_anchor.as_deref(),
+        Some(format!("peer_issued:{rid}").as_str())
+    );
 }
 
 // REG-PEERISSUED-OFFLINE-NOTFOUND-1 — name not in the by-name index → not_found
@@ -719,7 +936,16 @@ async fn peer_issued_via_meta_resolve() {
     let registry_kp = Keypair::generate();
     let rid = registry_kp.peer_id().as_str().to_string();
     let target = Keypair::generate().peer_id().as_str().to_string();
-    publish_binding(&cs, &li, &rid, &registry_kp, "billslab.com", &target, 1000, None);
+    publish_binding(
+        &cs,
+        &li,
+        &rid,
+        &registry_kp,
+        "billslab.com",
+        &target,
+        1000,
+        None,
+    );
 
     let cfg = ResolverConfigData {
         resolver_chain: vec![pi_entry(&rid, None)],
@@ -736,8 +962,14 @@ async fn peer_issued_via_meta_resolve() {
         .await
         .unwrap();
     let map = decode_result(&result);
-    assert_eq!(result_field(&map, "status").and_then(|v| v.as_text()), Some("resolved"));
-    assert_eq!(result_field(&map, "peer_id").and_then(|v| v.as_text()), Some(target.as_str()));
+    assert_eq!(
+        result_field(&map, "status").and_then(|v| v.as_text()),
+        Some("resolved")
+    );
+    assert_eq!(
+        result_field(&map, "peer_id").and_then(|v| v.as_text()),
+        Some(target.as_str())
+    );
 }
 
 // VERIFY-FAIL through meta_resolve → chain_exhausted (fail-closed, no pin downgrade).
@@ -748,7 +980,16 @@ async fn peer_issued_verify_fail_via_meta_is_chain_exhausted() {
     let attacker = Keypair::generate();
     let rid = registry_kp.peer_id().as_str().to_string();
     let target = Keypair::generate().peer_id().as_str().to_string();
-    publish_binding(&cs, &li, &rid, &attacker, "billslab.com", &target, 1000, None);
+    publish_binding(
+        &cs,
+        &li,
+        &rid,
+        &attacker,
+        "billslab.com",
+        &target,
+        1000,
+        None,
+    );
 
     let cfg = ResolverConfigData {
         resolver_chain: vec![pi_entry(&rid, None)],
@@ -860,10 +1101,15 @@ fn binding_hash_of(r: &entity_handler::HandlerResult) -> Hash {
 async fn register_proof_signature_not_by_target_rejected() {
     let (cs, li) = stores();
     let registry = IdentityKeypair::Ed25519(Keypair::generate());
-    install_policy(&cs, &li, registry.peer_id().as_str(), &IssuerPolicyData {
-        mode: MODE_OPEN.into(),
-        ..Default::default()
-    });
+    install_policy(
+        &cs,
+        &li,
+        registry.peer_id().as_str(),
+        &IssuerPolicyData {
+            mode: MODE_OPEN.into(),
+            ..Default::default()
+        },
+    );
 
     let owner = Keypair::generate(); // the peer the name should bind to
     let attacker = Keypair::generate(); // signs the request with the WRONG key
@@ -885,11 +1131,16 @@ async fn register_policy_allowlist() {
     let rid = registry.peer_id().as_str().to_string();
     let allowed = Keypair::generate();
     let blocked = Keypair::generate();
-    install_policy(&cs, &li, &rid, &IssuerPolicyData {
-        mode: MODE_ALLOWLIST.into(),
-        allowlist: Some(vec![allowed.peer_id().as_str().to_string()]),
-        ..Default::default()
-    });
+    install_policy(
+        &cs,
+        &li,
+        &rid,
+        &IssuerPolicyData {
+            mode: MODE_ALLOWLIST.into(),
+            allowlist: Some(vec![allowed.peer_id().as_str().to_string()]),
+            ..Default::default()
+        },
+    );
     let handler = reg_handler(&cs, &li, &registry);
 
     // Non-listed target → not_entitled (403).
@@ -902,7 +1153,10 @@ async fn register_policy_allowlist() {
         .unwrap();
     assert_eq!(rej.status, 403);
     let rej_map = decode_result(&rej);
-    assert_eq!(result_field(&rej_map, "code").and_then(|v| v.as_text()), Some("not_entitled"));
+    assert_eq!(
+        result_field(&rej_map, "code").and_then(|v| v.as_text()),
+        Some("not_entitled")
+    );
 
     // Allow-listed target → issued, and resolvable end-to-end.
     let ok = handler
@@ -919,7 +1173,10 @@ async fn register_policy_allowlist() {
         .expect("resolvable");
     assert!(resolved.is_resolved());
     assert_eq!(resolved.binding, Some(bh));
-    assert_eq!(resolved.peer_id.as_deref(), Some(allowed.peer_id().as_str()));
+    assert_eq!(
+        resolved.peer_id.as_deref(),
+        Some(allowed.peer_id().as_str())
+    );
 }
 
 // REG-REGISTER-REPLAY-1 — a re-submitted request (same requester + nonce) is
@@ -929,10 +1186,15 @@ async fn register_policy_allowlist() {
 async fn register_replay_rejected() {
     let (cs, li) = stores();
     let registry = IdentityKeypair::Ed25519(Keypair::generate());
-    install_policy(&cs, &li, registry.peer_id().as_str(), &IssuerPolicyData {
-        mode: MODE_OPEN.into(),
-        ..Default::default()
-    });
+    install_policy(
+        &cs,
+        &li,
+        registry.peer_id().as_str(),
+        &IssuerPolicyData {
+            mode: MODE_OPEN.into(),
+            ..Default::default()
+        },
+    );
     let handler = reg_handler(&cs, &li, &registry);
     let owner = Keypair::generate();
 
@@ -955,7 +1217,10 @@ async fn register_replay_rejected() {
         .unwrap();
     assert_eq!(replay.status, 409);
     let map = decode_result(&replay);
-    assert_eq!(result_field(&map, "code").and_then(|v| v.as_text()), Some("replay"));
+    assert_eq!(
+        result_field(&map, "code").and_then(|v| v.as_text()),
+        Some("replay")
+    );
 }
 
 // `manual` mode (also the default when no policy is installed): a valid request
@@ -976,9 +1241,14 @@ async fn register_manual_queues_pending_review() {
         .unwrap();
     assert_eq!(result.status, 200);
     let map = decode_result(&result);
-    assert_eq!(result_field(&map, "status").and_then(|v| v.as_text()), Some("pending_review"));
+    assert_eq!(
+        result_field(&map, "status").and_then(|v| v.as_text()),
+        Some("pending_review")
+    );
     // Nothing was published.
-    assert!(li.get(&crate::by_name_pointer_path(&rid, "billslab.com")).is_none());
+    assert!(li
+        .get(&crate::by_name_pointer_path(&rid, "billslab.com"))
+        .is_none());
 }
 
 // `open` mode: a free name is first-come-first-serve; a second target claiming
@@ -987,22 +1257,33 @@ async fn register_manual_queues_pending_review() {
 async fn register_open_name_taken() {
     let (cs, li) = stores();
     let registry = IdentityKeypair::Ed25519(Keypair::generate());
-    install_policy(&cs, &li, registry.peer_id().as_str(), &IssuerPolicyData {
-        mode: MODE_OPEN.into(),
-        ..Default::default()
-    });
+    install_policy(
+        &cs,
+        &li,
+        registry.peer_id().as_str(),
+        &IssuerPolicyData {
+            mode: MODE_OPEN.into(),
+            ..Default::default()
+        },
+    );
     let handler = reg_handler(&cs, &li, &registry);
     let first = Keypair::generate();
     let second = Keypair::generate();
 
     let ok = handler
-        .handle(&register_ctx(mk_request("dup.com", first.peer_id().as_str(), b"a"), &first))
+        .handle(&register_ctx(
+            mk_request("dup.com", first.peer_id().as_str(), b"a"),
+            &first,
+        ))
         .await
         .unwrap();
     assert_eq!(ok.status, 200);
 
     let taken = handler
-        .handle(&register_ctx(mk_request("dup.com", second.peer_id().as_str(), b"b"), &second))
+        .handle(&register_ctx(
+            mk_request("dup.com", second.peer_id().as_str(), b"b"),
+            &second,
+        ))
         .await
         .unwrap();
     assert_eq!(taken.status, 409);
@@ -1019,24 +1300,38 @@ async fn register_then_revoke_excludes() {
     let (cs, li) = stores();
     let registry = IdentityKeypair::Ed25519(Keypair::generate());
     let rid = registry.peer_id().as_str().to_string();
-    install_policy(&cs, &li, &rid, &IssuerPolicyData { mode: MODE_OPEN.into(), ..Default::default() });
+    install_policy(
+        &cs,
+        &li,
+        &rid,
+        &IssuerPolicyData {
+            mode: MODE_OPEN.into(),
+            ..Default::default()
+        },
+    );
     let handler = reg_handler(&cs, &li, &registry);
     let owner = Keypair::generate();
 
     let issued = handler
-        .handle(&register_ctx(mk_request("billslab.com", owner.peer_id().as_str(), b"r1"), &owner))
+        .handle(&register_ctx(
+            mk_request("billslab.com", owner.peer_id().as_str(), b"r1"),
+            &owner,
+        ))
         .await
         .unwrap();
     let bh = binding_hash_of(&issued);
-    assert!(peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com")
-        .map(|r| r.is_resolved())
-        .unwrap_or(false));
+    assert!(
+        peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com")
+            .map(|r| r.is_resolved())
+            .unwrap_or(false)
+    );
 
     // Revoke it → resolve now dead-ends (fail-closed).
     let revoked = handler
-        .handle(
-            &ctx("revoke-request", vec![(text("binding_hash"), Value::Bytes(bh.to_bytes().to_vec()))]),
-        )
+        .handle(&ctx(
+            "revoke-request",
+            vec![(text("binding_hash"), Value::Bytes(bh.to_bytes().to_vec()))],
+        ))
         .await
         .unwrap();
     assert_eq!(revoked.status, 200);
@@ -1050,12 +1345,23 @@ async fn register_then_renew_supersedes() {
     let (cs, li) = stores();
     let registry = IdentityKeypair::Ed25519(Keypair::generate());
     let rid = registry.peer_id().as_str().to_string();
-    install_policy(&cs, &li, &rid, &IssuerPolicyData { mode: MODE_OPEN.into(), ..Default::default() });
+    install_policy(
+        &cs,
+        &li,
+        &rid,
+        &IssuerPolicyData {
+            mode: MODE_OPEN.into(),
+            ..Default::default()
+        },
+    );
     let handler = reg_handler(&cs, &li, &registry);
     let owner = Keypair::generate();
 
     let issued = handler
-        .handle(&register_ctx(mk_request("billslab.com", owner.peer_id().as_str(), b"n"), &owner))
+        .handle(&register_ctx(
+            mk_request("billslab.com", owner.peer_id().as_str(), b"n"),
+            &owner,
+        ))
         .await
         .unwrap();
     let old = binding_hash_of(&issued);
@@ -1075,7 +1381,8 @@ async fn register_then_renew_supersedes() {
     assert_ne!(old, new, "renew issues a fresh successor binding");
 
     // The by-name pointer + resolve now follow the successor.
-    let resolved = peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com").unwrap();
+    let resolved =
+        peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com").unwrap();
     assert_eq!(resolved.binding, Some(new));
     let body = cs.get(&new).unwrap();
     let binding = BindingData::from_entity(&body).unwrap();

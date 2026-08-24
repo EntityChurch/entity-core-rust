@@ -14,9 +14,7 @@ use entity_capability::{
 use entity_crypto::Keypair;
 use entity_entity::Entity;
 use entity_hash::Hash;
-use entity_protocol::{
-    check_creator_authority, verify_capability_chain, ProtocolError,
-};
+use entity_protocol::{check_creator_authority, verify_capability_chain, ProtocolError};
 use entity_types::{PeerData, SignatureData, TYPE_CAP_TOKEN};
 
 // ---------------------------------------------------------------------------
@@ -352,7 +350,10 @@ fn vec5_multisig_with_parent_deny() {
         matches!(err, ProtocolError::CapabilityInvalid(_)),
         "expected CapabilityInvalid (→403), got: {err:?}"
     );
-    assert!(err.is_auth_error(), "M3 violation must classify as auth-error");
+    assert!(
+        err.is_auth_error(),
+        "M3 violation must classify as auth-error"
+    );
     let msg = format!("{}", err);
     assert!(
         msg.contains("multi-sig") && msg.contains("parent"),
@@ -447,8 +448,7 @@ fn vec11_multisig_local_peer_not_in_signers_deny() {
         s1,
         s2,
     ]);
-    let err =
-        verify_capability_chain(&cap.content_hash, &included, &stranger.peer_id).unwrap_err();
+    let err = verify_capability_chain(&cap.content_hash, &included, &stranger.peer_id).unwrap_err();
     assert!(matches!(err, ProtocolError::NotLocalPeer));
 }
 
@@ -596,7 +596,10 @@ fn vec17_creator_authority_multisig_in_signers_didnt_sign_not_found() {
         included.get(h).cloned().or_else(|| store.get(h).cloned())
     })
     .unwrap();
-    assert!(!res.found, "alice in signers but didn't sign — strict-with-sig rejects");
+    assert!(
+        !res.found,
+        "alice in signers but didn't sign — strict-with-sig rejects"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1130,7 +1133,10 @@ fn single_sig_encoding_is_byte_string_not_map() {
     let enc = encode_granter(&Granter::Single(h));
     let cbor = entity_ecf::to_ecf(&enc);
     let v: ciborium::Value = ciborium::from_reader(cbor.as_slice()).unwrap();
-    assert!(v.as_bytes().is_some(), "single-sig granter must encode as CBOR bstr");
+    assert!(
+        v.as_bytes().is_some(),
+        "single-sig granter must encode as CBOR bstr"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1195,7 +1201,10 @@ fn chain_no_delegation_denied() {
     ]);
     let err = verify_capability_chain(&child.content_hash, &included, &alice.peer_id)
         .expect_err("child of a no_delegation parent MUST be denied");
-    assert!(matches!(err, ProtocolError::CapabilityInvalid(_)), "got {err:?}");
+    assert!(
+        matches!(err, ProtocolError::CapabilityInvalid(_)),
+        "got {err:?}"
+    );
 }
 
 /// F: a child whose lifetime exceeds the parent's `max_delegation_ttl` MUST
@@ -1248,7 +1257,10 @@ fn chain_max_delegation_ttl_denied() {
     ]);
     let err = verify_capability_chain(&child.content_hash, &included, &alice.peer_id)
         .expect_err("child lifetime exceeding max_delegation_ttl MUST be denied");
-    assert!(matches!(err, ProtocolError::CapabilityInvalid(_)), "got {err:?}");
+    assert!(
+        matches!(err, ProtocolError::CapabilityInvalid(_)),
+        "got {err:?}"
+    );
 }
 
 /// F: a chain with a not-yet-valid intermediate link MUST deny, even when the
@@ -1315,5 +1327,8 @@ fn chain_per_link_temporal_denied() {
     ]);
     let err = verify_capability_chain(&leaf.content_hash, &included, &alice.peer_id)
         .expect_err("not-yet-valid intermediate link MUST be denied");
-    assert!(matches!(err, ProtocolError::CapabilityNotYetValid), "got {err:?}");
+    assert!(
+        matches!(err, ProtocolError::CapabilityNotYetValid),
+        "got {err:?}"
+    );
 }

@@ -48,10 +48,7 @@ pub fn list() -> anyhow::Result<()> {
             continue;
         }
 
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("?");
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?");
 
         match IdentityKeypair::load_from_file(&path) {
             Ok(kp) => {

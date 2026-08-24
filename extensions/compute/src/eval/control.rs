@@ -23,8 +23,7 @@ pub(super) fn eval_if(
         Some(h) => h,
         None => {
             return EvalResult::Value(
-                ComputeError::InvalidExpression("compute/if missing 'condition'".into())
-                    .to_value(),
+                ComputeError::InvalidExpression("compute/if missing 'condition'".into()).to_value(),
             )
         }
     };
@@ -44,8 +43,7 @@ pub(super) fn eval_if(
             Some(h) => h,
             None => {
                 return EvalResult::Value(
-                    ComputeError::InvalidExpression("compute/if missing 'then'".into())
-                        .to_value(),
+                    ComputeError::InvalidExpression("compute/if missing 'then'".into()).to_value(),
                 )
             }
         };
@@ -106,8 +104,7 @@ pub(super) fn eval_let(
             Some(n) => n.to_string(),
             None => {
                 return EvalResult::Value(
-                    ComputeError::InvalidExpression("let binding missing 'name'".into())
-                        .to_value(),
+                    ComputeError::InvalidExpression("let binding missing 'name'".into()).to_value(),
                 )
             }
         };
@@ -132,11 +129,11 @@ pub(super) fn eval_let(
             }
         };
 
-        let value_target =
-            match ctx.resolve_or_error(&value_hash, &format!("let binding {}", name)) {
-                Ok(e) => e,
-                Err(err) => return EvalResult::Value(err),
-            };
+        let value_target = match ctx.resolve_or_error(&value_hash, &format!("let binding {}", name))
+        {
+            Ok(e) => e,
+            Err(err) => return EvalResult::Value(err),
+        };
 
         let value = evaluate(&value_target, &new_scope, budget, ctx);
         if value.is_error() {
@@ -188,9 +185,5 @@ pub(super) fn eval_lambda(
 
     let env = capture_scope(scope, ctx);
 
-    ComputeValue::Closure(ClosureValue {
-        params,
-        body,
-        env,
-    })
+    ComputeValue::Closure(ClosureValue { params, body, env })
 }

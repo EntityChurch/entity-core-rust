@@ -71,15 +71,12 @@ pub fn verify_narrowing(
     visited.insert(child_name);
 
     let mut current = child_def.clone();
-    loop {
-        let parent_name = match current
-            .get("extends")
-            .and_then(|v| v.as_text())
-            .filter(|s| !s.is_empty())
-        {
-            Some(s) => s.to_string(),
-            None => break,
-        };
+    while let Some(parent_name) = current
+        .get("extends")
+        .and_then(|v| v.as_text())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+    {
         if !visited.insert(parent_name.clone()) {
             violations.push(NarrowingViolation {
                 field: String::new(),
@@ -88,22 +85,18 @@ pub fn verify_narrowing(
             });
             break;
         }
-        let parent_def = match resolve_type(
-            local_peer_id,
-            &parent_name,
-            content_store,
-            location_index,
-        ) {
-            Some(v) => v,
-            None => {
-                violations.push(NarrowingViolation {
-                    field: String::new(),
-                    constraint: String::new(),
-                    reason: format!("parent type not resolved: {}", parent_name),
-                });
-                break;
-            }
-        };
+        let parent_def =
+            match resolve_type(local_peer_id, &parent_name, content_store, location_index) {
+                Some(v) => v,
+                None => {
+                    violations.push(NarrowingViolation {
+                        field: String::new(),
+                        constraint: String::new(),
+                        reason: format!("parent type not resolved: {}", parent_name),
+                    });
+                    break;
+                }
+            };
         // Compare constraints for each field present on parent.
         verify_step(&current, &parent_def, &mut violations);
         current = parent_def;
@@ -149,10 +142,7 @@ fn verify_step(child: &Value, parent: &Value, out: &mut Vec<NarrowingViolation>)
             .iter()
             .find(|(k2, _)| k2.as_text() == Some(field_name.as_str()))
             .map(|(_, v)| v.clone());
-        let child_constraints = child_spec
-            .as_ref()
-            .map(constraints_of)
-            .unwrap_or_default();
+        let child_constraints = child_spec.as_ref().map(constraints_of).unwrap_or_default();
 
         for parent_c in &parent_constraints {
             let kind = constraint_type_of(parent_c);
@@ -274,9 +264,7 @@ fn check_narrower(kind: &str, child: &Value, parent: &Value) -> Result<(), Strin
             for v in &pv {
                 let b = entity_ecf::to_ecf(v);
                 if !cv_bytes.iter().any(|c| c == &b) {
-                    return Err(
-                        "child not_one_of missing value present in parent".to_string()
-                    );
+                    return Err("child not_one_of missing value present in parent".to_string());
                 }
             }
             Ok(())

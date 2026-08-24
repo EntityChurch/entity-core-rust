@@ -16,7 +16,7 @@
 //! this suite asserts cross-impl byte convergence — they are complementary.
 
 use entity_crypto::{
-    peer_identity_hash_with_key_type, peer_entity_from_components_with_key_type, Ed448Keypair,
+    peer_entity_from_components_with_key_type, peer_identity_hash_with_key_type, Ed448Keypair,
     KeyType, ED448_SECRET_KEY_LEN,
 };
 use entity_hash::{Hash, HASH_ALGORITHM_SHA384};
@@ -29,7 +29,8 @@ const FIXTURE_PUBKEY: [u8; 64] = [0xAA; 64];
 const GO_PUBLIC_KEY: &str = "2601850dc77aaf141e065b2fe83ecfe08b6c15ba930886e9f111b6f0fd8f9f246b167e0398f957df61c9cead939cdf5bc9fe43c9432f3b0e00";
 const GO_PEER_ID: &str = "3dR1gAppfHXSGMvPRuAfYkkt4P2C1fvnFYpxPBSQP8RLs4";
 const GO_SIGNATURE: &str = "0aff7a36b2b5e7502f9a133bc9ed39316284f0be738e2485546b33fda60966b19ac0e3424ed549072af7ac5caa6d695c3e1e6412207cecaf8085444fbf062cb5271ea6d127c6c87327e1e20793f2b10341d04bd4bed32e220eca1b2255cc8aa4d2a0c8304d67e6f20e814b90411049b33400";
-const GO_PEER_CONTENT_HASH: &str = "002785b314436a82503829339cb2519b4efe795712406ea19ac185e31ae8c70748";
+const GO_PEER_CONTENT_HASH: &str =
+    "002785b314436a82503829339cb2519b4efe795712406ea19ac185e31ae8c70748";
 const GO_SHA384_DIGEST: &str = "2e64bbde3c494cf7cd4fb53ae3bf6420ec6d9bfa686348729eaa687e421c01c059c1ed5775824bcffc50df0f3eef5a69";
 
 fn hex(bytes: &[u8]) -> String {

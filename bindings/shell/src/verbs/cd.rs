@@ -76,11 +76,21 @@ mod tests {
     }
 
     impl PeerBinding for StubBinding {
-        fn peer_id(&self) -> &str { &self.bound }
-        fn primary_peer_id(&self) -> String { self.primary.clone() }
-        fn peer_ids(&self) -> Vec<String> { self.peers.clone() }
-        fn connected_peers(&self) -> Vec<String> { Vec::new() }
-        fn peer_label(&self, _pid: &str) -> Option<String> { None }
+        fn peer_id(&self) -> &str {
+            &self.bound
+        }
+        fn primary_peer_id(&self) -> String {
+            self.primary.clone()
+        }
+        fn peer_ids(&self) -> Vec<String> {
+            self.peers.clone()
+        }
+        fn connected_peers(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn peer_label(&self, _pid: &str) -> Option<String> {
+            None
+        }
         fn tree_listing(&self, _pid: &str, _prefix: &str) -> Vec<crate::binding::TreeListingEntry> {
             Vec::new()
         }
@@ -111,7 +121,9 @@ mod tests {
     fn bare_cd_returns_to_peer_root() {
         let mut shell = Shell::with_wd("alice", "/alice/system/");
         let b = stub();
-        let sink = RecordingSink { published: RefCell::new(Vec::new()) };
+        let sink = RecordingSink {
+            published: RefCell::new(Vec::new()),
+        };
         let result = cd(&mut shell, &[], &b, Some(&sink)).unwrap();
         assert!(matches!(result, VerbOutput::Message(ref m) if m == "cd: /alice/"));
         assert_eq!(shell.wd(), "/alice/");
@@ -148,7 +160,9 @@ mod tests {
     fn sink_called_on_success() {
         let mut shell = Shell::with_wd("alice", "/alice/");
         let b = stub();
-        let sink = RecordingSink { published: RefCell::new(Vec::new()) };
+        let sink = RecordingSink {
+            published: RefCell::new(Vec::new()),
+        };
         cd(&mut shell, &["system"], &b, Some(&sink)).unwrap();
         assert_eq!(sink.published.borrow().as_slice(), &["/alice/system"]);
     }

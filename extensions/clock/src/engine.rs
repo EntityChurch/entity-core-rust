@@ -8,9 +8,14 @@ use std::sync::{Arc, RwLock};
 
 use entity_entity::Entity;
 use entity_hash::Hash;
-use entity_store::{ClockHlc, ClockLogical, ClockState, ContentStore, ExecutionContext, LocationIndex, SyncTreeHook, TreeChangeEvent};
+use entity_store::{
+    ClockHlc, ClockLogical, ClockState, ContentStore, ExecutionContext, LocationIndex,
+    SyncTreeHook, TreeChangeEvent,
+};
 
-use crate::{decode_counter, decode_hlc, decode_vector_entries, read_config, system_clock_ms, ClockConfig};
+use crate::{
+    decode_counter, decode_hlc, decode_vector_entries, read_config, system_clock_ms, ClockConfig,
+};
 
 // Platform-aware task spawning: tokio::spawn on native, wasm_bindgen_futures::spawn_local on WASM.
 // On native, the start() method uses tokio::spawn directly for JoinHandle return type,
@@ -169,7 +174,6 @@ impl ClockEngine {
         let config = self.cached_config();
         self.advance_clock(&config);
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -177,9 +181,11 @@ impl ClockEngine {
 // ---------------------------------------------------------------------------
 
 impl SyncTreeHook for ClockEngine {
-    fn on_tree_change(&self, event: &TreeChangeEvent, ctx: &mut ExecutionContext)
-        -> Result<(), entity_store::CascadeHalt>
-    {
+    fn on_tree_change(
+        &self,
+        event: &TreeChangeEvent,
+        ctx: &mut ExecutionContext,
+    ) -> Result<(), entity_store::CascadeHalt> {
         // Writes under `/{peer}/system/clock/` (incl. our own state writes) do
         // not advance the clock (§4.3). The config path lives there too — but
         // we need to invalidate the cache when it changes.
@@ -479,27 +485,29 @@ mod tests {
         "peer1abc".to_string()
     }
 
-    fn make_engine() -> (Arc<ClockEngine>, Arc<dyn ContentStore>, Arc<dyn LocationIndex>) {
+    fn make_engine() -> (
+        Arc<ClockEngine>,
+        Arc<dyn ContentStore>,
+        Arc<dyn LocationIndex>,
+    ) {
         let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
         let index: Arc<dyn LocationIndex> = Arc::new(MemoryLocationIndex::new());
         let peer_id = Hash::compute("test", b"local-peer");
         let peer_id_str = test_peer_id_str();
-        let engine = Arc::new(ClockEngine::new(store.clone(), index.clone(), peer_id, peer_id_str));
+        let engine = Arc::new(ClockEngine::new(
+            store.clone(),
+            index.clone(),
+            peer_id,
+            peer_id_str,
+        ));
         (engine, store, index)
     }
 
-    fn store_config(
-        store: &Arc<dyn ContentStore>,
-        index: &Arc<dyn LocationIndex>,
-        mode: &str,
-    ) {
+    fn store_config(store: &Arc<dyn ContentStore>, index: &Arc<dyn LocationIndex>, mode: &str) {
         let peer_id = test_peer_id_str();
         let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
             (entity_ecf::text("mode"), entity_ecf::text(mode)),
-            (
-                entity_ecf::text("wall_clock"),
-                entity_ecf::bool_val(true),
-            ),
+            (entity_ecf::text("wall_clock"), entity_ecf::bool_val(true)),
         ]));
         let path = format!("/{}/system/clock/config", peer_id);
         let entity = Entity::new(&path, data).unwrap();
@@ -592,7 +600,9 @@ mod tests {
 
         // Wall mode doesn't store any persistent state
         engine.process_event(&make_event("app/data"));
-        assert!(index.get(&format!("/{}/system/clock/logical", peer_id)).is_none());
+        assert!(index
+            .get(&format!("/{}/system/clock/logical", peer_id))
+            .is_none());
     }
 
     #[test]
@@ -604,10 +614,7 @@ mod tests {
         // Store an HLC with a far-future physical time
         let far_future = system_clock_ms() + MAX_HLC_DRIFT_MS + 100_000;
         let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-            (
-                entity_ecf::text("logical"),
-                entity_ecf::integer(5),
-            ),
+            (entity_ecf::text("logical"), entity_ecf::integer(5)),
             (
                 entity_ecf::text("peer"),
                 entity_ecf::Value::Bytes(engine.local_peer_id.to_bytes().to_vec()),

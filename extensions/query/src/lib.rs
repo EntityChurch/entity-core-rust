@@ -26,14 +26,13 @@ use entity_handler::{
 use entity_hash::Hash;
 use entity_store::{ContentStore, LocationIndex};
 
-
 /// Default limit when not specified in expression (spec §8).
 const DEFAULT_QUERY_LIMIT: u64 = 100;
 /// Maximum limit value (spec §8).
 const MAX_QUERY_LIMIT: u64 = 10_000;
 
 // Re-exports
-pub use index::{QueryIndexes, QueryIndexStore};
+pub use index::{QueryIndexStore, QueryIndexes};
 pub use indexing::IndexingLocationIndex;
 #[cfg(feature = "sqlite")]
 pub use sqlite_index::SqliteQueryIndexes;
@@ -65,7 +64,7 @@ struct QueryMatch {
 // ---------------------------------------------------------------------------
 
 struct QueryConstraints {
-    scope: String,           // "tree" or "content_store"
+    scope: String, // "tree" or "content_store"
     max_results: Option<u64>,
     type_scope_include: Option<Vec<String>>,
     type_scope_exclude: Option<Vec<String>>,
@@ -179,8 +178,10 @@ impl QueryHandler {
         if constraints.scope == "content_store" && constraints.type_scope_include.is_none() {
             return Ok(HandlerResult::error(
                 STATUS_FORBIDDEN,
-                make_error_entity("content_store_requires_type_scope",
-                    "content_store scope requires type_scope on grant constraints"),
+                make_error_entity(
+                    "content_store_requires_type_scope",
+                    "content_store scope requires type_scope on grant constraints",
+                ),
             ));
         }
 
@@ -255,7 +256,10 @@ impl QueryHandler {
             .iter()
             .map(|m| {
                 Value::Map(vec![
-                    (entity_ecf::text("hash"), Value::Bytes(m.hash.to_bytes().to_vec())),
+                    (
+                        entity_ecf::text("hash"),
+                        Value::Bytes(m.hash.to_bytes().to_vec()),
+                    ),
                     (entity_ecf::text("path"), entity_ecf::text(&m.path)),
                     (entity_ecf::text("type"), entity_ecf::text(&m.entity_type)),
                 ])
@@ -263,18 +267,9 @@ impl QueryHandler {
             .collect();
 
         let mut result_entries = vec![
-            (
-                entity_ecf::text("has_more"),
-                entity_ecf::bool_val(has_more),
-            ),
-            (
-                entity_ecf::text("matches"),
-                Value::Array(matches),
-            ),
-            (
-                entity_ecf::text("total"),
-                entity_ecf::integer(total as i64),
-            ),
+            (entity_ecf::text("has_more"), entity_ecf::bool_val(has_more)),
+            (entity_ecf::text("matches"), Value::Array(matches)),
+            (entity_ecf::text("total"), entity_ecf::integer(total as i64)),
         ];
         if let Some(ref cursor_val) = next_cursor {
             result_entries.push((entity_ecf::text("cursor"), entity_ecf::text(cursor_val)));
@@ -291,7 +286,10 @@ impl QueryHandler {
                     included.insert(m.hash, entity);
                 }
             }
-            Ok(HandlerResult::ok(build_envelope_result(result_entity, included)))
+            Ok(HandlerResult::ok(build_envelope_result(
+                result_entity,
+                included,
+            )))
         } else {
             Ok(HandlerResult::ok(result_entity))
         }
@@ -304,8 +302,10 @@ impl QueryHandler {
         if constraints.scope == "content_store" && constraints.type_scope_include.is_none() {
             return Ok(HandlerResult::error(
                 STATUS_FORBIDDEN,
-                make_error_entity("content_store_requires_type_scope",
-                    "content_store scope requires type_scope on grant constraints"),
+                make_error_entity(
+                    "content_store_requires_type_scope",
+                    "content_store scope requires type_scope on grant constraints",
+                ),
             ));
         }
 
@@ -454,7 +454,8 @@ impl QueryHandler {
         // Paths in the index are peer-qualified ({peer_id}/path). The expression's
         // path_prefix is a bare path. We qualify it so it matches indexed paths.
         if let Some(ref prefix) = expr.path_prefix {
-            let qualified_prefix = entity_entity::EntityUri::qualify_path(prefix, &self.local_peer_id);
+            let qualified_prefix =
+                entity_entity::EntityUri::qualify_path(prefix, &self.local_peer_id);
             candidates.retain(|m| m.path.starts_with(&qualified_prefix));
         }
 
@@ -618,12 +619,17 @@ fn make_error_entity(code: &str, message: &str) -> Entity {
 }
 
 fn entity_to_inline(entity: &Entity) -> Value {
-    let data_value: Value = ciborium::from_reader(entity.data.as_slice())
-        .unwrap_or(Value::Null);
+    let data_value: Value = ciborium::from_reader(entity.data.as_slice()).unwrap_or(Value::Null);
     Value::Map(vec![
-        (entity_ecf::text("content_hash"), Value::Bytes(entity.content_hash.to_bytes().to_vec())),
+        (
+            entity_ecf::text("content_hash"),
+            Value::Bytes(entity.content_hash.to_bytes().to_vec()),
+        ),
         (entity_ecf::text("data"), data_value),
-        (entity_ecf::text("type"), entity_ecf::text(&entity.entity_type)),
+        (
+            entity_ecf::text("type"),
+            entity_ecf::text(&entity.entity_type),
+        ),
     ])
 }
 
@@ -631,16 +637,16 @@ fn build_envelope_result(root: Entity, included: HashMap<Hash, Entity>) -> Entit
     let included_entries: Vec<_> = included
         .iter()
         .map(|(hash, entity)| {
-            (Value::Bytes(hash.to_bytes().to_vec()), entity_to_inline(entity))
+            (
+                Value::Bytes(hash.to_bytes().to_vec()),
+                entity_to_inline(entity),
+            )
         })
         .collect();
 
     let mut envelope_fields = vec![(entity_ecf::text("root"), entity_to_inline(&root))];
     if !included_entries.is_empty() {
-        envelope_fields.push((
-            entity_ecf::text("included"),
-            Value::Map(included_entries),
-        ));
+        envelope_fields.push((entity_ecf::text("included"), Value::Map(included_entries)));
     }
 
     let data = entity_ecf::to_ecf(&Value::Map(envelope_fields));
@@ -658,7 +664,12 @@ mod tests {
     use entity_handler::STATUS_OK;
     use entity_store::{MemoryContentStore, MemoryLocationIndex};
 
-    fn setup() -> (Arc<QueryIndexes>, Arc<MemoryContentStore>, Arc<MemoryLocationIndex>, QueryHandler) {
+    fn setup() -> (
+        Arc<QueryIndexes>,
+        Arc<MemoryContentStore>,
+        Arc<MemoryLocationIndex>,
+        QueryHandler,
+    ) {
         let content_store = Arc::new(MemoryContentStore::new());
         let location_index = Arc::new(MemoryLocationIndex::new());
         let indexes = Arc::new(QueryIndexes::new());
@@ -684,10 +695,8 @@ mod tests {
         entity_type: &str,
         data_val: &str,
     ) -> Hash {
-        let entity = Entity::new(
-            entity_type,
-            entity_ecf::to_ecf(&entity_ecf::text(data_val)),
-        ).unwrap();
+        let entity =
+            Entity::new(entity_type, entity_ecf::to_ecf(&entity_ecf::text(data_val))).unwrap();
         let hash = cs.put(entity.clone()).unwrap();
         li.set(path, hash);
         indexes.add_entries_for_entity(path, &entity);
@@ -695,10 +704,8 @@ mod tests {
     }
 
     fn make_find_ctx(expr_data: Value) -> HandlerContext {
-        let params = Entity::new(
-            "system/query/expression",
-            entity_ecf::to_ecf(&expr_data),
-        ).unwrap();
+        let params =
+            Entity::new("system/query/expression", entity_ecf::to_ecf(&expr_data)).unwrap();
         HandlerContext {
             handler_grant: None,
             caller_capability: None,
@@ -751,9 +758,30 @@ mod tests {
     #[tokio::test]
     async fn test_find_with_path_prefix() {
         let (indexes, cs, li, handler) = setup();
-        put_entity(&cs, &li, &indexes, "/test_peer/app/users/alice", "app/user", "alice");
-        put_entity(&cs, &li, &indexes, "/test_peer/app/users/bob", "app/user", "bob");
-        put_entity(&cs, &li, &indexes, "/test_peer/other/users/carol", "app/user", "carol");
+        put_entity(
+            &cs,
+            &li,
+            &indexes,
+            "/test_peer/app/users/alice",
+            "app/user",
+            "alice",
+        );
+        put_entity(
+            &cs,
+            &li,
+            &indexes,
+            "/test_peer/app/users/bob",
+            "app/user",
+            "bob",
+        );
+        put_entity(
+            &cs,
+            &li,
+            &indexes,
+            "/test_peer/other/users/carol",
+            "app/user",
+            "carol",
+        );
 
         let ctx = make_find_ctx(entity_ecf::cbor_map! {
             "type_filter" => entity_ecf::text("app/user"),
@@ -785,7 +813,8 @@ mod tests {
             entity_ecf::to_ecf(&entity_ecf::cbor_map! {
                 "target" => Value::Bytes(target.to_bytes().to_vec())
             }),
-        ).unwrap();
+        )
+        .unwrap();
         let ref_hash = cs.put(ref_entity.clone()).unwrap();
         li.set("refs/r1", ref_hash);
         indexes.add_entries_for_entity("refs/r1", &ref_entity);
@@ -821,7 +850,8 @@ mod tests {
             entity_ecf::to_ecf(&entity_ecf::cbor_map! {
                 "type_filter" => entity_ecf::text("app/user")
             }),
-        ).unwrap();
+        )
+        .unwrap();
         let mut ctx = make_find_ctx(entity_ecf::cbor_map! {
             "type_filter" => entity_ecf::text("app/user")
         });
@@ -830,8 +860,7 @@ mod tests {
         let result = handler.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
 
-        let count: ciborium::Value =
-            ciborium::from_reader(result.result.data.as_slice()).unwrap();
+        let count: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let n: i128 = count.as_integer().unwrap().into();
         assert_eq!(n, 2);
     }
@@ -849,7 +878,9 @@ mod tests {
         let (indexes, cs, li, handler) = setup();
         for i in 0..5 {
             put_entity(
-                &cs, &li, &indexes,
+                &cs,
+                &li,
+                &indexes,
                 &format!("users/user_{:02}", i),
                 "app/user",
                 &format!("user_{}", i),
@@ -864,10 +895,28 @@ mod tests {
         let result = handler.handle(&ctx).await.unwrap();
         let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
-        let has_more = map.iter().find(|(k, _)| k.as_text() == Some("has_more")).unwrap().1.as_bool().unwrap();
+        let has_more = map
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("has_more"))
+            .unwrap()
+            .1
+            .as_bool()
+            .unwrap();
         assert!(has_more);
-        let cursor_val = map.iter().find(|(k, _)| k.as_text() == Some("cursor")).unwrap().1.as_text().unwrap();
-        let matches = map.iter().find(|(k, _)| k.as_text() == Some("matches")).unwrap().1.as_array().unwrap();
+        let cursor_val = map
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("cursor"))
+            .unwrap()
+            .1
+            .as_text()
+            .unwrap();
+        let matches = map
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("matches"))
+            .unwrap()
+            .1
+            .as_array()
+            .unwrap();
         assert_eq!(matches.len(), 2);
 
         // Page 2: use cursor
@@ -879,13 +928,31 @@ mod tests {
         let result2 = handler.handle(&ctx2).await.unwrap();
         let val2: ciborium::Value = ciborium::from_reader(result2.result.data.as_slice()).unwrap();
         let map2 = val2.as_map().unwrap();
-        let matches2 = map2.iter().find(|(k, _)| k.as_text() == Some("matches")).unwrap().1.as_array().unwrap();
+        let matches2 = map2
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("matches"))
+            .unwrap()
+            .1
+            .as_array()
+            .unwrap();
         assert_eq!(matches2.len(), 2);
-        let has_more2 = map2.iter().find(|(k, _)| k.as_text() == Some("has_more")).unwrap().1.as_bool().unwrap();
+        let has_more2 = map2
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("has_more"))
+            .unwrap()
+            .1
+            .as_bool()
+            .unwrap();
         assert!(has_more2);
 
         // Page 3: last page
-        let cursor_val2 = map2.iter().find(|(k, _)| k.as_text() == Some("cursor")).unwrap().1.as_text().unwrap();
+        let cursor_val2 = map2
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("cursor"))
+            .unwrap()
+            .1
+            .as_text()
+            .unwrap();
         let ctx3 = make_find_ctx(entity_ecf::cbor_map! {
             "type_filter" => entity_ecf::text("app/user"),
             "limit" => entity_ecf::integer(2),
@@ -894,9 +961,21 @@ mod tests {
         let result3 = handler.handle(&ctx3).await.unwrap();
         let val3: ciborium::Value = ciborium::from_reader(result3.result.data.as_slice()).unwrap();
         let map3 = val3.as_map().unwrap();
-        let matches3 = map3.iter().find(|(k, _)| k.as_text() == Some("matches")).unwrap().1.as_array().unwrap();
+        let matches3 = map3
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("matches"))
+            .unwrap()
+            .1
+            .as_array()
+            .unwrap();
         assert_eq!(matches3.len(), 1);
-        let has_more3 = map3.iter().find(|(k, _)| k.as_text() == Some("has_more")).unwrap().1.as_bool().unwrap();
+        let has_more3 = map3
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("has_more"))
+            .unwrap()
+            .1
+            .as_bool()
+            .unwrap();
         assert!(!has_more3);
     }
 
@@ -931,7 +1010,14 @@ mod tests {
         let result = handler.handle(&ctx).await.unwrap();
         let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
-        let total: i128 = map.iter().find(|(k, _)| k.as_text() == Some("total")).unwrap().1.as_integer().unwrap().into();
+        let total: i128 = map
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("total"))
+            .unwrap()
+            .1
+            .as_integer()
+            .unwrap()
+            .into();
         assert_eq!(total, 2);
     }
 
@@ -949,12 +1035,13 @@ mod tests {
             resources: entity_capability::PathScope::new(vec!["*".into()]),
             operations: entity_capability::IdScope::new(vec!["*".into()]),
             peers: None,
-            constraints: Some(std::collections::BTreeMap::from([
-                ("type_scope".to_string(), ciborium::Value::Map(vec![
-                    (ciborium::Value::Text("include".into()),
-                     ciborium::Value::Array(vec![ciborium::Value::Text("app/user".into())])),
-                ])),
-            ])),
+            constraints: Some(std::collections::BTreeMap::from([(
+                "type_scope".to_string(),
+                ciborium::Value::Map(vec![(
+                    ciborium::Value::Text("include".into()),
+                    ciborium::Value::Array(vec![ciborium::Value::Text("app/user".into())]),
+                )]),
+            )])),
             allowances: None,
         };
         let cap = entity_capability::CapabilityToken {
@@ -979,7 +1066,14 @@ mod tests {
         assert_eq!(result.status, STATUS_OK);
         let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
-        let total: i128 = map.iter().find(|(k, _)| k.as_text() == Some("total")).unwrap().1.as_integer().unwrap().into();
+        let total: i128 = map
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("total"))
+            .unwrap()
+            .1
+            .as_integer()
+            .unwrap()
+            .into();
         assert_eq!(total, 1); // only alice (app/user)
 
         // Query for "app/order" — blocked by type_scope (not in include list)
@@ -1005,7 +1099,14 @@ mod tests {
     async fn test_query_max_results_constraint() {
         let (indexes, cs, li, handler) = setup();
         for i in 0..10 {
-            put_entity(&cs, &li, &indexes, &format!("users/u{:02}", i), "app/user", &format!("user{}", i));
+            put_entity(
+                &cs,
+                &li,
+                &indexes,
+                &format!("users/u{:02}", i),
+                "app/user",
+                &format!("user{}", i),
+            );
         }
 
         // Grant with max_results: 3
@@ -1014,9 +1115,10 @@ mod tests {
             resources: entity_capability::PathScope::new(vec!["*".into()]),
             operations: entity_capability::IdScope::new(vec!["*".into()]),
             peers: None,
-            constraints: Some(std::collections::BTreeMap::from([
-                ("max_results".to_string(), ciborium::Value::Integer(3.into())),
-            ])),
+            constraints: Some(std::collections::BTreeMap::from([(
+                "max_results".to_string(),
+                ciborium::Value::Integer(3.into()),
+            )])),
             allowances: None,
         };
 
@@ -1029,9 +1131,21 @@ mod tests {
         assert_eq!(result.status, STATUS_OK);
         let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
-        let matches = map.iter().find(|(k, _)| k.as_text() == Some("matches")).unwrap().1.as_array().unwrap();
+        let matches = map
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("matches"))
+            .unwrap()
+            .1
+            .as_array()
+            .unwrap();
         assert_eq!(matches.len(), 3); // limited by max_results
-        let has_more = map.iter().find(|(k, _)| k.as_text() == Some("has_more")).unwrap().1.as_bool().unwrap();
+        let has_more = map
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("has_more"))
+            .unwrap()
+            .1
+            .as_bool()
+            .unwrap();
         assert!(has_more);
     }
 
@@ -1046,9 +1160,10 @@ mod tests {
             operations: entity_capability::IdScope::new(vec!["*".into()]),
             peers: None,
             constraints: None,
-            allowances: Some(std::collections::BTreeMap::from([
-                ("scope".to_string(), ciborium::Value::Text("content_store".into())),
-            ])),
+            allowances: Some(std::collections::BTreeMap::from([(
+                "scope".to_string(),
+                ciborium::Value::Text("content_store".into()),
+            )])),
         };
 
         let mut ctx = make_find_ctx(entity_ecf::cbor_map! {
@@ -1068,19 +1183,27 @@ mod tests {
         let target = entity_hash::Hash::compute("target", b"target_data");
 
         // Entity A: app/user, references target
-        let e_a = Entity::new("app/user", entity_ecf::to_ecf(&entity_ecf::cbor_map! {
-            "name" => entity_ecf::text("alice"),
-            "ref" => Value::Bytes(target.to_bytes().to_vec())
-        })).unwrap();
+        let e_a = Entity::new(
+            "app/user",
+            entity_ecf::to_ecf(&entity_ecf::cbor_map! {
+                "name" => entity_ecf::text("alice"),
+                "ref" => Value::Bytes(target.to_bytes().to_vec())
+            }),
+        )
+        .unwrap();
         let h_a = cs.put(e_a.clone()).unwrap();
         li.set("users/alice", h_a);
         indexes.add_entries_for_entity("users/alice", &e_a);
 
         // Entity B: app/order, also references target
-        let e_b = Entity::new("app/order", entity_ecf::to_ecf(&entity_ecf::cbor_map! {
-            "id" => entity_ecf::text("o1"),
-            "user_ref" => Value::Bytes(target.to_bytes().to_vec())
-        })).unwrap();
+        let e_b = Entity::new(
+            "app/order",
+            entity_ecf::to_ecf(&entity_ecf::cbor_map! {
+                "id" => entity_ecf::text("o1"),
+                "user_ref" => Value::Bytes(target.to_bytes().to_vec())
+            }),
+        )
+        .unwrap();
         let h_b = cs.put(e_b.clone()).unwrap();
         li.set("orders/o1", h_b);
         indexes.add_entries_for_entity("orders/o1", &e_b);
@@ -1094,16 +1217,44 @@ mod tests {
         assert_eq!(result.status, STATUS_OK);
         let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
-        let total: i128 = map.iter().find(|(k, _)| k.as_text() == Some("total")).unwrap().1.as_integer().unwrap().into();
+        let total: i128 = map
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("total"))
+            .unwrap()
+            .1
+            .as_integer()
+            .unwrap()
+            .into();
         assert_eq!(total, 1);
     }
 
     #[tokio::test]
     async fn test_find_type_and_path_prefix_intersection() {
         let (indexes, cs, li, handler) = setup();
-        put_entity(&cs, &li, &indexes, "/test_peer/team/eng/alice", "app/user", "alice");
-        put_entity(&cs, &li, &indexes, "/test_peer/team/sales/bob", "app/user", "bob");
-        put_entity(&cs, &li, &indexes, "/test_peer/team/eng/carol", "app/user", "carol");
+        put_entity(
+            &cs,
+            &li,
+            &indexes,
+            "/test_peer/team/eng/alice",
+            "app/user",
+            "alice",
+        );
+        put_entity(
+            &cs,
+            &li,
+            &indexes,
+            "/test_peer/team/sales/bob",
+            "app/user",
+            "bob",
+        );
+        put_entity(
+            &cs,
+            &li,
+            &indexes,
+            "/test_peer/team/eng/carol",
+            "app/user",
+            "carol",
+        );
 
         // Query: type=app/user AND path_prefix=team/eng/
         let ctx = make_find_ctx(entity_ecf::cbor_map! {
@@ -1113,7 +1264,14 @@ mod tests {
         let result = handler.handle(&ctx).await.unwrap();
         let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
-        let total: i128 = map.iter().find(|(k, _)| k.as_text() == Some("total")).unwrap().1.as_integer().unwrap().into();
+        let total: i128 = map
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("total"))
+            .unwrap()
+            .1
+            .as_integer()
+            .unwrap()
+            .into();
         assert_eq!(total, 2); // alice and carol, not bob
     }
 
@@ -1129,9 +1287,22 @@ mod tests {
         assert_eq!(result.status, STATUS_OK);
         let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
-        let total: i128 = map.iter().find(|(k, _)| k.as_text() == Some("total")).unwrap().1.as_integer().unwrap().into();
+        let total: i128 = map
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("total"))
+            .unwrap()
+            .1
+            .as_integer()
+            .unwrap()
+            .into();
         assert_eq!(total, 0);
-        let has_more = map.iter().find(|(k, _)| k.as_text() == Some("has_more")).unwrap().1.as_bool().unwrap();
+        let has_more = map
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("has_more"))
+            .unwrap()
+            .1
+            .as_bool()
+            .unwrap();
         assert!(!has_more);
     }
 
@@ -1158,13 +1329,18 @@ mod sqlite_handler_tests {
     use entity_handler::STATUS_OK;
     use entity_store::sqlite::SqliteStore;
 
-    fn setup_sqlite() -> (Arc<dyn QueryIndexStore>, Arc<dyn ContentStore>, Arc<dyn LocationIndex>, QueryHandler) {
+    #[allow(clippy::type_complexity)] // test fixture tuple; naming it adds nothing
+    fn setup_sqlite() -> (
+        Arc<dyn QueryIndexStore>,
+        Arc<dyn ContentStore>,
+        Arc<dyn LocationIndex>,
+        QueryHandler,
+    ) {
         let store = SqliteStore::open_in_memory().unwrap();
         let content_store: Arc<dyn ContentStore> = Arc::new(store.content_store());
         let location_index: Arc<dyn LocationIndex> = Arc::new(store.location_index());
-        let indexes: Arc<dyn QueryIndexStore> = Arc::new(
-            crate::sqlite_index::SqliteQueryIndexes::new(store.connection()).unwrap()
-        );
+        let indexes: Arc<dyn QueryIndexStore> =
+            Arc::new(crate::sqlite_index::SqliteQueryIndexes::new(store.connection()).unwrap());
         let indexing: Arc<dyn LocationIndex> = Arc::new(indexing::IndexingLocationIndex::new(
             location_index.clone(),
             content_store.clone(),
@@ -1187,20 +1363,16 @@ mod sqlite_handler_tests {
         entity_type: &str,
         data_val: &str,
     ) {
-        let entity = Entity::new(
-            entity_type,
-            entity_ecf::to_ecf(&entity_ecf::text(data_val)),
-        ).unwrap();
+        let entity =
+            Entity::new(entity_type, entity_ecf::to_ecf(&entity_ecf::text(data_val))).unwrap();
         let hash = cs.put(entity.clone()).unwrap();
         li.set(path, hash);
         indexes.add_entries_for_entity(path, &entity);
     }
 
     fn make_find_ctx(expr_data: Value) -> HandlerContext {
-        let params = Entity::new(
-            "system/query/expression",
-            entity_ecf::to_ecf(&expr_data),
-        ).unwrap();
+        let params =
+            Entity::new("system/query/expression", entity_ecf::to_ecf(&expr_data)).unwrap();
         HandlerContext {
             handler_grant: None,
             caller_capability: None,
@@ -1226,7 +1398,13 @@ mod sqlite_handler_tests {
     fn extract_total(result: &HandlerResult) -> i128 {
         let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
-        map.iter().find(|(k, _)| k.as_text() == Some("total")).unwrap().1.as_integer().unwrap().into()
+        map.iter()
+            .find(|(k, _)| k.as_text() == Some("total"))
+            .unwrap()
+            .1
+            .as_integer()
+            .unwrap()
+            .into()
     }
 
     #[tokio::test]
@@ -1281,7 +1459,14 @@ mod sqlite_handler_tests {
     async fn test_sqlite_pagination() {
         let (indexes, cs, li, handler) = setup_sqlite();
         for i in 0..5 {
-            put_entity_sqlite(&cs, &li, &indexes, &format!("u/u{:02}", i), "app/user", &format!("u{}", i));
+            put_entity_sqlite(
+                &cs,
+                &li,
+                &indexes,
+                &format!("u/u{:02}", i),
+                "app/user",
+                &format!("u{}", i),
+            );
         }
 
         let ctx = make_find_ctx(entity_ecf::cbor_map! {
@@ -1292,9 +1477,21 @@ mod sqlite_handler_tests {
         assert_eq!(result.status, STATUS_OK);
         let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
-        let matches = map.iter().find(|(k, _)| k.as_text() == Some("matches")).unwrap().1.as_array().unwrap();
+        let matches = map
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("matches"))
+            .unwrap()
+            .1
+            .as_array()
+            .unwrap();
         assert_eq!(matches.len(), 2);
-        let has_more = map.iter().find(|(k, _)| k.as_text() == Some("has_more")).unwrap().1.as_bool().unwrap();
+        let has_more = map
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("has_more"))
+            .unwrap()
+            .1
+            .as_bool()
+            .unwrap();
         assert!(has_more);
         assert_eq!(extract_total(&result), 5);
     }
@@ -1308,7 +1505,8 @@ mod sqlite_handler_tests {
             entity_ecf::to_ecf(&entity_ecf::cbor_map! {
                 "target" => Value::Bytes(target.to_bytes().to_vec())
             }),
-        ).unwrap();
+        )
+        .unwrap();
         let hash = cs.put(entity.clone()).unwrap();
         li.set("refs/r1", hash);
         indexes.add_entries_for_entity("refs/r1", &entity);

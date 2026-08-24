@@ -322,7 +322,12 @@ impl<'a> RevisionOps<'a> {
         prefix: impl Into<String>,
     ) -> impl std::future::Future<Output = Result<CommitResult, SdkError>> + Send + 'static {
         let params = build_prefix_params("system/revision/commit-params", prefix.into());
-        let fut = self.ctx.execute("system/revision", "commit", params, ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/revision",
+            "commit",
+            params,
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
             if let Some(err) = SdkError::from_handler_result(&result, "system/revision:commit") {
@@ -339,7 +344,12 @@ impl<'a> RevisionOps<'a> {
         prefix: impl Into<String>,
     ) -> impl std::future::Future<Output = Result<CommitResult, SdkError>> + 'static {
         let params = build_prefix_params("system/revision/commit-params", prefix.into());
-        let fut = self.ctx.execute("system/revision", "commit", params, ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/revision",
+            "commit",
+            params,
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
             if let Some(err) = SdkError::from_handler_result(&result, "system/revision:commit") {
@@ -358,7 +368,12 @@ impl<'a> RevisionOps<'a> {
         prefix: impl Into<String>,
     ) -> impl std::future::Future<Output = Result<RevisionStatus, SdkError>> + Send + 'static {
         let params = build_prefix_params("system/revision/status-params", prefix.into());
-        let fut = self.ctx.execute("system/revision", "status", params, ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/revision",
+            "status",
+            params,
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
             if let Some(err) = SdkError::from_handler_result(&result, "system/revision:status") {
@@ -375,7 +390,12 @@ impl<'a> RevisionOps<'a> {
         prefix: impl Into<String>,
     ) -> impl std::future::Future<Output = Result<RevisionStatus, SdkError>> + 'static {
         let params = build_prefix_params("system/revision/status-params", prefix.into());
-        let fut = self.ctx.execute("system/revision", "status", params, ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/revision",
+            "status",
+            params,
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
             if let Some(err) = SdkError::from_handler_result(&result, "system/revision:status") {
@@ -403,7 +423,9 @@ impl<'a> RevisionOps<'a> {
         since: Option<Hash>,
     ) -> impl std::future::Future<Output = Result<RevisionLog, SdkError>> + Send + 'static {
         let params = build_log_params(prefix.into(), limit, since);
-        let fut = self.ctx.execute("system/revision", "log", params, ExecuteOptions::default());
+        let fut = self
+            .ctx
+            .execute("system/revision", "log", params, ExecuteOptions::default());
         async move {
             let result = fut.await?;
             if let Some(err) = SdkError::from_handler_result(&result, "system/revision:log") {
@@ -422,7 +444,9 @@ impl<'a> RevisionOps<'a> {
         since: Option<Hash>,
     ) -> impl std::future::Future<Output = Result<RevisionLog, SdkError>> + 'static {
         let params = build_log_params(prefix.into(), limit, since);
-        let fut = self.ctx.execute("system/revision", "log", params, ExecuteOptions::default());
+        let fut = self
+            .ctx
+            .execute("system/revision", "log", params, ExecuteOptions::default());
         async move {
             let result = fut.await?;
             if let Some(err) = SdkError::from_handler_result(&result, "system/revision:log") {
@@ -452,13 +476,15 @@ impl<'a> RevisionOps<'a> {
         prefix: impl Into<String>,
         path: impl Into<String>,
         resolved: Option<Hash>,
-    ) -> impl std::future::Future<Output = Result<RevisionResolveResult, SdkError>>
-    + Send
-    + 'static {
+    ) -> impl std::future::Future<Output = Result<RevisionResolveResult, SdkError>> + Send + 'static
+    {
         let params = build_resolve_params(prefix.into(), path.into(), resolved);
-        let fut = self
-            .ctx
-            .execute("system/revision", "resolve", params, ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/revision",
+            "resolve",
+            params,
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
             if let Some(err) = SdkError::from_handler_result(&result, "system/revision:resolve") {
@@ -477,9 +503,12 @@ impl<'a> RevisionOps<'a> {
         resolved: Option<Hash>,
     ) -> impl std::future::Future<Output = Result<RevisionResolveResult, SdkError>> + 'static {
         let params = build_resolve_params(prefix.into(), path.into(), resolved);
-        let fut = self
-            .ctx
-            .execute("system/revision", "resolve", params, ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/revision",
+            "resolve",
+            params,
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
             if let Some(err) = SdkError::from_handler_result(&result, "system/revision:resolve") {
@@ -508,13 +537,15 @@ impl<'a> RevisionOps<'a> {
         &self,
         prefix: impl Into<String>,
         target_version: Hash,
-    ) -> impl std::future::Future<Output = Result<RevisionCheckoutResult, SdkError>>
-    + Send
-    + 'static {
+    ) -> impl std::future::Future<Output = Result<RevisionCheckoutResult, SdkError>> + Send + 'static
+    {
         let params = build_checkout_params(prefix.into(), target_version);
-        let fut = self
-            .ctx
-            .execute("system/revision", "checkout", params, ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/revision",
+            "checkout",
+            params,
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
             if let Some(err) = SdkError::from_handler_result(&result, "system/revision:checkout") {
@@ -532,9 +563,12 @@ impl<'a> RevisionOps<'a> {
         target_version: Hash,
     ) -> impl std::future::Future<Output = Result<RevisionCheckoutResult, SdkError>> + 'static {
         let params = build_checkout_params(prefix.into(), target_version);
-        let fut = self
-            .ctx
-            .execute("system/revision", "checkout", params, ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/revision",
+            "checkout",
+            params,
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
             if let Some(err) = SdkError::from_handler_result(&result, "system/revision:checkout") {
@@ -563,12 +597,16 @@ impl<'a> RevisionOps<'a> {
     ) -> impl std::future::Future<Output = Result<RevisionFetchDiff, SdkError>> + Send + 'static
     {
         let params = build_fetch_diff_params(prefix.into(), base);
-        let fut = self
-            .ctx
-            .execute("system/revision", "fetch-diff", params, ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/revision",
+            "fetch-diff",
+            params,
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
-            if let Some(err) = SdkError::from_handler_result(&result, "system/revision:fetch-diff") {
+            if let Some(err) = SdkError::from_handler_result(&result, "system/revision:fetch-diff")
+            {
                 return Err(err);
             }
             decode_fetch_diff_result(&result.result)
@@ -583,12 +621,16 @@ impl<'a> RevisionOps<'a> {
         base: Option<Hash>,
     ) -> impl std::future::Future<Output = Result<RevisionFetchDiff, SdkError>> + 'static {
         let params = build_fetch_diff_params(prefix.into(), base);
-        let fut = self
-            .ctx
-            .execute("system/revision", "fetch-diff", params, ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/revision",
+            "fetch-diff",
+            params,
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
-            if let Some(err) = SdkError::from_handler_result(&result, "system/revision:fetch-diff") {
+            if let Some(err) = SdkError::from_handler_result(&result, "system/revision:fetch-diff")
+            {
                 return Err(err);
             }
             decode_fetch_diff_result(&result.result)
@@ -620,10 +662,19 @@ impl<'a> RevisionOps<'a> {
         dry_run: bool,
         merge_order: Option<String>,
     ) -> impl std::future::Future<Output = Result<MergeResult, SdkError>> + Send + 'static {
-        let params = build_merge_params(prefix.into(), remote_version, strategy, dry_run, merge_order);
-        let fut = self
-            .ctx
-            .execute("system/revision", "merge", params, ExecuteOptions::default());
+        let params = build_merge_params(
+            prefix.into(),
+            remote_version,
+            strategy,
+            dry_run,
+            merge_order,
+        );
+        let fut = self.ctx.execute(
+            "system/revision",
+            "merge",
+            params,
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
             if let Some(err) = SdkError::from_handler_result(&result, "system/revision:merge") {
@@ -643,10 +694,19 @@ impl<'a> RevisionOps<'a> {
         dry_run: bool,
         merge_order: Option<String>,
     ) -> impl std::future::Future<Output = Result<MergeResult, SdkError>> + 'static {
-        let params = build_merge_params(prefix.into(), remote_version, strategy, dry_run, merge_order);
-        let fut = self
-            .ctx
-            .execute("system/revision", "merge", params, ExecuteOptions::default());
+        let params = build_merge_params(
+            prefix.into(),
+            remote_version,
+            strategy,
+            dry_run,
+            merge_order,
+        );
+        let fut = self.ctx.execute(
+            "system/revision",
+            "merge",
+            params,
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
             if let Some(err) = SdkError::from_handler_result(&result, "system/revision:merge") {
@@ -674,7 +734,12 @@ impl<'a> RevisionOps<'a> {
         since: Option<Hash>,
     ) -> impl std::future::Future<Output = Result<RevisionFetch, SdkError>> + Send + 'static {
         let params = build_log_params(prefix.into(), depth, since);
-        let fut = self.ctx.execute("system/revision", "fetch", params, ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/revision",
+            "fetch",
+            params,
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
             if let Some(err) = SdkError::from_handler_result(&result, "system/revision:fetch") {
@@ -693,7 +758,12 @@ impl<'a> RevisionOps<'a> {
         since: Option<Hash>,
     ) -> impl std::future::Future<Output = Result<RevisionFetch, SdkError>> + 'static {
         let params = build_log_params(prefix.into(), depth, since);
-        let fut = self.ctx.execute("system/revision", "fetch", params, ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/revision",
+            "fetch",
+            params,
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
             if let Some(err) = SdkError::from_handler_result(&result, "system/revision:fetch") {
@@ -718,14 +788,20 @@ impl<'a> RevisionOps<'a> {
         prefix: impl Into<String>,
         snapshot: Hash,
         hashes: Vec<Hash>,
-    ) -> impl std::future::Future<Output = Result<RevisionFetchEntities, SdkError>> + Send + 'static {
+    ) -> impl std::future::Future<Output = Result<RevisionFetchEntities, SdkError>> + Send + 'static
+    {
         let params = build_fetch_entities_params(prefix.into(), snapshot, hashes);
-        let fut = self
-            .ctx
-            .execute("system/revision", "fetch-entities", params, ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/revision",
+            "fetch-entities",
+            params,
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
-            if let Some(err) = SdkError::from_handler_result(&result, "system/revision:fetch-entities") {
+            if let Some(err) =
+                SdkError::from_handler_result(&result, "system/revision:fetch-entities")
+            {
                 return Err(err);
             }
             decode_fetch_entities_result(&result.result)
@@ -741,12 +817,17 @@ impl<'a> RevisionOps<'a> {
         hashes: Vec<Hash>,
     ) -> impl std::future::Future<Output = Result<RevisionFetchEntities, SdkError>> + 'static {
         let params = build_fetch_entities_params(prefix.into(), snapshot, hashes);
-        let fut = self
-            .ctx
-            .execute("system/revision", "fetch-entities", params, ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/revision",
+            "fetch-entities",
+            params,
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
-            if let Some(err) = SdkError::from_handler_result(&result, "system/revision:fetch-entities") {
+            if let Some(err) =
+                SdkError::from_handler_result(&result, "system/revision:fetch-entities")
+            {
                 return Err(err);
             }
             decode_fetch_entities_result(&result.result)
@@ -772,10 +853,17 @@ impl<'a> RevisionOps<'a> {
         expected_hash: Option<Hash>,
     ) -> impl std::future::Future<Output = Result<ConfigResult, SdkError>> + Send + 'static {
         let params = build_config_params(name.into(), "set", Some(config), expected_hash);
-        let fut = self.ctx.execute("system/revision", "config", params, ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/revision",
+            "config",
+            params,
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
-            if let Some(err) = SdkError::from_handler_result(&result, "system/revision:config (set)") {
+            if let Some(err) =
+                SdkError::from_handler_result(&result, "system/revision:config (set)")
+            {
                 return Err(err);
             }
             decode_config_result(&result.result)
@@ -791,10 +879,17 @@ impl<'a> RevisionOps<'a> {
         expected_hash: Option<Hash>,
     ) -> impl std::future::Future<Output = Result<ConfigResult, SdkError>> + 'static {
         let params = build_config_params(name.into(), "set", Some(config), expected_hash);
-        let fut = self.ctx.execute("system/revision", "config", params, ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/revision",
+            "config",
+            params,
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
-            if let Some(err) = SdkError::from_handler_result(&result, "system/revision:config (set)") {
+            if let Some(err) =
+                SdkError::from_handler_result(&result, "system/revision:config (set)")
+            {
                 return Err(err);
             }
             decode_config_result(&result.result)
@@ -811,10 +906,17 @@ impl<'a> RevisionOps<'a> {
         expected_hash: Option<Hash>,
     ) -> impl std::future::Future<Output = Result<ConfigResult, SdkError>> + Send + 'static {
         let params = build_config_params(name.into(), "delete", None, expected_hash);
-        let fut = self.ctx.execute("system/revision", "config", params, ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/revision",
+            "config",
+            params,
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
-            if let Some(err) = SdkError::from_handler_result(&result, "system/revision:config (delete)") {
+            if let Some(err) =
+                SdkError::from_handler_result(&result, "system/revision:config (delete)")
+            {
                 return Err(err);
             }
             decode_config_result(&result.result)
@@ -829,10 +931,17 @@ impl<'a> RevisionOps<'a> {
         expected_hash: Option<Hash>,
     ) -> impl std::future::Future<Output = Result<ConfigResult, SdkError>> + 'static {
         let params = build_config_params(name.into(), "delete", None, expected_hash);
-        let fut = self.ctx.execute("system/revision", "config", params, ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/revision",
+            "config",
+            params,
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
-            if let Some(err) = SdkError::from_handler_result(&result, "system/revision:config (delete)") {
+            if let Some(err) =
+                SdkError::from_handler_result(&result, "system/revision:config (delete)")
+            {
                 return Err(err);
             }
             decode_config_result(&result.result)
@@ -865,12 +974,17 @@ impl<'a> RevisionOps<'a> {
             Some(config),
             expected_hash,
         );
-        let fut = self
-            .ctx
-            .execute("system/revision", "merge-config", params, ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/revision",
+            "merge-config",
+            params,
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
-            if let Some(err) = SdkError::from_handler_result(&result, "system/revision:merge-config (set)") {
+            if let Some(err) =
+                SdkError::from_handler_result(&result, "system/revision:merge-config (set)")
+            {
                 return Err(err);
             }
             decode_merge_config_result(&result.result)
@@ -893,12 +1007,17 @@ impl<'a> RevisionOps<'a> {
             Some(config),
             expected_hash,
         );
-        let fut = self
-            .ctx
-            .execute("system/revision", "merge-config", params, ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/revision",
+            "merge-config",
+            params,
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
-            if let Some(err) = SdkError::from_handler_result(&result, "system/revision:merge-config (set)") {
+            if let Some(err) =
+                SdkError::from_handler_result(&result, "system/revision:merge-config (set)")
+            {
                 return Err(err);
             }
             decode_merge_config_result(&result.result)
@@ -917,12 +1036,17 @@ impl<'a> RevisionOps<'a> {
     {
         let params =
             build_merge_config_params(scope.into(), name.into(), "delete", None, expected_hash);
-        let fut = self
-            .ctx
-            .execute("system/revision", "merge-config", params, ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/revision",
+            "merge-config",
+            params,
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
-            if let Some(err) = SdkError::from_handler_result(&result, "system/revision:merge-config (delete)") {
+            if let Some(err) =
+                SdkError::from_handler_result(&result, "system/revision:merge-config (delete)")
+            {
                 return Err(err);
             }
             decode_merge_config_result(&result.result)
@@ -939,12 +1063,17 @@ impl<'a> RevisionOps<'a> {
     ) -> impl std::future::Future<Output = Result<MergeConfigResult, SdkError>> + 'static {
         let params =
             build_merge_config_params(scope.into(), name.into(), "delete", None, expected_hash);
-        let fut = self
-            .ctx
-            .execute("system/revision", "merge-config", params, ExecuteOptions::default());
+        let fut = self.ctx.execute(
+            "system/revision",
+            "merge-config",
+            params,
+            ExecuteOptions::default(),
+        );
         async move {
             let result = fut.await?;
-            if let Some(err) = SdkError::from_handler_result(&result, "system/revision:merge-config (delete)") {
+            if let Some(err) =
+                SdkError::from_handler_result(&result, "system/revision:merge-config (delete)")
+            {
                 return Err(err);
             }
             decode_merge_config_result(&result.result)
@@ -961,8 +1090,7 @@ fn build_prefix_params(entity_type: &str, prefix: String) -> Entity {
         entity_ecf::text("prefix"),
         entity_ecf::text(&prefix),
     )]));
-    Entity::new(entity_type, data)
-        .expect("prefix-only params entity construction is infallible")
+    Entity::new(entity_type, data).expect("prefix-only params entity construction is infallible")
 }
 
 fn decode_commit_result(entity: &Entity) -> Result<CommitResult, SdkError> {
@@ -989,8 +1117,7 @@ fn decode_commit_result(entity: &Entity) -> Result<CommitResult, SdkError> {
     Ok(CommitResult {
         version: version
             .ok_or_else(|| SdkError::HandlerError("commit result missing `version`".into()))?,
-        root: root
-            .ok_or_else(|| SdkError::HandlerError("commit result missing `root`".into()))?,
+        root: root.ok_or_else(|| SdkError::HandlerError("commit result missing `root`".into()))?,
         parent,
     })
 }
@@ -1062,7 +1189,13 @@ fn decode_log_result(entity: &Entity) -> Result<RevisionLog, SdkError> {
 
     let root_value = envelope_map
         .iter()
-        .find_map(|(k, v)| if k.as_text() == Some("root") { Some(v) } else { None })
+        .find_map(|(k, v)| {
+            if k.as_text() == Some("root") {
+                Some(v)
+            } else {
+                None
+            }
+        })
         .ok_or_else(|| SdkError::HandlerError("log envelope missing root".into()))?;
     let root_map = root_value
         .as_map()
@@ -1072,7 +1205,13 @@ fn decode_log_result(entity: &Entity) -> Result<RevisionLog, SdkError> {
     // lives under `data`.
     let body = root_map
         .iter()
-        .find_map(|(k, v)| if k.as_text() == Some("data") { Some(v) } else { None })
+        .find_map(|(k, v)| {
+            if k.as_text() == Some("data") {
+                Some(v)
+            } else {
+                None
+            }
+        })
         .ok_or_else(|| SdkError::HandlerError("log root missing data".into()))?;
     let body_map = body
         .as_map()
@@ -1104,8 +1243,7 @@ fn decode_log_result(entity: &Entity) -> Result<RevisionLog, SdkError> {
     }
 
     Ok(RevisionLog {
-        prefix: prefix
-            .ok_or_else(|| SdkError::HandlerError("log result missing prefix".into()))?,
+        prefix: prefix.ok_or_else(|| SdkError::HandlerError("log result missing prefix".into()))?,
         versions,
         has_more,
     })
@@ -1155,8 +1293,7 @@ fn decode_resolve_result(entity: &Entity) -> Result<RevisionResolveResult, SdkEr
         }
     }
     Ok(RevisionResolveResult {
-        path: path
-            .ok_or_else(|| SdkError::HandlerError("resolve result missing path".into()))?,
+        path: path.ok_or_else(|| SdkError::HandlerError("resolve result missing path".into()))?,
         remaining_conflicts,
         resolved,
     })
@@ -1218,8 +1355,7 @@ fn decode_checkout_result(entity: &Entity) -> Result<RevisionCheckoutResult, Sdk
     }
 
     Ok(RevisionCheckoutResult {
-        head: head
-            .ok_or_else(|| SdkError::HandlerError("checkout result missing head".into()))?,
+        head: head.ok_or_else(|| SdkError::HandlerError("checkout result missing head".into()))?,
         target_version: target_version.ok_or_else(|| {
             SdkError::HandlerError("checkout result missing target_version".into())
         })?,
@@ -1256,8 +1392,7 @@ fn decode_fetch_diff_result(entity: &Entity) -> Result<RevisionFetchDiff, SdkErr
         .as_map()
         .ok_or_else(|| SdkError::HandlerError("fetch-diff envelope not a map".into()))?;
 
-    let mut included: std::collections::HashMap<Hash, Entity> =
-        std::collections::HashMap::new();
+    let mut included: std::collections::HashMap<Hash, Entity> = std::collections::HashMap::new();
     let mut root: Option<Hash> = None;
 
     for (k, v) in envelope_map {
@@ -1269,10 +1404,14 @@ fn decode_fetch_diff_result(entity: &Entity) -> Result<RevisionFetchDiff, SdkErr
                     .ok_or_else(|| SdkError::HandlerError("fetch-diff root not a map".into()))?;
                 let snapshot_body = root_map
                     .iter()
-                    .find_map(|(kk, vv)| if kk.as_text() == Some("data") { Some(vv) } else { None })
-                    .ok_or_else(|| {
-                        SdkError::HandlerError("fetch-diff root missing data".into())
-                    })?;
+                    .find_map(|(kk, vv)| {
+                        if kk.as_text() == Some("data") {
+                            Some(vv)
+                        } else {
+                            None
+                        }
+                    })
+                    .ok_or_else(|| SdkError::HandlerError("fetch-diff root missing data".into()))?;
                 let snapshot_body_map = snapshot_body.as_map().ok_or_else(|| {
                     SdkError::HandlerError("fetch-diff root.data not a map".into())
                 })?;
@@ -1556,7 +1695,10 @@ fn encode_revision_config(c: &RevisionConfigInput) -> ciborium::Value {
         fields.push((
             entity_ecf::text("exclude_types"),
             ciborium::Value::Array(
-                c.exclude_types.iter().map(|s| entity_ecf::text(s)).collect(),
+                c.exclude_types
+                    .iter()
+                    .map(|s| entity_ecf::text(s))
+                    .collect(),
             ),
         ));
     }
@@ -1710,8 +1852,7 @@ fn decode_envelope(
         .ok_or_else(|| SdkError::HandlerError(format!("{} envelope not a map", op_name)))?;
 
     let mut root_data: Vec<(ciborium::Value, ciborium::Value)> = Vec::new();
-    let mut included: std::collections::HashMap<Hash, Entity> =
-        std::collections::HashMap::new();
+    let mut included: std::collections::HashMap<Hash, Entity> = std::collections::HashMap::new();
 
     for (k, v) in envelope_map {
         match k.as_text() {
@@ -1920,11 +2061,7 @@ mod tests {
                 Entity::new("app/note", data).unwrap(),
             )
             .unwrap();
-        let c = ctx
-            .revision()
-            .commit(prefix.clone())
-            .await
-            .expect("commit");
+        let c = ctx.revision().commit(prefix.clone()).await.expect("commit");
 
         let diff = ctx
             .revision()
@@ -1962,7 +2099,10 @@ mod tests {
         // Seed two entities + two commits.
         let data1 = entity_ecf::to_ecf(&entity_ecf::text("one"));
         ctx.store()
-            .put(&format!("{}n1", prefix), Entity::new("app/note", data1).unwrap())
+            .put(
+                &format!("{}n1", prefix),
+                Entity::new("app/note", data1).unwrap(),
+            )
             .unwrap();
         let c1 = ctx
             .revision()
@@ -1972,7 +2112,10 @@ mod tests {
 
         let data2 = entity_ecf::to_ecf(&entity_ecf::text("two"));
         ctx.store()
-            .put(&format!("{}n2", prefix), Entity::new("app/note", data2).unwrap())
+            .put(
+                &format!("{}n2", prefix),
+                Entity::new("app/note", data2).unwrap(),
+            )
             .unwrap();
         let c2 = ctx
             .revision()
@@ -2024,13 +2167,12 @@ mod tests {
 
         let data = entity_ecf::to_ecf(&entity_ecf::text("seed"));
         ctx.store()
-            .put(&format!("{}n", prefix), Entity::new("app/note", data).unwrap())
+            .put(
+                &format!("{}n", prefix),
+                Entity::new("app/note", data).unwrap(),
+            )
             .unwrap();
-        let c = ctx
-            .revision()
-            .commit(prefix.clone())
-            .await
-            .expect("commit");
+        let c = ctx.revision().commit(prefix.clone()).await.expect("commit");
 
         let r = ctx
             .revision()
@@ -2073,13 +2215,12 @@ mod tests {
 
         let data = entity_ecf::to_ecf(&entity_ecf::text("hi"));
         ctx.store()
-            .put(&format!("{}n", prefix), Entity::new("app/note", data).unwrap())
+            .put(
+                &format!("{}n", prefix),
+                Entity::new("app/note", data).unwrap(),
+            )
             .unwrap();
-        let c = ctx
-            .revision()
-            .commit(prefix.clone())
-            .await
-            .expect("commit");
+        let c = ctx.revision().commit(prefix.clone()).await.expect("commit");
 
         let f = ctx
             .revision()
@@ -2090,8 +2231,14 @@ mod tests {
         assert_eq!(f.versions, vec![c.version]);
         assert!(!f.has_more);
         // Version + trie root entities must both be present.
-        assert!(f.included.contains_key(&c.version), "version entity included");
-        assert!(f.included.contains_key(&c.root), "trie root entity included");
+        assert!(
+            f.included.contains_key(&c.version),
+            "version entity included"
+        );
+        assert!(
+            f.included.contains_key(&c.root),
+            "trie root entity included"
+        );
     }
 
     /// `fetch_entities` on a prefix with no HEAD returns 404
@@ -2124,13 +2271,12 @@ mod tests {
 
         let data = entity_ecf::to_ecf(&entity_ecf::text("leaf"));
         ctx.store()
-            .put(&format!("{}n", prefix), Entity::new("app/note", data).unwrap())
+            .put(
+                &format!("{}n", prefix),
+                Entity::new("app/note", data).unwrap(),
+            )
             .unwrap();
-        let c = ctx
-            .revision()
-            .commit(prefix.clone())
-            .await
-            .expect("commit");
+        let c = ctx.revision().commit(prefix.clone()).await.expect("commit");
 
         let r = ctx
             .revision()
@@ -2168,11 +2314,16 @@ mod tests {
             .expect("config_set should land");
         // Path shape is /{pid}/system/revision/{prefix_hash}/config —
         // the {prefix_hash} segment sits between revision/ and /config.
-        assert!(r.config_path.starts_with(&format!("/{}/system/revision/", pid)));
+        assert!(r
+            .config_path
+            .starts_with(&format!("/{}/system/revision/", pid)));
         assert!(r.config_path.ends_with("/config"));
         assert!(r.config_hash.is_some());
         assert!(r.previous_hash.is_none(), "fresh write — no previous");
-        assert!(r.tracking_config_path.is_none(), "auto_version=false → no sidecar");
+        assert!(
+            r.tracking_config_path.is_none(),
+            "auto_version=false → no sidecar"
+        );
     }
 
     /// `merge_config_set` rejects `deletion_resolution: lww` per
@@ -2222,7 +2373,9 @@ mod tests {
             .expect("first set");
         assert_eq!(r.status, "set");
         let hash = r.hash.expect("set produces hash");
-        assert!(r.path.contains("system/revision/config/merge/path/round-trip"));
+        assert!(r
+            .path
+            .contains("system/revision/config/merge/path/round-trip"));
 
         // Re-issuing the same content should report no_change.
         let r2 = ctx

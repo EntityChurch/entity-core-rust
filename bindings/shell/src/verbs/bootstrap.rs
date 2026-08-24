@@ -21,9 +21,7 @@
 use tokio::sync::mpsc;
 
 use crate::binding::PeerBinding;
-use crate::result::{
-    DispatchChunk, InfoRow, ShellError, VerbOutput,
-};
+use crate::result::{DispatchChunk, InfoRow, ShellError, VerbOutput};
 use crate::runtime::BoxFuture;
 use crate::shell::Shell;
 
@@ -44,9 +42,7 @@ where
         Some("status") => Ok(status_op(shell.peer_id(), binding)),
         Some("export") => Ok(export_op(shell.peer_id(), binding)),
         Some("import") => import(shell, &args[1..], binding, spawn),
-        Some(first) if first.starts_with("--") => {
-            bootstrap_ceremony(shell, args, binding, spawn)
-        }
+        Some(first) if first.starts_with("--") => bootstrap_ceremony(shell, args, binding, spawn),
         Some(other) => Err(ShellError::unknown(format!(
             "bootstrap: unknown subcommand '{}'. Try: (no-arg ceremony), status, export, import.",
             other
@@ -84,10 +80,7 @@ where
     let task = Box::pin(async move {
         let chunk = match fut.await {
             Ok(rows) => DispatchChunk::Complete(render_labeled_rows(&rows)),
-            Err(e) => DispatchChunk::Failed(ShellError::dispatch(format!(
-                "✗ bootstrap → {}",
-                e
-            ))),
+            Err(e) => DispatchChunk::Failed(ShellError::dispatch(format!("✗ bootstrap → {}", e))),
         };
         let _ = tx.send(chunk).await;
     });
@@ -110,9 +103,9 @@ where
     while i < args.len() {
         match args[i] {
             "--threshold" => {
-                let v = args.get(i + 1).ok_or_else(|| {
-                    ShellError::usage("bootstrap: --threshold needs a number")
-                })?;
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| ShellError::usage("bootstrap: --threshold needs a number"))?;
                 threshold = v.parse::<usize>().map_err(|_| {
                     ShellError::usage(format!(
                         "bootstrap: --threshold value '{}' is not a non-negative integer",
@@ -122,9 +115,9 @@ where
                 i += 2;
             }
             "--label" => {
-                let v = args.get(i + 1).ok_or_else(|| {
-                    ShellError::usage("bootstrap: --label needs a value")
-                })?;
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| ShellError::usage("bootstrap: --label needs a value"))?;
                 label = Some((*v).to_string());
                 i += 2;
             }
@@ -201,9 +194,7 @@ where
     S: FnOnce(BoxFuture<'static, ()>),
 {
     let (tx, rx) = mpsc::channel::<DispatchChunk>(2);
-    let _ = tx.try_send(DispatchChunk::Dispatched(
-        "→ bootstrap import".into(),
-    ));
+    let _ = tx.try_send(DispatchChunk::Dispatched("→ bootstrap import".into()));
 
     let bytes = match decode_hex(&hex_bundle) {
         Ok(b) => b,
@@ -222,10 +213,9 @@ where
     let task = Box::pin(async move {
         let chunk = match fut.await {
             Ok(rows) => DispatchChunk::Complete(render_labeled_rows(&rows)),
-            Err(e) => DispatchChunk::Failed(ShellError::dispatch(format!(
-                "✗ bootstrap import → {}",
-                e
-            ))),
+            Err(e) => {
+                DispatchChunk::Failed(ShellError::dispatch(format!("✗ bootstrap import → {}", e)))
+            }
         };
         let _ = tx.send(chunk).await;
     });
@@ -341,15 +331,27 @@ mod tests {
     }
 
     impl PeerBinding for StubBinding {
-        fn peer_id(&self) -> &str { "p1" }
-        fn primary_peer_id(&self) -> String { "p1".into() }
-        fn peer_ids(&self) -> Vec<String> { vec!["p1".into()] }
-        fn connected_peers(&self) -> Vec<String> { Vec::new() }
-        fn peer_label(&self, _pid: &str) -> Option<String> { None }
+        fn peer_id(&self) -> &str {
+            "p1"
+        }
+        fn primary_peer_id(&self) -> String {
+            "p1".into()
+        }
+        fn peer_ids(&self) -> Vec<String> {
+            vec!["p1".into()]
+        }
+        fn connected_peers(&self) -> Vec<String> {
+            Vec::new()
+        }
+        fn peer_label(&self, _pid: &str) -> Option<String> {
+            None
+        }
         fn tree_listing(&self, _pid: &str, _prefix: &str) -> Vec<TreeListingEntry> {
             Vec::new()
         }
-        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> { None }
+        fn get_entity(&self, _pid: &str, _path: &str) -> Option<EntityRead> {
+            None
+        }
 
         fn bootstrap_identity(
             &self,
@@ -372,10 +374,7 @@ mod tests {
             self.status_result.clone()
         }
 
-        fn export_identity_bundle(
-            &self,
-            _peer_id: &str,
-        ) -> Result<Vec<u8>, String> {
+        fn export_identity_bundle(&self, _peer_id: &str) -> Result<Vec<u8>, String> {
             self.export_result
                 .lock()
                 .unwrap()
@@ -487,8 +486,7 @@ mod tests {
         *b.bootstrap_result.lock().unwrap() = Some(Err(
             "multi_signer_unsupported — quorum_threshold = 2 ...".into(),
         ));
-        let result =
-            bootstrap(&shell(), &["--threshold", "2"], &b, drive).unwrap();
+        let result = bootstrap(&shell(), &["--threshold", "2"], &b, drive).unwrap();
         match result {
             VerbOutput::Dispatch(mut rx) => {
                 let _ = rx.try_recv().unwrap();
@@ -529,7 +527,10 @@ mod tests {
                 ("bootstrapped".into(), "true".into()),
                 ("identity".into(), "abc1234".into()),
                 ("quorum".into(), "def5678".into()),
-                ("peer config".into(), "/p1/system/identity/peer-config".into()),
+                (
+                    "peer config".into(),
+                    "/p1/system/identity/peer-config".into(),
+                ),
             ],
             ..StubBinding::empty()
         };
@@ -607,8 +608,7 @@ mod tests {
             ("restored".into(), "true".into()),
             ("identity".into(), "abc1234".into()),
         ]));
-        let result =
-            bootstrap(&shell(), &["import", "deadbeef"], &b, drive).unwrap();
+        let result = bootstrap(&shell(), &["import", "deadbeef"], &b, drive).unwrap();
         match result {
             VerbOutput::Dispatch(mut rx) => {
                 let _ = rx.try_recv().unwrap();

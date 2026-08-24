@@ -55,7 +55,10 @@ impl Handler for HistoryHandler {
             "rollback" => self.handle_rollback(ctx),
             other => Ok(HandlerResult::error(
                 STATUS_BAD_REQUEST,
-                error_entity("unknown_operation", &format!("unknown operation: {}", other)),
+                error_entity(
+                    "unknown_operation",
+                    &format!("unknown operation: {}", other),
+                ),
             )),
         }
     }
@@ -100,10 +103,7 @@ impl HistoryHandler {
             }
         }
 
-        let head_pointer_path = format!(
-            "/{}/system/history/head{}",
-            self.local_peer_id, path
-        );
+        let head_pointer_path = format!("/{}/system/history/head{}", self.local_peer_id, path);
         let head_hash = self.location_index.get(&head_pointer_path);
 
         if head_hash.is_none() {
@@ -177,12 +177,7 @@ impl HistoryHandler {
             included.insert(hash, entity);
         }
 
-        let result = build_query_result(
-            &path,
-            Some(head_hash),
-            transition_values,
-            has_more,
-        );
+        let result = build_query_result(&path, Some(head_hash), transition_values, has_more);
         let envelope = build_envelope_result(result, included);
         Ok(HandlerResult::ok(envelope))
     }
@@ -244,9 +239,8 @@ impl HistoryHandler {
                 entity_ecf::Value::Bytes(target_hash.to_bytes().to_vec()),
             ),
         ]));
-        let result =
-            Entity::new(entity_types::TYPE_HISTORY_ROLLBACK_RESULT, result_data)
-                .map_err(|e| HandlerError::Internal(e.to_string()))?;
+        let result = Entity::new(entity_types::TYPE_HISTORY_ROLLBACK_RESULT, result_data)
+            .map_err(|e| HandlerError::Internal(e.to_string()))?;
         Ok(HandlerResult::ok(result))
     }
 
@@ -256,10 +250,7 @@ impl HistoryHandler {
 
     /// Check if a target_hash appears in the history chain for a path.
     fn is_in_history(&self, path: &str, target_hash: &Hash) -> bool {
-        let head_pointer_path = format!(
-            "/{}/system/history/head{}",
-            self.local_peer_id, path
-        );
+        let head_pointer_path = format!("/{}/system/history/head{}", self.local_peer_id, path);
         let mut current = self.location_index.get(&head_pointer_path);
 
         while let Some(hash) = current {
@@ -456,10 +447,7 @@ fn build_query_result(
         entity_ecf::text("transitions"),
         entity_ecf::Value::Array(transition_values),
     ));
-    fields.push((
-        entity_ecf::text("has_more"),
-        entity_ecf::bool_val(has_more),
-    ));
+    fields.push((entity_ecf::text("has_more"), entity_ecf::bool_val(has_more)));
 
     let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(fields));
     Entity::new(entity_types::TYPE_HISTORY_QUERY_RESULT, data)
@@ -467,12 +455,18 @@ fn build_query_result(
 }
 
 fn entity_to_inline(entity: &Entity) -> entity_ecf::Value {
-    let data_value: entity_ecf::Value = ciborium::from_reader(entity.data.as_slice())
-        .unwrap_or(entity_ecf::Value::Null);
+    let data_value: entity_ecf::Value =
+        ciborium::from_reader(entity.data.as_slice()).unwrap_or(entity_ecf::Value::Null);
     entity_ecf::Value::Map(vec![
-        (entity_ecf::text("content_hash"), entity_ecf::Value::Bytes(entity.content_hash.to_bytes().to_vec())),
+        (
+            entity_ecf::text("content_hash"),
+            entity_ecf::Value::Bytes(entity.content_hash.to_bytes().to_vec()),
+        ),
         (entity_ecf::text("data"), data_value),
-        (entity_ecf::text("type"), entity_ecf::text(&entity.entity_type)),
+        (
+            entity_ecf::text("type"),
+            entity_ecf::text(&entity.entity_type),
+        ),
     ])
 }
 
@@ -480,7 +474,10 @@ fn build_envelope_result(root: Entity, included: HashMap<Hash, Entity>) -> Entit
     let included_entries: Vec<_> = included
         .iter()
         .map(|(hash, entity)| {
-            (entity_ecf::Value::Bytes(hash.to_bytes().to_vec()), entity_to_inline(entity))
+            (
+                entity_ecf::Value::Bytes(hash.to_bytes().to_vec()),
+                entity_to_inline(entity),
+            )
         })
         .collect();
 
@@ -525,9 +522,10 @@ mod tests {
     }
 
     fn make_ctx(handler: &HistoryHandler, operation: &str, params: Entity) -> HandlerContext {
-        let execute_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-            (entity_ecf::text("request_id"), entity_ecf::text("test-req")),
-        ]));
+        let execute_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+            entity_ecf::text("request_id"),
+            entity_ecf::text("test-req"),
+        )]));
         let execute = Entity::new(entity_types::TYPE_EXECUTE, execute_data).unwrap();
         HandlerContext {
             handler_grant: None,
@@ -556,8 +554,7 @@ mod tests {
     /// re-encode it to get bytes for further decoding.
     fn unwrap_envelope_root_data(envelope: &Entity) -> Vec<u8> {
         assert_eq!(envelope.entity_type, entity_types::TYPE_ENVELOPE);
-        let val: ciborium::Value =
-            ciborium::from_reader(envelope.data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(envelope.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
         let root = map
             .iter()
@@ -578,8 +575,7 @@ mod tests {
 
     /// Count the included entities inside an envelope result entity.
     fn envelope_included_count(envelope: &Entity) -> usize {
-        let val: ciborium::Value =
-            ciborium::from_reader(envelope.data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(envelope.data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
         match map.iter().find(|(k, _)| k.as_text() == Some("included")) {
             Some((_, v)) => v.as_map().unwrap().len(),
@@ -622,8 +618,7 @@ mod tests {
             ));
         }
         let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(fields));
-        let entity =
-            Entity::new(entity_types::TYPE_HISTORY_TRANSITION, data).unwrap();
+        let entity = Entity::new(entity_types::TYPE_HISTORY_TRANSITION, data).unwrap();
         handler.content_store.put(entity).unwrap()
     }
 
@@ -634,16 +629,14 @@ mod tests {
             entity_ecf::text("path"),
             entity_ecf::text("docs/readme"),
         )]));
-        let params =
-            Entity::new(entity_types::TYPE_HISTORY_QUERY_PARAMS, params_data).unwrap();
+        let params = Entity::new(entity_types::TYPE_HISTORY_QUERY_PARAMS, params_data).unwrap();
         let ctx = make_ctx(&handler, "query", params);
         let result = handler.handle(&ctx).await.unwrap();
         assert_eq!(result.status, 200);
         assert_eq!(result.result.entity_type, entity_types::TYPE_ENVELOPE);
 
         let root_data = unwrap_envelope_root_data(&result.result);
-        let val: ciborium::Value =
-            ciborium::from_reader(root_data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(root_data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
         let transitions = map
             .iter()
@@ -676,16 +669,14 @@ mod tests {
             entity_ecf::text("path"),
             entity_ecf::text(&path),
         )]));
-        let params =
-            Entity::new(entity_types::TYPE_HISTORY_QUERY_PARAMS, params_data).unwrap();
+        let params = Entity::new(entity_types::TYPE_HISTORY_QUERY_PARAMS, params_data).unwrap();
         let ctx = make_ctx(&handler, "query", params);
         let result = handler.handle(&ctx).await.unwrap();
         assert_eq!(result.status, 200);
         assert_eq!(result.result.entity_type, entity_types::TYPE_ENVELOPE);
 
         let root_data = unwrap_envelope_root_data(&result.result);
-        let val: ciborium::Value =
-            ciborium::from_reader(root_data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(root_data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
         let transitions = map
             .iter()
@@ -698,7 +689,11 @@ mod tests {
 
         // Transitions must be inline CBOR maps, not byte strings (spec §2.4, issue #15)
         for t in transitions {
-            assert!(t.as_map().is_some(), "transition must be an inline map, not {:?}", t);
+            assert!(
+                t.as_map().is_some(),
+                "transition must be an inline map, not {:?}",
+                t
+            );
         }
 
         // Envelope included map should contain the 3 transition entities
@@ -723,14 +718,12 @@ mod tests {
             (entity_ecf::text("path"), entity_ecf::text(&path)),
             (entity_ecf::text("limit"), entity_ecf::integer(2)),
         ]));
-        let params =
-            Entity::new(entity_types::TYPE_HISTORY_QUERY_PARAMS, params_data).unwrap();
+        let params = Entity::new(entity_types::TYPE_HISTORY_QUERY_PARAMS, params_data).unwrap();
         let ctx = make_ctx(&handler, "query", params);
         let result = handler.handle(&ctx).await.unwrap();
 
         let root_data = unwrap_envelope_root_data(&result.result);
-        let val: ciborium::Value =
-            ciborium::from_reader(root_data.as_slice()).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(root_data.as_slice()).unwrap();
         let map = val.as_map().unwrap();
         let transitions = map
             .iter()
@@ -783,8 +776,7 @@ mod tests {
                 entity_ecf::Value::Bytes(original_hash.to_bytes().to_vec()),
             ),
         ]));
-        let params =
-            Entity::new(entity_types::TYPE_HISTORY_ROLLBACK_PARAMS, params_data).unwrap();
+        let params = Entity::new(entity_types::TYPE_HISTORY_ROLLBACK_PARAMS, params_data).unwrap();
         let ctx = make_ctx(&handler, "rollback", params);
         let result = handler.handle(&ctx).await.unwrap();
         assert_eq!(result.status, 200);
@@ -809,8 +801,7 @@ mod tests {
                 entity_ecf::Value::Bytes(unknown_hash.to_bytes().to_vec()),
             ),
         ]));
-        let params =
-            Entity::new(entity_types::TYPE_HISTORY_ROLLBACK_PARAMS, params_data).unwrap();
+        let params = Entity::new(entity_types::TYPE_HISTORY_ROLLBACK_PARAMS, params_data).unwrap();
         let ctx = make_ctx(&handler, "rollback", params);
         let result = handler.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_NOT_FOUND);

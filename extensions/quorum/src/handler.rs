@@ -88,7 +88,9 @@ impl QuorumHandler {
     }
 
     fn resource_path(&self, ctx: &HandlerContext) -> Option<String> {
-        ctx.resource_target.as_ref().and_then(|rt| rt.targets.first().cloned())
+        ctx.resource_target
+            .as_ref()
+            .and_then(|rt| rt.targets.first().cloned())
     }
 }
 
@@ -127,10 +129,7 @@ impl QuorumHandler {
     // §6.1 create
     // -------------------------------------------------------------------
 
-    async fn handle_create(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_create(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let map = match decode_map(&ctx.params.data) {
             Ok(m) => m,
             Err(e) => return Ok(error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string())),
@@ -201,10 +200,7 @@ impl QuorumHandler {
     // §6.2 update
     // -------------------------------------------------------------------
 
-    async fn handle_update(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_update(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let map = match decode_map(&ctx.params.data) {
             Ok(m) => m,
             Err(e) => return Ok(error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string())),
@@ -249,11 +245,7 @@ impl QuorumHandler {
             ),
         ];
         // ECF sort: kind, new_signers, new_threshold (already sorted).
-        props.sort_by(|a, b| {
-            a.0.as_text()
-                .unwrap_or("")
-                .cmp(b.0.as_text().unwrap_or(""))
-        });
+        props.sort_by(|a, b| a.0.as_text().unwrap_or("").cmp(b.0.as_text().unwrap_or("")));
         let att = AttestationData {
             attesting: quorum_id,
             attested: quorum_id,
@@ -293,10 +285,7 @@ impl QuorumHandler {
     // §6.3 publish
     // -------------------------------------------------------------------
 
-    async fn handle_publish(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_publish(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let map = match decode_map(&ctx.params.data) {
             Ok(m) => m,
             Err(e) => return Ok(error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string())),
@@ -353,11 +342,7 @@ impl QuorumHandler {
             }
         }
         // ECF-sort by key.
-        props.sort_by(|a, b| {
-            a.0.as_text()
-                .unwrap_or("")
-                .cmp(b.0.as_text().unwrap_or(""))
-        });
+        props.sort_by(|a, b| a.0.as_text().unwrap_or("").cmp(b.0.as_text().unwrap_or("")));
         let att = AttestationData {
             attesting: quorum_id,
             attested: quorum_id,
@@ -394,10 +379,7 @@ impl QuorumHandler {
     // §6.4 verify
     // -------------------------------------------------------------------
 
-    async fn handle_verify(
-        &self,
-        ctx: &HandlerContext,
-    ) -> Result<HandlerResult, HandlerError> {
+    async fn handle_verify(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let map = match decode_map(&ctx.params.data) {
             Ok(m) => m,
             Err(e) => return Ok(error(STATUS_BAD_REQUEST, "invalid_params", &e.to_string())),
@@ -413,10 +395,15 @@ impl QuorumHandler {
         let qctx = self.ctx(&ctx.included);
         let set = match current_signer_set(&quorum_id, &qctx) {
             Ok(s) => s,
-            Err(e) => return Ok(error(STATUS_BAD_REQUEST, "signer_set_failed", &e.to_string())),
+            Err(e) => {
+                return Ok(error(
+                    STATUS_BAD_REQUEST,
+                    "signer_set_failed",
+                    &e.to_string(),
+                ))
+            }
         };
-        let valid =
-            verify_k_of_n_signatures(&entity_hash, &set.signers, set.threshold, &qctx);
+        let valid = verify_k_of_n_signatures(&entity_hash, &set.signers, set.threshold, &qctx);
         Ok(verify_result(valid))
     }
 }

@@ -24,6 +24,11 @@ typedef enum EntityCoreError {
 } EntityCoreError;
 
 /**
+ * Opaque handle type for FFI objects.
+ */
+typedef uint64_t EntityCoreHandle;
+
+/**
  * A buffer of bytes owned by the FFI layer.
  *
  * Callers must free with `entity_core_buffer_free`.
@@ -34,25 +39,55 @@ typedef struct EntityCoreBuffer {
 } EntityCoreBuffer;
 
 /**
- * Opaque handle type for FFI objects.
+ * Generate a new random Ed25519 keypair.
  */
-typedef uint64_t EntityCoreHandle;
+EntityCoreHandle entity_keypair_generate(void);
 
 /**
- * Free a buffer previously returned by the FFI.
+ * Create an Ed25519 keypair from a 32-byte seed (deterministic).
  *
  * # Safety
- * Must only be called once on a buffer returned by this library.
+ * `seed_ptr` must point to exactly 32 bytes.
  */
-void entity_core_buffer_free(struct EntityCoreBuffer buf);
+EntityCoreHandle entity_keypair_from_seed(const uint8_t *seed_ptr);
 
 /**
- * Get a pointer to the last error message for the current thread.
- *
- * Returns null if no error has been set. The pointer is valid until the
- * next FFI call on the same thread.
+ * Free a keypair handle.
  */
-const char *entity_core_last_error(void);
+void entity_keypair_free(EntityCoreHandle handle);
+
+/**
+ * Get the 32-byte public key from a keypair.
+ */
+struct EntityCoreBuffer entity_keypair_public_key(EntityCoreHandle handle);
+
+/**
+ * Get the PeerID string for a keypair.
+ */
+struct EntityCoreBuffer entity_keypair_peer_id(EntityCoreHandle handle);
+
+/**
+ * Sign a message with a keypair. Returns 64-byte Ed25519 signature.
+ *
+ * # Safety
+ * `msg_ptr`/`msg_len` must be valid.
+ */
+struct EntityCoreBuffer entity_sign(EntityCoreHandle handle,
+                                    const uint8_t *msg_ptr,
+                                    uintptr_t msg_len);
+
+/**
+ * Verify an Ed25519 signature.
+ *
+ * # Safety
+ * `pubkey_ptr` must point to 32 bytes, `sig_ptr` to 64 bytes,
+ * `msg_ptr`/`msg_len` must be valid.
+ */
+enum EntityCoreError entity_verify(const uint8_t *pubkey_ptr,
+                                   const uint8_t *msg_ptr,
+                                   uintptr_t msg_len,
+                                   const uint8_t *sig_ptr,
+                                   uintptr_t sig_len);
 
 /**
  * Create a CBOR text string value.
@@ -145,6 +180,52 @@ struct EntityCoreBuffer ecf_to_diag(const uint8_t *ptr, uintptr_t len);
 struct EntityCoreBuffer ecf_from_diag(const uint8_t *ptr, uintptr_t len);
 
 /**
+ * Create a new entity from type string and CBOR data bytes.
+ *
+ * Computes the content hash. Returns 0 on error.
+ *
+ * # Safety
+ * `type_ptr`/`type_len` must be valid UTF-8, `data_ptr`/`data_len` must be valid bytes.
+ */
+EntityCoreHandle entity_new(const uint8_t *type_ptr,
+                            uintptr_t type_len,
+                            const uint8_t *data_ptr,
+                            uintptr_t data_len);
+
+/**
+ * Free an entity handle.
+ */
+void entity_free(EntityCoreHandle handle);
+
+/**
+ * Get the entity type string as a buffer.
+ */
+struct EntityCoreBuffer entity_get_type(EntityCoreHandle handle);
+
+/**
+ * Get the entity data bytes as a buffer.
+ */
+struct EntityCoreBuffer entity_get_data(EntityCoreHandle handle);
+
+/**
+ * Get the entity content hash as 33 bytes.
+ */
+struct EntityCoreBuffer entity_get_hash(EntityCoreHandle handle);
+
+/**
+ * Validate an entity's content hash.
+ */
+enum EntityCoreError entity_validate(EntityCoreHandle handle);
+
+/**
+ * Get a pointer to the last error message for the current thread.
+ *
+ * Returns null if no error has been set. The pointer is valid until the
+ * next FFI call on the same thread.
+ */
+const char *entity_core_last_error(void);
+
+/**
  * Compute the content hash of an entity (type + data).
  *
  * Returns 33 bytes (algorithm byte + 32-byte SHA-256 digest).
@@ -192,109 +273,6 @@ struct EntityCoreBuffer entity_hash_from_hex(const uint8_t *hex_ptr, uintptr_t h
  * `hash_ptr` must point to 33 valid bytes.
  */
 struct EntityCoreBuffer entity_hash_to_display(const uint8_t *hash_ptr);
-
-/**
- * Generate a new random Ed25519 keypair.
- */
-EntityCoreHandle entity_keypair_generate(void);
-
-/**
- * Create an Ed25519 keypair from a 32-byte seed (deterministic).
- *
- * # Safety
- * `seed_ptr` must point to exactly 32 bytes.
- */
-EntityCoreHandle entity_keypair_from_seed(const uint8_t *seed_ptr);
-
-/**
- * Free a keypair handle.
- */
-void entity_keypair_free(EntityCoreHandle handle);
-
-/**
- * Get the 32-byte public key from a keypair.
- */
-struct EntityCoreBuffer entity_keypair_public_key(EntityCoreHandle handle);
-
-/**
- * Get the PeerID string for a keypair.
- */
-struct EntityCoreBuffer entity_keypair_peer_id(EntityCoreHandle handle);
-
-/**
- * Sign a message with a keypair. Returns 64-byte Ed25519 signature.
- *
- * # Safety
- * `msg_ptr`/`msg_len` must be valid.
- */
-struct EntityCoreBuffer entity_sign(EntityCoreHandle handle,
-                                    const uint8_t *msg_ptr,
-                                    uintptr_t msg_len);
-
-/**
- * Verify an Ed25519 signature.
- *
- * # Safety
- * `pubkey_ptr` must point to 32 bytes, `sig_ptr` to 64 bytes,
- * `msg_ptr`/`msg_len` must be valid.
- */
-enum EntityCoreError entity_verify(const uint8_t *pubkey_ptr,
-                                   const uint8_t *msg_ptr,
-                                   uintptr_t msg_len,
-                                   const uint8_t *sig_ptr,
-                                   uintptr_t sig_len);
-
-/**
- * Create a new entity from type string and CBOR data bytes.
- *
- * Computes the content hash. Returns 0 on error.
- *
- * # Safety
- * `type_ptr`/`type_len` must be valid UTF-8, `data_ptr`/`data_len` must be valid bytes.
- */
-EntityCoreHandle entity_new(const uint8_t *type_ptr,
-                            uintptr_t type_len,
-                            const uint8_t *data_ptr,
-                            uintptr_t data_len);
-
-/**
- * Free an entity handle.
- */
-void entity_free(EntityCoreHandle handle);
-
-/**
- * Get the entity type string as a buffer.
- */
-struct EntityCoreBuffer entity_get_type(EntityCoreHandle handle);
-
-/**
- * Get the entity data bytes as a buffer.
- */
-struct EntityCoreBuffer entity_get_data(EntityCoreHandle handle);
-
-/**
- * Get the entity content hash as 33 bytes.
- */
-struct EntityCoreBuffer entity_get_hash(EntityCoreHandle handle);
-
-/**
- * Validate an entity's content hash.
- */
-enum EntityCoreError entity_validate(EntityCoreHandle handle);
-
-/**
- * Encode an entity to wire format (CBOR bytes: {type, data, content_hash}).
- * Does NOT consume the entity handle.
- */
-struct EntityCoreBuffer entity_encode(EntityCoreHandle handle);
-
-/**
- * Decode wire-format CBOR bytes into an entity handle.
- *
- * # Safety
- * `ptr`/`len` must point to valid CBOR bytes.
- */
-EntityCoreHandle entity_decode(const uint8_t *ptr, uintptr_t len);
 
 /**
  * Initialize the FFI runtime. Must be called before any peer operations.
@@ -409,5 +387,27 @@ struct EntityCoreBuffer entity_core_tree_put(EntityCoreHandle peer_handle,
 struct EntityCoreBuffer entity_core_tree_list(EntityCoreHandle handle,
                                               const uint8_t *prefix_ptr,
                                               uintptr_t prefix_len);
+
+/**
+ * Free a buffer previously returned by the FFI.
+ *
+ * # Safety
+ * Must only be called once on a buffer returned by this library.
+ */
+void entity_core_buffer_free(struct EntityCoreBuffer buf);
+
+/**
+ * Encode an entity to wire format (CBOR bytes: {type, data, content_hash}).
+ * Does NOT consume the entity handle.
+ */
+struct EntityCoreBuffer entity_encode(EntityCoreHandle handle);
+
+/**
+ * Decode wire-format CBOR bytes into an entity handle.
+ *
+ * # Safety
+ * `ptr`/`len` must point to valid CBOR bytes.
+ */
+EntityCoreHandle entity_decode(const uint8_t *ptr, uintptr_t len);
 
 #endif  /* ENTITY_CORE_FFI_H */

@@ -300,9 +300,7 @@ fn cbor_int_to_i64_clamped(i: CborInt) -> i64 {
         );
         return i64::MAX;
     }
-    godot_warn!(
-        "EntityCbor::decode_to_variant: CBOR integer below i64::MIN; clamped to i64::MIN"
-    );
+    godot_warn!("EntityCbor::decode_to_variant: CBOR integer below i64::MIN; clamped to i64::MIN");
     i64::MIN
 }
 
@@ -434,10 +432,7 @@ mod tests {
         assert_eq!(cbor_kind(&Value::Text(String::new())), "text");
         assert_eq!(cbor_kind(&Value::Array(vec![])), "array");
         assert_eq!(cbor_kind(&Value::Map(vec![])), "map");
-        assert_eq!(
-            cbor_kind(&Value::Tag(1, Box::new(Value::Null))),
-            "tag"
-        );
+        assert_eq!(cbor_kind(&Value::Tag(1, Box::new(Value::Null))), "tag");
     }
 
     /// Mirror of `value_to_variant`'s control flow that returns `()` on

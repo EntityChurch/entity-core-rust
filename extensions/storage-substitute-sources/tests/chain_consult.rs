@@ -8,14 +8,10 @@
 
 use std::sync::Arc;
 
-use entity_capability::{
-    CapabilityToken, GrantEntry, Granter, IdScope, PathScope, ResourceTarget,
-};
-use entity_hash::Hash;
-use entity_storage_substitute_sources::{
-    ChainConsultHook, ConsultMiss, SubstituteConsultHook,
-};
+use entity_capability::{CapabilityToken, GrantEntry, Granter, IdScope, PathScope, ResourceTarget};
 use entity_handler::{ExecuteFn, ExecuteOptions, HandlerError, HandlerResult};
+use entity_hash::Hash;
+use entity_storage_substitute_sources::{ChainConsultHook, ConsultMiss, SubstituteConsultHook};
 use entity_store::{MemoryContentStore, MemoryLocationIndex};
 
 const LOCAL_PEER: &str = "peer-A";

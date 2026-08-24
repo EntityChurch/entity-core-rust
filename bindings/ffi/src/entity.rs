@@ -23,15 +23,14 @@ pub unsafe extern "C" fn entity_new(
     data_len: usize,
 ) -> Handle {
     ffi_fn!({
-        let entity_type = match unsafe {
-            std::str::from_utf8(std::slice::from_raw_parts(type_ptr, type_len))
-        } {
-            Ok(s) => s,
-            Err(e) => {
-                set_last_error(&format!("invalid UTF-8 type: {}", e));
-                return 0;
-            }
-        };
+        let entity_type =
+            match unsafe { std::str::from_utf8(std::slice::from_raw_parts(type_ptr, type_len)) } {
+                Ok(s) => s,
+                Err(e) => {
+                    set_last_error(&format!("invalid UTF-8 type: {}", e));
+                    return 0;
+                }
+            };
         let data = unsafe { std::slice::from_raw_parts(data_ptr, data_len) }.to_vec();
         match entity_entity::Entity::new(entity_type, data) {
             Ok(e) => ENTITIES.insert(e),
@@ -94,17 +93,20 @@ pub extern "C" fn entity_get_hash(handle: Handle) -> EntityCoreBuffer {
 /// Validate an entity's content hash.
 #[no_mangle]
 pub extern "C" fn entity_validate(handle: Handle) -> EntityCoreError {
-    ffi_fn!({
-        match ENTITIES.with(handle, |e| e.validate()) {
-            Some(Ok(())) => EntityCoreError::Ok,
-            Some(Err(e)) => {
-                set_last_error(&format!("validation failed: {}", e));
-                EntityCoreError::InvalidArgument
+    ffi_fn!(
+        {
+            match ENTITIES.with(handle, |e| e.validate()) {
+                Some(Ok(())) => EntityCoreError::Ok,
+                Some(Err(e)) => {
+                    set_last_error(&format!("validation failed: {}", e));
+                    EntityCoreError::InvalidArgument
+                }
+                None => {
+                    set_last_error("invalid entity handle");
+                    EntityCoreError::InvalidArgument
+                }
             }
-            None => {
-                set_last_error("invalid entity handle");
-                EntityCoreError::InvalidArgument
-            }
-        }
-    }, EntityCoreError::InternalError)
+        },
+        EntityCoreError::InternalError
+    )
 }

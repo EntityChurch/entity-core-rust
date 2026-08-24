@@ -54,8 +54,8 @@ fn key_type_string_1_entity_data_field_is_string() {
     assert_eq!(entity.entity_type, TYPE_PEER);
 
     // Decode the ECF data; assert key_type field is text "ed25519".
-    let value: ciborium::Value = ciborium::from_reader(entity.data.as_slice())
-        .expect("entity data decodes as CBOR");
+    let value: ciborium::Value =
+        ciborium::from_reader(entity.data.as_slice()).expect("entity data decodes as CBOR");
     let map = value.as_map().expect("entity data is a map");
     let key_type_value = map
         .iter()
@@ -181,8 +181,8 @@ fn agility_entity_1_0xfe_peer_content_hash_pinned() {
     assert_eq!(entity.entity_type, TYPE_PEER);
 
     // Confirm entity-data string surface is "experimental-test".
-    let value: ciborium::Value = ciborium::from_reader(entity.data.as_slice())
-        .expect("entity data decodes as CBOR");
+    let value: ciborium::Value =
+        ciborium::from_reader(entity.data.as_slice()).expect("entity data decodes as CBOR");
     let map = value.as_map().expect("data is map");
     let label = map
         .iter()
@@ -226,7 +226,10 @@ fn agility_entity_1_0xfe_peer_content_hash_pinned() {
 /// segment would be 66 bytes per v7.66 §4.2).
 #[test]
 fn agility_canonical_1_0xfe_selects_sha256_form() {
-    assert_eq!(KeyType::ExperimentalTest.canonical_hash_type(), HASH_TYPE_SHA256);
+    assert_eq!(
+        KeyType::ExperimentalTest.canonical_hash_type(),
+        HASH_TYPE_SHA256
+    );
     assert_ne!(
         KeyType::ExperimentalTest.canonical_hash_type(),
         HASH_TYPE_IDENTITY
@@ -238,7 +241,10 @@ fn agility_canonical_1_0xfe_selects_sha256_form() {
     )
     .expect("canonical 0xFE mint succeeds");
     let dec = pid.decode().expect("decode");
-    assert_eq!(dec.hash_type, HASH_TYPE_SHA256, "0xFE canonical is SHA-256-form");
+    assert_eq!(
+        dec.hash_type, HASH_TYPE_SHA256,
+        "0xFE canonical is SHA-256-form"
+    );
     assert_eq!(
         dec.digest.len(),
         32,
@@ -326,8 +332,9 @@ fn agility_unknown_1_wire_handshake_returns_400_unsupported_key_type() {
     // [0xFD, 0x01]) and hash_type = identity-multihash. Digest is
     // arbitrary 32 bytes; the wire surface rejects on `key_type`
     // BEFORE digest length validation, so the digest is irrelevant.
-    let bad_peer_id =
-        synthesize_peer_id_for_fixture(0xFD, HASH_TYPE_IDENTITY, &[0x11u8; 32]).as_str().to_string();
+    let bad_peer_id = synthesize_peer_id_for_fixture(0xFD, HASH_TYPE_IDENTITY, &[0x11u8; 32])
+        .as_str()
+        .to_string();
 
     let hello = HelloData {
         peer_id: bad_peer_id,

@@ -60,8 +60,7 @@
 
 use entity_capability::{CapabilityToken, GrantEntry, Granter, IdScope, PathScope};
 use entity_crypto::{
-    peer_entity_from_components_with_format, Ed448Keypair, Keypair, KeyType,
-    ED448_SECRET_KEY_LEN,
+    peer_entity_from_components_with_format, Ed448Keypair, KeyType, Keypair, ED448_SECRET_KEY_LEN,
 };
 use entity_hash::{Hash, HASH_ALGORITHM_SHA256, HASH_ALGORITHM_SHA384};
 use entity_types::TYPE_CAP_TOKEN;
@@ -124,13 +123,16 @@ fn build_root_cap(granter_home: &Hash, grantee_home: &Hash, active_format: u8) -
 const M2_A_PUBKEY: &str = "2601850dc77aaf141e065b2fe83ecfe08b6c15ba930886e9f111b6f0fd8f9f246b167e0398f957df61c9cead939cdf5bc9fe43c9432f3b0e00";
 const M2_A_PEER_ID: &str = "3dR1gAppfHXSGMvPRuAfYkkt4P2C1fvnFYpxPBSQP8RLs4";
 const M2_A_PEER_CBOR: &str = "a2686b65795f747970656565643434386a7075626c69635f6b657958392601850dc77aaf141e065b2fe83ecfe08b6c15ba930886e9f111b6f0fd8f9f246b167e0398f957df61c9cead939cdf5bc9fe43c9432f3b0e00";
-const M2_A_CONTENT_HASH: &str = "002785b314436a82503829339cb2519b4efe795712406ea19ac185e31ae8c70748";
+const M2_A_CONTENT_HASH: &str =
+    "002785b314436a82503829339cb2519b4efe795712406ea19ac185e31ae8c70748";
 const M2_B_PUBKEY: &str = "22fc297792f0b6ffc0bfcfdb7edb0c0aa14e025a365ec0e342e86e3829cb74b6";
 const M2_B_PEER_ID: &str = "2K68ekpdm3sTCUfTs39tpNxowivTsXpRsukodvtqwZmudX";
 const M2_B_PEER_CBOR: &str = "a2686b65795f7479706567656432353531396a7075626c69635f6b6579582022fc297792f0b6ffc0bfcfdb7edb0c0aa14e025a365ec0e342e86e3829cb74b6";
-const M2_B_CONTENT_HASH: &str = "00f4a5dd5bb2afe38e8c822847832b2ce83616ac5ed86a7f3c668d4d98753be86b";
+const M2_B_CONTENT_HASH: &str =
+    "00f4a5dd5bb2afe38e8c822847832b2ce83616ac5ed86a7f3c668d4d98753be86b";
 const M2_CAP_CBOR: &str = "a5666772616e747381a36868616e646c657273a167696e636c75646580697265736f7572636573a167696e636c75646581781873797374656d2f76616c69646174652f6d61747269782f2a6a6f7065726174696f6e73a167696e636c75646580676772616e746565582100f4a5dd5bb2afe38e8c822847832b2ce83616ac5ed86a7f3c668d4d98753be86b676772616e7465725821002785b314436a82503829339cb2519b4efe795712406ea19ac185e31ae8c707486a637265617465645f6174006a657870697265735f617400";
-const M2_CAP_CONTENT_HASH: &str = "0095852ce2ad1fa6ec97cf827413a328a1ca531a37984952a0f5f215c305b6e2ba";
+const M2_CAP_CONTENT_HASH: &str =
+    "0095852ce2ad1fa6ec97cf827413a328a1ca531a37984952a0f5f215c305b6e2ba";
 const M2_CAP_SIG: &str = "6104711f3ba43ade204001ca3146c154b825b0db45a6be6811735bcbbc75da4e2cf5c6a69efb9d3bae3503b21164fd75e5b74f635c74f14f007381e23af338cb98afc299d45406956a029fb1bbfd418eff85ef2908467a56e549f4dbc74d50ca344ff0c1142770df68f956eccc3a5e023200";
 
 // === MATRIX-M3: cross-hash, same-key (Ed25519). A home SHA-384, B home SHA-256. ===
@@ -141,9 +143,11 @@ const M3_A_CONTENT_HASH: &str = "0166f421381111d3c861787a6e233c9cbc1a652093a472c
 const M3_B_PUBKEY: &str = "6355691c178a8ff91007a7478afb955ef7352c63e7b25703984cf78b26e21a56";
 const M3_B_PEER_ID: &str = "2KATqnFJZboriNzCpVQ6nx7oCtc2qcTBToin4muxqo3ja5";
 const M3_B_PEER_CBOR: &str = "a2686b65795f7479706567656432353531396a7075626c69635f6b657958206355691c178a8ff91007a7478afb955ef7352c63e7b25703984cf78b26e21a56";
-const M3_B_CONTENT_HASH: &str = "00bbc4eb0be2c82159a0fcd8eaf22b420b0ac5f3da6f746e0cddadb9f935e71040";
+const M3_B_CONTENT_HASH: &str =
+    "00bbc4eb0be2c82159a0fcd8eaf22b420b0ac5f3da6f746e0cddadb9f935e71040";
 const M3_CAP_CBOR: &str = "a5666772616e747381a36868616e646c657273a167696e636c75646580697265736f7572636573a167696e636c75646581781873797374656d2f76616c69646174652f6d61747269782f2a6a6f7065726174696f6e73a167696e636c75646580676772616e746565582100bbc4eb0be2c82159a0fcd8eaf22b420b0ac5f3da6f746e0cddadb9f935e71040676772616e74657258310166f421381111d3c861787a6e233c9cbc1a652093a472c177d6e4bdec0ed95e3873f9f482c282b781f7c44b4ff91b2c596a637265617465645f6174006a657870697265735f617400";
-const M3_CAP_CONTENT_HASH: &str = "0053016041ab2f1b3826175cb8e6576d166969315beaed249e071abeb5e1808cbe";
+const M3_CAP_CONTENT_HASH: &str =
+    "0053016041ab2f1b3826175cb8e6576d166969315beaed249e071abeb5e1808cbe";
 const M3_CAP_SIG: &str = "05a6170bbf1eb188ee7423c7f989f5da668b043eb3d1d3a20c389979549931053d64fa56d3cbd0d35fbe0161c72b3044b485882bd1716e5d667b56a369b36100";
 
 // === MATRIX-M6: combined cross-key + cross-hash. A Ed448 home SHA-384, B Ed25519 home SHA-256. ===
@@ -154,11 +158,14 @@ const M6_A_CONTENT_HASH: &str = "01ef28f9251ac8d26ee0a520b96b19cb93205a1923a238e
 const M6_B_PUBKEY: &str = "e28a8970753332bd72fef413e6b0b2ef1b4aadda7aa2c141f233712a6876b351";
 const M6_B_PEER_ID: &str = "2KK2QYVGptXdChBXoNcXWhfaGRik85xSpefSeL4tPzkeye";
 const M6_B_PEER_CBOR: &str = "a2686b65795f7479706567656432353531396a7075626c69635f6b65795820e28a8970753332bd72fef413e6b0b2ef1b4aadda7aa2c141f233712a6876b351";
-const M6_B_CONTENT_HASH: &str = "0056d326c087087e04f4f5a62b1ef518b20541705c2760283b3f490882f133c335";
+const M6_B_CONTENT_HASH: &str =
+    "0056d326c087087e04f4f5a62b1ef518b20541705c2760283b3f490882f133c335";
 const M6_CAP_CBOR: &str = "a5666772616e747381a36868616e646c657273a167696e636c75646580697265736f7572636573a167696e636c75646581781873797374656d2f76616c69646174652f6d61747269782f2a6a6f7065726174696f6e73a167696e636c75646580676772616e74656558210056d326c087087e04f4f5a62b1ef518b20541705c2760283b3f490882f133c335676772616e746572583101ef28f9251ac8d26ee0a520b96b19cb93205a1923a238ef903b07b896738396faafc4be2d1d7d77dee0a53c992584f9cd6a637265617465645f6174006a657870697265735f617400";
-const M6_CAP_CONTENT_HASH: &str = "004ae3ec9d8999658ab164d454de81399bac3752fb3a7465120fe933621a41eab8";
+const M6_CAP_CONTENT_HASH: &str =
+    "004ae3ec9d8999658ab164d454de81399bac3752fb3a7465120fe933621a41eab8";
 const M6_CAP_SIG: &str = "547e8bf136b104228b1bb551e143e85a8585562b8b0a4a1791688cc3778ee41d7ebe305d5e5f387262dac8a7c722260affeb9bd42f1b707c8042b2aab14f73996f153e00c05b0243fad15121b0ec70f5d160f553979f332b5b6b392ef0617d2e345998b44c8503168d6cc584687759482d00";
 
+#[allow(clippy::too_many_arguments)] // cohort pin tuple: every axis is a distinct assertion input
 fn assert_peer(
     tag: &str,
     pin: &PeerPin,
@@ -172,7 +179,11 @@ fn assert_peer(
     assert_eq!(pub_hex, pub_want, "{tag}: pubkey");
     assert_eq!(peer_id, peer_id_want, "{tag}: peer_id");
     assert_eq!(pin.data_cbor_hex, cbor_want, "{tag}: peer.data CBOR");
-    assert_eq!(hex(&pin.content_hash.to_bytes()), ch_want, "{tag}: content_hash");
+    assert_eq!(
+        hex(&pin.content_hash.to_bytes()),
+        ch_want,
+        "{tag}: content_hash"
+    );
 }
 
 #[test]
@@ -181,20 +192,43 @@ fn matrix_m2_cross_key_same_hash() {
     let b = Keypair::from_seed([0x43; 32]);
 
     let pin_a = derive_peer_pin(&a.public_key_bytes(), KeyType::Ed448, HASH_ALGORITHM_SHA256);
-    let pin_b = derive_peer_pin(&b.public_key_bytes(), KeyType::Ed25519, HASH_ALGORITHM_SHA256);
-    assert_peer(
-        "M2-A", &pin_a, &hex(&a.public_key_bytes()), M2_A_PUBKEY,
-        a.peer_id().as_str(), M2_A_PEER_ID, M2_A_PEER_CBOR, M2_A_CONTENT_HASH,
+    let pin_b = derive_peer_pin(
+        &b.public_key_bytes(),
+        KeyType::Ed25519,
+        HASH_ALGORITHM_SHA256,
     );
     assert_peer(
-        "M2-B", &pin_b, &hex(&b.public_key_bytes()), M2_B_PUBKEY,
-        b.peer_id().as_str(), M2_B_PEER_ID, M2_B_PEER_CBOR, M2_B_CONTENT_HASH,
+        "M2-A",
+        &pin_a,
+        &hex(&a.public_key_bytes()),
+        M2_A_PUBKEY,
+        a.peer_id().as_str(),
+        M2_A_PEER_ID,
+        M2_A_PEER_CBOR,
+        M2_A_CONTENT_HASH,
+    );
+    assert_peer(
+        "M2-B",
+        &pin_b,
+        &hex(&b.public_key_bytes()),
+        M2_B_PUBKEY,
+        b.peer_id().as_str(),
+        M2_B_PEER_ID,
+        M2_B_PEER_CBOR,
+        M2_B_CONTENT_HASH,
     );
 
-    let (cap_cbor, cap_ch) =
-        build_root_cap(&pin_a.content_hash, &pin_b.content_hash, HASH_ALGORITHM_SHA256);
+    let (cap_cbor, cap_ch) = build_root_cap(
+        &pin_a.content_hash,
+        &pin_b.content_hash,
+        HASH_ALGORITHM_SHA256,
+    );
     assert_eq!(cap_cbor, M2_CAP_CBOR, "M2: cap-token CBOR");
-    assert_eq!(hex(&cap_ch.to_bytes()), M2_CAP_CONTENT_HASH, "M2: cap-token content_hash");
+    assert_eq!(
+        hex(&cap_ch.to_bytes()),
+        M2_CAP_CONTENT_HASH,
+        "M2: cap-token content_hash"
+    );
 
     let sig = a.sign(&cap_ch.to_bytes());
     assert_eq!(hex(&sig), M2_CAP_SIG, "M2: signature");
@@ -206,22 +240,49 @@ fn matrix_m3_cross_hash_same_key() {
     let b = Keypair::from_seed([0x45; 32]);
 
     // A home = SHA-384, B home = SHA-256 (SEEDS.md §2.1).
-    let pin_a = derive_peer_pin(&a.public_key_bytes(), KeyType::Ed25519, HASH_ALGORITHM_SHA384);
-    let pin_b = derive_peer_pin(&b.public_key_bytes(), KeyType::Ed25519, HASH_ALGORITHM_SHA256);
-    assert_peer(
-        "M3-A", &pin_a, &hex(&a.public_key_bytes()), M3_A_PUBKEY,
-        a.peer_id().as_str(), M3_A_PEER_ID, M3_A_PEER_CBOR, M3_A_CONTENT_HASH,
+    let pin_a = derive_peer_pin(
+        &a.public_key_bytes(),
+        KeyType::Ed25519,
+        HASH_ALGORITHM_SHA384,
+    );
+    let pin_b = derive_peer_pin(
+        &b.public_key_bytes(),
+        KeyType::Ed25519,
+        HASH_ALGORITHM_SHA256,
     );
     assert_peer(
-        "M3-B", &pin_b, &hex(&b.public_key_bytes()), M3_B_PUBKEY,
-        b.peer_id().as_str(), M3_B_PEER_ID, M3_B_PEER_CBOR, M3_B_CONTENT_HASH,
+        "M3-A",
+        &pin_a,
+        &hex(&a.public_key_bytes()),
+        M3_A_PUBKEY,
+        a.peer_id().as_str(),
+        M3_A_PEER_ID,
+        M3_A_PEER_CBOR,
+        M3_A_CONTENT_HASH,
+    );
+    assert_peer(
+        "M3-B",
+        &pin_b,
+        &hex(&b.public_key_bytes()),
+        M3_B_PUBKEY,
+        b.peer_id().as_str(),
+        M3_B_PEER_ID,
+        M3_B_PEER_CBOR,
+        M3_B_CONTENT_HASH,
     );
 
     // Active = SHA-256 even though A's home is SHA-384 (SEEDS.md §2.2).
-    let (cap_cbor, cap_ch) =
-        build_root_cap(&pin_a.content_hash, &pin_b.content_hash, HASH_ALGORITHM_SHA256);
+    let (cap_cbor, cap_ch) = build_root_cap(
+        &pin_a.content_hash,
+        &pin_b.content_hash,
+        HASH_ALGORITHM_SHA256,
+    );
     assert_eq!(cap_cbor, M3_CAP_CBOR, "M3: cap-token CBOR");
-    assert_eq!(hex(&cap_ch.to_bytes()), M3_CAP_CONTENT_HASH, "M3: cap-token content_hash");
+    assert_eq!(
+        hex(&cap_ch.to_bytes()),
+        M3_CAP_CONTENT_HASH,
+        "M3: cap-token content_hash"
+    );
 
     let sig = a.sign(&cap_ch.to_bytes());
     assert_eq!(hex(&sig), M3_CAP_SIG, "M3: signature");
@@ -234,20 +295,43 @@ fn matrix_m6_cross_key_cross_hash() {
 
     // A Ed448 home = SHA-384, B Ed25519 home = SHA-256 (SEEDS.md §2.1).
     let pin_a = derive_peer_pin(&a.public_key_bytes(), KeyType::Ed448, HASH_ALGORITHM_SHA384);
-    let pin_b = derive_peer_pin(&b.public_key_bytes(), KeyType::Ed25519, HASH_ALGORITHM_SHA256);
-    assert_peer(
-        "M6-A", &pin_a, &hex(&a.public_key_bytes()), M6_A_PUBKEY,
-        a.peer_id().as_str(), M6_A_PEER_ID, M6_A_PEER_CBOR, M6_A_CONTENT_HASH,
+    let pin_b = derive_peer_pin(
+        &b.public_key_bytes(),
+        KeyType::Ed25519,
+        HASH_ALGORITHM_SHA256,
     );
     assert_peer(
-        "M6-B", &pin_b, &hex(&b.public_key_bytes()), M6_B_PUBKEY,
-        b.peer_id().as_str(), M6_B_PEER_ID, M6_B_PEER_CBOR, M6_B_CONTENT_HASH,
+        "M6-A",
+        &pin_a,
+        &hex(&a.public_key_bytes()),
+        M6_A_PUBKEY,
+        a.peer_id().as_str(),
+        M6_A_PEER_ID,
+        M6_A_PEER_CBOR,
+        M6_A_CONTENT_HASH,
+    );
+    assert_peer(
+        "M6-B",
+        &pin_b,
+        &hex(&b.public_key_bytes()),
+        M6_B_PUBKEY,
+        b.peer_id().as_str(),
+        M6_B_PEER_ID,
+        M6_B_PEER_CBOR,
+        M6_B_CONTENT_HASH,
     );
 
-    let (cap_cbor, cap_ch) =
-        build_root_cap(&pin_a.content_hash, &pin_b.content_hash, HASH_ALGORITHM_SHA256);
+    let (cap_cbor, cap_ch) = build_root_cap(
+        &pin_a.content_hash,
+        &pin_b.content_hash,
+        HASH_ALGORITHM_SHA256,
+    );
     assert_eq!(cap_cbor, M6_CAP_CBOR, "M6: cap-token CBOR");
-    assert_eq!(hex(&cap_ch.to_bytes()), M6_CAP_CONTENT_HASH, "M6: cap-token content_hash");
+    assert_eq!(
+        hex(&cap_ch.to_bytes()),
+        M6_CAP_CONTENT_HASH,
+        "M6: cap-token content_hash"
+    );
 
     let sig = a.sign(&cap_ch.to_bytes());
     assert_eq!(hex(&sig), M6_CAP_SIG, "M6: signature");

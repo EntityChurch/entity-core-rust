@@ -1,12 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
+use entity_ecf::ValueExt;
 use entity_entity::Entity;
 use entity_hash::Hash;
 use entity_store::{
     CascadeHalt, ContentStore, ExecutionContext, LocationIndex, SyncTreeHook, TreeChangeEvent,
 };
-use entity_ecf::ValueExt;
 
 use crate::eval::{self, qualify_path, EvalContext};
 use crate::types::*;
@@ -170,7 +170,8 @@ impl ComputeEngine {
                 continue;
             }
 
-            let bare_subgraph = entry.path
+            let bare_subgraph = entry
+                .path
                 .strip_prefix(&format!("/{}/", self.local_peer_id))
                 .unwrap_or(&entry.path)
                 .to_string();
@@ -179,11 +180,7 @@ impl ComputeEngine {
         }
     }
 
-    fn re_evaluate(
-        &self,
-        entry: &DependencyEntry,
-        ctx: &mut ExecutionContext,
-    ) {
+    fn re_evaluate(&self, entry: &DependencyEntry, ctx: &mut ExecutionContext) {
         let qualified_subgraph = qualify_path(&entry.subgraph_path, &self.local_peer_id);
         let subgraph_hash = match self.location_index.get(&qualified_subgraph) {
             Some(h) => h,
@@ -220,9 +217,9 @@ impl ComputeEngine {
         // §7.2: Verify installation grant is still available and not expired
         let grant_hash = data_hash(&data, "installation_grant");
         let installation_grant = grant_hash.and_then(|h| self.content_store.get(&h));
-        let grant_token = installation_grant.as_ref().and_then(|e| {
-            entity_capability::CapabilityToken::from_entity(e).ok()
-        });
+        let grant_token = installation_grant
+            .as_ref()
+            .and_then(|e| entity_capability::CapabilityToken::from_entity(e).ok());
 
         if let Some(ref token) = grant_token {
             if let Some(expires_at) = token.expires_at {
@@ -293,7 +290,8 @@ impl ComputeEngine {
             let error_entity = err.to_entity();
             let error_hash = self.content_store.put(error_entity).expect("store error");
             let qualified_result = qualify_path(&result_path, &self.local_peer_id);
-            self.location_index.set_with_context(&qualified_result, error_hash, ctx.clone());
+            self.location_index
+                .set_with_context(&qualified_result, error_hash, ctx.clone());
             return;
         }
 
@@ -309,7 +307,8 @@ impl ComputeEngine {
         }
 
         let stored_hash = self.content_store.put(result_entity).expect("store result");
-        self.location_index.set_with_context(&qualified_result, stored_hash, ctx.clone());
+        self.location_index
+            .set_with_context(&qualified_result, stored_hash, ctx.clone());
     }
 
     fn freeze_subgraph(
@@ -324,12 +323,13 @@ impl ComputeEngine {
             "code" => entity_ecf::text(error_code),
             "message" => entity_ecf::text(error_message)
         };
-        let error_entity = Entity::new(TYPE_ERROR, entity_ecf::to_ecf(&error_data))
-            .expect("error entity");
+        let error_entity =
+            Entity::new(TYPE_ERROR, entity_ecf::to_ecf(&error_data)).expect("error entity");
         let error_hash = self.content_store.put(error_entity).expect("store error");
 
         let qualified_result = qualify_path(result_path, &self.local_peer_id);
-        self.location_index.set_with_context(&qualified_result, error_hash, ctx.clone());
+        self.location_index
+            .set_with_context(&qualified_result, error_hash, ctx.clone());
 
         // Update subgraph status to frozen
         let qualified_subgraph = qualify_path(subgraph_path, &self.local_peer_id);
@@ -339,7 +339,10 @@ impl ComputeEngine {
                     entity_ecf::map_insert(&mut sg_data, "status", entity_ecf::text("frozen"));
                     let new_data = entity_ecf::to_ecf(&sg_data);
                     if let Ok(updated) = Entity::new(TYPE_SUBGRAPH, new_data) {
-                        let updated_hash = self.content_store.put(updated).expect("store frozen subgraph");
+                        let updated_hash = self
+                            .content_store
+                            .put(updated)
+                            .expect("store frozen subgraph");
                         self.location_index.set(&qualified_subgraph, updated_hash);
                     }
                 }
@@ -351,7 +354,10 @@ impl ComputeEngine {
 /// Load authorized_data_hashes from subgraph metadata (v3.7 D5).
 fn load_authorized_hashes(subgraph_data: &ciborium::Value) -> HashSet<Hash> {
     let mut set = HashSet::new();
-    if let Some(arr) = subgraph_data.get("authorized_data_hashes").and_then(|v| v.as_array()) {
+    if let Some(arr) = subgraph_data
+        .get("authorized_data_hashes")
+        .and_then(|v| v.as_array())
+    {
         for item in arr {
             if let Some(bytes) = item.as_bytes() {
                 if let Ok(hash) = Hash::from_bytes(bytes) {
@@ -507,10 +513,13 @@ mod tests {
     #[test]
     fn test_dependency_index_add_lookup() {
         let index = DependencyIndex::new();
-        index.add("app/data/x", DependencyEntry {
-            expression_uri: "app/expr/1".into(),
-            subgraph_path: "system/compute/processes/abc".into(),
-        });
+        index.add(
+            "app/data/x",
+            DependencyEntry {
+                expression_uri: "app/expr/1".into(),
+                subgraph_path: "system/compute/processes/abc".into(),
+            },
+        );
 
         let entries = index.lookup("app/data/x");
         assert_eq!(entries.len(), 1);
@@ -520,14 +529,20 @@ mod tests {
     #[test]
     fn test_dependency_index_remove_subgraph() {
         let index = DependencyIndex::new();
-        index.add("app/data/x", DependencyEntry {
-            expression_uri: "app/expr/1".into(),
-            subgraph_path: "system/compute/processes/abc".into(),
-        });
-        index.add("app/data/x", DependencyEntry {
-            expression_uri: "app/expr/2".into(),
-            subgraph_path: "system/compute/processes/def".into(),
-        });
+        index.add(
+            "app/data/x",
+            DependencyEntry {
+                expression_uri: "app/expr/1".into(),
+                subgraph_path: "system/compute/processes/abc".into(),
+            },
+        );
+        index.add(
+            "app/data/x",
+            DependencyEntry {
+                expression_uri: "app/expr/2".into(),
+                subgraph_path: "system/compute/processes/def".into(),
+            },
+        );
 
         index.remove_subgraph("system/compute/processes/abc");
 
@@ -542,7 +557,8 @@ mod tests {
         let li: Arc<dyn LocationIndex> = Arc::new(MemoryLocationIndex::new());
         let identity_hash = Hash::compute("test", b"identity");
 
-        let engine = ComputeEngine::new(cs.clone(), li.clone(), TEST_PID.to_string(), identity_hash);
+        let engine =
+            ComputeEngine::new(cs.clone(), li.clone(), TEST_PID.to_string(), identity_hash);
 
         let lookup = make_tree_lookup("app/data/x");
         cs.put(lookup.clone()).unwrap();
@@ -565,7 +581,8 @@ mod tests {
         let li: Arc<dyn LocationIndex> = Arc::new(MemoryLocationIndex::new());
         let identity_hash = Hash::compute("test", b"identity");
 
-        let engine = ComputeEngine::new(cs.clone(), li.clone(), TEST_PID.to_string(), identity_hash);
+        let engine =
+            ComputeEngine::new(cs.clone(), li.clone(), TEST_PID.to_string(), identity_hash);
 
         let event = TreeChangeEvent {
             path: format!("/{}/system/compute/processes/abc", TEST_PID),
@@ -600,15 +617,22 @@ mod tests {
         // Create subgraph metadata
         let metadata = make_subgraph_metadata("app/expr/1", "app/results/1");
         let meta_h = cs.put(metadata).unwrap();
-        li.set(&format!("/{}/system/compute/processes/test1", TEST_PID), meta_h);
+        li.set(
+            &format!("/{}/system/compute/processes/test1", TEST_PID),
+            meta_h,
+        );
 
-        let engine = ComputeEngine::new(cs.clone(), li.clone(), TEST_PID.to_string(), identity_hash);
+        let engine =
+            ComputeEngine::new(cs.clone(), li.clone(), TEST_PID.to_string(), identity_hash);
 
         // Register dependency with qualified path (matching event.path format)
-        engine.dependency_index.add(&format!("/{}/app/data/x", TEST_PID), DependencyEntry {
-            expression_uri: "app/expr/1".into(),
-            subgraph_path: "system/compute/processes/test1".into(),
-        });
+        engine.dependency_index.add(
+            &format!("/{}/app/data/x", TEST_PID),
+            DependencyEntry {
+                expression_uri: "app/expr/1".into(),
+                subgraph_path: "system/compute/processes/test1".into(),
+            },
+        );
 
         // Trigger re-evaluation
         let event = TreeChangeEvent {
@@ -655,9 +679,13 @@ mod tests {
 
         let metadata = make_subgraph_metadata("app/expr/1", "app/results/1");
         let meta_h = cs.put(metadata).unwrap();
-        li.set(&format!("/{}/system/compute/processes/test1", TEST_PID), meta_h);
+        li.set(
+            &format!("/{}/system/compute/processes/test1", TEST_PID),
+            meta_h,
+        );
 
-        let engine = ComputeEngine::new(cs.clone(), li.clone(), TEST_PID.to_string(), identity_hash);
+        let engine =
+            ComputeEngine::new(cs.clone(), li.clone(), TEST_PID.to_string(), identity_hash);
 
         // Register through the real path — walker emits the bare path,
         // engine.register_subgraph_dependencies canonicalizes at the index
@@ -716,13 +744,20 @@ mod tests {
         // Subgraph
         let metadata = make_subgraph_metadata("app/expr/1", "app/results/1");
         let meta_h = cs.put(metadata).unwrap();
-        li.set(&format!("/{}/system/compute/processes/test1", TEST_PID), meta_h);
+        li.set(
+            &format!("/{}/system/compute/processes/test1", TEST_PID),
+            meta_h,
+        );
 
-        let engine = ComputeEngine::new(cs.clone(), li.clone(), TEST_PID.to_string(), identity_hash);
-        engine.dependency_index.add(&format!("/{}/app/data/x", TEST_PID), DependencyEntry {
-            expression_uri: "app/expr/1".into(),
-            subgraph_path: "system/compute/processes/test1".into(),
-        });
+        let engine =
+            ComputeEngine::new(cs.clone(), li.clone(), TEST_PID.to_string(), identity_hash);
+        engine.dependency_index.add(
+            &format!("/{}/app/data/x", TEST_PID),
+            DependencyEntry {
+                expression_uri: "app/expr/1".into(),
+                subgraph_path: "system/compute/processes/test1".into(),
+            },
+        );
 
         let event = TreeChangeEvent {
             path: format!("/{}/app/data/x", TEST_PID),
@@ -761,9 +796,13 @@ mod tests {
         // Store subgraph metadata
         let metadata = make_subgraph_metadata("app/expr/1", "app/results/1");
         let meta_h = cs.put(metadata).unwrap();
-        li.set(&format!("/{}/system/compute/processes/test1", TEST_PID), meta_h);
+        li.set(
+            &format!("/{}/system/compute/processes/test1", TEST_PID),
+            meta_h,
+        );
 
-        let engine = ComputeEngine::new(cs.clone(), li.clone(), TEST_PID.to_string(), identity_hash);
+        let engine =
+            ComputeEngine::new(cs.clone(), li.clone(), TEST_PID.to_string(), identity_hash);
 
         // Rebuild should find the subgraph and register its dependency
         engine.rebuild_index();

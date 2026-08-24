@@ -47,11 +47,8 @@ fn sqlite_backend_persists_entity_across_restart() {
         let peer = build_peer(&db);
         let pid = peer.peer_id().to_string();
 
-        let entity = entity_entity::Entity::new(
-            "test/restart/marker",
-            b"hello restart".to_vec(),
-        )
-        .unwrap();
+        let entity =
+            entity_entity::Entity::new("test/restart/marker", b"hello restart".to_vec()).unwrap();
         let hash = peer.content_store().put(entity).unwrap();
         peer.location_index()
             .set(&format!("/{}/test/restart/marker", pid), hash);
@@ -97,10 +94,8 @@ fn subscription_routing_index_rebuilds_from_tree_after_restart() {
         let pid = peer.peer_id().to_string();
 
         let subscriber = entity_hash::Hash::compute("system/peer", b"test-subscriber");
-        let deliver_token = entity_hash::Hash::compute(
-            "system/capability/token",
-            b"test-deliver-token",
-        );
+        let deliver_token =
+            entity_hash::Hash::compute("system/capability/token", b"test-deliver-token");
         let pattern = format!("/{}/app/data/*", pid);
 
         let sub = SubscriptionData {

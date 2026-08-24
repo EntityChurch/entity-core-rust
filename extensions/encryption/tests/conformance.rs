@@ -35,16 +35,32 @@ fn enc_aad_1_peer_per_key_tamper() {
     let good_aad = aad::peer_aad(0x01, 0x01, 0x01, &nonce, &recipient_key, &ephemeral_key);
     let ct = xchacha_encrypt(&key, &nonce, &good_aad, plaintext).unwrap();
     // Sanity: the untampered AAD opens.
-    assert_eq!(xchacha_decrypt(&key, &nonce, &good_aad, &ct).unwrap(), plaintext);
+    assert_eq!(
+        xchacha_decrypt(&key, &nonce, &good_aad, &ct).unwrap(),
+        plaintext
+    );
 
     // One tampered AAD per key in the set; each MUST fail.
     let other_hash = Hash::new(0x00, [0x99u8; 32]);
     let tampered: Vec<Vec<u8>> = vec![
-        aad::self_aad(0x01, 0x01, &nonce, &[0x00; 16], entity_encryption::KdfParams::default().to_ecf_value()), // mode flip (self vs peer)
+        aad::self_aad(
+            0x01,
+            0x01,
+            &nonce,
+            &[0x00; 16],
+            entity_encryption::KdfParams::default().to_ecf_value(),
+        ), // mode flip (self vs peer)
         aad::peer_aad(0x02, 0x01, 0x01, &nonce, &recipient_key, &ephemeral_key), // enc_key_type
         aad::peer_aad(0x01, 0x02, 0x01, &nonce, &recipient_key, &ephemeral_key), // aead_id
         aad::peer_aad(0x01, 0x01, 0x02, &nonce, &recipient_key, &ephemeral_key), // kdf_id
-        aad::peer_aad(0x01, 0x01, 0x01, &[0x23; 24], &recipient_key, &ephemeral_key), // nonce
+        aad::peer_aad(
+            0x01,
+            0x01,
+            0x01,
+            &[0x23; 24],
+            &recipient_key,
+            &ephemeral_key,
+        ), // nonce
         aad::peer_aad(0x01, 0x01, 0x01, &nonce, &other_hash, &ephemeral_key),    // recipient_key
         aad::peer_aad(0x01, 0x01, 0x01, &nonce, &recipient_key, &[0x45; 32]),    // ephemeral_key
     ];
@@ -75,8 +91,15 @@ fn enc_tier_interop_1_uniform_binding() {
 
     // F2-3 trap: a re-minted equivalent at a different `created` → different
     // hash → would derive a different key → interop fails.
-    let reminted = EncryptionPubkeyData { created: 1, ..kat_pubkey(recipient_pub.to_vec()) };
-    assert_ne!(hash_a, reminted.content_hash(), "re-minted entity must differ");
+    let reminted = EncryptionPubkeyData {
+        created: 1,
+        ..kat_pubkey(recipient_pub.to_vec())
+    };
+    assert_ne!(
+        hash_a,
+        reminted.content_hash(),
+        "re-minted entity must differ"
+    );
 
     // Cross-tier round-trip binds the one authored hash.
     let ed = peer_encrypt(PeerEncryptInput {
@@ -103,7 +126,11 @@ fn enc_roundtrip_format_1_sha384_recipient_key() {
 
     let hash_384 = pubkey.content_hash_format(0x01).expect("SHA-384 supported");
     assert_eq!(hash_384.algorithm, 0x01);
-    assert_eq!(hash_384.to_bytes().len(), 1 + 48, "format byte + SHA-384 digest");
+    assert_eq!(
+        hash_384.to_bytes().len(),
+        1 + 48,
+        "format byte + SHA-384 digest"
+    );
 
     let ed = peer_encrypt(PeerEncryptInput {
         recipient_pubkey: recipient_pub.to_vec(),
@@ -114,5 +141,8 @@ fn enc_roundtrip_format_1_sha384_recipient_key() {
     })
     .unwrap();
     assert_eq!(ed.recipient_key.unwrap().algorithm, 0x01);
-    assert_eq!(peer_decrypt(&ed, &recipient_seed).unwrap(), b"sha-384 recipient");
+    assert_eq!(
+        peer_decrypt(&ed, &recipient_seed).unwrap(),
+        b"sha-384 recipient"
+    );
 }

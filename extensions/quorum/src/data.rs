@@ -65,7 +65,10 @@ impl QuorumData {
                     .collect(),
             ),
         ));
-        fields.push((text("threshold"), entity_ecf::integer(self.threshold as i64)));
+        fields.push((
+            text("threshold"),
+            entity_ecf::integer(self.threshold as i64),
+        ));
         let data = to_ecf(&Value::Map(fields));
         Entity::new(TYPE_QUORUM, data).map_err(|e| QuorumError::Encode(e.to_string()))
     }
@@ -96,16 +99,20 @@ pub(crate) fn get_field<'a>(
     map: &'a [(ciborium::Value, ciborium::Value)],
     key: &str,
 ) -> Option<&'a ciborium::Value> {
-    map.iter()
-        .find_map(|(k, v)| if k.as_text() == Some(key) { Some(v) } else { None })
+    map.iter().find_map(|(k, v)| {
+        if k.as_text() == Some(key) {
+            Some(v)
+        } else {
+            None
+        }
+    })
 }
 
 pub(crate) fn field_hash(
     map: &[(ciborium::Value, ciborium::Value)],
     key: &str,
 ) -> Result<Hash, QuorumError> {
-    let v = get_field(map, key)
-        .ok_or_else(|| QuorumError::Decode(format!("missing {}", key)))?;
+    let v = get_field(map, key).ok_or_else(|| QuorumError::Decode(format!("missing {}", key)))?;
     let bytes = v
         .as_bytes()
         .ok_or_else(|| QuorumError::Decode(format!("{} must be bytes", key)))?;
@@ -133,8 +140,7 @@ pub(crate) fn field_hash_array(
     map: &[(ciborium::Value, ciborium::Value)],
     key: &str,
 ) -> Result<Vec<Hash>, QuorumError> {
-    let v = get_field(map, key)
-        .ok_or_else(|| QuorumError::Decode(format!("missing {}", key)))?;
+    let v = get_field(map, key).ok_or_else(|| QuorumError::Decode(format!("missing {}", key)))?;
     let arr = v
         .as_array()
         .ok_or_else(|| QuorumError::Decode(format!("{} must be array", key)))?;
@@ -152,8 +158,7 @@ pub(crate) fn field_u64(
     map: &[(ciborium::Value, ciborium::Value)],
     key: &str,
 ) -> Result<u64, QuorumError> {
-    let v = get_field(map, key)
-        .ok_or_else(|| QuorumError::Decode(format!("missing {}", key)))?;
+    let v = get_field(map, key).ok_or_else(|| QuorumError::Decode(format!("missing {}", key)))?;
     let i = v
         .as_integer()
         .ok_or_else(|| QuorumError::Decode(format!("{} must be integer", key)))?;
@@ -177,10 +182,7 @@ pub(crate) fn field_u64_opt(
                 .ok_or_else(|| QuorumError::Decode(format!("{} must be integer", key)))?;
             let n: i128 = i.into();
             if n < 0 {
-                return Err(QuorumError::Decode(format!(
-                    "{} must be non-negative",
-                    key
-                )));
+                return Err(QuorumError::Decode(format!("{} must be non-negative", key)));
             }
             Ok(Some(n as u64))
         }

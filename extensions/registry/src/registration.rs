@@ -167,7 +167,11 @@ impl RegisterRequestHandler {
         }
         let nonce_path = register_nonce_path(&self.peer_id, &req.target_peer_id, &req.nonce);
         if self.location_index.get(&nonce_path).is_some() {
-            return error(STATUS_CONFLICT, "replay", "nonce already seen for this requester");
+            return error(
+                STATUS_CONFLICT,
+                "replay",
+                "nonce already seen for this requester",
+            );
         }
 
         // Layer 2 — issuer-policy admission (§6a.9.1).
@@ -186,7 +190,11 @@ impl RegisterRequestHandler {
         match policy.mode.as_str() {
             MODE_OPEN => {
                 // First-come-first-serve: only the name-taken check gates.
-                if self.location_index.get(&by_name_pointer_path(&self.peer_id, &norm)).is_some() {
+                if self
+                    .location_index
+                    .get(&by_name_pointer_path(&self.peer_id, &norm))
+                    .is_some()
+                {
                     return error(STATUS_CONFLICT, "name_taken", "name already bound");
                 }
             }
@@ -203,7 +211,11 @@ impl RegisterRequestHandler {
                         "target_peer_id not in the registry allowlist",
                     );
                 }
-                if self.location_index.get(&by_name_pointer_path(&self.peer_id, &norm)).is_some() {
+                if self
+                    .location_index
+                    .get(&by_name_pointer_path(&self.peer_id, &norm))
+                    .is_some()
+                {
                     return error(STATUS_CONFLICT, "name_taken", "name already bound");
                 }
             }
@@ -255,7 +267,13 @@ impl RegisterRequestHandler {
             .and_then(|b| Hash::from_bytes(b).ok())
         {
             Some(h) => h,
-            None => return error(STATUS_BAD_REQUEST, "invalid_params", "binding_hash required"),
+            None => {
+                return error(
+                    STATUS_BAD_REQUEST,
+                    "invalid_params",
+                    "binding_hash required",
+                )
+            }
         };
         let reason = get_field(&map, "reason")
             .and_then(|v| v.as_text())
@@ -285,11 +303,16 @@ impl RegisterRequestHandler {
             &format!("{}{}", revocation_prefix(&self.peer_id), rev_hash.to_hex()),
             rev_hash,
         );
-        self.location_index
-            .set(&revocation_by_target_path(&self.peer_id, &binding_hash), rev_hash);
+        self.location_index.set(
+            &revocation_by_target_path(&self.peer_id, &binding_hash),
+            rev_hash,
+        );
         status_result(vec![
             (text("revoked"), Value::Bool(true)),
-            (text("revocation"), Value::Bytes(rev_hash.to_bytes().to_vec())),
+            (
+                text("revocation"),
+                Value::Bytes(rev_hash.to_bytes().to_vec()),
+            ),
         ])
     }
 
@@ -306,7 +329,13 @@ impl RegisterRequestHandler {
             .and_then(|b| Hash::from_bytes(b).ok())
         {
             Some(h) => h,
-            None => return error(STATUS_BAD_REQUEST, "invalid_params", "binding_hash required"),
+            None => {
+                return error(
+                    STATUS_BAD_REQUEST,
+                    "invalid_params",
+                    "binding_hash required",
+                )
+            }
         };
         let new_ttl = get_field(&map, "ttl")
             .and_then(|v| v.as_integer())
@@ -409,10 +438,14 @@ impl RegisterRequestHandler {
             .map_err(|e| error(STATUS_BAD_REQUEST, "store_failed", &e.to_string()))?;
         self.sign_and_publish(&binding_hash)?;
         // §3 universal body path + §6a.3 by-name index.
-        self.location_index
-            .set(&binding_body_path(&self.peer_id, &binding_hash), binding_hash);
-        self.location_index
-            .set(&by_name_pointer_path(&self.peer_id, name_norm), binding_hash);
+        self.location_index.set(
+            &binding_body_path(&self.peer_id, &binding_hash),
+            binding_hash,
+        );
+        self.location_index.set(
+            &by_name_pointer_path(&self.peer_id, name_norm),
+            binding_hash,
+        );
         Ok(binding_hash)
     }
 

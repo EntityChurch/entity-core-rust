@@ -9,32 +9,25 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use entity_attestation::{
-    AttestationData, AttestationIndex,
-};
+use entity_attestation::{AttestationData, AttestationIndex};
 use entity_capability::{CapabilityToken, GrantEntry, Granter};
 use entity_crypto::IdentityKeypair;
 use entity_ecf::{text, to_ecf, Value};
 use entity_entity::{Entity, TYPE_SIGNATURE};
 use entity_handler::{
-    error_entity, Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST, STATUS_OK,
+    error_entity, Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST,
+    STATUS_OK,
 };
 use entity_hash::Hash;
 use entity_quorum::{ResolverRegistry, SignerSetCache};
 use entity_store::{ContentStore, LocationIndex};
 
 use crate::kinds::{
-    is_valid_mode_for_function, Function, Mode, KIND_IDENTITY_CERT,
-    KIND_IDENTITY_RETIREMENT, KIND_IDENTITY_ROTATION_HANDOFF,
-    KIND_IDENTITY_ROTATION_RECOVERY,
+    is_valid_mode_for_function, Function, Mode, KIND_IDENTITY_CERT, KIND_IDENTITY_RETIREMENT,
+    KIND_IDENTITY_ROTATION_HANDOFF, KIND_IDENTITY_ROTATION_RECOVERY,
 };
-use crate::paths::{
-    canonical_cert_path, path_identity_event,
-};
-use crate::validation::{
-    lookup_target_cert, read_function, read_mode,
-    IdentityCtx,
-};
+use crate::paths::{canonical_cert_path, path_identity_event};
+use crate::validation::{lookup_target_cert, read_function, read_mode, IdentityCtx};
 
 pub struct IdentityHandler {
     pub(crate) content_store: Arc<dyn ContentStore>,
@@ -54,6 +47,7 @@ pub struct IdentityHandler {
 }
 
 impl IdentityHandler {
+    #[allow(clippy::too_many_arguments)] // composition-layer wiring: each substrate handle is distinct
     pub fn new(
         content_store: Arc<dyn ContentStore>,
         location_index: Arc<dyn LocationIndex>,
@@ -94,7 +88,9 @@ impl IdentityHandler {
     }
 
     pub(crate) fn resource_path(&self, ctx: &HandlerContext) -> Option<String> {
-        ctx.resource_target.as_ref().and_then(|rt| rt.targets.first().cloned())
+        ctx.resource_target
+            .as_ref()
+            .and_then(|rt| rt.targets.first().cloned())
     }
 }
 
@@ -146,7 +142,6 @@ impl Handler for IdentityHandler {
 
 // §6 — configure — moved to ops/configure.rs
 
-
 // §6 — create_quorum — moved to ops/create_quorum.rs
 
 // ===========================================================================
@@ -185,8 +180,10 @@ impl IdentityHandler {
                         function
                     )));
                 }
-                Ok(canonical_cert_path(mode, contact_id, &att_hash)
-                    .map(|bare| self.qualify(&bare)))
+                Ok(
+                    canonical_cert_path(mode, contact_id, &att_hash)
+                        .map(|bare| self.qualify(&bare)),
+                )
             }
             KIND_IDENTITY_ROTATION_HANDOFF
             | KIND_IDENTITY_ROTATION_RECOVERY
@@ -195,7 +192,13 @@ impl IdentityHandler {
                 let target_hash = att
                     .properties
                     .iter()
-                    .find_map(|(k, v)| if k.as_text() == Some("target_cert") { v.as_bytes() } else { None })
+                    .find_map(|(k, v)| {
+                        if k.as_text() == Some("target_cert") {
+                            v.as_bytes()
+                        } else {
+                            None
+                        }
+                    })
                     .and_then(|b| Hash::from_bytes(b).ok())
                     .ok_or_else(|| HandlerError::Internal("missing target_cert".into()))?;
                 let target = self
@@ -204,12 +207,18 @@ impl IdentityHandler {
                     .ok_or_else(|| HandlerError::Internal("target_cert not indexed".into()))?;
                 let target_mode = read_mode(&target)
                     .ok_or_else(|| HandlerError::Internal("target cert missing mode".into()))?;
-                let target_mode_enum = Mode::parse(target_mode)
-                    .map_err(|e| HandlerError::Internal(e.to_string()))?;
+                let target_mode_enum =
+                    Mode::parse(target_mode).map_err(|e| HandlerError::Internal(e.to_string()))?;
                 let target_contact_id = target
                     .properties
                     .iter()
-                    .find_map(|(k, v)| if k.as_text() == Some("contact_id") { v.as_bytes() } else { None })
+                    .find_map(|(k, v)| {
+                        if k.as_text() == Some("contact_id") {
+                            v.as_bytes()
+                        } else {
+                            None
+                        }
+                    })
                     .and_then(|b| Hash::from_bytes(b).ok());
                 Ok(crate::paths::same_tier_path(
                     target_mode_enum,
@@ -233,7 +242,6 @@ impl IdentityHandler {
 
 // PI-13 cap-revocation helper (used by revoke_attestation + retirement processing).
 impl IdentityHandler {
-
     /// PI-13 (PROPOSAL-IDENTITY-COMPOSITION-CLEANUP §PI-13, Rev 3):
     /// cascade-by-default cap cleanup on controller revocation. Walks
     /// `system/capability/grants/identity/peer-to-controller/*` and
@@ -277,7 +285,6 @@ impl IdentityHandler {
     }
 }
 
-
 // ===========================================================================
 // PI-5 — Controller-events stream
 // ===========================================================================
@@ -307,13 +314,19 @@ impl IdentityHandler {
             .unwrap_or_default()
             .as_millis() as u64;
         let data = to_ecf(&Value::Map(vec![
-            (text("attestation_hash"), Value::Bytes(attestation_hash.to_bytes().to_vec())),
+            (
+                text("attestation_hash"),
+                Value::Bytes(attestation_hash.to_bytes().to_vec()),
+            ),
             (text("attestation_kind"), text(attestation_kind)),
             (text("error_code"), text(error_code)),
             (text("error_detail"), text(error_detail)),
             (text("event_subkind"), text(event_subkind)),
             (text("handler_id"), text(handler_id)),
-            (text("timestamp_ms"), entity_ecf::integer(timestamp_ms as i64)),
+            (
+                text("timestamp_ms"),
+                entity_ecf::integer(timestamp_ms as i64),
+            ),
         ]));
         let entity = match Entity::new(entity_types::TYPE_IDENTITY_EVENT, data) {
             Ok(e) => e,
@@ -370,8 +383,14 @@ impl IdentityHandler {
         let sig_data = to_ecf(&Value::Map(vec![
             (text("algorithm"), text(self.keypair.key_type().label())),
             (text("signature"), Value::Bytes(sig_bytes)),
-            (text("signer"), Value::Bytes(self.identity_hash.to_bytes().to_vec())),
-            (text("target"), Value::Bytes(cap_entity.content_hash.to_bytes().to_vec())),
+            (
+                text("signer"),
+                Value::Bytes(self.identity_hash.to_bytes().to_vec()),
+            ),
+            (
+                text("target"),
+                Value::Bytes(cap_entity.content_hash.to_bytes().to_vec()),
+            ),
         ]));
         let sig_entity = Entity::new(TYPE_SIGNATURE, sig_data).map_err(|e| e.to_string())?;
         let sig_hash = self
@@ -424,8 +443,11 @@ pub(crate) fn error(status: u32, code: &str, message: &str) -> HandlerResult {
 /// is defined as an empty payload, so the generic `system/protocol/status`
 /// is the right envelope type for it).
 pub(crate) fn status_ok() -> HandlerResult {
-    let result = Entity::new(entity_types::TYPE_PROTOCOL_STATUS, to_ecf(&Value::Map(vec![])))
-        .unwrap();
+    let result = Entity::new(
+        entity_types::TYPE_PROTOCOL_STATUS,
+        to_ecf(&Value::Map(vec![])),
+    )
+    .unwrap();
     HandlerResult {
         status: STATUS_OK,
         result,
@@ -468,7 +490,10 @@ pub(crate) fn create_quorum_result(quorum_id: Hash) -> HandlerResult {
 
 /// `system/identity/create-attestation-result` per V7 §3.4. Regular shape:
 /// `{attestation_hash, storage_path?}`.
-pub(crate) fn create_attestation_result(att_hash: Hash, storage_path: Option<&str>) -> HandlerResult {
+pub(crate) fn create_attestation_result(
+    att_hash: Hash,
+    storage_path: Option<&str>,
+) -> HandlerResult {
     let mut fields: Vec<(Value, Value)> = vec![(
         text("attestation_hash"),
         Value::Bytes(att_hash.to_bytes().to_vec()),
@@ -518,7 +543,10 @@ pub(crate) fn create_attestation_result_embedded(embedded_data: &[u8]) -> Handle
 
 /// `system/identity/supersede-attestation-result` per V7 §3.4. Same payload
 /// shape as create-attestation-result; distinct type tag for SDK dispatch.
-pub(crate) fn supersede_attestation_result(att_hash: Hash, storage_path: Option<&str>) -> HandlerResult {
+pub(crate) fn supersede_attestation_result(
+    att_hash: Hash,
+    storage_path: Option<&str>,
+) -> HandlerResult {
     let mut fields: Vec<(Value, Value)> = vec![(
         text("attestation_hash"),
         Value::Bytes(att_hash.to_bytes().to_vec()),
@@ -590,8 +618,15 @@ pub(crate) fn configure_result(peer_config_path: &str, issued: &[Hash]) -> Handl
     let result = Entity::new(
         entity_types::TYPE_IDENTITY_CONFIGURE_RESULT,
         to_ecf(&Value::Map(vec![
-            (text("local_peer_to_controller_caps"),
-             Value::Array(issued.iter().map(|h| Value::Bytes(h.to_bytes().to_vec())).collect())),
+            (
+                text("local_peer_to_controller_caps"),
+                Value::Array(
+                    issued
+                        .iter()
+                        .map(|h| Value::Bytes(h.to_bytes().to_vec()))
+                        .collect(),
+                ),
+            ),
             (text("peer_config_path"), text(peer_config_path)),
         ])),
     )
@@ -627,6 +662,6 @@ pub(crate) fn require_resource(ctx: &HandlerContext, expected: &str) -> Result<(
 #[allow(dead_code)]
 const _: fn(&AttestationData) -> Option<&str> = lookup_target_cert_kind;
 pub(crate) fn lookup_target_cert_kind(att: &AttestationData) -> Option<&str> {
-    lookup_target_cert as fn(_, _) -> _;
+    let _ = lookup_target_cert as fn(_, _) -> _;
     att.kind()
 }

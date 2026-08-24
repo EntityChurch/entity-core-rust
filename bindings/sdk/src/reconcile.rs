@@ -80,8 +80,7 @@ impl PeerContext {
         remote_peer_id: impl Into<String>,
         prefix: impl Into<String>,
         last_seen: Option<Hash>,
-    ) -> impl std::future::Future<Output = Result<ReconcileResult, SdkError>> + Send + 'static
-    {
+    ) -> impl std::future::Future<Output = Result<ReconcileResult, SdkError>> + Send + 'static {
         let remote_peer_id = remote_peer_id.into();
         let prefix = prefix.into();
 
@@ -119,10 +118,9 @@ impl PeerContext {
                 return Err(e);
             }
             let fetch_result = fetch_fut.await?;
-            if let Some(err) = SdkError::from_handler_result(
-                &fetch_result,
-                "reconcile: revision:fetch-diff",
-            ) {
+            if let Some(err) =
+                SdkError::from_handler_result(&fetch_result, "reconcile: revision:fetch-diff")
+            {
                 return Err(err);
             }
             let envelope = fetch_result.result;
@@ -189,10 +187,9 @@ impl PeerContext {
                 return Err(e);
             }
             let fetch_result = fetch_fut.await?;
-            if let Some(err) = SdkError::from_handler_result(
-                &fetch_result,
-                "reconcile: revision:fetch-diff",
-            ) {
+            if let Some(err) =
+                SdkError::from_handler_result(&fetch_result, "reconcile: revision:fetch-diff")
+            {
                 return Err(err);
             }
             let envelope = fetch_result.result;
@@ -277,10 +274,7 @@ fn build_tree_merge_params(envelope: &Entity, prefix: &str, strategy: &str) -> E
     let env_value: ciborium::Value =
         ciborium::de::from_reader(envelope.data.as_slice()).unwrap_or(ciborium::Value::Null);
     let source_envelope = ciborium::Value::Map(vec![
-        (
-            entity_ecf::text("data"),
-            env_value,
-        ),
+        (entity_ecf::text("data"), env_value),
         (
             entity_ecf::text("type"),
             entity_ecf::text(&envelope.entity_type),

@@ -84,9 +84,7 @@ fn hash_to_pba(h: &entity_hash::Hash) -> PackedByteArray {
 ///
 /// The bootstrap SDK injects `kind`, `function`, `mode` itself; per
 /// the SDK docs callers SHOULD NOT include those three keys.
-pub(crate) fn decode_string_properties(
-    dict: &VarDictionary,
-) -> Vec<(String, ciborium::Value)> {
+pub(crate) fn decode_string_properties(dict: &VarDictionary) -> Vec<(String, ciborium::Value)> {
     use ciborium::Value;
     let mut out: Vec<(String, Value)> = Vec::new();
     for (k, v) in dict.iter_shared() {
@@ -97,14 +95,10 @@ pub(crate) fn decode_string_properties(
         let key = key_s.to_string();
         let value = match v.get_type() {
             VariantType::BOOL => Value::Bool(v.to::<bool>()),
-            VariantType::INT => {
-                Value::Integer(ciborium::value::Integer::from(v.to::<i64>()))
-            }
+            VariantType::INT => Value::Integer(ciborium::value::Integer::from(v.to::<i64>())),
             VariantType::FLOAT => Value::Float(v.to::<f64>()),
             VariantType::STRING => Value::Text(v.to::<GString>().to_string()),
-            VariantType::PACKED_BYTE_ARRAY => {
-                Value::Bytes(v.to::<PackedByteArray>().to_vec())
-            }
+            VariantType::PACKED_BYTE_ARRAY => Value::Bytes(v.to::<PackedByteArray>().to_vec()),
             other => {
                 godot_warn!(
                     "bootstrap properties: skipping key {:?} — unsupported value type {:?}",

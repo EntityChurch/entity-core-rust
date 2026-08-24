@@ -100,10 +100,10 @@ pub fn decode_substitute_source(
         .ok_or(SubstituteSourceDecodeError::MissingField("substitute_type"))?;
     let source_peer_id = field_hash(map, "source_peer_id")
         .ok_or(SubstituteSourceDecodeError::MissingField("source_peer_id"))?;
-    let priority = field_int(map, "priority")
-        .ok_or(SubstituteSourceDecodeError::MissingField("priority"))?;
-    let enabled = field_bool(map, "enabled")
-        .ok_or(SubstituteSourceDecodeError::MissingField("enabled"))?;
+    let priority =
+        field_int(map, "priority").ok_or(SubstituteSourceDecodeError::MissingField("priority"))?;
+    let enabled =
+        field_bool(map, "enabled").ok_or(SubstituteSourceDecodeError::MissingField("enabled"))?;
 
     let endpoint = lookup(map, "endpoint").cloned();
     let fetch_template = field_text(map, "fetch_template");
