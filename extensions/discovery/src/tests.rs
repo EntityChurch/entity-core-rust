@@ -320,7 +320,14 @@ mod handler_tests {
             }
             Ok(())
         }
-        async fn announce_stop(&self, _p: &str) -> Result<(), DiscoveryError> {
+        async fn announce_stop(&self, p: &str) -> Result<(), DiscoveryError> {
+            // §3.3's two cases, resolution question FIRST. This returned a bare
+            // `Ok(())` — idempotent for everything, which is the shape the
+            // ruling calls "not conformant merely by being idempotent".
+            if p != "mock-profile" {
+                return Err(DiscoveryError::UnknownProfileRef(p.to_string()));
+            }
+            // Recognized but not running — the idempotent case.
             Ok(())
         }
     }
@@ -539,5 +546,57 @@ mod handler_tests {
             .await
             .unwrap();
         assert_eq!(known.status, 200);
+    }
+
+    /// DISCOVERY §3.3 `[corrected 2026-08-11]` — `:announce-stop` is a
+    /// **two-case** rule, and both cases must be reachable.
+    ///
+    /// rust fixed the `:announce` half (`2ac8ed2`) and left this one: the mDNS
+    /// backend answered an idempotent 200 for *every* `profile_ref`, so it
+    /// never asked the resolution question at all. The ruling names exactly
+    /// that: an implementation whose stop never maps its unknown-profile
+    /// sentinel is not conformant merely by being idempotent.
+    ///
+    /// The idempotent arm is what makes this test able to fail for the right
+    /// reason — "400 on every stop" would satisfy the first assertion alone,
+    /// and would break the symmetric lifecycle the idempotency rule protects.
+    #[tokio::test]
+    async fn announce_stop_classifies_before_it_answers() {
+        let (cs, li) = stores();
+        let backend = Arc::new(MockBackend {
+            observations: vec![],
+        });
+        let handler = DiscoveryHandler::new(cs, li, PEER.into(), vec![backend]);
+
+        // Case 1 — unrecognized by the backend: 400 on stop, same as announce.
+        let unknown = handler
+            .handle(&announce_ctx(
+                "announce-stop",
+                "mock",
+                "no-such-transport-profile",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            unknown.status, 400,
+            "an unrecognized profile_ref is a caller error on stop too, not an idempotent no-op"
+        );
+        assert_eq!(
+            result_map(&unknown)
+                .iter()
+                .find(|(k, _)| k.as_text() == Some("code"))
+                .and_then(|(_, v)| v.as_text()),
+            Some("unknown_profile_ref")
+        );
+
+        // Case 2 — recognized but not currently announced: idempotent 200.
+        let not_running = handler
+            .handle(&announce_ctx("announce-stop", "mock", "mock-profile"))
+            .await
+            .unwrap();
+        assert_eq!(
+            not_running.status, 200,
+            "stopping a recognized profile that is not running is idempotent"
+        );
     }
 }

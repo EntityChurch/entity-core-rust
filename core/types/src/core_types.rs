@@ -1400,8 +1400,8 @@ fn system_inbox_delivery() -> TypeDefinition {
         .build()
 }
 
-fn system_inbox_notification() -> TypeDefinition {
-    TypeDefBuilder::new("system/protocol/inbox/notification")
+fn system_subscription_notification() -> TypeDefinition {
+    TypeDefBuilder::new(crate::TYPE_SUBSCRIPTION_NOTIFICATION)
         .field("subscription_id", t("primitive/string"))
         .field("event", t("primitive/string"))
         .field("uri", t("system/tree/path"))
@@ -2681,7 +2681,7 @@ pub fn all_core_types() -> Vec<TypeDefinition> {
         system_config_subscription(),
         // Inbox extension
         system_inbox_delivery(),
-        system_inbox_notification(),
+        system_subscription_notification(),
         // Continuation extension
         system_continuation(),
         system_continuation_transform(),

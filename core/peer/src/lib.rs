@@ -5792,12 +5792,13 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let client = IdentityKeypair::Ed25519(Keypair::from_seed([0x32; 32]));
-        // The client's identity hash UNDER THE ACTIVE FORMAT — what it
-        // authors as its grantee on this connection (§4.5a).
-        let client_active_identity = client
-            .peer_entity_with_format(expected_active)
-            .unwrap()
-            .content_hash;
+        // The client's identity hash AT THE FLOOR — §4.5a item 1a pins
+        // `system/peer` there whatever the active format, so this is the
+        // grantee on every cell of the matrix, not just the SHA-256 ones.
+        // This read `peer_entity_with_format(expected_active)`, which agreed
+        // with the implementation on the floor cells and was untested
+        // elsewhere.
+        let client_active_identity = client.peer_entity().unwrap().content_hash;
 
         let conn = transport::TcpConnector
             .connect(&format!("tcp://127.0.0.1:{}", tcp_port))
@@ -5875,11 +5876,16 @@ mod tests {
             .build()
             .unwrap();
 
-        // (1) The peer's own persistent identity hash is SHA-384.
+        // (1) The peer's own persistent identity hash is at the FLOOR, not the
+        // home format — §4.5a item 1a, the single named exception to "a peer's
+        // persistent state is uniformly its home format" (§1.2). This asserted
+        // S384 until v7.77 ruled the exception; a SHA-384-home peer stores its
+        // own `system/peer` entity at its floor hash, and nothing else changes
+        // — which is what the rest of this test goes on to check.
         assert_eq!(
             peer.keypair().peer_identity_hash().algorithm,
-            S384,
-            "home identity entity authored under SHA-384"
+            S256,
+            "§4.5a item 1a: system/peer is pinned to the floor whatever the home format"
         );
 
         // (2) Content authored via the home default is SHA-384. The tree/trie

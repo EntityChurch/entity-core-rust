@@ -698,14 +698,15 @@ pub(crate) fn build_authenticate_response_envelope(
 
     tracing::info!("authenticated remote peer: {}", remote_peer_id);
 
-    // §4.5a: author the local identity under the connection's negotiated
-    // active `content_hash_format` (not the peer's home-format startup
-    // identity), so the granter/signer references we mint are in the one
-    // format in play on this connection.
+    // §4.5a item 1a: the local identity is authored at the ECFv1-SHA-256 floor
+    // whatever the active format — the one exception to item 1's
+    // author-under-the-active-format rule. The granter reference we mint is
+    // therefore the same bytes the remote derives from our peer-id, on this
+    // connection and every other.
     let active_format = conn.active_hash_format;
     let local_identity = shared
         .keypair
-        .peer_entity_with_format(active_format)
+        .peer_entity()
         .map_err(|e| PeerError::ConnectionError(format!("build identity: {}", e)))?;
 
     // V7 §1.8 (v7.69): the cap `grantee` is the remote's **authored**
@@ -3900,7 +3901,7 @@ mod reentry_grant_tests {
     }
 
     fn identity_hash(kp: &IdentityKeypair) -> entity_hash::Hash {
-        kp.peer_entity_with_format(FMT).unwrap().content_hash
+        kp.peer_entity().unwrap().content_hash
     }
 
     /// These four are acceptance-side (signature) tests, so the grant *set* is

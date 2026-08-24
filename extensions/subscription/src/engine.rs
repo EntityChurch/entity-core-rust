@@ -939,7 +939,7 @@ fn build_notification(
         ));
     }
     let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(fields));
-    Entity::new("system/protocol/inbox/notification", data).ok()
+    Entity::new(entity_types::TYPE_SUBSCRIPTION_NOTIFICATION, data).ok()
 }
 
 fn now_nanos() -> u64 {
@@ -1310,7 +1310,10 @@ mod tests {
     fn test_build_notification() {
         let hash = Hash::compute("test", b"data");
         let entity = build_notification("sub-1", "created", "app/data", &hash, None).unwrap();
-        assert_eq!(entity.entity_type, "system/protocol/inbox/notification");
+        assert_eq!(
+            entity.entity_type,
+            entity_types::TYPE_SUBSCRIPTION_NOTIFICATION
+        );
     }
 
     #[test]

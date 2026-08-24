@@ -1953,6 +1953,99 @@ mod tests {
         }
     }
 
+    /// **core-go's cohort question, answered by measurement rather than by
+    /// reading our own dispatch code** — "can a delegated child capability
+    /// `register` in your tree?"
+    ///
+    /// Our previous answer was that we found no rule treating a child
+    /// (`parent != None`) differently, so it "points toward yes". Under §5.5a
+    /// that reasoning describes the **defect**, not the pass, and it was
+    /// looking at the wrong dimension entirely: nothing about delegation
+    /// decides this. The **granter frame** does.
+    ///
+    /// §5.5a: a peer-relative resource pattern (bare `*`, `system/foo`)
+    /// canonicalizes against the **granter's** peer-id, not the verifier's.
+    /// A cap granted by the client therefore authorizes only the *client's*
+    /// namespace, and reaches nothing on the responder — so `403` is the
+    /// spec-REQUIRED answer, not a defect. go withdrew the same theory after
+    /// reading the same passage.
+    ///
+    /// The control is the half that makes this a measurement: the identical
+    /// cap with `/*/*` (explicit cross-peer form, which §5.5a MANDATES for
+    /// cross-peer dispatch) **is** admitted. Without it, "denied" would be
+    /// satisfied by a peer that denies everything.
+    #[test]
+    fn foreign_granted_peer_relative_resources_reach_nothing_locally() {
+        // The cap is minted by REMOTE and presented against LOCAL_PEER.
+        const REMOTE_GRANTER: &str = "2KRemoteGranterBase58xxxxxxxxxxxxxxxxxxxxxxxx";
+        let target = ResourceTarget {
+            targets: vec![format!("/{}/system/registry", LOCAL_PEER)],
+            exclude: vec![],
+        };
+
+        // Every peer-relative spelling go probed, including the wildcard and
+        // a literal path. All are granter-local, so none of them reach here.
+        for resource in ["*", "system/registry", "system/registry/*"] {
+            let token = make_token(vec![make_grant(&["*"], &[resource], &["*"])]);
+            assert!(
+                check_permission_with_grant(
+                    "register-request",
+                    "system/registry",
+                    LOCAL_PEER,
+                    Some(&target),
+                    &token,
+                    LOCAL_PEER,
+                    REMOTE_GRANTER,
+                )
+                .is_none(),
+                "peer-relative resource {:?} on a FOREIGN-granted cap authorized \
+                 the verifier's namespace — §5.5a says it canonicalizes to the \
+                 granter's",
+                resource,
+            );
+        }
+
+        // Control: explicit cross-peer form is admitted. This is the arm that
+        // proves the denials above are about the frame and not about the cap
+        // being refused wholesale.
+        let open = make_token(vec![make_grant(&["*"], &["/*/*"], &["*"])]);
+        assert!(
+            check_permission_with_grant(
+                "register-request",
+                "system/registry",
+                LOCAL_PEER,
+                Some(&target),
+                &open,
+                LOCAL_PEER,
+                REMOTE_GRANTER,
+            )
+            .is_some(),
+            "explicit cross-peer /*/* form must still authorize — §5.5a mandates \
+             exactly this form for cross-peer dispatch",
+        );
+
+        // And the same peer-relative cap DOES reach its own granter's
+        // namespace — the frame is applied, not merely ignored.
+        let self_target = ResourceTarget {
+            targets: vec![format!("/{}/system/registry", REMOTE_GRANTER)],
+            exclude: vec![],
+        };
+        let token = make_token(vec![make_grant(&["*"], &["system/registry"], &["*"])]);
+        assert!(
+            check_permission_with_grant(
+                "register-request",
+                "system/registry",
+                LOCAL_PEER,
+                Some(&self_target),
+                &token,
+                LOCAL_PEER,
+                REMOTE_GRANTER,
+            )
+            .is_some(),
+            "a granter-local resource must cover the GRANTER's own namespace",
+        );
+    }
+
     #[test]
     fn test_check_permission_simple() {
         let token = make_token(vec![make_grant(&["system/tree"], &["*"], &["get"])]);

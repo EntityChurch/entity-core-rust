@@ -243,6 +243,12 @@ impl DiscoveryHandler {
         };
         match backend.announce_stop(&profile_ref).await {
             Ok(()) => status_result(vec![(entity_ecf::text("stopped"), Value::Bool(true))]),
+            // §3.3 binds BOTH ops, and `:announce` a few lines above already
+            // maps this sentinel. Missing it here is how a stop stays green by
+            // being idempotent while never classifying — the two-case shape.
+            Err(DiscoveryError::UnknownProfileRef(detail)) => {
+                error(STATUS_BAD_REQUEST, "unknown_profile_ref", &detail)
+            }
             Err(e) => error(
                 entity_handler::STATUS_UNAVAILABLE,
                 "backend_error",

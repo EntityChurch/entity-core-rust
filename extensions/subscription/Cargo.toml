@@ -12,6 +12,7 @@ entity-store.workspace = true
 entity-handler.workspace = true
 entity-capability.workspace = true
 entity-protocol.workspace = true
+entity-types.workspace = true
 async-trait.workspace = true
 ciborium.workspace = true
 thiserror.workspace = true
@@ -27,5 +28,4 @@ wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time"] }
-entity-types.workspace = true
 entity-crypto.workspace = true

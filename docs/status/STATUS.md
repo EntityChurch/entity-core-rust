@@ -1,6 +1,6 @@
 # entity-core-rust — status
 
-_Updated: 2026-08-07 · public: v0.8.0 (master)_
+_Updated: 2026-08-10 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -34,6 +34,278 @@ and tree semantics are interop-validated against the Go and Python peers, not
 just self-tested.
 
 ## Where we left off
+
+_2026-08-11 (b) — **core-go's peer packet is through, and it led with a live security
+hole in our tree.**_
+(`ROUTING-2026-08-11-b-the-packet-is-through-and-the-security-hole-is-closed.md`.)
+
+Six commits, plus the nine that had been sitting unpushed. Measured against Go oracle
+`76d4775`, **all three passes at zero failures and zero skips**, every pass exit 0:
+
+| Pass | Result |
+|---|---|
+| 1 — all surfaces, closure scope | `1569 · 1558 P / 11 W / 0 F / 0 S` |
+| 2 — `serving_mode`, namespace scope | `55 · 55 P / 0 F / 0 S` |
+| 3 — `registry_issuer`, registry posture | `18 · 18 P / 0 F / 0 S` |
+
+- **`revoke`/`renew` verified nobody** (`0caf911`) — REGISTRY §6a.9 `[RULED
+  2026-08-11]`. Any peer that could reach the registry could permanently revoke any
+  binding in it; revocation is monotonic, so there was no undo. All three impls
+  shipped it, because §6a.9 named a proof vector for `register` and none for the other
+  two — *the vector list, not the prose, is what got implemented against*. go predicted
+  our `registry_issuer` would drop 16/16 → 16/18; it went to **18/18**, because the fix
+  landed before the measurement. Our own two acceptance tests sent **unsigned** requests
+  and passed, which is GUIDE-CONFORMANCE §2.4a's point reproduced exactly.
+- **`system/peer` pinned to the floor** (`c2c1c60`) — §4.5a item 1a. We had it wrong in
+  both directions (active format on the wire, home format at rest) and every test we
+  had passed, because the two agree while both are the floor. Deleting the format
+  *parameter* rather than defaulting it surfaced four sites. **rust independently
+  derived all six values in go's v767 M3/M6 re-stamp proposal and matched its bytes
+  exactly** — corroboration, not ratification; the corpus still carries the stale pins.
+- **§3.3's second case** (`ba8b0bd`) — our `2ac8ed2` fixed `:announce` and left
+  `:announce-stop` answering an idempotent 200 for every `profile_ref`, never asking
+  the resolution question. go's packet said "verify against the two-case shape rather
+  than assuming your existing fix covers both", and it was right.
+- **The `notification` cut** (`d90610e`) — the open question ("may one round contain
+  two strings?") is answered by the ratified banner: *one round, two strings*.
+- **Containment read, not probed** (`c459905`) — rust is **not** exposed to go's §8.3
+  boundary bug, by two invariants that are not boundary checks (trailing-slash prefix
+  normalization; `Path::strip_prefix` being component-aware). Both now pinned.
+
+**The delegated-cap question is answered, and our previous reasoning was wrong.**
+A delegated child cap does **not** register in rust, and `403` is the spec-required
+answer — §5.5a makes peer-relative cap resources **granter-local**, so a
+client-granted cap reaches nothing in the responder's namespace. Nothing about
+delegation decides it; the granter frame does, and our earlier "points toward yes"
+was looking at the wrong dimension entirely. go withdrew the same theory after
+reading the same passage. Proven with a control (`/*/*` **is** admitted) rather than
+argued: `foreign_granted_peer_relative_resources_reach_nothing_locally`.
+
+**py's `system/*` reservation hole is not ours** — go's new
+`core_register_reserved_refused` and `core_register_reserved_publishes_nothing` both
+PASS against a rust peer in the gate above, the negative half included.
+
+**F-1 (go's flaky liveness check) narrowed for them:** 8/8 green against a rust peer
+with go's exact envelope, spread **5.039–5.045 s** — a 6 ms band where go's peer is
+bimodal 1-in-4. Rules out the validator and jitter; the ordering means go's suspected
+suspect-then-demote interaction was exercised and stayed green against a second impl.
+Report: `docs/validation/reports/2026-08-11-rust-delegated-cap-answer-and-f1-liveness-data.md`.
+
+<details>
+<summary>2026-08-10 — the cohort's four items are through, and the gate is clean for the
+first time</summary>
+
+_2026-08-10 — **the cohort's four items are through, and the gate is clean for the first
+time.**_
+(`ROUTING-2026-08-10-the-four-items-are-through-and-the-gate-is-clean-to-cohort.md`.)
+
+Eight commits. Measured against Go oracle `31cd2b3`, **all three passes at zero failures
+and zero skips** — the stated bar (ADR-0012: a skip counts as a failure), met on every
+pass together for the first time:
+
+| Pass | Result |
+|---|---|
+| 1 — all surfaces, closure scope | `1566 · 1555 P / 11 W / 0 F / 0 S` |
+| 2 — `serving_mode`, namespace scope | `55 · 55 P / 0 F / 0 S` |
+| 3 — `registry_issuer`, registry posture | `16 · 16 P / 0 F / 0 S` |
+
+**Self-check labelling, now published (the item we owed the cohort).** 29 of pass 1's
+1566 rows are `[self]` — they never contact the peer under test, so they are not
+peer-attributable and a PASS in them says nothing about this implementation.
+**1566 total → 29 self → 1537 peer-attributable.** The label is Go's (`17fc8ed`); what we
+owed was reading it and publishing the split instead of a headline that reads as fully
+peer-attributable. Every number above is quoted with the breakdown from here on.
+
+- **The inbox cut landed** (`801feb1`) — `system/inbox/delivery`, EXTENSION-INBOX §2.1
+  `[RATIFIED]`. One round, no dual-kind window; go cut at `927070c`, py has not. We did
+  **not** cut `notification`: EXTENSION-SUBSCRIPTION §2.2 still carries an unratified
+  banner, so go's question about whether "one round" contains two strings stands.
+- **Four §8.4.5 width pins cleared** (`8f75835`) — go named two, the prescribed grep found
+  four. The load-bearing one was the serving route, which answered `400` on a SHA-384
+  `CONTENT_GET` where python answered `200` (30 of 31 SHA-384 failures sat behind that one
+  sentence). REVISION's fixed-66 stays and now says why — §8.4.6 rules `prefix_hash`
+  derive-to-meet, pinned to the floor, so its width follows from the pinned *format*.
+- **REGISTRY §6a.9.2 built** (`99f1f31`), which made `registry_issuer` reachable against a
+  rust peer **for the first time** — the category needs an armed registry and we have no
+  CLI arming flag, so `set-issuer-policy` is what opened it. It found two defects shipping
+  unmeasured since the handler landed (`2ed8c22`): layer-1 answered 403 where go and py
+  both answer 401, and `manual` queued at 200 where both answer 202. Converged and routed;
+  the spec names neither code.
+- **Two containment holes in local-files** (`64f2516`). go's V4a reported 404-instead-of-403;
+  reproducing it locally gave **200** and a listing of the outside directory. A trailing
+  slash makes `lstat` resolve the final symlink, so `list` — which normalizes its path to
+  end in `/` — inspected the target instead of the link. Fixing that exposed a second:
+  the escaping component is the one a *leaf*-only check never looks at, so
+  `escape-dir/secret.txt` walked straight out. Nothing reported the second; it would have
+  survived a green cross-impl run.
+- **A put re-derived every reference it did not author** (`9bd8633`). Same rule as the
+  width work one layer up: there the code assumed a hash's *length*, here its *format*.
+- **`make wasm` now holds the three worker crates** (`0580fb2`). Go's carried "S1 wasm
+  probe" item does not match S1 as we recorded it (landed 2026-08-02); this is the nearest
+  real gap and the naming is routed back.
+
+**Closed by go, not by us:** `type_system_peer_published_root_match`, our single F for two
+sessions, now PASSes — go added the `prefix` override at `core/types/core.go:194`. We had
+declined to conform to the oracle against the spec's own text; the spec won.
+
+`make test` 2021 passed / 0 failed · clippy · fmt · wasm green.
+
+</details>
+
+_2026-08-08 (fourth session) — **`published-root` carries its prefix; the last failure is
+the oracle's.**_
+(`ROUTING-2026-08-08-b-prefix-landed-and-your-typedef-is-the-last-failure-to-go.md`.)
+
+One commit (`5e3894c`). `1542 total · 1532 P / 9 W / 1 F / 0 S`, pass 2 `54/54`, against
+the Go `59bdfc5` surface. Arch `391c92b` landed EXTENSION-TREE §3.3a, which makes
+`published-root.prefix` **REQUIRED**; Go built it plus two vectors and each sibling failed
+exactly three checks on the one missing field. Two of ours now pass
+(`v9_prefix_key_form`, `v10_prefix_reconstruction`).
+
+- **We declare `/{peer_id}/`, not `"/"`.** Our keys are peer-stripped, and §3.3 now rules
+  the universal prefix a **no-op trim** whose keys stay fully qualified (python's shape).
+  Declaring `"/"` while keying peer-relative is exactly the divergence Go reproduced on
+  demand — v8 PASSes through it, v9/v10 do not. The declaration is derived from
+  `RootTrackerEngine::qualified_bare_prefix`, the same function that computes the trim
+  actually applied, so it cannot drift from the keys it describes.
+- **The remaining failure is Go's type registry, and we are not matching it.**
+  `type_system_peer_published_root_match` reports `local: primitive/string, remote:
+  system/tree/path` — `local` is Go's own registry. The spec says `system/tree/path`; Go
+  reflects `Prefix string` and never added the override, though `core/types/core.go`
+  carries 21 of them. **Python reached this independently** (`e60c822`) before us.
+  Conforming to the oracle instead of the spec is how a cohort converges on something no
+  document says; routed with the evidence.
+- **Recorded, not fixed:** our config spelling `"/"` means the peer-qualified shape, not
+  §3.3's universal one. The wire is correct; the config name is not. Changing it would move
+  the tracked-root storage path and re-key every published trie, which is the "nobody
+  re-keys a trie" the cohort ruled out.
+
+`make test` 2005 passed / 0 failed · clippy · fmt · wasm green.
+
+_2026-08-08 (third session) — **alignment with the oracle confirmed to the check, and the
+peer-issued read seam is built.**_
+(`HANDOFF-2026-08-08-c-alignment-confirmed-and-the-peer-issued-seam-is-built.md`.)
+
+Four commits. `1540 total · 1525 P / 9 W / 0 F / 6 S`, pass 2 `54/54`, measured at both
+`703bb7b` and `5c58195` against Go oracle `5eab686` — **zero regression** across the
+session's changes. **This matches Go's published cohort table exactly**, verified from our
+own run rather than their summary. The +8 P / −7 S on the morning's number is their
+`8a25d90` peer-manager forward: the 7 `signaling` vectors we had hand-passed are now
+reachable from the suite.
+
+- **`5c58195` — the peer-issued live remote-read seam.** The 6 skips were framed as
+  Go-only tooling for two handoffs; half right, because the flag is Go's but the gap
+  underneath was ours. `RegistryTreeReader` (extension owns *which* paths — that is the
+  trust logic) + `HttpPollRegistryReader` over a new `poll_read` module (host owns the
+  transport), warming the store in the handler *before* the sync chain runs. Lazy by
+  conformance, not optimization: §2.2 says a cached binding resolves **without touching
+  the wire**, and a cold miss must probe even to report a negative. Revocation is a direct
+  probe of the §6a.6 by-target index. `--peer-issued-registry <peer_id>@<url>` reads the
+  endpoint from `hints.endpoint` and nowhere else. **The vectors stay SKIP until Go flips
+  its `go|python` gate** — routed, and the seam is so far proven only against our own
+  recording origin, which is same-tree evidence.
+- **`144da10` — `CapTokenScope` was the third divergent copy of one convention.** §6.5.6's
+  bare-`/{peer_id}` listing arm lives in three implementations of it and had drifted in all
+  three directions; its includes canonicalize against `local_pid`, so it reached only the
+  local peer-id. One test now asserts all three predicates at once.
+- **`ac299d9` — the floor/ceiling collision is now visible**, and the node role has a CI
+  guard. `system/capability/policy/{key}` is a floor on the connection path and a **ceiling**
+  on the §6.2 request path; both readings are correct, nothing said so. Diagnosed, not
+  fixed — the two readings still share a key.
+- **`58488ec` — Go's v8 folded.** Their `published_root.v8_trie_key_convention` PASSes for
+  us: the trie **algorithm** agrees byte-for-byte across all three impls, never measured
+  before. The **keys** still do not, three ways — and v8 by construction *cannot* fail on
+  key form, so a green v8 is not evidence our keys are cohort-correct. Written into the
+  entry, because that is the exact reasoning that produced the wrong 2026-07-31 closure.
+
+**The trap this session paid for, twice:** a test can be disarmed by its own setup and look
+identical to a passing one. The first signaling guard admitted its caller with a
+per-grantee policy entry, which the §6.2 lookup finds *before* the `default` fallback — so
+the ceiling it existed to catch was never consulted. Found only by breaking the code and
+watching the test stay green.
+
+`make test` 2004 passed / 0 failed · clippy · fmt · wasm · `make features` green.
+
+_2026-08-08 (second session) — **the republish landed, and it uncovered three defects a
+green suite was hiding.**_
+(`HANDOFF-2026-08-08-the-republish-landed-and-it-uncovered-two-defects.md`.)
+
+Four commits. `1539 total · 1517 P / 9 W / 0 F / 13 S`, pass 2 `54/54`, rust `703bb7b`
+against Go oracle `05d1fca` — **+27 P / −27 S** on the morning's number, F held at 0.
+
+- **`8879e06` — `--publish-root` republishes on every trie-root change.** The morning
+  handoff's item 00, built to its design: a tracking-config for the served prefix, and a
+  hook that re-signs the hash `RootTrackerEngine` already maintains incrementally.
+  128 µs/put at N=1100, 130 at N=2200 (baseline 50) — flat, guarded by a new canary.
+  Two things the design didn't anticipate: **EXTENSION-TREE §3.4.1's universal prefix
+  `"/"` was never implemented** (it qualified to `/{peer}//` and tracked nothing
+  silently), and **the re-entry guard is not the recursion fix** — without the
+  publisher's write tag you get a signed root permanently one step behind the tree, not
+  a runaway, and a seq-count assertion passes right through it.
+- **`aaf13bc` — ClosureScope's tree-face had no ancestor arm.** Listing routes address
+  prefixes, which carry no binding, so `{prefix}.list` / `{peer_id}.list` / `peers.list`
+  all 404'd under `--serve-closure-root`. Never exercised by anything: the eleven checks
+  gate on `seed_republished`, and the unit test next door only fetches bound leaves. The
+  first run after the republish read **11 F where there had been 27 S** — the skips were
+  correct as harness behavior *and* were concealing this. Both arms of the fix already
+  existed in `NamespaceScope` and in Go.
+- **`0de80f7` + `703bb7b` — `peer start --signaling-node`.** The morning handoff scoped
+  the node role as its own arc; it was six lines, because `entity-signaling-node` had
+  already paid for the isolation boundary and the same handler drops onto any peer
+  through the public seam. `signaling` measures **7/7**. `703bb7b` reverses my own
+  regression from `0de80f7`: seeding `system/capability/policy/default` took
+  `capability` 13/13 → 7 P / 6 F, because that entry is a **floor** for connection
+  grants and a **ceiling** for §6.2 `request` — two opposite readings of one key.
+
+**The 7 signaling passes are not yet reachable from the suite** — peer-manager forwards
+`-signaling-node` only on its `--type go` branch, so they still report SKIP. Hand-passed,
+pass 1 reads `1523 P / 0 F / 7 S`; that is a host-native run, cited as "what the suite
+reads once Go forwards the flag," not as the suite number.
+
+**Routed out:** two Go-side asks (forward the flag; `--publish-descriptors`' help says
+"Rust pending" and we honor it), and to arch — **the published trie's key convention is
+unproven cross-impl, and the 2026-07-31 closure that said otherwise was wrong.** `v5`
+verifies a signature, `v7` asserts an entity type; no vector in any Go category resolves
+a key from a published root. rust tracks `"/"`, Go tracks `"system/"`.
+
+**Still open:** the 6 `peer_issued` skips are bigger than the morning's "Go-only tooling"
+framing — our backend resolves against the local store only, and the live remote-read
+seam is unbuilt.
+
+Green at `make test` / `make clippy` / `make fmt` / `make wasm`.
+
+_2026-08-08 — **the §6.5 ledger is hash-keyed, and the parity gap is two unbuilt surfaces.**_
+(`HANDOFF-2026-08-08-the-ledger-is-hash-keyed-and-parity-needs-two-surfaces.md`.)
+
+Reviewed `entity-core-go` through `05d1fca` and folded arch `c78b3dc`. Two commits.
+
+- **`fc4fcc2` — the §6.5 minted-and-delivered ledger now resolves by CAP HASH.** arch pinned
+  that as a MUST; we keyed on recipient peer-id alone, which the ruling permits only as an
+  *additional* index. The wielder's peer-id equals the delivery recipient's only while the cap
+  is wielded by the peer it went to — so under **delegation** a recipient-keyed-only ledger
+  resolves nothing and fails **closed**: `403` on valid authority, the same wrong answer as the
+  store-only revocation walk by a different route. Single-impl-invisible, which is why neither
+  impl filed it; arch pinned it to Go's shape before py builds a third. The rewritten case 3 is
+  the tell — it had been asserting the very semantics the ruling overturns.
+- **`bd897c9` — both open ambiguities closed.** DURABILITY §5 `handle` taken as filed
+  (`system/path` → `system/tree/path`; we were already there). NETWORK §12.3 ruled **(b)**, the
+  reading we did *not* take: a type is owed by the surface that uses it. Our interim (a) was
+  safe for the reason we gave — we implement both §6.7 ops, so we owe and publish all three
+  types — but we were right about our conformance and wrong about the general rule. The
+  `check-reachability 400` pushback is moot from both ends and should not be re-litigated.
+
+**Re-measured, and it is the first crossing of the 08-07 work.** `1539 total · 1490 P / 9 W /
+0 F / 40 S`, pass 2 `54/54`, rust `bd897c9` against Go oracle `05d1fca`. Go's published
+baseline carries the same numbers but was pinned to `e17c2ad`+tree — which predates all five
+08-07 commits. So the sender flip, `check-reachability`, the constraints, the durability
+retype and the ledger change are now crossed against a live Go peer with **zero regressions**
+(`origination` 5/5, `rexec_delivered` PASS). The dedicated V3 reciprocal-grant crossing from
+Go's seat is still un-run and is not claimed.
+
+**The remaining distance is skips, not failures:** 27 published-root republish + 7 SIGNALING
+§4/§5 node role are ours; the 6 `peer_issued` are Go-only tooling and must not be chased.
+
+Green at `make test` / `make clippy` / `make fmt` / `make wasm`.
 
 _2026-08-07 — **the flag day is closed, and §6.7 is built on both halves.**_
 (`ROUTING-2026-08-07-the-flag-day-is-closed-and-6.7-is-built-both-halves-to-cohort.md`.)
@@ -830,6 +1102,44 @@ up only if a future profile shows `verify_request` back on the hot path.
 > basis. A cold-start reference that is wrong about what is *done* is worse than
 > one that is merely incomplete. The punch/WebRTC arc (2026-08-01 → 04) now leads
 > the list, because that is where the work actually is.
+
+00. **Conformance parity — what is left after 2026-08-08 (third session).** _(rewritten
+    2026-08-08, third session.)_ Every item this entry carried is now **closed or routed**.
+    rust reads `1540 total · 1525 P / 9 W / 0 F / 6 S` at `5c58195` against Go `5eab686`,
+    pass 2 `54/54` — **matching Go's published cohort table exactly**, verified from our own
+    run. Details in
+    `HANDOFF-2026-08-08-c-alignment-confirmed-and-the-peer-issued-seam-is-built.md`.
+
+    **a. The two Go-side asks landed** (their `8a25d90`). `-signaling-node` is forwarded for
+    `--type rust` and the 7 `signaling` vectors converted SKIP → PASS exactly as predicted;
+    `--publish-descriptors`' stale help is fixed. Nothing owed either way.
+
+    **b. The peer-issued seam is BUILT** (`5c58195`) — `RegistryTreeReader` +
+    `HttpPollRegistryReader` over the new `poll_read` module, warming the store in the
+    handler before the sync chain, plus `--peer-issued-registry <peer_id>@<url>`. **The 6
+    vectors still read SKIP**, and will until Go flips its `go|python` gate; that is a
+    sibling-repo change, routed in
+    `ROUTING-2026-08-08-the-peer-issued-read-seam-is-built-to-go.md` along with the exact
+    fetch pattern we emit. Quote `1525 P / 6 S` until they do.
+
+    **Not claimed:** the seam is proven against our own recording origin, not against Go's
+    fixture bundle — same-tree evidence, which AGENTS-STANDARD warns reads stronger than it
+    is. The first real measurement is theirs. One caveat is in the routing doc: if their
+    fixture serves revocations only under the own-hash-keyed path, REVOKED-1 will read as
+    "not revoked" against us and the finding would be the fixture's, since we probe the
+    §6a.6 by-target index directly.
+
+    **c. Both internal fixes landed.** `CapTokenScope` got its universal-tree top-level arm
+    (`144da10`), with one test now pinning all three scope predicates to the convention. The
+    seed-policy floor/ceiling collision is **diagnosed and visible, not fixed** (`ac299d9`):
+    the lookup reports which form matched, the request path warns when a matched entry
+    attenuates to nothing, and `with_seed_policy`'s doc states both meanings. The two
+    readings still share a key — the real fix is separate floor and ceiling entries, and it
+    is worth doing before someone else seeds a narrow `default`.
+
+    **d. What is genuinely left here:** wait on Go's gate flip and measure honestly; decide
+    whether `poll_read::list_children` (built, currently unused — the peer-issued fetch plan
+    resolves everything by direct lookup) gets a consumer or gets deleted.
 
 0. **The browser leg — S5.** S3 is built here (`worker_webrtc`, the §6.3
    container, §6.5 `Require`); S4 is `entity-browser-rust`'s and built; **S5 has

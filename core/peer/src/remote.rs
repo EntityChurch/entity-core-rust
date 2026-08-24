@@ -2052,8 +2052,11 @@ pub(crate) fn build_reentry_grant_envelope(
         .duration_since(web_time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
+    // §4.5a item 1a — floor, not `active_format`. `active_format` still governs
+    // the cap-token entity built just below (item 1); only the identity is
+    // excepted.
     let local_identity = keypair
-        .peer_entity_with_format(active_format)
+        .peer_entity()
         .map_err(|e| PeerError::ConnectionError(format!("build identity: {}", e)))?;
     let cap_token = entity_capability::CapabilityToken {
         grants,

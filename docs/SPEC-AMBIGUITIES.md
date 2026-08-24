@@ -4967,3 +4967,52 @@ which is what both impls mean and what the erratum's own reasoning supports. If
 the entity-resolution reading is intended, it needs a companion rule saying a
 peer MUST publish its own transport profiles, and that is a larger change than
 an erratum.
+
+---
+
+## v767 M3/M6 corpus pins contradict §4.5a item 1a (CORROBORATED, awaiting arch)
+
+**Status:** not ours to resolve — core-go raised it first and proposed values.
+**Spec:** `ENTITY-CORE-PROTOCOL` §4.5a item 1a (v7.77, core-protocol `fc54930`)
+vs `specs/test-vectors/v767/SEEDS.md` §2.4 + `conformance-vectors-v1.cbor`
+(core-protocol `56d4de4`).
+
+**The conflict:** item 1a pins `system/peer` to the ECFv1-SHA-256 floor
+**whatever the peer's home format**. SEEDS.md §2.4's "home-format reference
+discipline" predates it, and M3/M6 are the SHA-384-home rows — so their
+`expected_peer_a_content_hash_sha384` pins (`01…`, 49 B) can no longer be
+produced by any conformant implementation. The corpus was landed verbatim, so
+it still self-verifies; it just no longer agrees with the ruling.
+
+**What rust adds:** core-go's re-stamp proposal
+(`entity-core-go/docs/validation/spec-issues/2026-08-11-d-v767-m3-m6-restamp-proposal.md`)
+lists six derived values. **Rust derived all six independently and matched go's
+bytes exactly** — both peer content hashes, both root-cap content hashes, and
+both signatures (Ed25519 64 B, Ed448 114 B). Two ground-up implementations
+agreeing is corroboration of the proposal, **not** ratification.
+
+**Interim choice:** implement item 1a (it is landed, normative text) and carry
+go's proposed values in `cohort_compare_v767_phase2.rs`, with the header stating
+plainly that they are proposed and that this test is what will say so if arch
+lands different ones. We did **not** hand-edit a red run green: the ruling moved
+the values, and the test names the ruling.
+
+**Note carried from go's proposal, which we agree with:** the field name
+`expected_peer_a_content_hash_sha384` is now a misnomer — under 1a that value
+can never again be SHA-384.
+
+---
+
+## §6a.9's status table pins two rows it calls derived rather than measured
+
+**Status:** measured by rust, reporting back rather than assuming.
+**Spec:** `EXTENSION-REGISTRY` §6a.9, "Statuses `[MUST]` `[RATIFIED 2026-08-11]`".
+
+The table pins four rows and says the `409 name_taken` / `403 not_entitled` rows
+are **derived** from V7 §3.3's class rules rather than measured, asking impls to
+"report a divergence rather than assuming it is yours".
+
+**No divergence to report.** rust answers `409 name_taken` and `403 not_entitled`
+and both pass against the go oracle (`policy_allowlist_rejects_unlisted`,
+`register_open_name_taken`). Recorded so the rows stop being derived-only: two
+impls now agree on the wire, which is a stronger basis than the derivation alone.

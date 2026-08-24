@@ -477,33 +477,29 @@ pub fn peer_entity_from_components(public_key: &[u8; 32]) -> Result<Entity, Cryp
 }
 
 /// Construct a `system/peer` entity from raw components for any
-/// allocated `key_type` per V7 §1.5 v7.66 reserved-range table.
+/// allocated `key_type` per V7 §1.5 v7.66 reserved-range table —
+/// **always at the ECFv1-SHA-256 floor**
+/// (V7 §4.5a item 1a, v7.77).
 ///
-/// `public_key` length MUST match `key_type.public_key_len()`. The
-/// `key_type` field is encoded as `key_type.label()` (entity-data string
-/// surface — distinct from the binary peer_id wire prefix per v7.66 §2
-/// errata). Hashable basis: `{key_type, public_key}` only.
+/// There is deliberately **no format parameter**. `system/peer` is the one
+/// entity on the wire/identity surface with no author-chosen content: its data
+/// is wholly recoverable from the public peer-id, so every consumer *derives*
+/// its hash rather than fetching it (`SPECIFICATION-FORMAT.md` §8.4.6
+/// `[derive-to-meet]`). Pinning it to the floor makes the identity hash the
+/// same bytes on every connection in the network rather than merely within
+/// one, so `signature.signer`, cap `granter`/`grantee`, and the `{peer_id_hex}`
+/// path segment are **one value** instead of two that coincide only while the
+/// active format happens to be the floor.
+///
+/// It is the single exception to §1.2's "a peer's persistent state is uniformly
+/// its home format": a non-floor-home peer stores its own `system/peer` entity
+/// at its floor hash, and nothing else changes. §4.5a item 4 names *two
+/// derivation functions* as the defect this prevents — an impl that derives an
+/// identity hash for a path segment and authors one for an equality check is
+/// using **one** function, and that is the conformant shape.
 pub fn peer_entity_from_components_with_key_type(
     public_key: &[u8],
     key_type: KeyType,
-) -> Result<Entity, CryptoError> {
-    peer_entity_from_components_with_format(
-        public_key,
-        key_type,
-        entity_hash::default_hash_format(),
-    )
-}
-
-/// Construct a `system/peer` entity under an explicit `content_hash_format`
-/// (V7 §4.5a — author the local identity under the connection's negotiated
-/// active format). The hashable basis (`{key_type, public_key}`) is
-/// identical across formats; only the `content_hash` digest algorithm
-/// differs. Home-format callers use
-/// [`peer_entity_from_components_with_key_type`] (process home default).
-pub fn peer_entity_from_components_with_format(
-    public_key: &[u8],
-    key_type: KeyType,
-    format_code: u8,
 ) -> Result<Entity, CryptoError> {
     if public_key.len() != key_type.public_key_len() {
         return Err(CryptoError::InvalidPublicKey);
@@ -519,7 +515,9 @@ pub fn peer_entity_from_components_with_format(
         ),
     ]);
     let data = entity_ecf::to_ecf(&data_value);
-    Entity::new_with_format(TYPE_PEER, data, format_code)
+    // The floor, unconditionally — NOT `default_hash_format()`. The home
+    // format must not reach this call: that is what item 1a excepts.
+    Entity::new_with_format(TYPE_PEER, data, entity_hash::HASH_ALGORITHM_SHA256)
         .map_err(|e| CryptoError::IdentityError(e.to_string()))
 }
 
@@ -1087,25 +1085,14 @@ impl IdentityKeypair {
         BASE64.encode(self.public_key_bytes())
     }
 
-    /// Construct the canonical `system/peer` entity for this identity under
-    /// the process home `content_hash_format`
-    /// ([`entity_hash::default_hash_format`] — V7 §1.2). Per-connection
-    /// re-derivation under a negotiated active format (§4.5a) uses
-    /// [`Keypair::peer_entity_with_format`].
+    /// Construct the canonical `system/peer` entity for this identity —
+    /// **at the ECFv1-SHA-256 floor, on every connection** (V7 §4.5a item 1a).
+    ///
+    /// There is no per-connection variant and no format parameter: the
+    /// `peer_entity_with_format(active_format)` this replaced is precisely the
+    /// second derivation function item 4 names as the defect.
     pub fn peer_entity(&self) -> Result<Entity, CryptoError> {
-        self.peer_entity_with_format(entity_hash::default_hash_format())
-    }
-
-    /// Construct this identity's `system/peer` entity under an explicit
-    /// `content_hash_format` (V7 §4.5a — re-derive the local identity per
-    /// connection under the negotiated active format, without mutating
-    /// peer-startup state).
-    pub fn peer_entity_with_format(&self, format_code: u8) -> Result<Entity, CryptoError> {
-        peer_entity_from_components_with_format(
-            &self.public_key_bytes(),
-            self.key_type(),
-            format_code,
-        )
+        peer_entity_from_components_with_key_type(&self.public_key_bytes(), self.key_type())
     }
 
     /// `content_hash(system/peer)` — the canonical cryptographic identity.

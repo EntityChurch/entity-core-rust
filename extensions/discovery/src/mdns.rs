@@ -223,13 +223,27 @@ impl DiscoveryBackend for MdnsBackend {
     }
 
     async fn announce_stop(&self, profile_ref: &str) -> Result<(), DiscoveryError> {
+        // §3.3 is a TWO-CASE rule, and the resolution question is asked FIRST
+        // (`[corrected 2026-08-11]`). A `profile_ref` this backend does not
+        // recognize is a caller error on **both** ops — the idempotency rule
+        // below covers *recognized but not running*, and only that. Answering
+        // an idempotent 200 here means the backend never asked whether it
+        // recognizes the ref at all, which is "not conformant merely by being
+        // idempotent" in the ruling's own words.
+        if !MDNS_V1_PROFILE_REFS.contains(&profile_ref) {
+            return Err(DiscoveryError::UnknownProfileRef(format!(
+                "{:?} (v1 mDNS backend serves: {})",
+                profile_ref,
+                MDNS_V1_PROFILE_REFS.join(", ")
+            )));
+        }
         let fullname = self
             .announced
             .lock()
             .expect("announce map poisoned")
             .remove(profile_ref);
         let Some(fullname) = fullname else {
-            // No active session for this profile_ref — idempotent stop.
+            // Recognized, not currently announced — the idempotent case: 200.
             return Ok(());
         };
         self.daemon()?

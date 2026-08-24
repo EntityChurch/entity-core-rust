@@ -266,12 +266,23 @@ fn run_handshake(responder_home: u8, initiator_home: u8) -> (u8, entity_hash::Ha
         auth_env.root.content_hash.algorithm, HASH_ALGORITHM_SHA256,
         "EXECUTE root stays SHA-256 (process default; per-entity self-describing)"
     );
+    // ...with ONE exception: `system/peer` is pinned to the ECFv1-SHA-256
+    // floor whatever the active format (§4.5a item 1a, v7.77). The signature
+    // still follows the active format — item 1 is unchanged for everything
+    // that is not the identity entity. This loop asserted `active` for both
+    // until the ruling, which is the two-values-that-coincide shape item 1a
+    // exists to collapse.
     for (_h, e) in auth_env.included.iter() {
-        if e.entity_type == TYPE_SIGNATURE || e.entity_type == entity_types::TYPE_PEER {
+        if e.entity_type == TYPE_SIGNATURE {
             assert_eq!(
                 e.content_hash.algorithm, active,
-                "identity-bound entity {} authored under active format",
-                e.entity_type
+                "signature authored under the active format (§4.5a item 1)"
+            );
+        }
+        if e.entity_type == entity_types::TYPE_PEER {
+            assert_eq!(
+                e.content_hash.algorithm, HASH_ALGORITHM_SHA256,
+                "system/peer pinned to the floor (§4.5a item 1a)"
             );
         }
     }
@@ -285,9 +296,16 @@ fn run_handshake(responder_home: u8, initiator_home: u8) -> (u8, entity_hash::Ha
     let grantee = conn
         .remote_identity_hash
         .expect("§1.8 authored signer captured");
+    // The grantee IS the authored `system/peer` hash, so it is at the floor on
+    // every cell of the matrix (§4.5a item 1a) — not merely on the cells where
+    // the active format happens to be the floor. That is item 1a's whole
+    // point: one value instead of two that coincide. Asserted against the
+    // constant, not against `active`, so a regression to per-connection
+    // derivation fails here rather than passing on two cells out of three.
+    let _ = active;
     assert_eq!(
-        grantee.algorithm, active,
-        "grantee (authored signer, §1.8) is under the connection active format"
+        grantee.algorithm, HASH_ALGORITHM_SHA256,
+        "grantee (authored signer, §1.8) is the floor-pinned identity hash"
     );
     (conn.active_hash_format, grantee)
 }
@@ -310,17 +328,21 @@ fn m3_cross_format_handshake_sha256_responder_sha384_initiator() {
     assert_eq!(active, HASH_ALGORITHM_SHA256);
 }
 
-/// Two SHA-384 peers complete the handshake authoring every identity-bound
-/// entity under SHA-384 (`0x01`) — the native-SHA-384 path the v7.67
-/// Phase-2 MATRIX-M3 deferral left unreachable, now live.
+/// Two SHA-384 peers negotiate SHA-384 active and author the wire surface
+/// (authenticate, signature, caps) under `0x01` — the native-SHA-384 path the
+/// v7.67 Phase-2 MATRIX-M3 deferral left unreachable, now live — while the
+/// **identity** entity stays at the floor (§4.5a item 1a).
+///
+/// This is the cell where the two rules visibly disagree, and it asserted a
+/// SHA-384 grantee until v7.77 ruled the exception.
 #[test]
 fn m3_cross_format_handshake_both_sha384_authors_sha384() {
     let (active, grantee) = run_handshake(HASH_ALGORITHM_SHA384, HASH_ALGORITHM_SHA384);
     assert_eq!(active, HASH_ALGORITHM_SHA384);
-    assert_eq!(grantee.algorithm, HASH_ALGORITHM_SHA384);
+    assert_eq!(grantee.algorithm, HASH_ALGORITHM_SHA256);
     assert_eq!(
         grantee.digest().len(),
-        48,
-        "SHA-384 grantee digest is 48 bytes"
+        32,
+        "the floor-pinned identity digest is 32 bytes even on a SHA-384 connection"
     );
 }

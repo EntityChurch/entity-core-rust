@@ -152,6 +152,20 @@ pub const TYPE_DURABILITY_RESULT: &str = "system/durability-result";
 pub const TYPE_SUBSCRIPTION: &str = "system/subscription";
 pub const TYPE_SUBSCRIPTION_REQUEST: &str = "system/subscription/request";
 pub const TYPE_SUBSCRIPTION_REDIRECT: &str = "system/subscription/redirect";
+// EXTENSION-SUBSCRIPTION §2.2 `[RATIFIED 2026-08-10]` — renamed from
+// `system/protocol/inbox/notification` AND re-homed INBOX → SUBSCRIPTION: a
+// subscription event belongs to the spec that defines subscriptions
+// (SPECIFICATION-FORMAT §8.4.2 owner-not-problem-domain). Its sibling
+// `system/inbox/delivery` (async op results) correctly stays INBOX-owned,
+// which is why the identifier moved namespaces here and did not there.
+//
+// Cut in the SAME ROUND as `delivery` — "one round, two strings" — with no
+// dual-kind acceptance window for either. A peer holding undelivered mail at
+// cut time MUST drain it first: a notification written under the old string is
+// not matched by an upgraded handler and stalls its continuation SILENTLY
+// (the §3.2 silent-drop class, no loud error). That is a deployment
+// obligation, not something this rename can carry.
+pub const TYPE_SUBSCRIPTION_NOTIFICATION: &str = "system/subscription/notification";
 pub const TYPE_SUBSCRIPTION_CONFIG: &str = "system/config/subscription";
 
 // Continuation

@@ -32,7 +32,7 @@
 //! against a single peer by writing that entity, and `get-issuer-policy` would
 //! report `not_found` on a registry demonstrably running a mode.
 //!
-//! Two proof layers gate `register-request` (§6a.9.1):
+//! Two proof layers gate registration (§6a.9.1):
 //! - **Layer 1 — peer-id control (always):** the request carries a
 //!   `system/signature` by `target_peer_id` over the request's `content_hash`
 //!   (V7 §5.2). This proves the requester holds the key they are binding the
@@ -41,9 +41,18 @@
 //!   [`IssuerPolicyData`] mode (`open` / `allowlist` / `manual`) decides whether
 //!   *this* requester may have *this* name. `domain-control` is DEFERRED (§6a.10).
 //!
+//! **Layer 1 binds all three write ops** (§6a.9 `[RULED 2026-08-11]`), via
+//! [`RegisterRequestHandler::require_layer1`] — for `revoke`/`renew` against the
+//! `target_peer_id` of the binding named by `binding_hash`, before any state
+//! change and before any publication. Layer 2 gates `register` alone: revoke and
+//! renew act on an *existing* binding the registry already chose to issue, so
+//! there is no fresh entitlement question to ask.
+//!
 //! Replay defense: a per-requester seen-`nonce` marker plus an `issued_at`
-//! freshness window (§6a.9). Ed25519-only, consistent with the resolve-side pin
-//! (spec-problems **P5**).
+//! freshness window (§6a.9), bound to `register` and `renew` by the §6a.9
+//! discriminator — replay of either has a non-idempotent state effect, while
+//! `revoke` is monotonic on a content-addressed target. Ed25519-only,
+//! consistent with the resolve-side pin (spec-problems **P5**).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -57,7 +66,7 @@ use entity_handler::{
 };
 use entity_hash::Hash;
 use entity_store::{ContentStore, LocationIndex};
-use entity_types::SignatureData;
+use entity_types::{SignatureData, TYPE_REGISTRY_BINDING};
 
 use crate::data::{
     decode_map, get_field, normalize_name, validate_name_safety, BindingData, IssuerPolicyData,
@@ -71,6 +80,12 @@ use crate::{
     binding_body_path, by_name_pointer_path, issuer_policy_path, register_nonce_path,
     revocation_by_target_path, revocation_prefix, signature_pointer_path,
 };
+
+/// Layer-1 rejection code (§6a.9 ratified status table). **Normative** — this
+/// is what a peer branches on; the accompanying message text is impl-local and
+/// no conformance check may assert on it. rust previously answered
+/// `invalid_signature`, which no longer matches the table.
+const REG_ERR_SIGNATURE_INVALID: &str = "signature_invalid";
 
 /// Reject a request whose `issued_at` is older than this (replay-window floor).
 const REGISTER_STALE_AFTER_MS: u64 = 600_000; // 10 min
@@ -210,41 +225,20 @@ impl RegisterRequestHandler {
 
         // Layer 1 — peer-id control: a system/signature by `target_peer_id` over
         // the request hash (REG-REGISTER-PROOF-1). Always required.
-        if !self.verify_layer1(&request_hash, &req.target_peer_id, &ctx.included) {
-            // 401, not 403. Layer-1 is an *authentication* result — the
-            // requester failed to prove they hold the key they are binding the
-            // name to. 403 is the layer-2 answer (`not_entitled`: proof
-            // accepted, policy says no), and collapsing the two loses the
-            // distinction the two layers exist to draw. The spec pins neither
-            // code; go and py both answer 401 here and each recorded
-            // converging on the other, leaving rust the sole outlier.
-            return error(
-                STATUS_AUTH_FAILED,
-                "invalid_signature",
-                "request not signed by target_peer_id (layer-1 ownership proof failed)",
-            );
+        // 401, not 403 — layer-1 is an *authentication* result, now pinned by
+        // the ratified status table along with the `signature_invalid` code.
+        if let Some(rejection) =
+            self.require_layer1(&request_hash, &req.target_peer_id, &ctx.included)
+        {
+            return rejection;
         }
 
         // Replay defense — freshness window + per-requester seen-nonce
         // (REG-REGISTER-REPLAY-1).
-        let now = now_ms();
-        if req.issued_at > now.saturating_add(REGISTER_FUTURE_SKEW_MS)
-            || now > req.issued_at.saturating_add(REGISTER_STALE_AFTER_MS)
-        {
-            return error(
-                STATUS_FORBIDDEN,
-                "stale_request",
-                "issued_at outside the accepted freshness window",
-            );
+        if let Some(rejection) = self.check_replay(&req.target_peer_id, &req.nonce, req.issued_at) {
+            return rejection;
         }
         let nonce_path = register_nonce_path(&self.peer_id, &req.target_peer_id, &req.nonce);
-        if self.location_index.get(&nonce_path).is_some() {
-            return error(
-                STATUS_CONFLICT,
-                "replay",
-                "nonce already seen for this requester",
-            );
-        }
 
         // Layer 2 — issuer-policy admission (§6a.9.1). Store-only, and an
         // unarmed registry does not run this surface at all (§6a.9.2).
@@ -365,6 +359,28 @@ impl RegisterRequestHandler {
             .and_then(|v| v.as_text())
             .map(|s| s.to_string());
 
+        // Layer 1 (§6a.9 `[RULED 2026-08-11]`) — signed by the *binding's*
+        // `target_peer_id`, before any state change and before any publication.
+        // This verified NOTHING: any peer that could reach the registry could
+        // revoke any binding in it, and revocation is monotonic, so there was
+        // no undo. Found because core-py declined to converge and reported.
+        //
+        // "Or the operator" is ruled local-only — the corpus defines no
+        // operator key and no request field one could populate, so the wire
+        // surface accepts `target_peer_id` proof exclusively. An operator
+        // revokes by acting on its own registry directly.
+        let binding = match self.load_binding(&binding_hash) {
+            Ok(b) => b,
+            Err(result) => return result,
+        };
+        if let Some(rejection) = self.require_layer1(
+            &ctx.params.content_hash,
+            &binding.target_peer_id,
+            &ctx.included,
+        ) {
+            return rejection;
+        }
+
         let rev = RevocationData {
             revokes: binding_hash,
             revoked_at: now_ms(),
@@ -426,15 +442,46 @@ impl RegisterRequestHandler {
         let new_ttl = get_field(&map, "ttl")
             .and_then(|v| v.as_integer())
             .and_then(|i| u64::try_from(i).ok());
-
-        let prev = match self
-            .content_store
-            .get(&binding_hash)
-            .and_then(|e| BindingData::from_entity(&e).ok())
-        {
-            Some(p) => p,
-            None => return error(STATUS_NOT_FOUND, "not_found", "no such binding"),
+        // `nonce` + `issued_at` are pinned into renew's schema (§6a.9): renew
+        // has a non-idempotent state effect, so a captured one can be replayed
+        // to keep a binding alive past the registrant's intended lapse.
+        let nonce = match get_field(&map, "nonce").and_then(|v| v.as_bytes()) {
+            Some(n) => n.to_vec(),
+            None => return error(STATUS_BAD_REQUEST, "invalid_params", "nonce required"),
         };
+        let issued_at = match get_field(&map, "issued_at")
+            .and_then(|v| v.as_integer())
+            .and_then(|i| u64::try_from(i).ok())
+        {
+            Some(t) => t,
+            None => return error(STATUS_BAD_REQUEST, "invalid_params", "issued_at required"),
+        };
+
+        // Layer 1 before replay, and both before any state change (§6a.9
+        // `[RULED 2026-08-11]`). Replay defense alone is not authorization: it
+        // stopped a *captured* renew being re-run while leaving a *fresh
+        // unsigned* one from any peer accepted. The nonce is keyed off the
+        // binding's `target_peer_id`, so an unauthorized renew also burned the
+        // real target's nonce space.
+        let prev = match self.load_binding(&binding_hash) {
+            Ok(p) => p,
+            Err(result) => return result,
+        };
+        if let Some(rejection) = self.require_layer1(
+            &ctx.params.content_hash,
+            &prev.target_peer_id,
+            &ctx.included,
+        ) {
+            return rejection;
+        }
+        if let Some(rejection) = self.check_replay(&prev.target_peer_id, &nonce, issued_at) {
+            return rejection;
+        }
+        self.location_index.set(
+            &register_nonce_path(&self.peer_id, &prev.target_peer_id, &nonce),
+            ctx.params.content_hash,
+        );
+
         let norm = normalize_name(&prev.name, "none");
         match self.issue_binding(
             &norm,
@@ -590,6 +637,106 @@ impl RegisterRequestHandler {
             return false;
         }
         Keypair::verify(&pubkey, &request_hash.to_bytes(), &sig.signature).is_ok()
+    }
+
+    /// The layer-1 gate for **all three write ops** (§6a.9 `[RULED 2026-08-11]`).
+    ///
+    /// `Some(rejection)` means refuse and publish nothing. This is a helper and
+    /// not three inline checks on purpose: `revoke` and `renew` shipped with no
+    /// verification at all because §6a.9 named `REG-REGISTER-PROOF-1` and no
+    /// vector for the other two — *the vector list, not the prose, is what got
+    /// implemented against*, in all three impls. A gate every caller inherits
+    /// is the only shape where a fourth op can't reintroduce the hole.
+    ///
+    /// 401 (not 403) per the ratified status table: an unverifiable signer is
+    /// an authentication failure. Code is `signature_invalid` — normative, and
+    /// what a peer branches on.
+    #[allow(clippy::result_large_err)]
+    fn require_layer1(
+        &self,
+        request_hash: &Hash,
+        target_peer_id: &str,
+        included: &HashMap<Hash, entity_entity::Entity>,
+    ) -> Option<HandlerResult> {
+        if self.verify_layer1(request_hash, target_peer_id, included) {
+            return None;
+        }
+        Some(error(
+            STATUS_AUTH_FAILED,
+            REG_ERR_SIGNATURE_INVALID,
+            "request not signed by target_peer_id (layer-1 ownership proof failed)",
+        ))
+    }
+
+    /// Replay defense — `issued_at` freshness window + per-requester seen-nonce
+    /// (§6a.9.1). Checks only; the marker is written by the caller after
+    /// admission, so a rejected request leaves no trace.
+    ///
+    /// Bound to `register` and `renew` by the §6a.9 discriminator (replay has a
+    /// non-idempotent state effect), **not** to `revoke`, which is monotonic on
+    /// a content-addressed target. Replay defense is not authorization — it is
+    /// layered on top of [`Self::require_layer1`], never instead of it.
+    fn check_replay(
+        &self,
+        requester_peer_id: &str,
+        nonce: &[u8],
+        issued_at: u64,
+    ) -> Option<HandlerResult> {
+        let now = now_ms();
+        if issued_at > now.saturating_add(REGISTER_FUTURE_SKEW_MS)
+            || now > issued_at.saturating_add(REGISTER_STALE_AFTER_MS)
+        {
+            return Some(error(
+                STATUS_FORBIDDEN,
+                "stale_request",
+                "issued_at outside the accepted freshness window",
+            ));
+        }
+        if self
+            .location_index
+            .get(&register_nonce_path(
+                &self.peer_id,
+                requester_peer_id,
+                nonce,
+            ))
+            .is_some()
+        {
+            return Some(error(
+                STATUS_CONFLICT,
+                "replay",
+                "nonce already seen for this requester",
+            ));
+        }
+        None
+    }
+
+    /// Resolve the binding named by `binding_hash`. `revoke`/`renew` take their
+    /// layer-1 `target_peer_id` from **the binding**, not from the request —
+    /// a request-supplied one would let the requester name the peer it claims
+    /// to be, which proves nothing.
+    #[allow(clippy::result_large_err)]
+    fn load_binding(&self, binding_hash: &Hash) -> Result<BindingData, HandlerResult> {
+        let entity = self.content_store.get(binding_hash).ok_or_else(|| {
+            error(
+                STATUS_NOT_FOUND,
+                "not_found",
+                "no such binding in this registry",
+            )
+        })?;
+        if entity.entity_type != TYPE_REGISTRY_BINDING {
+            return Err(error(
+                STATUS_BAD_REQUEST,
+                "invalid_params",
+                "binding_hash addresses a non-binding entity",
+            ));
+        }
+        BindingData::from_entity(&entity).map_err(|e| {
+            error(
+                STATUS_BAD_REQUEST,
+                "invalid_params",
+                &format!("decode existing binding: {}", e),
+            )
+        })
     }
 
     /// `registry-issue-binding` (§6a.8): build the binding body, sign its hash

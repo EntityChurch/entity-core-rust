@@ -682,11 +682,12 @@ pub fn build_authenticate_envelope(
     let auth_entity = Entity::new_with_format(TYPE_AUTHENTICATE, auth_data, active_format)
         .map_err(|e| ProtocolError::Invalid(e.to_string()))?;
 
-    // Build identity entity under the active format (§4.5a — the signer
-    // reference must be the active-format identity hash, not the peer's
-    // home-format startup identity).
+    // The identity entity is the ONE exception to the line above: §4.5a item
+    // 1a pins `system/peer` to the ECFv1-SHA-256 floor unconditionally, so the
+    // `signature.signer` reference is the same bytes on every connection in
+    // the network rather than merely within this one.
     let identity = keypair
-        .peer_entity_with_format(active_format)
+        .peer_entity()
         .map_err(|e| ProtocolError::Invalid(e.to_string()))?;
     let identity_hash = identity.content_hash;
 

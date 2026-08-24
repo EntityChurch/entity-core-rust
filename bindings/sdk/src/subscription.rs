@@ -111,7 +111,7 @@ impl SubscribeOptions {
 
 /// One L1 subscription event delivered to the subscribe callback.
 ///
-/// Decoded from the `system/protocol/inbox/notification` entity the
+/// Decoded from the `system/subscription/notification` entity the
 /// subscription engine dispatches to the SDK's delivery handler.
 #[derive(Debug, Clone)]
 pub struct L1SubscriptionEvent {
@@ -1311,7 +1311,7 @@ fn build_delivery_body(
     })
 }
 
-/// Decode the `system/protocol/inbox/notification` entity dispatched by
+/// Decode the `system/subscription/notification` entity dispatched by
 /// the subscription engine.
 fn decode_notification(entity: &Entity) -> Option<L1SubscriptionEvent> {
     let value: ciborium::Value = ciborium::from_reader(entity.data.as_slice()).ok()?;

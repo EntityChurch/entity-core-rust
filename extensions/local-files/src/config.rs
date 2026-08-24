@@ -264,6 +264,64 @@ mod tests {
         assert!(err.contains("path traversal"));
     }
 
+    /// `LF-CONTAIN-BOUNDARY-1` (DOMAIN-LOCAL-FILES §8.3) — a containment
+    /// prefix test MUST break on a component boundary. core-go's had none, so
+    /// a root at `/srv/peerroot` contained `/srv/peerroot-backup`; arch took
+    /// the spec defect as theirs (§8.3's own pseudocode read as a raw string
+    /// prefix test) and restructured the section with this as its own MUST.
+    ///
+    /// **Rust is not exposed, and the reason is worth pinning rather than
+    /// re-deriving.** Two separate mechanisms carry the boundary, neither of
+    /// them an explicit boundary check:
+    ///
+    /// 1. **Tree side** — [`RootMapping::from_config`] normalizes `prefix` to
+    ///    always end in `/`, so the separator is *inside* the needle and
+    ///    `str::strip_prefix` cannot match a sibling whose name merely starts
+    ///    with the root's. This test drives `from_config` rather than the
+    ///    `root()` helper, because the helper takes the prefix verbatim and
+    ///    would assert the invariant into existence instead of checking it.
+    /// 2. **Filesystem side** — `watcher.rs` compares with
+    ///    `Path::strip_prefix`, which is component-aware by construction
+    ///    (`/srv/peerroot-backup/x` does not strip `/srv/peerroot`), unlike the
+    ///    `str` method of the same name. Asserted below so a "simplification"
+    ///    to string comparison fails here.
+    ///
+    /// The V4 probe is read-only and structurally cannot reach either — "V4a
+    /// green is not containment audited" is normative. This is the read.
+    #[test]
+    fn containment_prefix_breaks_on_a_component_boundary() {
+        let cfg = RootConfigData {
+            prefix: "local/files/shared".to_string(), // no trailing slash
+            filesystem_root: "/tmp/shared".to_string(),
+            ..Default::default()
+        };
+        let r = RootMapping::from_config("test".into(), &cfg).unwrap();
+        assert_eq!(
+            r.prefix, "local/files/shared/",
+            "prefix is boundary-normalized"
+        );
+
+        // The sibling root whose name starts with ours is NOT contained.
+        assert!(
+            resolve_fs_path(&r, "local/files/shared-backup/secret").is_err(),
+            "a sibling prefix sharing our leading characters resolved as ours"
+        );
+        // ...while the genuine child still resolves.
+        let (_fs, rel) = resolve_fs_path(&r, "local/files/shared/readme.md").unwrap();
+        assert_eq!(rel, "readme.md");
+
+        // Filesystem side: component-aware, not textual.
+        assert!(
+            Path::new("/srv/peerroot-backup/x")
+                .strip_prefix(Path::new("/srv/peerroot"))
+                .is_err(),
+            "fs containment must break on a component boundary"
+        );
+        assert!(Path::new("/srv/peerroot/x")
+            .strip_prefix(Path::new("/srv/peerroot"))
+            .is_ok());
+    }
+
     #[test]
     fn exclude_matches_glob() {
         let pats = vec!["*.tmp".to_string(), ".git".to_string()];

@@ -1066,7 +1066,49 @@ fn mk_request(name: &str, target: &str, nonce: &[u8]) -> Entity {
 /// A `register-request` ctx: params = the request entity; `included` carries the
 /// layer-1 `system/signature` (by `signing_key`) over the request hash + the
 /// signer's `system/peer` entity.
+/// Spec-pinned request types for the two follow-on ops (§6a.9). The handler
+/// decodes the params map and does not branch on the type, but a test that
+/// sends the wrong type proves less than it looks like it does.
+const TYPE_REVOKE_REQUEST: &str = "system/registry/revoke-request";
+const TYPE_RENEW_REQUEST: &str = "system/registry/renew-request";
+
+/// A `revoke`/`renew` request carrying a layer-1 `system/signature` by
+/// `signing_key` over its own `content_hash` (§6a.9). The unsigned counterpart
+/// is [`ctx`] — which is what these two ops used to be tested with, and is
+/// exactly the request a stranger sends.
+fn signed_op_ctx(
+    op: &str,
+    entity_type: &str,
+    params_fields: Vec<(Value, Value)>,
+    signing_key: &Keypair,
+) -> HandlerContext {
+    let params = Entity::new(entity_type, to_ecf(&Value::Map(params_fields))).unwrap();
+    signed_ctx(op, params, signing_key)
+}
+
+/// `renew-request` params per the pinned schema — `nonce` + `issued_at`
+/// included, since renew is replay-defended (§6a.9's discriminator: replay
+/// extends a binding's life past the registrant's intended lapse).
+fn renew_fields(binding_hash: Hash, nonce: &[u8]) -> Vec<(Value, Value)> {
+    vec![
+        (
+            text("binding_hash"),
+            Value::Bytes(binding_hash.to_bytes().to_vec()),
+        ),
+        (text("ttl"), entity_ecf::integer(172_800_000)),
+        (text("nonce"), Value::Bytes(nonce.to_vec())),
+        (
+            text("issued_at"),
+            entity_ecf::integer(crate::log::now_ms() as i64),
+        ),
+    ]
+}
+
 fn register_ctx(req: Entity, signing_key: &Keypair) -> HandlerContext {
+    signed_ctx("register-request", req, signing_key)
+}
+
+fn signed_ctx(op: &str, req: Entity, signing_key: &Keypair) -> HandlerContext {
     let request_hash = req.content_hash;
     let sig = SignatureData {
         target: request_hash,
@@ -1082,7 +1124,7 @@ fn register_ctx(req: Entity, signing_key: &Keypair) -> HandlerContext {
 
     let execute = Entity::new(entity_types::TYPE_EXECUTE, to_ecf(&Value::Map(vec![]))).unwrap();
     HandlerContext::builder(execute, req)
-        .operation("register-request".to_string())
+        .operation(op.to_string())
         .included(included)
         .build()
 }
@@ -1346,11 +1388,13 @@ async fn register_then_revoke_excludes() {
             .unwrap_or(false)
     );
 
-    // Revoke it → resolve now dead-ends (fail-closed).
+    // Revoke it, signed by the binding's target → resolve dead-ends (fail-closed).
     let revoked = handler
-        .handle(&ctx(
+        .handle(&signed_op_ctx(
             "revoke-request",
+            TYPE_REVOKE_REQUEST,
             vec![(text("binding_hash"), Value::Bytes(bh.to_bytes().to_vec()))],
+            &owner,
         ))
         .await
         .unwrap();
@@ -1387,12 +1431,11 @@ async fn register_then_renew_supersedes() {
     let old = binding_hash_of(&issued);
 
     let renewed = handler
-        .handle(&ctx(
+        .handle(&signed_op_ctx(
             "renew-request",
-            vec![
-                (text("binding_hash"), Value::Bytes(old.to_bytes().to_vec())),
-                (text("ttl"), entity_ecf::integer(172_800_000)),
-            ],
+            TYPE_RENEW_REQUEST,
+            renew_fields(old, b"rn1"),
+            &owner,
         ))
         .await
         .unwrap();
@@ -1408,6 +1451,227 @@ async fn register_then_renew_supersedes() {
     let binding = BindingData::from_entity(&body).unwrap();
     assert_eq!(binding.supersedes, Some(old));
     assert_eq!(binding.ttl, Some(172_800_000));
+}
+
+// ---------------------------------------------------------------------------
+// REG-REVOKE-PROOF-1 / REG-RENEW-PROOF-1 — layer 1 binds all three write ops
+// (§6a.9 `[RULED 2026-08-11]`).
+//
+// rust shipped `revoke` and `renew` with NO requester verification: any peer
+// that could reach the registry could permanently revoke any binding in it,
+// and revocation is monotonic, so there is no undo. §6a.9 named a proof vector
+// for `register` and none for these two, and all three impls implemented
+// against the vector list rather than the prose.
+//
+// Both vectors require BOTH halves (GUIDE-CONFORMANCE §2.4a): refused AND
+// nothing published. The acceptance half is `register_then_revoke_excludes` /
+// `register_then_renew_supersedes` above — which used to send an UNSIGNED
+// request and pass, which is precisely what "a check that asserts only
+// acceptance certifies the hole" means.
+// ---------------------------------------------------------------------------
+
+/// Issue a binding to `owner` under an `open` policy, returning its hash.
+async fn issued_binding(
+    cs: &Arc<dyn ContentStore>,
+    li: &Arc<dyn LocationIndex>,
+    registry: &IdentityKeypair,
+    owner: &Keypair,
+) -> Hash {
+    install_policy(
+        cs,
+        li,
+        registry.peer_id().as_str(),
+        &IssuerPolicyData {
+            mode: MODE_OPEN.into(),
+            ..Default::default()
+        },
+    );
+    let issued = reg_handler(cs, li, registry)
+        .handle(&register_ctx(
+            mk_request("billslab.com", owner.peer_id().as_str(), b"sec"),
+            owner,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(issued.status, 200);
+    binding_hash_of(&issued)
+}
+
+// REG-REVOKE-PROOF-1, negative half — an unsigned revoke is refused and emits
+// no revocation. This is the denial-of-name: `stranger` never held the name.
+#[tokio::test]
+async fn revoke_proof_unsigned_rejected_and_publishes_nothing() {
+    let (cs, li) = stores();
+    let registry = IdentityKeypair::Ed25519(Keypair::generate());
+    let rid = registry.peer_id().as_str().to_string();
+    let owner = Keypair::generate();
+    let bh = issued_binding(&cs, &li, &registry, &owner).await;
+
+    let refused = reg_handler(&cs, &li, &registry)
+        .handle(&ctx(
+            "revoke-request",
+            vec![(text("binding_hash"), Value::Bytes(bh.to_bytes().to_vec()))],
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(refused.status, 401, "layer-1 is an authentication failure");
+    assert_eq!(
+        result_field(&decode_result(&refused), "code").and_then(|v| v.as_text()),
+        Some("signature_invalid")
+    );
+    // The negative half: no revocation was published, by either index.
+    assert!(
+        li.get(&crate::revocation_by_target_path(&rid, &bh))
+            .is_none(),
+        "a refused revoke published a revocation"
+    );
+    // And the name still resolves — the actual harm this prevents.
+    assert!(
+        peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com")
+            .map(|r| r.is_resolved())
+            .unwrap_or(false),
+        "a refused revoke still killed the name"
+    );
+}
+
+// REG-REVOKE-PROOF-1, wrong-signer half — a *validly signed* request from a
+// peer who is not the binding's target is still refused. Without this, an
+// impl that checked "is there a signature" instead of "is it the target's"
+// would pass the unsigned case above.
+#[tokio::test]
+async fn revoke_proof_wrong_signer_rejected_and_publishes_nothing() {
+    let (cs, li) = stores();
+    let registry = IdentityKeypair::Ed25519(Keypair::generate());
+    let rid = registry.peer_id().as_str().to_string();
+    let owner = Keypair::generate();
+    let stranger = Keypair::generate();
+    let bh = issued_binding(&cs, &li, &registry, &owner).await;
+
+    let refused = reg_handler(&cs, &li, &registry)
+        .handle(&signed_op_ctx(
+            "revoke-request",
+            TYPE_REVOKE_REQUEST,
+            vec![(text("binding_hash"), Value::Bytes(bh.to_bytes().to_vec()))],
+            &stranger,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(refused.status, 401);
+    assert!(
+        li.get(&crate::revocation_by_target_path(&rid, &bh))
+            .is_none(),
+        "a stranger's signature revoked someone else's binding"
+    );
+    assert!(
+        peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com")
+            .map(|r| r.is_resolved())
+            .unwrap_or(false)
+    );
+}
+
+// REG-RENEW-PROOF-1, negative half — an unsigned renew is refused and issues
+// no successor binding. Replay defense is not authorization: the nonce check
+// stopped a *captured* renew being re-run while leaving a *fresh unsigned* one
+// from any peer accepted.
+#[tokio::test]
+async fn renew_proof_unsigned_rejected_and_publishes_nothing() {
+    let (cs, li) = stores();
+    let registry = IdentityKeypair::Ed25519(Keypair::generate());
+    let rid = registry.peer_id().as_str().to_string();
+    let owner = Keypair::generate();
+    let bh = issued_binding(&cs, &li, &registry, &owner).await;
+
+    let refused = reg_handler(&cs, &li, &registry)
+        .handle(&ctx("renew-request", renew_fields(bh, b"rn-unsigned")))
+        .await
+        .unwrap();
+
+    assert_eq!(refused.status, 401);
+    assert_eq!(
+        result_field(&decode_result(&refused), "code").and_then(|v| v.as_text()),
+        Some("signature_invalid")
+    );
+    // No successor was published — the by-name pointer still names the original.
+    let resolved =
+        peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com").unwrap();
+    assert_eq!(
+        resolved.binding,
+        Some(bh),
+        "a refused renew published a successor binding"
+    );
+    // ...and it did not burn the real target's nonce space either.
+    assert!(li
+        .get(&crate::register_nonce_path(
+            &rid,
+            owner.peer_id().as_str(),
+            b"rn-unsigned"
+        ))
+        .is_none());
+}
+
+// REG-RENEW-PROOF-1, wrong-signer half.
+#[tokio::test]
+async fn renew_proof_wrong_signer_rejected_and_publishes_nothing() {
+    let (cs, li) = stores();
+    let registry = IdentityKeypair::Ed25519(Keypair::generate());
+    let rid = registry.peer_id().as_str().to_string();
+    let owner = Keypair::generate();
+    let stranger = Keypair::generate();
+    let bh = issued_binding(&cs, &li, &registry, &owner).await;
+
+    let refused = reg_handler(&cs, &li, &registry)
+        .handle(&signed_op_ctx(
+            "renew-request",
+            TYPE_RENEW_REQUEST,
+            renew_fields(bh, b"rn-stranger"),
+            &stranger,
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(refused.status, 401);
+    let resolved =
+        peer_issued::resolve_one(&cs, &li, &pi_entry(&rid, None), "billslab.com").unwrap();
+    assert_eq!(resolved.binding, Some(bh));
+}
+
+// Renew IS replay-defended (§6a.9's discriminator) — a second renew reusing a
+// seen nonce is refused even when the signature is valid.
+#[tokio::test]
+async fn renew_replay_same_nonce_rejected() {
+    let (cs, li) = stores();
+    let registry = IdentityKeypair::Ed25519(Keypair::generate());
+    let owner = Keypair::generate();
+    let bh = issued_binding(&cs, &li, &registry, &owner).await;
+    let handler = reg_handler(&cs, &li, &registry);
+
+    let first = handler
+        .handle(&signed_op_ctx(
+            "renew-request",
+            TYPE_RENEW_REQUEST,
+            renew_fields(bh, b"rn-dup"),
+            &owner,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(first.status, 200);
+
+    let replayed = handler
+        .handle(&signed_op_ctx(
+            "renew-request",
+            TYPE_RENEW_REQUEST,
+            renew_fields(bh, b"rn-dup"),
+            &owner,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(replayed.status, 409);
+    assert_eq!(
+        result_field(&decode_result(&replayed), "code").and_then(|v| v.as_text()),
+        Some("replay")
+    );
 }
 
 // ---------------------------------------------------------------------------
