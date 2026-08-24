@@ -92,39 +92,74 @@ impl std::fmt::Debug for RendezvousKey {
 /// believes (§1.1 pin 3 — TTL is *advisory to peers, binding on the node*).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
-    /// How long a deposited message survives, in ms.
-    ///
-    /// **60 s — §1.1 pin 6** (ruling 2026-07-28, closing open item 3).
-    /// Node-configurable and published in [`advertise`](SignalingCore::advertise).
-    /// The number is bound by the lifetime of what the blob *describes*, not by
-    /// node memory: a candidate list's `srflx` entry dies with the NAT binding
-    /// that produced it (commonly 30–120 s), so a longer TTL would only serve
-    /// candidates that are already unpunchable.
-    pub bucket_ttl_ms: i64,
-    /// Largest single deposited message, in bytes — **8 KiB, §1.1 pin 5**.
+    /// Largest single deposited blob, in bytes — **8 KiB, §5 pin 5**.
     ///
     /// §4 sizes a handshake at ~1 KB, so this is generous by 8×. The value is
     /// pinned rather than left to the operator because *a limit the client does
     /// not know is a cross-impl reject boundary*: Go offering 64 KiB at a node
     /// that stops at 4 KiB presents as a rendezvous miss, not as the size
     /// refusal it is.
-    pub max_message_bytes: usize,
-    /// Largest number of live messages at one key — **32, §1.1 pin 5**. `lobby`
+    pub max_blob_bytes: u64,
+    /// Largest number of live blobs at one key — **32, §5 pin 5**. `lobby`
     /// and `tag` are inherently multi-party (§1.1 pin 2), so this is not 1.
-    pub max_messages_per_key: usize,
+    pub max_bucket_blobs: u64,
+    /// How long a deposited blob survives, **in seconds** — **60 s, §5 pin 6**.
+    ///
+    /// Node-configurable and published in [`advertise`](SignalingCore::advertise).
+    /// The number is bound by the lifetime of what the blob *describes*, not by
+    /// node memory: a candidate list's `srflx` entry dies with the NAT binding
+    /// that produced it (commonly 30–120 s), so a longer TTL would only serve
+    /// candidates that are already unpunchable.
+    ///
+    /// **Seconds, not milliseconds** (§4.5). The unit is the whole field: a node
+    /// publishing `60000` at a client reading seconds is a 1000× TTL, which
+    /// presents as blobs that never reap — not as a unit error. Internal clock
+    /// math goes through [`Limits::ttl_ms`].
+    pub ttl_seconds: u64,
+    /// The pool's `lobby` constant, **only when it overrides [`LOBBY_DEFAULT`]**
+    /// (§4.5). `None` means "I use the default" and is encoded as an *absent*
+    /// field, never null — a peer that sees no `lobby_constant` derives its
+    /// lobby key from [`LOBBY_DEFAULT`].
+    ///
+    /// Bytes on the wire (`primitive/bytes`, §4.5) because it is a **derivation
+    /// input**, not a display string: §3.1 hashes it verbatim, and bytes is the
+    /// shape that cannot acquire a normalization step on the way in. Held here
+    /// as a `String` because every deployment sets a UTF-8 label; the codec is
+    /// the boundary.
+    ///
+    /// The node itself never uses this: it is mode-blind and derives nothing
+    /// (§1). This is a value the node *publishes for peers to derive with*,
+    /// which is why it rides on `advertise` rather than touching any bucket.
+    pub lobby_constant: Option<String>,
     /// Largest number of live keys. The backstop that keeps a stateless
     /// introducer from becoming an unbounded store under abuse.
+    ///
+    /// **Node-internal, never published.** §4.5's `system/signaling/limits` has
+    /// exactly four fields and this is not one of them — emitting it would put
+    /// an unspec'd key inside a spec'd type. It is also not a limit a *client*
+    /// can act on: a peer cannot size a retry against a number describing the
+    /// node's whole keyspace.
     pub max_keys: usize,
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Self {
-            bucket_ttl_ms: 60_000,
-            max_message_bytes: 8192,
-            max_messages_per_key: 32,
+            max_blob_bytes: 8192,
+            max_bucket_blobs: 32,
+            ttl_seconds: 60,
+            lobby_constant: None,
             max_keys: 65_536,
         }
+    }
+}
+
+impl Limits {
+    /// [`ttl_seconds`](Self::ttl_seconds) in milliseconds, for the core's
+    /// `now_ms` clock domain. The published contract is seconds; only this
+    /// conversion knows about ms.
+    pub fn ttl_ms(&self) -> i64 {
+        (self.ttl_seconds as i64).saturating_mul(1000)
     }
 }
 
@@ -153,23 +188,18 @@ pub enum OfferOutcome {
 /// So the constant is pinned, and a pool that wants its own advertises it.
 pub const LOBBY_DEFAULT: &str = "lobby:default";
 
-/// What `advertise` returns (§1): where the node is, what it will accept, and —
-/// only if it overrides the default — its `lobby` constant.
+/// What `advertise` returns — `system/signaling/advertise-result` (§4.5): where
+/// the node is, and what it will accept.
+///
+/// **Exactly two fields.** The `lobby` override lives inside
+/// [`Limits::lobby_constant`], not beside `endpoint` — §4.5 puts it there, and a
+/// peer reading the published contract reads one map, not two.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Advertisement {
     /// The node's reachable endpoint, as configured by the operator.
     pub endpoint: String,
-    /// The operating limits above.
+    /// The operating limits above, including the `lobby` override.
     pub limits: Limits,
-    /// The pool's `lobby` constant, **only when it overrides
-    /// [`LOBBY_DEFAULT`]**. `None` means "I use the default" and is encoded as
-    /// an *absent* field, never null — a peer that sees no `lobby` derives its
-    /// lobby key from [`LOBBY_DEFAULT`].
-    ///
-    /// The node itself never uses this: it is mode-blind and derives nothing
-    /// (§1). This is a value the node *publishes for peers to derive with*,
-    /// which is why it rides on `advertise` rather than touching any bucket.
-    pub lobby: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -184,9 +214,9 @@ pub enum CoreError {
     #[error("rendezvous key must be {} bytes, got {got}", RENDEZVOUS_KEY_LEN)]
     InvalidKeyLength { got: usize },
     #[error("message is {got} bytes, limit is {max}")]
-    MessageTooLarge { got: usize, max: usize },
+    MessageTooLarge { got: u64, max: u64 },
     #[error("key already holds {max} live messages")]
-    BucketFull { max: usize },
+    BucketFull { max: u64 },
     #[error("node is holding its maximum of {max} live keys")]
     CapacityExhausted { max: usize },
 }
@@ -216,7 +246,6 @@ pub struct SignalingCore {
     buckets: RwLock<HashMap<RendezvousKey, Vec<Deposit>>>,
     limits: Limits,
     endpoint: String,
-    lobby: Option<String>,
 }
 
 impl SignalingCore {
@@ -230,7 +259,6 @@ impl SignalingCore {
             buckets: RwLock::new(HashMap::new()),
             limits,
             endpoint: endpoint.into(),
-            lobby: None,
         }
     }
 
@@ -241,7 +269,7 @@ impl SignalingCore {
     /// for the same fact.
     pub fn with_lobby(mut self, lobby: impl Into<String>) -> Self {
         let lobby = lobby.into();
-        self.lobby = if lobby == LOBBY_DEFAULT {
+        self.limits.lobby_constant = if lobby == LOBBY_DEFAULT {
             None
         } else {
             Some(lobby)
@@ -257,7 +285,10 @@ impl SignalingCore {
     /// override if one is set, else [`LOBBY_DEFAULT`]. Client-side convenience;
     /// the node never derives anything itself.
     pub fn lobby_constant(&self) -> &str {
-        self.lobby.as_deref().unwrap_or(LOBBY_DEFAULT)
+        self.limits
+            .lobby_constant
+            .as_deref()
+            .unwrap_or(LOBBY_DEFAULT)
     }
 
     // -----------------------------------------------------------------------
@@ -287,10 +318,10 @@ impl SignalingCore {
         message: &[u8],
         now_ms: i64,
     ) -> Result<OfferOutcome, CoreError> {
-        if message.len() > self.limits.max_message_bytes {
+        if message.len() as u64 > self.limits.max_blob_bytes {
             return Err(CoreError::MessageTooLarge {
-                got: message.len(),
-                max: self.limits.max_message_bytes,
+                got: message.len() as u64,
+                max: self.limits.max_blob_bytes,
             });
         }
 
@@ -312,9 +343,9 @@ impl SignalingCore {
                 if deposits.iter().any(|d| d.digest == digest) {
                     return Ok(OfferOutcome::Duplicate);
                 }
-                if deposits.len() >= self.limits.max_messages_per_key {
+                if deposits.len() as u64 >= self.limits.max_bucket_blobs {
                     return Err(CoreError::BucketFull {
-                        max: self.limits.max_messages_per_key,
+                        max: self.limits.max_bucket_blobs,
                     });
                 }
             }
@@ -330,7 +361,7 @@ impl SignalingCore {
         buckets.entry(key).or_default().push(Deposit {
             message: message.to_vec(),
             digest,
-            expires_at_ms: now_ms.saturating_add(self.limits.bucket_ttl_ms),
+            expires_at_ms: now_ms.saturating_add(self.limits.ttl_ms()),
         });
         Ok(OfferOutcome::Stored)
     }
@@ -392,7 +423,6 @@ impl SignalingCore {
         Advertisement {
             endpoint: self.endpoint.clone(),
             limits: self.limits.clone(),
-            lobby: self.lobby.clone(),
         }
     }
 

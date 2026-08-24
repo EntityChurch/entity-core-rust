@@ -52,13 +52,16 @@ struct Args {
     #[arg(long)]
     keypair: Option<PathBuf>,
 
-    /// Bucket TTL in ms. The default is **60 s** (§1.1 pin 6, closing open item
-    /// 3) and is published in `advertise`, so a deployment that moves it tells
-    /// its peers rather than surprising them. Raising it far above the default
-    /// mostly buys dead candidates: an `srflx` entry expires with the NAT
-    /// binding that produced it, commonly inside 30–120 s.
+    /// Bucket TTL in **seconds**. The default is **60 s** (§5 pin 6) and is
+    /// published in `advertise` as `ttl_seconds`, so a deployment that moves it
+    /// tells its peers rather than surprising them. Raising it far above the
+    /// default mostly buys dead candidates: an `srflx` entry expires with the
+    /// NAT binding that produced it, commonly inside 30–120 s.
+    ///
+    /// Seconds, not ms, because §4.5 publishes seconds — an operator flag in a
+    /// unit the node cannot publish is a sub-second TTL that advertises as `0`.
     #[arg(long)]
-    ttl_ms: Option<i64>,
+    ttl_seconds: Option<u64>,
 
     /// Override the pool's `lobby` key constant (§2.2). Omit to use
     /// `lobby:default` — which every peer already assumes, so an override only
@@ -143,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let limits = Limits {
-        bucket_ttl_ms: args.ttl_ms.unwrap_or(Limits::default().bucket_ttl_ms),
+        ttl_seconds: args.ttl_seconds.unwrap_or(Limits::default().ttl_seconds),
         ..Limits::default()
     };
     let mut core = SignalingCore::with_limits(&endpoint, limits.clone());
@@ -176,11 +179,8 @@ async fn main() -> anyhow::Result<()> {
     println!("  tcp:       {}", listener.socket_addr());
     println!("  endpoint:  {}", endpoint);
     println!(
-        "  limits:    ttl={}ms max_msg={}B per_key={} keys={}",
-        limits.bucket_ttl_ms,
-        limits.max_message_bytes,
-        limits.max_messages_per_key,
-        limits.max_keys
+        "  limits:    ttl={}s max_blob={}B per_bucket={} keys={}",
+        limits.ttl_seconds, limits.max_blob_bytes, limits.max_bucket_blobs, limits.max_keys
     );
     println!("  lobby:     {}", lobby_constant);
     println!("  surface:   wrapped (cross-peer execute) — offer/collect/advertise");

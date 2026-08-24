@@ -511,12 +511,12 @@ async fn candidate_exchange_completes_over_tcp() {
     let k = key::pair_key(&a_pid, &b_pid);
 
     let alice_candidates = vec![
-        Candidate::new(CANDIDATE_HOST, SUBSTRATE_TCP, "192.168.1.5:4040", 1),
-        Candidate::new(CANDIDATE_SRFLX, SUBSTRATE_TCP, "203.0.113.7:51820", 2),
+        Candidate::new(CANDIDATE_HOST, SUBSTRATE_TCP, "192.168.1.5:4040"),
+        Candidate::new(CANDIDATE_SRFLX, SUBSTRATE_TCP, "203.0.113.7:51820"),
     ];
     let bob_candidates = vec![
-        Candidate::new(CANDIDATE_HOST, SUBSTRATE_TCP, "10.0.0.9:4040", 1),
-        Candidate::new(CANDIDATE_SRFLX, SUBSTRATE_TCP, "198.51.100.4:33445", 2),
+        Candidate::new(CANDIDATE_HOST, SUBSTRATE_TCP, "10.0.0.9:4040"),
+        Candidate::new(CANDIDATE_SRFLX, SUBSTRATE_TCP, "198.51.100.4:33445"),
     ];
 
     // Alice initiates.

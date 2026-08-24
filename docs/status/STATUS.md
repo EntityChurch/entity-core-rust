@@ -1,6 +1,6 @@
 # entity-core-rust — status
 
-_Updated: 2026-07-30 · public: v0.8.0 (master)_
+_Updated: 2026-07-31 · public: v0.8.0 (master)_
 
 ## Where it is
 
@@ -34,6 +34,44 @@ and tree semantics are interop-validated against the Go and Python peers, not
 just self-tested.
 
 ## Where we left off
+
+_2026-07-31 — **the owed cross-impl backlog is clear, and Rust joined the signaling meet.**_
+(`docs/validation/reports/2026-07-31-seven-categories-cleared-and-rust-joins-the-meet.md`.)
+
+Go ran all seven owed categories against a Rust peer built from the committed tree — **clean
+sweep, zero warn/fail/skip**, oracle-pinned Go `a2e2076` vs Rust `c043c7f`: `signaling` 5·0·0·0,
+`authz` 11·0·0·0, `security` 30·0·0·0, `connectivity`/RT-6 24·0·0·0, `concurrency` 6·0·0·0,
+`network_reconnect_anchor` 5·0·0·0, `continuation_bounds` 3·0·0·0, `published_root` 7·0·0·0.
+**RT-6 now fires on the wire** — the case that was unreachable before the intercept moved
+pre-verification, and the reason the whole backlog was worth clearing: it had been fixed,
+shipped, and still WARNing, green on our own seat. `published_root` beat the prediction — the
+trie-key convention **byte-matches Go**, so that known-open is resolved.
+
+**The 3×3 meet is green — 27/27.** Go ran `{go,py,rust}` initiator × `{go,py,rust}` responder ×
+`{tag,secret,lobby}` live through one Rust `--open` node, using Rust's driver @ `879a327`
+(their `docs/validation/reports/2026-07-31-signaling-meet-3x3-cross-impl.md`). **The six
+off-diagonal Rust cells are the new evidence** — Rust↔Go and Rust↔Py, both directions, had never
+met live. Signaling Stage 1 is settled cross-impl; closeout and next steps in
+`docs/status/HANDOFF-2026-07-31-signaling-closeout-and-next.md`.
+
+**Both halves of the stale-image trap are closed.** Go's peer-manager keys provenance on the
+sibling's git HEAD (`3c46cb3`); this repo now stamps the commit into the image
+(`org.entity.git.commit` / `org.opencontainers.image.revision`, `<sha>-dirty` on a dirty tree),
+so image contents are inspectable rather than merely probably fresh. Owed: confirm the stamp on
+a real `make build` — the mechanism was proven on a minimal equivalent image, not the full one.
+
+**Rust now has a client seat.** `cmd/signaling-meet` speaks the same CLI/JSON/exit contract as
+Go's and Python's drivers, and its derived keys are **byte-identical to their published vectors
+across all four modes** (six for six, `pair` symmetry included) — obtained read-only, no build
+or git op in a sibling tree. Live Rust↔Rust meets pass at `tag`/`secret`/`lobby` through a real
+`--open` node. That closes the last piece of this feature with no cross-impl evidence: every
+other signaling test here is Rust↔Rust, and we were the *node* in Go's matrix, never a
+participant. **Not yet run:** a live Rust↔Go / Rust↔Python meet — one command from either side
+now, and the key agreement says it should be uneventful, which is exactly the claim this
+exercise exists to distrust.
+
+Gate: `cargo test --workspace` **2276 passed / 0 failed / 12 ignored**, fmt clean, clippy clean
+but for the pre-existing `assertions_on_constants` in `extensions/continuation`.
 
 _2026-07-30 — signaling Stage 1 merged to `dev`; the go/py client brief is issued_
 (`docs/status/HANDOFF-2026-07-30-signaling-go-py-client-brief.md`, following
@@ -84,6 +122,27 @@ enumerated grant refuses an operation it does not name. Both are correct; client
 treat 400 as the only signal that `reflect` is unserved. Also recorded from Python: a
 responder that answers the first request in a `pair`/`lobby` bucket adopts a **stale** one on
 any rerun inside the 60 s TTL, since those keys are stable by construction.
+
+_2026-07-30 (same day) — the full `validate-peer` packet is issued to Go_
+(`docs/status/HANDOFF-2026-07-30-validate-peer-packet-for-go.md`). Go's client then ran the
+**live cross-impl meet** — go↔py through a Rust node, both directions, `tag`/`secret`/`lobby`,
+byte-identical keys, rerun-safe on the stable `lobby` bucket. §2.2 and §3.1.1 are validated
+**live across independent implementations**, not just statically — the highest-risk unknown in
+this feature, and the one thing no amount of Rust-side testing could settle. `pair` is covered
+statically only (needs an out-of-band peer-id exchange — harness plumbing, not a protocol
+unknown).
+
+The packet exists because signaling is not the only thing owed: **six categories are green only
+on our own seat** — `authz` (F40), `security` (incl. RT-6), `concurrency` (RT-13b Part A),
+`network_reconnect_anchor`, `continuation_bounds` anchor-1 (owed since 2026-07-18), and
+`published_root`. RT-6 is the cautionary one and the reason to clear the rest: it was fixed,
+shipped, and *still* WARNed, because the intercept sat after generic verification and the
+oracle's bare-authenticate replay never reached it — green on our side, unfireable on the wire.
+
+**Our own next build:** Rust has never been a *client* in a cross-impl meet. Every Rust live
+test is Rust↔Rust; we are the node in Go's matrix, not a participant. A Rust `signaling-meet`
+driver speaking the CLI+JSON contract Go and Python already share would make it a 3×3 matrix and
+close the last same-impl assumption on our side.
 
 **Rust's part is done and the next move is not ours.** Stage 1 proves mechanism, not
 connectivity — it does *not* connect two NAT'd peers, which is Stage 2. And nothing in this
@@ -232,9 +291,10 @@ post-verification duplicate was deleted. New test
 `test_rt6_bare_authenticate_replay_returns_401_invalid_nonce` reproduces the exact shape the
 oracle sends. Full detail in the "Correction" section of the same handoff doc.
 
-Owed: cross-impl `validate-peer` re-run to confirm RT-6 now PASSes on the wire (self-tested only
-so far — this is exactly the gap that bit the first landing); the F40 vector run; the RT-13b
-Part-A wire probe against a live Go peer; full-workspace `make check`/`make wasm` gate.
+~~Owed: cross-impl `validate-peer` re-run to confirm RT-6 now PASSes on the wire; the F40 vector
+run; the RT-13b Part-A wire probe against a live Go peer.~~ **All three CLEARED 2026-07-31** —
+Go's sweep vs Rust `c043c7f`: `connectivity`/RT-6 24·0·0·0 (fires on the wire), `authz` 11·0·0·0,
+`concurrency` 6·0·0·0. See `docs/validation/reports/2026-07-31-seven-categories-cleared-and-rust-joins-the-meet.md`.
 
 _2026-07-16:_ NETWORK Amendment 12 **rung 3** landed on `dev` — the
 `system/network` maintain-peer reconnect lifecycle in a new
@@ -363,9 +423,10 @@ both O1s — the exact hold conditions Rust's 2026-07-17 note set):
   deliverer and threaded through `make_execute_fn` — the declared O1 signal, not
   an inference.
 - **Gate green:** clippy `-D warnings` clean, 119 test-suites pass (6 new unit
-  tests + a wire round-trip), fmt clean, wasm32 CI build green. **Owed:** the
-  cross-impl `validate-peer` / Go↔Rust anchor-1 run (a same-side round-trip cannot
-  prove wire fidelity); ttl-refill parity (§6) is flagged, not built.
+  tests + a wire round-trip), fmt clean, wasm32 CI build green. ~~**Owed:** the
+  cross-impl `validate-peer` / Go↔Rust anchor-1 run.~~ **CLEARED 2026-07-31** —
+  `continuation_bounds` 3·0·0·0 vs Rust `c043c7f`. ttl-refill parity (§6) is still
+  flagged, not built.
 
 _Earlier 2026-07-16:_ Go's `network` category asked two questions it had never
 asked before, and **both found real defects on all three seats**
@@ -539,17 +600,30 @@ up only if a future profile shows `verify_request` back on the hot path.
    brake is built (field + CBOR, cross-peer bounds propagation, step-6
    inherit/increment, O1 signal, §3.9 suspend + §3.7 resume) plus the standing-model
    §3 (Q2) `reactive_trigger` convergence marker
-   (`ROUTING-2026-07-18-bounds-and-q2-build-rust.md`). **Owed:** run the cross-impl
-   `validate-peer` / Go↔Rust `continuation_bounds` anchor-1 and file the report
-   under `docs/validation/reports/` — a same-side round-trip cannot prove wire
-   fidelity, and it needs the Go peer this tree cannot drive alone.
-3. **Cross-peer subscription delivery to a Rust subscriber** — unblocked at the
+   (`ROUTING-2026-07-18-bounds-and-q2-build-rust.md`). ~~**Owed:** the cross-impl
+   `continuation_bounds` anchor-1 run.~~ **CLEARED 2026-07-31** — 3·0·0·0 vs Rust
+   `c043c7f`. This was the oldest owed item in the tree.
+3. **The cross-impl backlog is clear — nothing is owed to Go's seat.** All seven
+   categories swept green 2026-07-31 (`docs/validation/reports/`
+   `2026-07-31-seven-categories-cleared-and-rust-joins-the-meet.md`): `signaling`,
+   `authz`/F40, `security`, `connectivity`/RT-6, `concurrency`/RT-13b,
+   `network_reconnect_anchor`, `continuation_bounds`, `published_root`. Keep it that
+   way — **run `validate-peer` on any wire-shape touch rather than banking a
+   same-seat green**, which is precisely how RT-6 sat WARNing on top of a real fix.
+4. ~~**Run the 3×3 signaling meet.**~~ **DONE 2026-07-31 — 27/27**, all six Rust
+   off-diagonal cells live. Signaling Stage 1 is settled cross-impl.
+5. ~~**Stamp the podman image with its git commit.**~~ **DONE 2026-07-31** — both
+   halves of the stale-image trap are closed. **Owed:** confirm the stamp on a real
+   `make build`; the label mechanism was proven on a minimal equivalent image, not
+   the full one.
+5a. **Re-diff signaling against the arch corpus when it lands.** The highest-value
+   outstanding item and the one that upgrades every green result in the signaling
+   arc from cohort-consistent to independent convergence. Not ours to schedule.
+5b. **Validate `EXTENSION-NETWORK` §6.7.1** (`observed_address` on HELLO,
+   Amendment 13) — buildable in all three impls **now**, never validated by anyone,
+   and the source of the v1 punch's `srflx`. The cheapest real progress toward
+   Stage 2, and unlike Stage 2 itself it is not blocked on arch.
+6. **Cross-peer subscription delivery to a Rust subscriber** — unblocked at the
    core by ruling 24; land the SDK-side grantee/signature/handler-scope fixes.
-4. Keep the green gate (`make check` = lint + test) and `make wasm` passing on
-   any change; run `validate-peer` / `wire-conformance` on any wire-shape touch.
-   **Two re-probes are owed from Go's side and neither has run:** the `security`
-   category (30/30 — the injection FAIL is fixed here, and the coordinate has
-   since churned from the hash to sentinels, so the probe's expected value moved
-   with it), and `network_reconnect_anchor` (was 4/5 on Rust; #3 + #2 are the
-   fix). Our own vectors are green on both; a same-seat suite cannot close
-   either.
+7. Keep the green gate (`make check` = lint + test) and `make wasm` passing on
+   any change.

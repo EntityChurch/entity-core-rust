@@ -155,10 +155,15 @@ side.
 > (`core/tree/src/trie.rs`); `--publish-root` selects it and publishes even an
 > empty subtree (the canonical empty CHAMP root is a real served node). This
 > closes validate-peer published_root **v4** (MANIFEST_GET served) and **v7**
-> (CONTENT_GET(root_hash) → trie node). **Still open:** (2) cross-impl trie
-> **key convention** byte-match (Rust keys peer-prefix-stripped; Go uses
-> RootTracker/`PrefixForLocalPeer`) and (3) auto-republish-on-change (Rust is
-> still static one-time publish). Both reconcile at the live validate-peer run.
+> (CONTENT_GET(root_hash) → trie node). ~~**Still open:** (2) cross-impl trie
+> **key convention** byte-match~~ — **RESOLVED 2026-07-31 at the live run**, as
+> predicted: Go's `published_root` swept **7·0·0·0** against Rust `c043c7f`, and
+> v5+v7 passing proves the key convention byte-matches despite the different
+> derivations (Rust keys peer-prefix-stripped; Go uses
+> RootTracker/`PrefixForLocalPeer`). **Still open:** (3) auto-republish-on-change —
+> Rust is still static one-time publish, gated on pinning the multi-prefix →
+> single-root selection (point 1 below). See
+> `docs/validation/reports/2026-07-31-seven-categories-cleared-and-rust-joins-the-meet.md`.
 
 **Spec:** STRATEGY-REGISTRY-DISCOVERY-IMPL §0.5 P1/P2 +
 `PROPOSAL-PEER-MANIFEST-STATIC-HANDSHAKE.md` §1.1/§4.
@@ -4113,3 +4118,54 @@ does not know a socket-options requirement exists.
 **Question for arch.** Make the socket requirement explicit in §4.2 (or in §5's TCP-simopen
 row) — that same-local-endpoint on TCP means binding the punch socket to the reflector
 connection's local port with address/port reuse.
+
+---
+
+## `EXTENSION-SIGNALING` §8.1 — capability names, and the missing one for `advertise`
+
+**Passage.** §8.1 Admission: *"`system/capability/signaling-use` gates `offer` / `collect`. A
+deployment serving a private device mesh grants it narrowly; `advertise` is typically
+operator-only."* (`EXTENSION-SIGNALING.md` v1.0 @ arch `4241b96`.)
+
+**The ambiguity.** The passage names **one** capability and covers **two** verbs with it. For
+the third verb it gives a *policy* ("typically operator-only") but **no capability name**, so
+"implement §8.1" is underdetermined: an implementation must either invent a name for
+`advertise`'s capability — the thing an implementation is not allowed to do — or gate
+`advertise` on `signaling-use` too, which contradicts the sentence that distinguishes them.
+
+**Interim choice.** Rust keeps its three existing names (`system/capability/signaling-offer`,
+`-collect`, `-advertise`) unchanged pending a ruling. Renaming to `signaling-use` unilaterally
+would change the grant strings on the live node every cross-impl run uses, and would move Rust
+away from Py — which carries `signaling-offer` / `signaling-collect` — while moving it toward
+the spec. That is a cohort migration, not a spec-conformance edit, and it is not completable
+for `advertise` from the text as written.
+
+**Question for arch.** Confirm `system/capability/signaling-use` as the single offer+collect
+capability, and either name the `advertise` capability or rule that `advertise` is grant-policy
+over `signaling-use` rather than a distinct capability. Then all three impls move together.
+
+## `EXTENSION-SIGNALING` §9.2 — does the closed error enum bind the wrapped surface?
+
+**Passage.** §9.2: *"Error codes (closed enum)"* — `message_too_large`, `bucket_full`,
+`bad_request`, `rate_limited` — *"Services MUST NOT invent codes outside this set."* The
+section sits inside **§9, The Unwrapped Protocol**.
+
+**The ambiguity.** §2.1 pins the core as wrapper-agnostic and implemented once, and §2.2 warns
+against a verb "completable on one surface only." An error vocabulary that differs by surface
+is arguably that same divergence — but §9.2 is scoped to §9 by placement, and the wrapped
+surface's error entities are `SDK-OPERATIONS`'s vocabulary, not this spec's. The text does not
+say which reading holds.
+
+Two concrete consequences in Rust today (`extensions/signaling/src/lib.rs`): the wrapped
+surface emits `invalid_params` where §9.2 says `bad_request`, and it emits
+`capacity_exhausted` for a `max_keys` refusal — **a condition §9.2's enum has no member for
+at all**, so the closed enum cannot express a refusal the node genuinely makes.
+
+**Interim choice.** Unchanged. Rust serves only the wrapped surface, so nothing is
+non-conformant today under either reading; the codes are left as they are rather than guessing
+at a mapping that a §9 build would then have to unpick.
+
+**Question for arch.** Does §9.2's closed enum bind the wrapped surface too? If so, what is the
+unwrapped code for a keyspace-capacity refusal — `rate_limited`, or does `max_keys` have no
+unwrapped expression (in which case the enum needs a member or §5 needs to say the limit is
+unpublishable)?

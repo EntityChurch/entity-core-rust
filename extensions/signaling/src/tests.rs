@@ -182,7 +182,7 @@ fn pin4_order_survives_dedup_and_expiry() {
 #[test]
 fn pin3_ttl_is_binding_on_the_node() {
     let core = SignalingCore::new("test:1");
-    let ttl = core.limits().bucket_ttl_ms;
+    let ttl = core.limits().ttl_ms();
     core.offer(key(4), b"stale", T0).unwrap();
 
     assert_eq!(core.collect(&key(4), T0 + ttl - 1).len(), 1);
@@ -197,7 +197,7 @@ fn pin3_ttl_is_binding_on_the_node() {
 #[test]
 fn expiry_is_enforced_on_read_not_by_the_reaper() {
     let core = SignalingCore::new("test:1");
-    let ttl = core.limits().bucket_ttl_ms;
+    let ttl = core.limits().ttl_ms();
     core.offer(key(5), b"stale", T0).unwrap();
 
     // Never call reap(): the read path alone must hide the expired deposit.
@@ -218,7 +218,7 @@ fn expiry_is_enforced_on_read_not_by_the_reaper() {
 #[test]
 fn reoffer_after_expiry_stores_again() {
     let core = SignalingCore::new("test:1");
-    let ttl = core.limits().bucket_ttl_ms;
+    let ttl = core.limits().ttl_ms();
     core.offer(key(6), b"msg", T0).unwrap();
     assert_eq!(
         core.offer(key(6), b"msg", T0 + ttl + 1).unwrap(),
@@ -286,10 +286,14 @@ fn wrong_width_key_is_rejected_loudly() {
 #[test]
 fn pin5_default_bounds_are_8kib_and_32() {
     let limits = Limits::default();
-    assert_eq!(limits.max_message_bytes, 8192);
-    assert_eq!(limits.max_messages_per_key, 32);
-    // §1.1 pin 6, published in the same advertisement.
-    assert_eq!(limits.bucket_ttl_ms, 60_000);
+    assert_eq!(limits.max_blob_bytes, 8192);
+    assert_eq!(limits.max_bucket_blobs, 32);
+    // §5 pin 6, published in the same advertise-result — in SECONDS (§4.5).
+    // The unit is asserted, not just the magnitude: 60 and 60_000 are the same
+    // TTL to a reader who assumes the wrong one, and the failure presents as
+    // blobs that never reap rather than as a unit error.
+    assert_eq!(limits.ttl_seconds, 60);
+    assert_eq!(limits.ttl_ms(), 60_000);
 
     // A §4-sized handshake (~1 KB) fits with 8× headroom — the point of the
     // number, not a coincidence worth leaving unasserted.
@@ -322,7 +326,7 @@ fn pin5_a_full_bucket_refuses_rather_than_evicting() {
     let core = SignalingCore::with_limits(
         "test:1",
         Limits {
-            max_messages_per_key: 3,
+            max_bucket_blobs: 3,
             ..Limits::default()
         },
     );
@@ -353,8 +357,8 @@ async fn pin5_bounds_surface_as_named_codes() {
     let core = Arc::new(SignalingCore::with_limits(
         "test:1",
         Limits {
-            max_message_bytes: 16,
-            max_messages_per_key: 1,
+            max_blob_bytes: 16,
+            max_bucket_blobs: 1,
             ..Limits::default()
         },
     ));
@@ -399,7 +403,7 @@ fn oversized_message_is_refused_and_deposits_nothing() {
     let core = SignalingCore::with_limits(
         "test:1",
         Limits {
-            max_message_bytes: 8,
+            max_blob_bytes: 8,
             ..Limits::default()
         },
     );
@@ -418,7 +422,7 @@ fn bucket_and_node_capacity_are_bounded() {
     let core = SignalingCore::with_limits(
         "test:1",
         Limits {
-            max_messages_per_key: 2,
+            max_bucket_blobs: 2,
             max_keys: 2,
             ..Limits::default()
         },
@@ -444,11 +448,11 @@ fn expired_bucket_frees_its_own_capacity() {
     let core = SignalingCore::with_limits(
         "test:1",
         Limits {
-            max_messages_per_key: 1,
+            max_bucket_blobs: 1,
             ..Limits::default()
         },
     );
-    let ttl = core.limits().bucket_ttl_ms;
+    let ttl = core.limits().ttl_ms();
     core.offer(key(22), b"old", T0).unwrap();
     assert!(core.offer(key(22), b"new", T0).is_err());
     assert_eq!(
@@ -513,22 +517,29 @@ fn advertisement_round_trips_with_bare_limits_map() {
 
 /// §2.2 Finding B: `lobby` must name an actual constant, or two peers on the
 /// same open node each invent a different input and never share a bucket. A
-/// node that does not override it emits **no `lobby` key at all** (absent, not
-/// null), and peers fall back to `LOBBY_DEFAULT`.
+/// node that does not override it emits **no `lobby_constant` key at all**
+/// (absent, not null), and peers fall back to `LOBBY_DEFAULT`.
 #[test]
 fn advertisement_omits_lobby_unless_the_pool_overrides_it() {
     let core = SignalingCore::new("signal.example:4040");
-    assert_eq!(core.advertise().lobby, None);
+    assert_eq!(core.advertise().limits.lobby_constant, None);
     assert_eq!(core.lobby_constant(), LOBBY_DEFAULT);
 
     let entity = crate::data::advertisement_to_entity(&core.advertise()).unwrap();
     let decoded: entity_ecf::Value = ciborium::from_reader(entity.data.as_slice()).unwrap();
+    let limits = decoded
+        .into_map()
+        .unwrap()
+        .into_iter()
+        .find(|(k, _)| k.as_text() == Some("limits"))
+        .expect("limits map")
+        .1;
     assert!(
-        !decoded
+        !limits
             .into_map()
             .unwrap()
             .iter()
-            .any(|(k, _)| k.as_text() == Some("lobby")),
+            .any(|(k, _)| k.as_text() == Some("lobby_constant")),
         "the key must be absent, not present-and-null"
     );
 }
@@ -537,11 +548,45 @@ fn advertisement_omits_lobby_unless_the_pool_overrides_it() {
 fn advertisement_carries_an_overridden_lobby_constant() {
     let core = SignalingCore::new("signal.example:4040").with_lobby("lobby:chess-club");
     let ad = core.advertise();
-    assert_eq!(ad.lobby.as_deref(), Some("lobby:chess-club"));
+    assert_eq!(
+        ad.limits.lobby_constant.as_deref(),
+        Some("lobby:chess-club")
+    );
     assert_eq!(core.lobby_constant(), "lobby:chess-club");
 
     let entity = crate::data::advertisement_to_entity(&ad).unwrap();
     assert_eq!(advertisement_from_params(&entity.data).unwrap(), ad);
+}
+
+/// §4.5 types `lobby_constant` as `primitive/bytes`, not text — it is a
+/// derivation input (§3.1 hashes it verbatim), and a peer that reads it as text
+/// against a node that wrote bytes derives a different lobby key and silently
+/// never meets. A same-side round-trip agrees either way, so the CBOR major
+/// type is asserted directly.
+#[test]
+fn lobby_constant_is_a_byte_string_on_the_wire() {
+    let core = SignalingCore::new("signal.example:4040").with_lobby("lobby:chess-club");
+    let entity = crate::data::advertisement_to_entity(&core.advertise()).unwrap();
+    let decoded: entity_ecf::Value = ciborium::from_reader(entity.data.as_slice()).unwrap();
+    let limits = decoded
+        .into_map()
+        .unwrap()
+        .into_iter()
+        .find(|(k, _)| k.as_text() == Some("limits"))
+        .expect("limits map")
+        .1;
+    let lobby = limits
+        .into_map()
+        .unwrap()
+        .into_iter()
+        .find(|(k, _)| k.as_text() == Some("lobby_constant"))
+        .expect("lobby_constant")
+        .1;
+    assert_eq!(
+        lobby.as_bytes(),
+        Some(&b"lobby:chess-club".to_vec()),
+        "must be a CBOR bstr, not a text string"
+    );
 }
 
 /// Setting the override *to* the default is the same fact as not overriding, so
@@ -549,7 +594,7 @@ fn advertisement_carries_an_overridden_lobby_constant() {
 #[test]
 fn explicitly_setting_the_default_lobby_is_normalized_to_absent() {
     let core = SignalingCore::new("signal.example:4040").with_lobby(LOBBY_DEFAULT);
-    assert_eq!(core.advertise().lobby, None);
+    assert_eq!(core.advertise().limits.lobby_constant, None);
 }
 
 // ---------------------------------------------------------------------------
@@ -1120,13 +1165,17 @@ async fn client_reads_the_advertisement() {
 
     let ad = client.advertise().await.unwrap();
     assert_eq!(ad.endpoint, "signal.example:4050");
-    assert_eq!(ad.lobby.as_deref(), Some("lobby:chess-club"));
-    assert_eq!(ad.limits.bucket_ttl_ms, core.limits().bucket_ttl_ms);
+    // §4.5: the lobby override lives inside `limits`, not beside `endpoint`.
+    assert_eq!(
+        ad.limits.lobby_constant.as_deref(),
+        Some("lobby:chess-club")
+    );
+    assert_eq!(ad.limits.ttl_seconds, core.limits().ttl_seconds);
 
     // And the constant it publishes is the one a peer must derive with — using
     // LOBBY_DEFAULT here would land in a bucket nobody on this pool uses.
     assert_ne!(
-        key::lobby_key(ad.lobby.as_deref().unwrap()),
+        key::lobby_key(ad.limits.lobby_constant.as_deref().unwrap()),
         key::lobby_key(LOBBY_DEFAULT)
     );
 }
@@ -1147,9 +1196,8 @@ fn candidates_for(who: &str) -> Vec<Candidate> {
             CANDIDATE_HOST,
             SUBSTRATE_TCP,
             format!("192.168.1.5:{}", who.len()),
-            1,
         ),
-        Candidate::new(CANDIDATE_SRFLX, SUBSTRATE_TCP, "203.0.113.7:51820", 2),
+        Candidate::new(CANDIDATE_SRFLX, SUBSTRATE_TCP, "203.0.113.7:51820"),
     ]
 }
 
@@ -1336,17 +1384,19 @@ fn unrecognized_blobs_classify_as_unknown_not_an_error() {
     );
 }
 
-/// §4's dial plan: `host` → `srflx` → `relay`, then priority. The order *is* the
-/// plan ("first pair that completes a connectivity check wins"), and it must be
-/// total — two peers ordering differently cross at different candidates and
-/// waste attempts.
+/// The dial plan (`EXTENSION-NETWORK.md` §6.7.3): `host` → `srflx` → `relay`,
+/// then address. The order *is* the plan ("first pair that completes a
+/// connectivity check wins"), and it must be total — two peers ordering
+/// differently cross at different candidates and waste attempts. Address is the
+/// tiebreak because the wire carries no `priority`; it is the only field left
+/// that both peers see identically.
 #[test]
 fn candidates_order_host_then_srflx_then_relay() {
     let unordered = vec![
-        Candidate::new(CANDIDATE_RELAY, SUBSTRATE_TCP, "relay.example:3478", 1),
-        Candidate::new(CANDIDATE_SRFLX, SUBSTRATE_TCP, "203.0.113.7:51820", 5),
-        Candidate::new(CANDIDATE_HOST, SUBSTRATE_TCP, "192.168.1.5:4040", 9),
-        Candidate::new(CANDIDATE_SRFLX, SUBSTRATE_TCP, "203.0.113.7:51821", 2),
+        Candidate::new(CANDIDATE_RELAY, SUBSTRATE_TCP, "relay.example:3478"),
+        Candidate::new(CANDIDATE_SRFLX, SUBSTRATE_TCP, "203.0.113.7:51820"),
+        Candidate::new(CANDIDATE_HOST, SUBSTRATE_TCP, "192.168.1.5:4040"),
+        Candidate::new(CANDIDATE_SRFLX, SUBSTRATE_TCP, "203.0.113.7:51821"),
     ];
     let ordered = coordination::order_for_dialing(&unordered);
     let kinds: Vec<&str> = ordered.iter().map(|c| c.candidate_type.as_str()).collect();
@@ -1359,8 +1409,44 @@ fn candidates_order_host_then_srflx_then_relay() {
             CANDIDATE_RELAY
         ]
     );
-    // Within srflx, lower priority first.
-    assert_eq!(ordered[1].priority, 2);
+    // Within srflx, address ascending — the total-order tiebreak.
+    assert_eq!(ordered[1].address, "203.0.113.7:51820");
+    assert_eq!(ordered[2].address, "203.0.113.7:51821");
+}
+
+/// The wire carries exactly `system/network/candidate`'s three fields
+/// (`EXTENSION-NETWORK.md` §6.7.3) — no `priority`. A same-side round-trip
+/// passes with a fourth field present, so the encoded map is inspected directly.
+#[test]
+fn candidate_wire_shape_is_the_three_spec_fields() {
+    let req = ConnectRequest {
+        candidates: vec![Candidate::new(
+            CANDIDATE_HOST,
+            SUBSTRATE_TCP,
+            "192.168.1.5:4040",
+        )],
+        initiator: "peer-a".into(),
+        nonce: Nonce(vec![7u8; 16]),
+    };
+    let entity = req.to_entity().unwrap();
+    let decoded: entity_ecf::Value = ciborium::from_reader(entity.data.as_slice()).unwrap();
+    let cands = decoded
+        .into_map()
+        .unwrap()
+        .into_iter()
+        .find(|(k, _)| k.as_text() == Some("candidates"))
+        .expect("candidates")
+        .1;
+    let first = cands.into_array().unwrap().into_iter().next().unwrap();
+    let keys: Vec<String> = first
+        .into_map()
+        .unwrap()
+        .iter()
+        .filter_map(|(k, _)| k.as_text().map(str::to_string))
+        .collect();
+    // ECF sorts keys length-first, then bytewise (RFC 8949 §4.2), so this is
+    // the exact encoded order — three keys, and `priority` is not among them.
+    assert_eq!(keys, vec!["type", "address", "substrate"]);
 }
 
 /// An unknown candidate class sorts last rather than being dropped — a peer that
@@ -1368,8 +1454,8 @@ fn candidates_order_host_then_srflx_then_relay() {
 #[test]
 fn unknown_candidate_class_sorts_last_and_survives() {
     let mixed = vec![
-        Candidate::new("quantum-tunnel", SUBSTRATE_TCP, "??", 0),
-        Candidate::new(CANDIDATE_HOST, SUBSTRATE_TCP, "192.168.1.5:4040", 9),
+        Candidate::new("quantum-tunnel", SUBSTRATE_TCP, "??"),
+        Candidate::new(CANDIDATE_HOST, SUBSTRATE_TCP, "192.168.1.5:4040"),
     ];
     let ordered = coordination::order_for_dialing(&mixed);
     assert_eq!(ordered.len(), 2, "nothing is dropped");

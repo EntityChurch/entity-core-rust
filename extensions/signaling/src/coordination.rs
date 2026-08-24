@@ -68,7 +68,7 @@
 //! everyone else" cross-peer failure. So candidates live **inside** these
 //! messages and never as tree state, and nothing in this module writes anything.
 
-use entity_ecf::{array, bytes, integer, text, to_ecf, Value};
+use entity_ecf::{array, bytes, text, to_ecf, Value};
 use entity_entity::Entity;
 
 use crate::SignalingError;
@@ -105,6 +105,14 @@ pub const SUBSTRATE_QUIC: &str = "quic";
 pub const SUBSTRATE_WEBRTC: &str = "webrtc";
 
 /// One address a peer might be reachable at, typed and ordered ICE-style.
+///
+/// **Exactly the three fields of `system/network/candidate`**
+/// (`EXTENSION-NETWORK.md` §6.7.3) — this is that type, carried, not a signaling
+/// variant of it. There is deliberately **no `priority`**: try order derives
+/// from the candidate `type` (`host` → `srflx` → `relay`), so a wire priority
+/// would be a second, disagreeing source for the same ordering. §10's
+/// `(priority asc, profile-id lex)` loop orders *durable transport profiles*;
+/// candidates are ephemeral and ordered by class instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Candidate {
     /// `host` | `srflx` | `relay`.
@@ -115,10 +123,6 @@ pub struct Candidate {
     /// entity layer never interprets `IP:port`, which is the load-bearing
     /// addressing invariant these facts are careful not to break.
     pub address: String,
-    /// Lower is tried first, matching §10's existing `(priority asc, profile-id
-    /// lex)` profile loop — the same try-in-order idea applied to ephemeral
-    /// candidates instead of durable profiles.
-    pub priority: u32,
 }
 
 impl Candidate {
@@ -126,13 +130,11 @@ impl Candidate {
         candidate_type: impl Into<String>,
         substrate: impl Into<String>,
         address: impl Into<String>,
-        priority: u32,
     ) -> Self {
         Self {
             candidate_type: candidate_type.into(),
             substrate: substrate.into(),
             address: address.into(),
-            priority,
         }
     }
 
@@ -152,7 +154,6 @@ impl Candidate {
     fn to_value(&self) -> Value {
         Value::Map(vec![
             (text("address"), text(&self.address)),
-            (text("priority"), integer(self.priority as i64)),
             (text("substrate"), text(&self.substrate)),
             (text("type"), text(&self.candidate_type)),
         ])
@@ -166,24 +167,23 @@ impl Candidate {
             candidate_type: field_text(map, "type")?,
             substrate: field_text(map, "substrate")?,
             address: field_text(map, "address")?,
-            priority: field_u32(map, "priority").unwrap_or(0),
         })
     }
 }
 
 /// Order a candidate list for dialing: class first (`host` → `srflx` →
-/// `relay`), then `priority` ascending, then address for a total order.
+/// `relay`), then address for a total order.
 ///
-/// "First pair that completes a connectivity check wins" (§4), so this ordering
-/// *is* the dial plan. It is deterministic to the last tiebreak on purpose —
-/// two peers that order differently waste attempts crossing at different
-/// candidates.
+/// "First pair that completes a connectivity check wins"
+/// (`EXTENSION-NETWORK.md` §6.7.3), so this ordering *is* the dial plan. It is
+/// deterministic to the last tiebreak on purpose — two peers that order
+/// differently waste attempts crossing at different candidates. Address is that
+/// tiebreak precisely because the wire carries no `priority` to break it with.
 pub fn order_for_dialing(candidates: &[Candidate]) -> Vec<Candidate> {
     let mut ordered = candidates.to_vec();
     ordered.sort_by(|a, b| {
         a.class_rank()
             .cmp(&b.class_rank())
-            .then_with(|| a.priority.cmp(&b.priority))
             .then_with(|| a.address.cmp(&b.address))
     });
     ordered
@@ -536,12 +536,6 @@ fn field_u64(map: &[(Value, Value)], key: &str) -> Result<u64, SignalingError> {
         .ok_or_else(|| {
             SignalingError::Decode(format!("missing/invalid unsigned integer field {}", key))
         })
-}
-
-fn field_u32(map: &[(Value, Value)], key: &str) -> Option<u32> {
-    get_field(map, key)
-        .and_then(|v| v.as_integer())
-        .and_then(|i| u32::try_from(i).ok())
 }
 
 fn field_candidates(map: &[(Value, Value)]) -> Result<Vec<Candidate>, SignalingError> {

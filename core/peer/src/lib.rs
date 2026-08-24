@@ -14,6 +14,7 @@ pub mod http_connection;
 pub mod http_live;
 pub mod ingest;
 pub mod keepalive;
+pub mod live_establish;
 pub mod liveness;
 #[cfg(feature = "network")]
 pub mod network_link;
@@ -22,6 +23,9 @@ pub mod published_root;
 #[cfg(feature = "relay")]
 pub mod relay_forwarder;
 pub mod remote;
+/// EXTENSION-SIGNALING §7.3 socket options — native only (no sockets on wasm32).
+#[cfg(not(target_arch = "wasm32"))]
+pub mod reuseport;
 pub mod runtime;
 pub mod server;
 pub mod session_entity;
@@ -146,6 +150,12 @@ pub struct PeerShared {
     /// Optional grant resolver consulted at AUTHENTICATE before falling
     /// back to `default_connection_grants` (EXTENSION-ROLE §4.7).
     pub grant_resolver: Option<GrantResolver>,
+    /// `EXTENSION-NETWORK` §10.3 (A14) — the live-establishment seam,
+    /// consulted at §10 step 3b when durable-profile resolution finds no
+    /// dialable address. `None` (nothing registered) makes the ladder
+    /// byte-identical to the pre-seam behavior, which is A14's stated
+    /// no-regression property. See [`live_establish::LiveEstablish`].
+    pub live_establish: Option<Arc<dyn live_establish::LiveEstablish>>,
     /// `(author_hash_hex, request_id) → preserved handle` — idempotency
     /// index for durable requests (EXTENSION-DURABILITY §5 / Amendment 1).
     /// A replayed durable request whose pair matches a previously preserved
@@ -209,6 +219,14 @@ pub struct Peer {
     /// Optional grant resolver wired post-construction via
     /// `Peer::set_grant_resolver`. Cloned into every `PeerShared`.
     grant_resolver: Option<GrantResolver>,
+    /// Optional §10.3 live-establishment seam wired post-construction via
+    /// `Peer::set_live_establish`. Cloned into every `PeerShared`.
+    ///
+    /// Wired after construction rather than at build time for the same reason
+    /// the grant resolver is: the registered policy (`EXTENSION-SIGNALING` §7)
+    /// needs a carrier client, which needs a peer to execute through — so the
+    /// peer must exist before its own traversal policy can be built.
+    live_establish: Option<Arc<dyn live_establish::LiveEstablish>>,
     /// Substrate attestation index (when the `attestation` feature is
     /// enabled). Exposed so the role policy resolver — wired
     /// post-construction — can read from the same index that
@@ -314,6 +332,7 @@ impl Peer {
             connector: self.connector.clone(),
             attestation_store: self.attestation_store.clone(),
             grant_resolver: self.grant_resolver.clone(),
+            live_establish: self.live_establish.clone(),
             preserved_requests: self.preserved_requests.clone(),
             dispatch_hooks: self.dispatch_hooks.clone(),
             wire_hooks: self.wire_hooks.clone(),
@@ -325,6 +344,16 @@ impl Peer {
     /// each `shared()` snapshot picks up the resolver at clone time.
     pub fn set_grant_resolver(&mut self, resolver: GrantResolver) {
         self.grant_resolver = Some(resolver);
+    }
+
+    /// Register the `EXTENSION-NETWORK` §10.3 live-establishment seam (A14).
+    ///
+    /// Must be called before any dispatch that should escalate to traversal;
+    /// each `shared()` snapshot picks the seam up at clone time. With nothing
+    /// registered the §10 ladder is unchanged — §10.3's additive property — so
+    /// this is opt-in per deployment, not a default posture.
+    pub fn set_live_establish(&mut self, seam: Arc<dyn live_establish::LiveEstablish>) {
+        self.live_establish = Some(seam);
     }
 
     /// Substrate attestation index. Available when the `attestation`
@@ -2446,6 +2475,10 @@ impl PeerBuilder {
             handler_registry,
             tree,
             config: self.config,
+            // §10.3 is opt-in: a peer with no traversal policy registered runs
+            // the pre-seam ladder exactly. Wired post-construction via
+            // `set_live_establish`.
+            live_establish: None,
             connector,
             remote: Arc::new(remote::RemoteState::new()),
             event_tx,
@@ -6510,6 +6543,292 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(remote_pid, server_pid);
+
+        server_handle.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // EXTENSION-NETWORK §10.3 (A14) — the live-establishment seam
+    // -----------------------------------------------------------------------
+
+    /// A seam that hands back an already-established memory connection to the
+    /// server, standing in for a punched socket. §10.3 does not specify how the
+    /// connection was obtained — candidate exchange, simultaneous open and the
+    /// §7.4 check all belong to the registered policy — so a stub that skips
+    /// straight to "here is a live transport" exercises exactly the seam's own
+    /// contract and nothing else.
+    struct StubEstablisher {
+        registry: std::sync::Arc<transport::MemoryTransportRegistry>,
+        target: String,
+        /// Counts consultations, so a test can prove the seam is consulted
+        /// **once** and the result reused (§10.3) rather than re-traversed.
+        calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// What the caller declared about retry ownership (§10.3 obligation 4).
+        saw_caller_owns_retry: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl StubEstablisher {
+        fn new(
+            registry: std::sync::Arc<transport::MemoryTransportRegistry>,
+            target: String,
+        ) -> Self {
+            Self {
+                registry,
+                target,
+                calls: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                saw_caller_owns_retry: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+                    false,
+                )),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl live_establish::LiveEstablish for StubEstablisher {
+        async fn establish_live(
+            &self,
+            ctx: live_establish::EstablishCtx,
+            _peer_id: &str,
+        ) -> Option<transport::Connection> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.saw_caller_owns_retry
+                .store(ctx.caller_owns_retry, std::sync::atomic::Ordering::SeqCst);
+            // A real policy checks the deadline between rungs rather than
+            // starting a carrier round trip it cannot finish (§10.3).
+            if ctx.expired() {
+                return None;
+            }
+            use transport::Connector;
+            transport::MemoryConnector::new(self.registry.clone())
+                .connect(&format!("memory://{}", self.target))
+                .await
+                .ok()
+        }
+    }
+
+    /// The additive, no-regression property (§10.3): with **nothing registered**
+    /// the ladder is byte-identical to the pre-seam behavior. A peer with no
+    /// resolvable durable profile still fails resolution, exactly as before —
+    /// the seam must not turn a resolution miss into some new outcome.
+    #[tokio::test]
+    async fn live_establish_unregistered_leaves_the_ladder_unchanged() {
+        let client = PeerBuilder::new()
+            .keypair(Keypair::from_seed([40u8; 32]))
+            .build()
+            .unwrap();
+        client.local_only();
+        let shared = client.shared();
+        assert!(
+            shared.live_establish.is_none(),
+            "§10.3 is opt-in — a peer must not acquire a traversal policy by default"
+        );
+
+        let err = remote::get_or_connect(
+            &shared.remote,
+            "PeerWithNoPublishedProfile",
+            &shared.keypair,
+            shared.content_store.as_ref(),
+            shared.location_index.as_ref(),
+            &shared.peer_id.to_string(),
+            shared.connector.as_ref(),
+            shared.config.home_hash_format,
+            Some(shared.clone()),
+        )
+        .await;
+        assert!(
+            err.is_err(),
+            "an unregistered seam must fall straight through to the pre-seam error"
+        );
+    }
+
+    /// The seam's own contract: a returned connection is handshaken, **pooled**,
+    /// and reused by every later dispatch (§10.3 — "returns a connection, not a
+    /// result, and that is why it is a separate seam"). A seam consulted per
+    /// message would punch a fresh hole each time and stay invisible to §10
+    /// step 1; the call counter is what distinguishes those two worlds.
+    #[tokio::test]
+    async fn live_establish_connection_is_pooled_and_reused() {
+        use transport::{MemoryListener, MemoryTransportRegistry};
+        let registry = MemoryTransportRegistry::new();
+
+        let server = PeerBuilder::new()
+            .keypair(Keypair::from_seed([41u8; 32]))
+            .build()
+            .unwrap();
+        let server_pid = server.peer_id().to_string();
+        let listener = MemoryListener::bind(server_pid.clone(), registry.clone()).unwrap();
+        let server_shared = server.shared();
+        server.start_engines(&server_shared);
+        let sc = server_shared.clone();
+        let server_handle = tokio::spawn(async move {
+            let _ = server::run(listener, sc).await;
+        });
+        tokio::task::yield_now().await;
+
+        let mut client = PeerBuilder::new()
+            .keypair(Keypair::from_seed([42u8; 32]))
+            .build()
+            .unwrap();
+        client.local_only();
+        let stub = std::sync::Arc::new(StubEstablisher::new(registry.clone(), server_pid.clone()));
+        let calls = stub.calls.clone();
+        let saw_retry = stub.saw_caller_owns_retry.clone();
+        client.set_live_establish(stub);
+        let shared = client.shared();
+
+        // The server publishes no transport profile into the client's tree, so
+        // durable-profile resolution misses and step 3b is the only way through.
+        let first = remote::get_or_connect(
+            &shared.remote,
+            &server_pid,
+            &shared.keypair,
+            shared.content_store.as_ref(),
+            shared.location_index.as_ref(),
+            &shared.peer_id.to_string(),
+            shared.connector.as_ref(),
+            shared.config.home_hash_format,
+            Some(shared.clone()),
+        )
+        .await
+        .expect("§10.3 seam should have produced a live connection");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let second = remote::get_or_connect(
+            &shared.remote,
+            &server_pid,
+            &shared.keypair,
+            shared.content_store.as_ref(),
+            shared.location_index.as_ref(),
+            &shared.peer_id.to_string(),
+            shared.connector.as_ref(),
+            shared.config.home_hash_format,
+            Some(shared.clone()),
+        )
+        .await
+        .expect("second dispatch");
+
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "the traversal connection must be POOLED — a second dispatch that \
+             re-enters the seam would punch a fresh hole per message"
+        );
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the seam is consulted once, at resolution — not per dispatch"
+        );
+        // §10.3 obligation 4: a §10 *dispatch* consultation leaves the policy
+        // owning its own §7.2 exchange budget. Only the §4.1 reconnection path
+        // caps it at one third-party exchange, and that call site is rung 4 —
+        // asserted here so the two never quietly become one.
+        assert!(
+            !saw_retry.load(std::sync::atomic::Ordering::SeqCst),
+            "a dispatch-driven consultation must not claim caller-owned retry"
+        );
+
+        server_handle.abort();
+    }
+
+    /// §10.3: *"`ctx` carries a deadline and is cancellable (MUST)... a seam
+    /// with no cancellation makes an unreachable peer indistinguishable from a
+    /// hung dispatcher."*
+    ///
+    /// The deadline half is asserted here. The cancellation half is structural
+    /// in Rust — dropping the future cancels it — so there is nothing to assert
+    /// beyond the fact that the caller can wrap the call, which `tokio::time::
+    /// timeout` does for free.
+    #[tokio::test]
+    async fn establish_ctx_carries_a_deadline_and_reports_expiry() {
+        use live_establish::EstablishCtx;
+
+        let live = EstablishCtx::dispatch(
+            web_time::Instant::now() + live_establish::DEFAULT_TRAVERSAL_BUDGET,
+        );
+        assert!(!live.expired());
+        assert!(!live.caller_owns_retry);
+        assert!(live.remaining() > std::time::Duration::from_secs(1));
+
+        // An already-elapsed deadline reads as expired rather than panicking or
+        // wrapping — a policy consulted late must decline, not run.
+        let past =
+            EstablishCtx::dispatch(web_time::Instant::now() - std::time::Duration::from_secs(1));
+        assert!(past.expired());
+        assert_eq!(past.remaining(), std::time::Duration::ZERO);
+
+        // The §4.1 constructor is the only thing that sets the obligation-4
+        // flag; the two are named rather than boolean so a transposed argument
+        // cannot silently swap the retry authority (§7.2.1).
+        assert!(EstablishCtx::reconnect(web_time::Instant::now()).caller_owns_retry);
+    }
+
+    /// §10.3 MUST 1: the punched mapping is **session-scoped** — it is an
+    /// ordinary transport and MUST NOT be published as a durable
+    /// `system/peer/transport/*` profile (`EXTENSION-NETWORK.md` §6.7.3).
+    ///
+    /// Worth an explicit assertion rather than trusting the code path: writing
+    /// the observed address into a durable profile is the *cheap* fix for "we
+    /// know where this peer is now", and it corrupts §10 dispatch for every
+    /// later reader — the same defect A13 calls out for `observed_address`.
+    #[tokio::test]
+    async fn live_establish_publishes_no_durable_transport_profile() {
+        use transport::{MemoryListener, MemoryTransportRegistry};
+        let registry = MemoryTransportRegistry::new();
+
+        let server = PeerBuilder::new()
+            .keypair(Keypair::from_seed([43u8; 32]))
+            .build()
+            .unwrap();
+        let server_pid = server.peer_id().to_string();
+        let listener = MemoryListener::bind(server_pid.clone(), registry.clone()).unwrap();
+        let server_shared = server.shared();
+        server.start_engines(&server_shared);
+        let sc = server_shared.clone();
+        let server_handle = tokio::spawn(async move {
+            let _ = server::run(listener, sc).await;
+        });
+        tokio::task::yield_now().await;
+
+        let mut client = PeerBuilder::new()
+            .keypair(Keypair::from_seed([44u8; 32]))
+            .build()
+            .unwrap();
+        client.local_only();
+        client.set_live_establish(std::sync::Arc::new(StubEstablisher::new(
+            registry.clone(),
+            server_pid.clone(),
+        )));
+        let shared = client.shared();
+
+        remote::get_or_connect(
+            &shared.remote,
+            &server_pid,
+            &shared.keypair,
+            shared.content_store.as_ref(),
+            shared.location_index.as_ref(),
+            &shared.peer_id.to_string(),
+            shared.connector.as_ref(),
+            shared.config.home_hash_format,
+            Some(shared.clone()),
+        )
+        .await
+        .expect("§10.3 seam should have produced a live connection");
+
+        // A *published* profile lives at `system/peer/transport/{peer_id}/
+        // {profile-id}` (D-13, §6.5.2a). Bootstrap `system/type/...` entities
+        // declaring the profile *types* are unrelated and always present — the
+        // filter excludes them so this asserts publication, not vocabulary.
+        let profiles: Vec<String> = shared
+            .location_index
+            .list("")
+            .into_iter()
+            .map(|e| e.path)
+            .filter(|p| p.contains("system/peer/transport") && !p.contains("system/type/"))
+            .collect();
+        assert!(
+            profiles.is_empty(),
+            "a traversal connection must publish no durable transport profile, found: {:?}",
+            profiles
+        );
 
         server_handle.abort();
     }

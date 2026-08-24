@@ -27,3 +27,24 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /out/entity /usr/local/bin/entity
 ENTRYPOINT ["entity"]
+
+# Source provenance — which commit is actually inside this image.
+#
+# A floating `entity-core-rust` tag carries no identity, so a consumer cannot
+# tell a fresh image from a stale one. That is not hypothetical: on 2026-07-30 a
+# cross-impl run was served a 36-hour-old image whose layer cache had not
+# invalidated, and it would have reported old code as passing — the same
+# green-but-meaningless shape as RT-6, one layer down in the tooling.
+#
+# `entity-core-go`'s peer-manager reads both keys below and warns on a mismatch
+# against the sibling's HEAD. A dirty tree stamps `<sha>-dirty`, because
+# labelling uncommitted work with a bare commit would be a false provenance
+# claim; `org.entity.git.dirty` carries the same fact machine-readably.
+#
+# Declared last so the changing value only rebuilds the metadata layer.
+ARG GIT_COMMIT=unknown
+ARG GIT_DIRTY=false
+LABEL org.opencontainers.image.revision="${GIT_COMMIT}" \
+      org.entity.git.commit="${GIT_COMMIT}" \
+      org.entity.git.dirty="${GIT_DIRTY}" \
+      org.opencontainers.image.source="https://github.com/EntityChurch/entity-core-rust"

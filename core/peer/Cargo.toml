@@ -85,6 +85,13 @@ thiserror.workspace = true
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "macros", "signal", "sync"] }
+# EXTENSION-SIGNALING §7.3: the TCP simultaneous-open punch MUST leave from the
+# same local endpoint whose NAT mapping the reflector observed, and that is
+# "not satisfiable by discipline" — it needs SO_REUSEADDR/SO_REUSEPORT plus an
+# explicit bind, which tokio's own API does not expose. Already in Cargo.lock
+# at this version (transitive via tokio), so this adds no new supply-chain
+# surface — it promotes an existing edge to a direct one.
+socket2 = { version = "0.6", features = ["all"] }
 hyper = { version = "1", features = ["server", "http1"], optional = true }
 hyper-util = { version = "0.1", features = ["tokio"], optional = true }
 http-body-util = { version = "0.1", optional = true }

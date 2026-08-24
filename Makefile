@@ -6,6 +6,21 @@
 IMAGE  := entity-core-rust
 CARGO_CACHE := $(HOME)/.cache/cargo-entity-core-rust
 
+# ----------------------------------------------------------------------------
+# Source provenance stamped into the image (see the LABEL block in Dockerfile).
+# A floating tag carries no identity, so a stale image is undetectable — which
+# is exactly how a 2026-07-30 cross-impl run was served 36-hour-old code. These
+# make the commit inside an image inspectable:
+#     podman inspect --format '{{ index .Labels "org.entity.git.commit" }}' entity-core-rust
+# A dirty tree stamps `<sha>-dirty` rather than claiming the bare commit.
+# Kept separate from PODMAN_BUILD_CAPS so a caller injecting `--no-cache`
+# through that variable (peer-manager does) composes rather than collides.
+# ----------------------------------------------------------------------------
+GIT_COMMIT := $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
+GIT_DIRTY  := $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo true || echo false)
+GIT_STAMP  := $(GIT_COMMIT)$(if $(filter true,$(GIT_DIRTY)),-dirty,)
+PODMAN_BUILD_ARGS := --build-arg GIT_COMMIT=$(GIT_STAMP) --build-arg GIT_DIRTY=$(GIT_DIRTY)
+
 # ============================================================================
 # Podman resource caps — per-container ceilings so a build/run can't take the
 # host down. Tune the COMMITTED defaults for THIS project; override per-machine
@@ -55,7 +70,7 @@ help:
 # Release build: compiles the `entity` CLI inside the container (Dockerfile
 # builder stage) and produces the runtime image. Green on a bare box.
 build:
-	podman build $(PODMAN_BUILD_CAPS) -t $(IMAGE) .
+	podman build $(PODMAN_BUILD_CAPS) $(PODMAN_BUILD_ARGS) -t $(IMAGE) .
 
 # `image` alias keeps the older name working; `build` is the Tier-1 entry point.
 image: build

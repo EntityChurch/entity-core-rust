@@ -699,6 +699,36 @@ pub async fn get_or_connect(
                 );
                 return Ok(inbound);
             }
+            // §10 step 3b — the EXTENSION-NETWORK §10.3 live-establishment seam
+            // (A14). Durable-profile resolution has failed, but the peer may be
+            // reachable *right now* by traversal. `None` — including nothing
+            // registered — falls through to the same error as before, which is
+            // A14's byte-identical no-regression property.
+            //
+            // Consulted AFTER §6.11(b) inbound reentry: reusing a socket the
+            // peer already opened to us is strictly cheaper than punching a new
+            // one, and reentry is part of resolving *this* peer rather than an
+            // escalation past it. Flagged to arch rather than assumed.
+            //
+            // Ordered BEFORE the §10.2 delivery fallback (MUST, §10.3) — which
+            // this tree does not implement, so the ordering holds trivially and
+            // is not evidence for the rule. See the punch scope checkpoint.
+            if let Some(conn) = try_establish_live(peer_id, reentry.as_ref()).await {
+                let punched_addr = conn.remote_addr.clone();
+                return adopt_transport_connection(
+                    pool,
+                    peer_id,
+                    keypair,
+                    content_store,
+                    location_index,
+                    local_peer_id,
+                    home_format,
+                    reentry,
+                    conn,
+                    &punched_addr,
+                )
+                .await;
+            }
             return Err(e);
         }
     };
@@ -759,6 +789,49 @@ pub async fn get_or_connect(
         PeerError::ConnectionError(format!("connect to {} at {}: {}", peer_id, addr, e))
     })?;
 
+    adopt_transport_connection(
+        pool,
+        peer_id,
+        keypair,
+        content_store,
+        location_index,
+        local_peer_id,
+        home_format,
+        reentry,
+        transport_conn,
+        &addr,
+    )
+    .await
+}
+
+/// Run the handshake over an established transport connection and take it all
+/// the way to a pooled, keepalive'd endpoint.
+///
+/// **Extracted so the §10.3 traversal path and the ordinary dial path are the
+/// same code, not merely the same shape.** A13/A14 put two MUSTs on a punched
+/// connection — that it is an *ordinary* transport, never published as a
+/// durable `system/peer/transport/*` profile, and that it runs §5 keepalive —
+/// and both hold here structurally: a traversal connection reaches the pool
+/// through this function or not at all, and this function publishes no profile.
+///
+/// `addr` is the human-readable remote endpoint used for the §3.13 connection
+/// state write and its transport label. A traversal caller passes the punched
+/// connection's own `remote_addr`, which is the observed peer address — a
+/// session-scoped fact recorded on the *connection*, never on a transport
+/// profile (`EXTENSION-NETWORK.md` §6.7.3).
+#[allow(clippy::too_many_arguments)]
+async fn adopt_transport_connection(
+    pool: &RemoteState,
+    peer_id: &str,
+    keypair: &IdentityKeypair,
+    content_store: &dyn ContentStore,
+    location_index: &dyn LocationIndex,
+    local_peer_id: &str,
+    home_format: u8,
+    reentry: Option<Arc<crate::PeerShared>>,
+    transport_conn: crate::transport::Connection,
+    addr: &str,
+) -> Result<Arc<dyn RemoteEndpoint>, PeerError> {
     // The dispatch context is threaded to the reader (reentry) AND to the
     // §5 keepalive spawn below — clone the Arc before the move.
     let keepalive_shared = reentry.clone();
@@ -782,8 +855,8 @@ pub async fn get_or_connect(
         local_peer_id,
         &conn.remote_peer_id,
         &conn.remote_identity_hash,
-        crate::connection_state::transport_label(&addr),
-        &addr,
+        crate::connection_state::transport_label(addr),
+        addr,
     );
     crate::liveness::write_connected_status(
         content_store,
@@ -806,6 +879,37 @@ pub async fn get_or_connect(
         }
     }
     Ok(won)
+}
+
+/// Consult the §10.3 seam, if one is registered on this dispatch context.
+///
+/// `None` covers all three of "no traversal extension installed", "no carrier
+/// configured", and "traversal was attempted and failed" — deliberately
+/// indistinguishable to the ladder, because §10.3 makes a failed traversal a
+/// *fall-through*, never an error. A platform without the §7.3 socket options
+/// lands here too.
+async fn try_establish_live(
+    peer_id: &str,
+    reentry: Option<&Arc<crate::PeerShared>>,
+) -> Option<crate::transport::Connection> {
+    let seam = reentry?.live_establish.as_ref()?;
+    tracing::debug!(
+        remote_peer = %peer_id,
+        "step 3b: no durable profile; consulting the §10.3 live-establishment seam"
+    );
+    // §10.3: the seam MUST carry a deadline. This is the *dispatch* caller, so
+    // the policy owns its own exchange budget (§7.2 — up to 3). The §4.1
+    // reconnection path constructs `EstablishCtx::reconnect` instead, which
+    // caps the policy at one third-party exchange (§7.2.1); that call site
+    // arrives with rung 4.
+    let ctx = crate::live_establish::EstablishCtx::dispatch(
+        web_time::Instant::now() + crate::live_establish::DEFAULT_TRAVERSAL_BUDGET,
+    );
+    let conn = seam.establish_live(ctx, peer_id).await;
+    if conn.is_none() {
+        tracing::debug!(remote_peer = %peer_id, "§10.3: no live path; falling through");
+    }
+    conn
 }
 
 /// R6 dialer-side write: record the cap received from remote at handshake

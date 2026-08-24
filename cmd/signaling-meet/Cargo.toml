@@ -1,0 +1,18 @@
+[package]
+name = "signaling-meet"
+version = "0.8.0"
+edition.workspace = true
+description = "Rust's participant in the cross-impl signaling meet — one role, one exchange, one JSON line"
+
+[[bin]]
+name = "signaling-meet"
+path = "src/main.rs"
+
+[dependencies]
+entity-core.workspace = true
+entity-signaling.workspace = true
+entity-entity.workspace = true
+entity-hash.workspace = true
+clap.workspace = true
+tokio.workspace = true
+anyhow.workspace = true

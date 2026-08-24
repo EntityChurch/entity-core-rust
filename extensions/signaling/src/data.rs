@@ -38,8 +38,10 @@ pub const TYPE_OFFER_RESULT: &str = "system/signaling/offer-result";
 pub const TYPE_COLLECT_REQUEST: &str = "system/signaling/collect-request";
 /// `collect` result.
 pub const TYPE_COLLECT_RESULT: &str = "system/signaling/collect-result";
-/// `advertise` result.
-pub const TYPE_ADVERTISEMENT: &str = "system/signaling/advertisement";
+/// `advertise` result (§4.5). The name follows §3.7's
+/// `{handler-path}/{op-name}-result` rule — `advertise-result`, not
+/// `advertisement`, which named the concept rather than the operation.
+pub const TYPE_ADVERTISE_RESULT: &str = "system/signaling/advertise-result";
 
 // ---------------------------------------------------------------------------
 // offer
@@ -163,30 +165,34 @@ impl CollectResult {
 /// Encode an [`Advertisement`]. `limits` is a **bare map** — a field typed as a
 /// specific struct, not as `core/entity`, so it gets no entity wrapper.
 pub fn advertisement_to_entity(a: &Advertisement) -> Result<Entity, SignalingError> {
-    let limits = Value::Map(vec![
-        (text("bucket_ttl_ms"), integer(a.limits.bucket_ttl_ms)),
-        (text("max_keys"), integer(a.limits.max_keys as i64)),
+    let mut limits = vec![
         (
-            text("max_message_bytes"),
-            integer(a.limits.max_message_bytes as i64),
+            text("max_blob_bytes"),
+            integer(a.limits.max_blob_bytes as i64),
         ),
         (
-            text("max_messages_per_key"),
-            integer(a.limits.max_messages_per_key as i64),
+            text("max_bucket_blobs"),
+            integer(a.limits.max_bucket_blobs as i64),
         ),
-    ]);
-    let mut fields = vec![
-        (text("endpoint"), text(&a.endpoint)),
-        (text("limits"), limits),
+        (text("ttl_seconds"), integer(a.limits.ttl_seconds as i64)),
     ];
     // Absent, never null: a node that does not override the default emits no
-    // `lobby` key at all, and a peer that sees none derives from
+    // `lobby_constant` key at all, and a peer that sees none derives from
     // `LOBBY_DEFAULT`. ECF sorts keys, so insertion order is for readability.
-    if let Some(lobby) = a.lobby.as_deref() {
-        fields.push((text("lobby"), text(lobby)));
+    //
+    // **Bytes, not text** — §4.5 types it `primitive/bytes` because it is a
+    // derivation input (§3.1 hashes it verbatim), not a label to display.
+    if let Some(lobby) = a.limits.lobby_constant.as_deref() {
+        limits.push((text("lobby_constant"), bytes(lobby.as_bytes().to_vec())));
     }
+    // `max_keys` is deliberately absent — a node-internal backstop, not one of
+    // §4.5's four published limits (see `Limits::max_keys`).
+    let fields = vec![
+        (text("endpoint"), text(&a.endpoint)),
+        (text("limits"), Value::Map(limits)),
+    ];
     let data = to_ecf(&Value::Map(fields));
-    Entity::new(TYPE_ADVERTISEMENT, data).map_err(|e| SignalingError::Encode(e.to_string()))
+    Entity::new(TYPE_ADVERTISE_RESULT, data).map_err(|e| SignalingError::Encode(e.to_string()))
 }
 
 /// Decode an advertisement (client side / registry pool membership).
@@ -197,18 +203,23 @@ pub fn advertisement_from_params(data: &[u8]) -> Result<Advertisement, Signaling
         .ok_or_else(|| SignalingError::Decode("missing/invalid map field limits".into()))?;
     Ok(Advertisement {
         endpoint: field_text(&map, "endpoint")?,
-        // Absent → no override. A `lobby` present but equal to the default is
-        // normalized away so the decoded value compares equal to a node that
-        // never set one.
-        lobby: get_field(&map, "lobby")
-            .and_then(|v| v.as_text())
-            .filter(|s| *s != crate::core::LOBBY_DEFAULT)
-            .map(|s| s.to_string()),
         limits: Limits {
-            bucket_ttl_ms: field_i64(limits_map, "bucket_ttl_ms")?,
-            max_message_bytes: field_i64(limits_map, "max_message_bytes")? as usize,
-            max_messages_per_key: field_i64(limits_map, "max_messages_per_key")? as usize,
-            max_keys: field_i64(limits_map, "max_keys")? as usize,
+            max_blob_bytes: field_i64(limits_map, "max_blob_bytes")? as u64,
+            max_bucket_blobs: field_i64(limits_map, "max_bucket_blobs")? as u64,
+            ttl_seconds: field_i64(limits_map, "ttl_seconds")? as u64,
+            // Absent → no override. A `lobby_constant` present but equal to the
+            // default is normalized away so the decoded value compares equal to
+            // a node that never set one. Non-UTF-8 bytes decode to `None`
+            // rather than erroring: it is an override this peer cannot derive
+            // with, and MUST-ignore says skip the field, not the message.
+            lobby_constant: get_field(limits_map, "lobby_constant")
+                .and_then(|v| v.as_bytes())
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .filter(|s| *s != crate::core::LOBBY_DEFAULT)
+                .map(|s| s.to_string()),
+            // Never published (§4.5 has four fields); a decoding client has no
+            // node keyspace of its own, so the default stands in.
+            max_keys: Limits::default().max_keys,
         },
     })
 }

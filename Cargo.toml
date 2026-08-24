@@ -48,6 +48,9 @@ members = [
     # is built. Installed through the public `PeerBuilder::handler()` seam.
     "extensions/signaling",
     "cmd/entity-signaling-node",
+    # Rust's seat in the cross-impl signaling meet — same CLI/JSON/exit contract
+    # as go's cmd/signaling-meet and py's signaling_meet.py.
+    "cmd/signaling-meet",
     "bindings/ffi",
     "bindings/godot",
     "bindings/sdk",
@@ -109,6 +112,7 @@ default-members = [
     # operator installs the handler), not "untested".
     "extensions/signaling",
     "cmd/entity-signaling-node",
+    "cmd/signaling-meet",
 ]
 
 [workspace.package]
