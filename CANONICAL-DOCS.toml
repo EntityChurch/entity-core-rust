@@ -139,7 +139,7 @@ blurb = "Current project status — where the project is, recent work, backlog, 
 group = "Overview"
 
 # ── Project files ─────────────────────────────────────────────────────────────
-# These were public at the last release but were never declared, and canon-filter
+# These were public at the last release but were never declared, and this manifest
 # is a KEEP-LIST — so the next release would have DELETED all of them from the
 # public repo. Declaring them is what keeps them. (Found by the arch-tools first
 # full pass, 2026-08-22; the same omission was measured in every repo in the fleet.)

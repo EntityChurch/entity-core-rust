@@ -194,7 +194,7 @@ from here.** Memory is where a finding waits while it is still only prose.
   Sites legitimately out of scope (the SDK entry points, `Peer::execute_with_options`) say so;
   sites in scope and not yet flipped say **what blocks the flip**, because *"we know"* with no
   stated blocker is indistinguishable from an exemption. Both are pinned at the code citing
-  `ROUTING-2026-09-10-a`. And note which way the cost runs: the subscription instance cannot be
+  the packet routed that day. And note which way the cost runs: the subscription instance cannot be
   flipped from one seat — our `deliver_token` is A-rooted (conformant, §1.2) but minted as a
   **self-grant**, so its leaf `grantee` is not this engine and it relaxes nothing; flipping the
   ceiling alone refuses every cross-peer delivery. **A restrictive fix whose correctness depends

@@ -25,6 +25,30 @@ server. The crate DAG and design rationale live in `docs/ARCHITECTURE.md`; WASM
 compatibility and the worker stack live in `docs/ARCHITECTURE-WASM-AND-TRANSPORT.md`
 — this file does not repeat them.
 
+## Our public surface — what "breaking" is measured against
+
+**In:** every item reachable from a workspace crate's root (`pub` through a `pub mod` or a
+`pub use`) — its signature, its variants, its public fields, its documented behaviour; the
+**wire contract** we implement (frame shapes, ECF encoding, and the `status`/`code` pair a
+given refusal carries, because a peer reads those and a sibling implementation is tested
+against them); the `cmd/*` binaries' flags, exit codes and `--json` lines where those are
+cross-impl agreements; and **the repo-relative paths of the artifacts we publish**, the
+conformance corpus among them.
+
+**Out:** module layout beneath a crate root, `#[doc(hidden)]` items, anything not `pub`,
+test fixtures and vectors we consume rather than ship, `docs/status/` and the routing
+corpus, and the `bindings/wasm-worker-*` internals (wasm32-only, no native consumer).
+
+⚠ **Artifact paths are surface, and that is the non-obvious half.** A consumer that pins
+`conformance/<file>` has no symbol to compile against and no deprecation to read — it gets
+a 404. So **de-versioning or moving a published file is a breaking change**, is recorded in
+`.release-removals`, and is named in the changelog's breaking verdict. The bump does not
+care that no `pub fn` moved.
+
+⚠ **Our error enums are not `#[non_exhaustive]`.** `ProtocolError` and `WireError` are
+matched exhaustively downstream, so **adding a variant is breaking** — it is not an
+additive change, and it does not become one by being a bug fix.
+
 ## Committing & pushing — standing authorization
 
 **Commit and push finished work without asking.** When a change is complete and the
@@ -77,7 +101,7 @@ them.
 One line in each `docs/status/TRACKER-<counterpart>.md`:
 
 ```markdown
-_Last read `<counterpart>`'s outbox through 2026-09-16, at `dev` @ `9f1c3ab`._
+_Last read `<counterpart>`'s outbox through `<date>`, at `dev` @ `<short-sha>`._
 ```
 
 **Fetch their repo first**, list their `docs/outbox/` for a filename dated after the

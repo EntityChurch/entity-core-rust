@@ -82,7 +82,7 @@ from here.** Memory is where a finding waits while it is still only prose.
   into R-27 §5 rather than ruling it, because *"the operation name and the byte rule are the
   two halves of one check."* **Provenance stated exactly: this did not bite us a second time —
   we found it in a sibling.** So the rule is broadened on evidence but stays a **candidate**
-  at this seat, per the ladder. **Enforcement, the new half:** when a spec MUST turns on
+  in this implementation, per the ladder. **Enforcement, the new half:** when a spec MUST turns on
   *byte-identical* — or you are comparing two encodings of the "same" value to reach an
   authz / dedup / change verdict — extract the **raw field bytes**
   (`entity_wire::cbor_map_field_raw`) from both sides; never compare decoded structs.

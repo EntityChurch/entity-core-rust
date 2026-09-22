@@ -1,51 +1,68 @@
-# .release-removals — deliberate deletions against the PUBLISHED tree.
+# .release-removals — files that were in a previous release and are deliberately
+# not in this one.
 #
-# One path or path-prefix per line; `#` comments allowed. The `[6/6] public-regress`
-# gate blocks any release that removes a file already on public `master` unless it is
-# declared here. A deletion is not forbidden — it must be intended, and this file is
-# the reviewed record that it was. Read by dev-pipeline/promote/promote.sh.
+# One path or path-prefix per line; `#` comments allowed. A comment-only or blank
+# file declares nothing — it is not an allow-all.
 #
-# A comment-only or blank file is NOT an allow-all; it declares nothing.
+# If you followed a link here, you are in the right place: every entry below says
+# what went away, where the thing it carried lives now, and why the name did not
+# stay behind as an alias. A removal is not forbidden; an unrecorded one is.
 
-# ── One matcher, not two: the §4.6 type-pattern glob is deleted ───────────────
+# ── One path matcher, not two: the §4.6 type-pattern glob is gone ─────────────
 # EXTENSION-TYPE §4.6 [v1.2] pins `type_pattern` to ENTITY-CORE-PROTOCOL §5.4
-# `matches_pattern`. Our `glob.rs` was a second, independent path-glob with its own
+# `matches_pattern`. This file was a second, independent path-glob with its own
 # reading of `*` and `**`, and the two answered §4.6's OWN worked example —
 # `system/capability/*` against `system/capability/path-scope/foo` — with opposite
-# verdicts. A type_pattern verdict is a validation outcome, so that divergence
-# surfaces as one peer accepting an entity another peer rejects.
+# verdicts. A `type_pattern` verdict is a validation outcome, so that divergence
+# shows up as one peer accepting an entity another peer rejects.
 #
-# It was deleted rather than rewritten, deliberately, and the commit that did it
-# (`ea27715`, 2026-08-18) states the reason: *a second matcher that happens to agree
-# is the shape core-go's matcher-convergence finding names*, so `type_pattern` now
-# delegates to the one §5.4 `matches_pattern` in the workspace. Convergence was
-# verified by construction rather than assumed — core-go `79cc8da` calls
-# `capability.MatchesPattern` at BOTH sites in `ext/type/constraint/handler.go`,
-# enumerated, not grepped for one hit.
+# It was deleted rather than rewritten, deliberately: a second matcher that happens
+# to agree today is the thing that diverges later without anyone noticing. So
+# `type_pattern` now delegates to the one §5.4 `matches_pattern` in the workspace,
+# and the agreement with the Go implementation was verified by enumerating both of
+# its call sites rather than by finding one.
 #
-# What a reader loses: nothing. The behaviour did not go away; it moved to the single
-# implementation the spec names, and a matcher that can disagree with it no longer
-# exists in this tree to be reached by mistake.
+# What a reader loses: nothing. The behaviour did not go away; it moved to the
+# single implementation the spec names, and a matcher that can disagree with it no
+# longer exists in this tree to be reached by mistake.
 extensions/type-system/src/glob.rs
 
-# ── [ADR-0031] — the rolling status log moves to `docs/STATUS.md` ─────────────
-# `docs/status/STATUS.md` has been public since the last release. It is not being
-# withdrawn: it is being MOVED, and `docs/STATUS.md` is declared canonical in
-# CANONICAL-DOCS.toml in the same commit as this line.
+# ── The rolling status log moved up one directory ─────────────────────────────
+# `docs/status/STATUS.md` was published in the last release. It is not withdrawn:
+# it MOVED, and the same content is published as **`docs/STATUS.md`**.
 #
-# Why the move. [ADR-0031] as first written banned `docs/status/` outright and was
-# corrected the same day — the dated snapshots beside it (`HANDOFF-*`,
-# `CHECKPOINT-*`, `REVIEW-*`, `STATUS-YYYY-MM-DD-*`) are working memory and publish
-# nothing, but the single rolling canonical STATUS.md publishes, because it is how a
-# repo says out loud what it is working on and what it is blocked by. Splitting them
-# by PATH means the distinction is enforced by where a file sits rather than by
-# everyone remembering which one filename is the exception — which is the property
-# whose absence produced the original over-broad ban.
+# Why. `docs/status/` holds working notes — handoffs, checkpoints, dated snapshots —
+# and none of that is written for a reader outside this project. The one rolling
+# status log is, because it is how the repo says out loud what it is working on and
+# what it is blocked by. Separating the two by directory means the distinction holds
+# by itself instead of depending on everyone remembering which single filename in
+# that directory was the exception.
 #
-# What a reader loses: nothing. The same file, same content, one directory up.
-#
-# DECLARED EVEN THOUGH THE GATE MAY NOT ASK. `public_regression_ok` runs
-# `git diff --diff-filter=D` with rename detection at its default (ON), so a pure
-# move can pass silently. Declaring only what the gate happens to notice would make
-# this file a record of the tool's blind spot rather than of our intent.
+# What a reader loses: nothing. Same file, same content, one directory up.
 docs/status/STATUS.md
+
+# ── The conformance corpus is de-versioned: `vectors-v1.cbor` is superseded ────
+# `conformance/vectors-v1.cbor` (69 vectors, sha256 `9d96f007…`) has been published
+# since v0.8.0. It is removed, and the file that replaces it is
+# **`conformance/conformance-vectors.cbor`** (71 vectors, sha256 `9695b1f1…`).
+#
+# They are not one corpus under two names. `vectors-v1.cbor` was an early starter
+# set vendored from the Go implementation's own vectors, predating the cross-blessed
+# corpus. `conformance-vectors.cbor` is the canonical corpus vendored from the
+# protocol repository, which is what `conformance/MANIFEST.md` had already named as
+# the source to re-vendor from. MANIFEST.md carries **both** digests — the current
+# one under *Current*, this one under *Superseded* — so which corpus you are holding
+# is answerable from the published tree itself, not only from this note.
+#
+# Why the old name did not stay as an alias. The corpus was de-versioned upstream,
+# and identity here is the **digest**, not the filename. A checker keyed to the old
+# filename does not go red when the name moves — it quietly becomes unable to look,
+# which is not the same as a failure and does not read like one. Leaving
+# `vectors-v1.cbor` on disk as a courtesy is exactly what lets such a checker keep
+# passing against a corpus nobody re-vendors.
+#
+# What a reader loses: a path. Anything pinning `conformance/vectors-v1.cbor` gets a
+# 404 and should move to `conformance/conformance-vectors.cbor` — and should verify
+# the digest in MANIFEST.md rather than the name. This is called a breaking change in
+# the changelog entry for this release; it is declared, not smuggled.
+conformance/vectors-v1.cbor

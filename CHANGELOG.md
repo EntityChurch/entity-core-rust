@@ -13,6 +13,78 @@ release. Published numbers are oracle-pinned and reproducible.
 
 Development lands on `dev`; `master` carries the last release.
 
+### Changed in ways that can break an existing caller
+
+**Breaking: yes**, on all three counts — an exported signature moved, a published path
+went away, and refusals that a peer can observe changed their `status`/`code` pair. This
+section had said *Documentation* and nothing else, which was a false summary of the
+tree: read it as the correction, not as a late addition.
+
+**A published file is gone.** `conformance/vectors-v1.cbor` has been in every release
+since `v0.8.0` and is **not** in this one. The corpus it carried was superseded and
+de-versioned; the file that replaces it is `conformance/conformance-vectors.cbor`, and
+`conformance/MANIFEST.md` carries both digests so the two are distinguishable by content
+rather than by filename. **Anything pinning the old path gets a 404** — repoint it. The
+new corpus is 71 vectors and is not a rename of the old 69; it is a different corpus.
+
+**Exported items that moved.** Each needs a caller edit, not a recompile:
+
+- `entity_capability::canonicalize` returns `String`, not `Option<String>`. The two
+  reserved shapes it used to answer `None` for — a `./`- or `../`-leading path, and a bare
+  `*/rest` — now canonicalize to the `NEVER_MATCH` sentinel, which matches nothing in
+  either operand of `matches_pattern`. A caller that treated `None` as *reject* and
+  `Some` as *admit* now admits a grant that covers no path, which is the intended
+  §5.4 reading; a caller that needs the old rejection must test for the sentinel.
+- `entity_relay::CODE_UNKNOWN_OPERATION` is removed. Use
+  `entity_relay::CODE_UNSUPPORTED_OPERATION`. The string moved too — see the wire note
+  below; this is not a pure rename.
+- `entity_relay::ModeStore::put` takes two further arguments, `cost: u64` and
+  `now_ms: i64`, so the store can account for live bytes against a retention window.
+- `entity_signaling::webrtc::find_counterpart_offer` takes `&[Collected]` where it took
+  an `IntoIterator`, plus a third argument, the caller's own peer id. It now returns the
+  **newest** unanswered counterpart offer rather than the first one it finds, and skips
+  offers this peer has already answered.
+- `entity_peer::remote::RemoteState::remove_inbound` is removed; the eviction it wrapped
+  is reached through the teardown path that owns it.
+
+**Error enums gained variants, and neither is `#[non_exhaustive]`.** An exhaustive `match`
+downstream stops compiling until the new arms are handled:
+
+- `entity_protocol::ProtocolError` — `IncompatibleProtocol`, `InvalidRequest(&'static str)`,
+  `InvalidNonce(&'static str)`, `IdentityMismatch(&'static str)`.
+- `entity_wire::WireError` — `CborTag { offset }`, `IncludedKeyMismatch { key, actual }`,
+  `TruncatedFrame`.
+
+**Public structs gained public fields**, so a full struct literal no longer compiles
+(`..Default::default()` is unaffected where a `Default` exists): `PeerConfig`
+(`relay_store_retention_ms`, `relay_max_storage_bytes`), `Connection` (`local_protocols`),
+`ForwardRequest` (`expires_at`), `AdvertiseLimits` (`max_retention_ms`), `StoredEntry`
+(`cost`).
+
+**Refusals a peer can observe changed.** These are wire-visible and a conformance
+expectation pinned to the old pair will fail:
+
+- An unimplemented relay operation answers **`501 unsupported_operation`**, not
+  `400 unknown_operation`. The old code was a minted synonym in no spec code set, and the
+  old status told the caller its request was malformed when the request was fine.
+- A CBOR **tag** (major type 6) anywhere in a frame is refused `400 non_canonical_ecf`
+  rather than being decoded. Tags are not part of ECF; this is a pre-admission refusal
+  distinct from *these bytes do not decode*.
+- An EXECUTE whose handler URI names a peer that is not us is refused
+  `400 invalid_request`. It was previously served — our handler ran under their address.
+- A pre-`hello` `authenticate` is discriminated on the frame's operation rather than on
+  connection state, so it is no longer processed as a `hello` and no longer answers
+  `400 handshake_failed`.
+- Capability `exclude` is honoured at sites where it previously failed open, and the
+  authorization subject is the first effective target rather than the raw request path.
+  A grant that was accepted before may now be refused; that is the fix.
+- Relay storage is bounded: entries carry a byte cost against a retention window, and a
+  `put` over the ceiling is refused `507`. A payload over the frame ceiling is `413`.
+
+**Kernel consumers should expect to edit, not just re-pin.** `PeerConfig`, `ProtocolError`
+and `WireError` are all on the embedding path, so a downstream peer moving to this release
+does more than bump a ref.
+
 ### Documentation
 
 - **`AGENTS.md` split into `AGENTS.md` + `docs/agents/memory/`.** It had reached

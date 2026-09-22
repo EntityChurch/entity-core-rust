@@ -273,7 +273,7 @@ from here.** Memory is where a finding waits while it is still only prose.
   **not an exclusion ground at all**. The second one is the shape our own charter already names, a
   surface present in the tree and absent from the substrate, and writing it into the exclusions doc
   is how it survived: `substitute 0P/**1S**` read as *declared* rather than as *undone*, and a skip
-  counts as a failure. It was the sole reason this seat's release gate exited 1 while go's exited 0.
+  counts as a failure. It was the sole reason this implementation's release gate exited 1 while go's exited 0.
   **Wiring it (one `builder.handler(...)` line) turned an unmeasured surface into `5P/3F`
   immediately, and a fourth defect surfaced while fixing those three.** All four had been shipping,
   invisible, behind a fully green in-tree suite:

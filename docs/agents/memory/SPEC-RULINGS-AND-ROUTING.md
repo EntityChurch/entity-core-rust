@@ -39,7 +39,7 @@ from here.** Memory is where a finding waits while it is still only prose.
   dispatch table and you cannot see it from here.** *(Candidate: bit us once, 2026-09-03,
   caught by the cross-impl run rather than by review.)* We told arch that TYPE §7.4–§7.6's
   `converge` / `adopt` / `reconcile` *"exist in **no tree**"*, to argue a fold should not wait
-  on a rust build. Arch **adopted the sentence verbatim** into `ROUTING-2026-09-03-a` §4 item
+  on a rust build. Arch **adopted the sentence verbatim** into its §4 ruling, item
   6. It is false: core-go ships `ext/type/{converge,adopt,reconcile}.go` — 650 lines with test
   files — and dispatches all three at `ext/type/handler.go:80-84`. The claim was true about
   *our* tree and we generalized it to the cohort, which is the exact move
@@ -153,7 +153,7 @@ from here.** Memory is where a finding waits while it is still only prose.
   input produced it** — read your own function before believing a report about it, and put the
   correction in the reply as a measurement rather than leaving the ledger wrong.
 - **A per-seat worklist reads as exhaustive PER SEAT, and the row that binds you may be filed
-  under someone else's name.** *(Candidate: bit us once, 2026-09-06.)* `ROUTING-2026-09-06-b`
+  under someone else's name.** *(Candidate: bit us once, 2026-09-06.)* That round's packet
   splits into a `### rust` and a `### py` relay section, each two items, under a shared ruling.
   Ours did not name `unsupported_content_hash_format` — `EXTENSION-TREE` Appendix A **v4.5**'s
   fourth `put` row — because that row was item **3 of go's own worklist**, go being the seat that
@@ -169,7 +169,7 @@ from here.** Memory is where a finding waits while it is still only prose.
   construction. Cheap tell: an item whose fix is a **code value** rather than a code path.
   **Ratified 2026-09-10, and the second shape is a DEFECT filed under another seat's name that
   is also in your tree — at a site the author could not have known you had.**
-  `ROUTING-2026-09-10-e`'s §4 table gives rust *"`grantee` = the delivering engine"* and gives py
+  The §4 table of that round's relay gives rust *"`grantee` = the delivering engine"* and gives py
   *"stop minting `peers:["*"]` — it makes Dimension 4 vacuous."* Recomputed against our tree,
   **both** were here, split across two mint sites: `bindings/sdk::mint_delivery_grant` had the
   wrong grantee with `peers` correctly absent, and `core/peer::generate_deliver_token` had the
@@ -220,7 +220,7 @@ from here.** Memory is where a finding waits while it is still only prose.
     write and the SA-9 `store` crossing in one sentence. Arch routed only `store`;
     `result_path` was broken identically (minted form handled, SA-1 value form passed
     through verbatim). `materialize_error_value` now serves both — `d149915`.
-  - **Sibling *arms*.** ROUTING-2026-08-16-i routed `apply.rs:187`, the builtin intercept.
+  - **Sibling *arms*.** An earlier packet routed `apply.rs:187`, the builtin intercept.
     That same function had a second arm — the unrecognized-bare-name fall-through — which
     reached external dispatch with `capability`/`resource` still attached, where they *would*
     be honored. §2.1 keys on the **path**, not on the name resolving, so both arms bind —
