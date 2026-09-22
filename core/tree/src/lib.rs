@@ -467,14 +467,21 @@ impl Handler for TreeHandler {
             "diff" => self.handle_diff(ctx),
             "merge" => self.handle_merge(ctx),
             "extract" => self.handle_extract(ctx),
+            // Advertised but unbuilt. Same code SLOT as the fall-through
+            // below and therefore the same spelling: §3.3's 501 row says the
+            // unit of conformance is the slot, never a token, so "we know this
+            // verb and have not written it" and "we do not know this verb" are
+            // one row (0.8.2.7). `not_implemented` is named non-conformant at
+            // §9.1. The distinction survives in the MESSAGE, which is where a
+            // human-readable difference belongs.
             "create" | "destroy" => error_result(
                 STATUS_NOT_SUPPORTED,
-                "not_implemented",
+                "unsupported_operation",
                 &format!("{} is not yet implemented", ctx.operation),
             ),
             _ => error_result(
-                STATUS_BAD_REQUEST,
-                "unknown_operation",
+                STATUS_NOT_SUPPORTED,
+                "unsupported_operation",
                 &format!("unknown operation: {}", ctx.operation),
             ),
         }
@@ -1780,7 +1787,18 @@ mod tests {
         let tree = make_tree();
         let ctx = make_handler_context("frobnicate", None, None);
         let result = tree.handle(&ctx).await.unwrap();
-        assert_eq!(result.status, STATUS_BAD_REQUEST);
+        assert_eq!(result.status, STATUS_NOT_SUPPORTED);
+        // §3.3's 501 row (0.8.2.7): the unit of conformance is the code SLOT,
+        // so the pair is pinned, not just the status. Asserting the status
+        // alone is what let five synonyms share this slot.
+        assert!(
+            result
+                .result
+                .data
+                .windows(21)
+                .any(|w| w == b"unsupported_operation"),
+            "the 501 slot carries exactly one spelling"
+        );
     }
 
     // -----------------------------------------------------------------------

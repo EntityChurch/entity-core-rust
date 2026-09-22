@@ -876,6 +876,13 @@ impl EntityPeer {
     /// Respond with a handler error. `kind` is one of "internal" /
     /// "not_supported" / "invalid_params"; defaults to "internal" for
     /// unknown values.
+    ///
+    /// These are GDScript-facing selectors for [`HandlerErrorKind`], **not**
+    /// wire codes, and 0.8.2.7's §3.3 code-slot sweep deliberately left them
+    /// alone: the wire code is chosen by the dispatcher's variant mapping in
+    /// `core/peer/src/connection.rs`, where `NotSupported` now emits `501
+    /// unsupported_operation`. Renaming the selector here would break every
+    /// existing `.gd` caller and change nothing a peer emits.
     #[func]
     fn respond_to_handler_error(
         &mut self,

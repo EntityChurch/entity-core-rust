@@ -14,7 +14,8 @@ use async_trait::async_trait;
 use entity_entity::Entity;
 use entity_handler::{
     ExecuteOptions, Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_GATEWAY,
-    STATUS_BAD_REQUEST, STATUS_CONFLICT, STATUS_INTERNAL_ERROR, STATUS_NOT_FOUND, STATUS_OK,
+    STATUS_BAD_REQUEST, STATUS_CONFLICT, STATUS_INTERNAL_ERROR, STATUS_NOT_FOUND,
+    STATUS_NOT_SUPPORTED, STATUS_OK,
 };
 use entity_hash::Hash;
 use entity_store::{CascadeResult, ContentStore, ExecutionContext, LocationIndex};
@@ -247,8 +248,8 @@ impl Handler for RevisionHandler {
             "fetch-entities" => self.handle_fetch_entities(ctx).await,
             "fetch-diff" => self.handle_fetch_diff(ctx).await,
             _ => Ok(error_result(
-                STATUS_BAD_REQUEST,
-                "unknown_operation",
+                STATUS_NOT_SUPPORTED,
+                "unsupported_operation",
                 &format!("unknown: {}", ctx.operation),
             )),
         };

@@ -22,7 +22,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use entity_ecf::Value;
-use entity_handler::{Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST};
+use entity_handler::{
+    Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST, STATUS_NOT_SUPPORTED,
+};
 use entity_store::{ContentStore, LocationIndex};
 
 use crate::backend::{AnnounceParams, DiscoveryBackend, Observation};
@@ -267,8 +269,8 @@ impl Handler for DiscoveryHandler {
             "announce" => Ok(self.handle_announce(ctx).await),
             "announce-stop" => Ok(self.handle_announce_stop(ctx).await),
             other => Ok(error(
-                STATUS_BAD_REQUEST,
-                "unknown_operation",
+                STATUS_NOT_SUPPORTED,
+                "unsupported_operation",
                 &format!("unknown discovery op: {}", other),
             )),
         }

@@ -41,8 +41,8 @@ use ciborium::Value;
 use entity_ecf::ValueExt;
 use entity_entity::Entity;
 use entity_handler::{
-    ExecuteOptions, Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST,
-    STATUS_OK,
+    error_entity, ExecuteOptions, Handler, HandlerContext, HandlerError, HandlerResult,
+    STATUS_BAD_REQUEST, STATUS_NOT_SUPPORTED, STATUS_OK,
 };
 use entity_store::LocationIndex;
 use entity_types::{TYPE_VALIDATE_RES, TYPE_VIOLATION};
@@ -417,9 +417,9 @@ impl Handler for TypeHandler {
             "compare" => Ok(self.handle_compare(ctx)),
             "compatible" => Ok(self.handle_compatible(ctx)),
             other => Ok(HandlerResult::error(
-                STATUS_BAD_REQUEST,
+                STATUS_NOT_SUPPORTED,
                 error_entity(
-                    "unknown_operation",
+                    "unsupported_operation",
                     &format!("system/type does not support {}", other),
                 ),
             )),
@@ -580,10 +580,11 @@ fn classify_reason(reason: &str) -> &'static str {
     }
 }
 
-fn error_entity(error_type: &str, message: &str) -> Entity {
-    let data = entity_ecf::to_ecf(&Value::Map(vec![
-        (entity_ecf::text("type"), entity_ecf::text(error_type)),
-        (entity_ecf::text("message"), entity_ecf::text(message)),
-    ]));
-    Entity::new("system/protocol/error", data).expect("error entity")
-}
+// The error body is built by `entity_handler::error_entity`, never a local
+// copy. §3.3's code slot is a claim about the `code` FIELD, not just the
+// spelling: this file shadowed the canonical helper and wrote the code under
+// key `type`, so every 400/404/501 it emitted decoded to `code = absent` at a
+// conformant reader — including the `unsupported_operation` spelling the
+// 0.8.2.7 slot sweep had just landed here. `system/protocol/error` declares
+// `code` REQUIRED (`core/types::system_protocol_error`), so the local shape
+// also violated our own published descriptor.

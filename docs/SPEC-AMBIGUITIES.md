@@ -6295,11 +6295,31 @@ does not implement ping", which is false of us.
   already logged in this file, which is about the **grant**, not about whether the frame is
   verified at all. They are two questions and only one of them was written down.
 
-**Interim choice (ours): a post-Established `ping` is VERIFIED.** The §5.1 intercept sits after
-`verify_request` in `dispatch_request` (`core/peer/src/connection.rs`), exempt from the
-handler-scope grant check but not from signature/capability verification. The reading is that
-§4.2's pre-authorization is scoped to the pre-authorized *state* — the handshake — and that once a
-connection has a verified signer, §5.1's "authenticated EXECUTE" is what the frame is.
+**RULED 2026-09-03 against our reading — 0.8.2.6, relayed as `ROUTING-2026-09-03-a` §4 item 2.
+The pre-authorization is NOT state-scoped: an unauthenticated post-handshake `ping` MUST be
+served.** §3.3 line 773 excepts the connection path from `author`/`capability` **with no state
+qualifier**, and §5.1's requirement is scoped to *"every **authenticated** EXECUTE"* — which is the
+class that exception defines. We read §5.1 as the general rule with §4.2 as its exception; it is
+the other way round. The intercept moved ahead of `verify_request` in `dispatch_request`
+(`core/peer/src/connection.rs`), into the connect block that already owns §4.7's post-Established
+rows, so every connect-path decision this function makes is now taken in one place before
+verification. core-go's `pingServedOnceEstablished` control is correct as written and is not
+changing; the non-conformant party was us.
+
+*Interim choice, kept for the record: a post-Established `ping` was VERIFIED — the intercept sat
+after `verify_request`, exempt from the handler-scope grant check but not from
+signature/capability verification, on the reading that §4.2's pre-authorization was scoped to the
+pre-authorized state.*
+
+**What the fix is pinned by, and it is not the obvious test.** `a12_keepalive_ping_answers_pong`
+drives a fully signed client and is **green under both readings** — measured by restoring the
+pre-fix placement, not assumed. The row that discriminates is control B of
+`incompatible_protocol_and_unknown_connect_op_on_both_transports`, which sends the bare
+unauthenticated frame post-Established; its assertion was widened from *"not row 10's pair"* to
+*"200 `system/network/pong`"*, because the old form was satisfied by the `401
+authentication_failed` this ruling outlaws. Against the restored pre-fix tree that row is RED and
+its neighbour is GREEN, which is the whole evidence that the pin is on the ruling and not on the
+feature.
 
 **What it costs, measured.** core-go's `connect_ping_before_hello` (§4.7's out-of-order row, 409)
 is gated by an applicability control, `pingServedOnceEstablished`, that completes a handshake and
@@ -6309,10 +6329,12 @@ authenticated. Bisected across `1ded022` → `0494020`: the skip is present at b
 pre-existing and independent of CE-1. A skip counts as a failure, so this reading is currently
 costing us a §4.7 row we believe we implement.
 
-**Ask.** One sentence in §4.2 saying whether the pre-authorization is scoped to the pre-Established
-states. If it is not — if a connect-path EXECUTE is unauthenticated in every state — the intercept
-moves ahead of `verify_request` here and the row un-skips. Either way core-go's control should say
-which ping it is asking about, since "serves ping" and "serves *unauthenticated* ping" are
-different predicates and only the second one is being measured.
+**Ask (answered).** One sentence in §4.2 saying whether the pre-authorization is scoped to the
+pre-Established states. It is not, and the intercept moved. The second half of the ask — that a
+control should say which ping it is asking about, since *"serves ping"* and *"serves
+**unauthenticated** ping"* are different predicates and only the second was being measured — was
+upheld on the record as a general point and does not fire here: under the ruling the
+unauthenticated probe **is** the rule, so go's control asks exactly the right question.
 
-Routed in `docs/status/ROUTING-2026-09-02-g-ce1-landed-and-the-must-not-was-on-the-code-not-the-input.md`.
+Routed in `docs/status/ROUTING-2026-09-02-g-ce1-landed-and-the-must-not-was-on-the-code-not-the-input.md`;
+ruled in arch `ROUTING-2026-09-03-a` §4 item 2. **Closed.**

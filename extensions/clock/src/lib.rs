@@ -11,8 +11,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use entity_entity::Entity;
 use entity_handler::{
-    Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST, STATUS_NOT_SUPPORTED,
-    STATUS_OK,
+    Handler, HandlerContext, HandlerError, HandlerResult, STATUS_NOT_SUPPORTED, STATUS_OK,
 };
 use entity_hash::Hash;
 use entity_store::{ContentStore, LocationIndex};
@@ -48,14 +47,18 @@ impl Handler for ClockHandler {
         match ctx.operation.as_str() {
             "now" => self.handle_now(ctx).await,
             "compare" => self.handle_compare(ctx).await,
+            // Advertised but unbuilt — same 501 slot as the fall-through
+            // below, so the same spelling (0.8.2.7: the unit of conformance is
+            // the slot). §9.1 names `not_implemented` non-conformant. The
+            // "not yet" lives in the message, which is where it belongs.
             "tick" => Ok(error_result(
                 STATUS_NOT_SUPPORTED,
-                "not_implemented",
+                "unsupported_operation",
                 "tick operation not yet implemented",
             )),
             _ => Ok(error_result(
-                STATUS_BAD_REQUEST,
-                "unknown_operation",
+                STATUS_NOT_SUPPORTED,
+                "unsupported_operation",
                 &format!("unknown: {}", ctx.operation),
             )),
         }
@@ -1251,7 +1254,18 @@ mod tests {
         let handler = make_handler();
         let ctx = make_ctx("invalid", entity_ecf::Value::Null);
         let result = handler.handle(&ctx).await.unwrap();
-        assert_eq!(result.status, STATUS_BAD_REQUEST);
+        assert_eq!(result.status, STATUS_NOT_SUPPORTED);
+        // §3.3's 501 row (0.8.2.7): the unit of conformance is the code SLOT,
+        // so the pair is pinned, not just the status. Asserting the status
+        // alone is what let five synonyms share this slot.
+        assert!(
+            result
+                .result
+                .data
+                .windows(21)
+                .any(|w| w == b"unsupported_operation"),
+            "the 501 slot carries exactly one spelling"
+        );
     }
 
     #[tokio::test]

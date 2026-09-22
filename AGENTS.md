@@ -341,6 +341,21 @@ gates by making the TCP path compile on wasm32.
   stronger and *different* finding than the one asked about — go at least reaches its L1
   check. The standard's "prove a negative before you claim it" has a method: **bound the
   region syntactically, then enumerate over the bounded region.**
+  **And the rule binds hardest OUTSIDE your tree, where the bounded region is a sibling's
+  dispatch table and you cannot see it from here.** *(Candidate: bit us once, 2026-09-03,
+  caught by the cross-impl run rather than by review.)* We told arch that TYPE §7.4–§7.6's
+  `converge` / `adopt` / `reconcile` *"exist in **no tree**"*, to argue a fold should not wait
+  on a rust build. Arch **adopted the sentence verbatim** into `ROUTING-2026-09-03-a` §4 item
+  6. It is false: core-go ships `ext/type/{converge,adopt,reconcile}.go` — 650 lines with test
+  files — and dispatches all three at `ext/type/handler.go:80-84`. The claim was true about
+  *our* tree and we generalized it to the cohort, which is the exact move
+  `AGENTS-STANDARD`'s *"prove a negative before you claim it"* forbids, made easier by the
+  fact that nothing in our own repo can contradict it. **A negative about a sibling needs the
+  sibling's own closed table read** — for an operation that is one grep with a boundary that
+  closes (`grep -rn 'case "<op>"' ../entity-core-go/ext/`, the `switch` in `Handle` **is** the
+  inventory). Same shape as the routed-item rule below: a claim written from your seat is a
+  claim about your seat. And the cost is not symmetric — a wrong absence handed *upstream*
+  gets ratified into a routing and comes back as everyone's premise.
 - **A fix that rewrites its own test's expectation has destroyed the evidence that it is a
   fix — the mutation still goes red, and it goes red against the new belief.** *(Candidate:
   bit us once, `aaa591e` → `cf570b2`, caught by the cross-impl gate in the same session.)*
@@ -460,6 +475,59 @@ gates by making the TCP path compile on wasm32.
   and closer to home, because there is no sibling to blame and no cross-impl check that would
   ever see it. When a routed item is about a hash's *encoding*, run §8.4.5's grep before
   reporting it closed.
+- **A census of a code SLOT must key on the status VALUE, not on a spelling of the status —
+  a local `const` alias hides the sites from the grep that looks for the canonical one.**
+  *(Candidate: bit us once, 2026-09-03, and it is arch's AP-21 one level down.)* 0.8.2.7 makes
+  the unit of conformance the **code slot** — the set of `code` values emitted at a given
+  status — precisely because `grep -c <token>` says nothing about what else occupies the
+  token's position. Censusing our own 500 slot against that ruling, arch put our debt at
+  **3** bare `internal`; the tree had **19**. The 16 they could not see live in
+  `extensions/capability` and `extensions/handler-ops`, which each declare their own
+  `const STATUS_INTERNAL: u32 = 500;` and emit through `error_entity("internal", …)`, so a
+  census reading `STATUS_INTERNAL_ERROR` misses every one. A seventeenth, `handler_error`,
+  was mis-filed into our **501** row and is the dispatcher's whole generic-500 surface.
+  **The slot is a property of the wire, and every layer of indirection between the emit site
+  and the number is a place a census stops.** Enforcement, in order: `grep -rn 'const STATUS_'
+  --include=*.rs` to enumerate the aliases FIRST, then census on the resolved integer, and
+  treat any helper that fixes a status internally (`bad_request(code, msg)`,
+  `error_result(STATUS, code, msg)`) as its own emit shape to enumerate. A census whose method
+  you cannot state is a grep, and a grep is what produced the claim this ruling struck.
+  **And one layer BELOW the slot, which is where the recursion ends: a code is
+  `(status, FIELD, spelling)`, and a census keyed on the first and third is blind to the
+  second.** *(Candidate: bit us once, 2026-09-03, found by a sibling's harness and not by any
+  gate of ours.)* `extensions/type-system/{validate,constraint}.rs` each declared a local
+  `fn error_entity(error_type: &str, …)` shadowing `entity_handler::error_entity` and wrote the
+  code under key **`type`**, not `code` — so all 14 of their emit sites decoded to
+  `code = absent` at a conformant reader. The 501 sweep of `4d888f8` had just landed
+  `unsupported_operation` at two of those sites and **could not be observed on the wire**: the
+  spelling was right, the slot was right, the field was wrong, and every census we ran counted
+  it as closed. `system/protocol/error` declares `code` **REQUIRED**
+  (`core/types::system_protocol_error`), so the local shape also violated our own published
+  descriptor — and `validate.rs` imported the canonical *decoder* while using its own encoder,
+  so the crate's internal constraint dispatch silently dropped the code from its own
+  `DispatchFailed` reason. The canonical helper's doc comment states the intent verbatim
+  (*"keeps the wire shape in one place so extensions can't drift on field names"*); a local
+  copy is exactly how that intent is defeated, and `impl`-local `fn`s are invisible to a
+  call-site grep.
+  **Why nothing here could catch it, and it is the transferable half.** Our own test for that
+  body — `a_malformed_validate_request_is_invalid_request_never_bad_request` — scans
+  `res.result.data` for the **substring** `invalid_request`, which is present under `type` and
+  under `code` alike. It passes under both shapes and stayed green through the whole defect:
+  a byte scan measures the spelling, which is the layer the census was already blind at.
+  Same class as the same-side round-trip pitfall — the assertion and the defect share a
+  vocabulary.
+  **Enforcement:** the mint sites of a wire error are a closed region — enumerate them
+  (`grep -rn 'Entity::new(TYPE_ERROR\|Entity::new("system/protocol/error"' --include=*.rs`;
+  25 here) and extract the **field key** written at each, not the code value. Any local
+  `fn error_entity` outside `core/handler` is the finding, whatever its body says. An assertion
+  about a code MUST read the decoded **key** (`Value::Map` lookup), never a substring of the
+  body and never a round-trip through our own reader. Teeth:
+  `every_type_handler_error_carries_its_code_in_the_code_field`
+  (`extensions/type-system/tests/validate_integration.rs`), one row per handler because both
+  files shadowed the helper independently — verified RED per file, and verified **on the wire**
+  (`validate-peer -category type`: `27P/3W/0F` fixed vs `27P/0W/3F` against the restored local
+  helper, peer rebuilt `dirty=true` at HEAD). Note the category: the op rows live in `type`,
+  while `type_system` is the descriptor category and scores `438P/8W/0F` under **both** shapes.
 - **An operation added to a `Handler` has two registration sites, and the second one is in
   another crate.** `impl Handler::operations()` makes it answerable; `bootstrap_handler(...)` in
   `core/peer/src/lib.rs` writes the **advertised** `system/handler/{pattern}` interface entity
@@ -658,6 +726,29 @@ gates by making the TCP path compile on wasm32.
   confirm they are `PASS`, not `SKIP` — and when the harness cannot arm you, drive the category by
   hand against a peer you started with the flags, report *that* number, and say at the report that
   the gate's pass is structural. Then hand the sibling the flag names so the gap closes.
+  **(Closed 2026-09-03: the harness forwards the flags now — PASS 4 scores `2P/0F/0S` on
+  `v1_retention_clamp_beyond_ceiling_live` and `v2_retention_clamp_null_takes_ceiling_live`.
+  The entry stays because the check that caught it — read the ROWS, not the exit code — is
+  the transferable part.)**
+  **And the third level: a harness TOLERANCE encodes the pre-ruling answer, so the first seat
+  to land a ruling is the seat that turns it red.** *(Candidate: bit us once, 2026-09-03,
+  predicted-by-nothing and found only by running the gate.)* Our 501 slot sweep made
+  `op_converge_roundtrip` / `op_adopt_roundtrip` / `op_reconcile_roundtrip` go **WARN → FAIL**.
+  Not our defect: `checkOptionalOp` (`cmd/internal/validate/typeext.go`) tolerates an
+  unimplemented TYPE §7.4–§7.6 MAY op **only at `status == 400`**, under a comment reading
+  *"Implementations that don't ship the op emit `unknown_operation`"* — the exact pair 0.8.2.7
+  retires. go cannot see it: go **implements** all three, so that branch is unreachable
+  against go, and go's own `system/type` default already answers `501 unsupported_operation`
+  (`ext/type/handler.go:85`) — the harness contradicts the peer that ships it. Same family as
+  the descriptor bite (*"the first seat to land goes red, and that is the check working"*),
+  with a sharper cause: there the check compared us to a sibling's table, here the check
+  **hard-codes a value the ruling deleted**, and the seat that owns the check is immune.
+  **Enforcement, and it is one grep that would have predicted both this and the `reachability`
+  tolerance:** when a ruling changes a code you EMIT, grep the sibling harness for the **old**
+  token before running the gate — `grep -rn '<retired_code>' ../entity-core-go/cmd/internal/validate/`
+  — and read every hit for a tolerance keyed on the pre-ruling answer. A red row you predicted
+  is a routing item with a one-line fix attached; the same row discovered by the gate is an
+  hour of deciding whether to revert.
   **The same holds *inside* a check, and that half is newly earned (`898e55b`).** A
   multi-row check short-circuits at the first failing row, so a FAIL is evidence about **one**
   row and silence about the rest — including rows measuring the *same* defect. go's

@@ -590,3 +590,114 @@ fn a_malformed_validate_request_is_invalid_request_never_bad_request() {
         has("bad_request")
     );
 }
+
+/// §3.3's code slot is a property of the **`code` field**, not of the spelling
+/// appearing somewhere in the body.
+///
+/// Both handlers in this crate shadowed `entity_handler::error_entity` with a
+/// local copy that wrote the code under key `type`, so every error they emitted
+/// decoded to `code = absent` at a conformant reader — including the
+/// `unsupported_operation` spelling the 0.8.2.7 slot sweep had just landed here,
+/// and including `system/protocol/error`'s own REQUIRED `code` field
+/// (`core/types::system_protocol_error`). core-go's corrected `checkOptionalOp`
+/// is what surfaced it; nothing in this tree could.
+///
+/// Note why the neighbour above cannot stand in for this: it scans the body for
+/// a **substring**, and `invalid_request` is present under `type` and under
+/// `code` alike — it passes under both shapes. The discriminator is the KEY, so
+/// this asserts on the decoded map key and never on a byte scan or a round-trip
+/// through our own reader.
+#[test]
+fn every_type_handler_error_carries_its_code_in_the_code_field() {
+    fn error_fields(data: &[u8]) -> Vec<(String, String)> {
+        let v: Value = ciborium::from_reader(data).expect("error body is CBOR");
+        match v {
+            Value::Map(m) => m
+                .iter()
+                .filter_map(|(k, val)| {
+                    Some((
+                        k.as_text()?.to_string(),
+                        val.as_text().unwrap_or("<non-text>").to_string(),
+                    ))
+                })
+                .collect(),
+            _ => panic!("error body is not a map"),
+        }
+    }
+
+    fn assert_coded(label: &str, res: &HandlerResult, want_status: u32, want_code: &str) {
+        assert_eq!(res.status, want_status, "{label}: status");
+        assert_eq!(
+            res.result.entity_type, "system/protocol/error",
+            "{label}: entity type"
+        );
+        let fields = error_fields(&res.result.data);
+        let code = fields.iter().find(|(k, _)| k == "code").map(|(_, v)| v);
+        assert_eq!(
+            code.map(String::as_str),
+            Some(want_code),
+            "{label}: the code MUST be under key `code`. Got fields {fields:?}"
+        );
+        assert!(
+            !fields.iter().any(|(k, _)| k == "type"),
+            "{label}: `type` is not a field of system/protocol/error. Got {fields:?}"
+        );
+    }
+
+    let cs = Arc::new(MemoryContentStore::new());
+    let li = Arc::new(MemoryLocationIndex::new());
+    let constraint_handler = Arc::new(StandardConstraintHandler::new(PEER_ID.to_string()));
+    let type_handler = TypeHandler::new(
+        PEER_ID.to_string(),
+        cs.clone() as Arc<dyn ContentStore>,
+        li.clone() as Arc<dyn LocationIndex>,
+    );
+
+    // The 501 row — the spelling the slot sweep landed, in the field that
+    // makes it readable. One row per handler: both shadowed the helper, so a
+    // fix to one is not a fix to the other.
+    let unknown_op = |pattern: String, op: &str| {
+        let params = Entity::new(
+            "system/type/validate-request",
+            entity_ecf::to_ecf(&cbor_map! { "entity" => text("x") }),
+        )
+        .unwrap();
+        HandlerContext::builder(params.clone(), params)
+            .pattern(pattern)
+            .operation(op)
+            .request_id("test")
+            .build()
+    };
+
+    let res = futures_block_on(
+        type_handler.handle(&unknown_op(format!("/{}/system/type", PEER_ID), "converge")),
+    )
+    .unwrap();
+    assert_coded("system/type unknown op", &res, 501, "unsupported_operation");
+
+    let res = futures_block_on(constraint_handler.handle(&unknown_op(
+        format!("/{}/system/type/constraint/max", PEER_ID),
+        "converge",
+    )))
+    .unwrap();
+    assert_coded(
+        "system/type/constraint/* unknown op",
+        &res,
+        501,
+        "unsupported_operation",
+    );
+
+    // The 400 row — same helper, so it drifted with it.
+    let params = Entity::new(
+        "system/type/validate-request",
+        entity_ecf::to_ecf(&cbor_map! { "not_entity" => text("x") }),
+    )
+    .unwrap();
+    let res = run_validate(&type_handler, params, build_execute_fn(constraint_handler));
+    assert_coded(
+        "system/type malformed request",
+        &res,
+        400,
+        "invalid_request",
+    );
+}

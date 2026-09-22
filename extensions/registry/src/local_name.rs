@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use entity_ecf::{text, Value};
 use entity_handler::{
     Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST, STATUS_CONFLICT,
-    STATUS_NOT_FOUND,
+    STATUS_NOT_FOUND, STATUS_NOT_SUPPORTED,
 };
 use entity_hash::Hash;
 use entity_store::{ContentStore, LocationIndex};
@@ -134,8 +134,8 @@ impl Handler for LocalNameHandler {
             "list" => Ok(self.handle_list(ctx)),
             "update-transports" => Ok(self.handle_update_transports(ctx)),
             other => Ok(error(
-                STATUS_BAD_REQUEST,
-                "unknown_operation",
+                STATUS_NOT_SUPPORTED,
+                "unsupported_operation",
                 &format!("unknown local-name op: {}", other),
             )),
         }

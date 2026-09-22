@@ -1570,25 +1570,64 @@ pub(crate) async fn dispatch_request(
                 // `401 authentication_failed`, the same wrong-class answer row 9
                 // was fixed for one arm over.
                 //
-                // **`ping` is deliberately NOT an arm here.** It is
-                // EXTENSION-NETWORK §5.1's keepalive, it IS implemented, and it
-                // must fall through to verification to be answered further down.
-                // Naming it here would work and would be the bug: the refusal
-                // would then be keyed on *"not hello and not authenticate"* in
-                // one place and on `CONNECT_OPERATIONS` in another, and the two
-                // would drift the first time an operation is added. The helper
-                // returns `None` for every advertised operation, so falling
-                // through IS the ping arm — one inventory, read once. Measured:
-                // with a `"ping" => {}` arm here, mutating the helper's
-                // membership test to `matches!(op, "hello" | "authenticate")`
-                // is **unobservable** — this arm masks it, and the row-10
-                // control passes against a peer that refuses every keepalive.
+                // **`ping` is still not a membership arm here**, and it is now
+                // SERVED here rather than falling through to verification.
+                //
+                // Membership is decided in exactly one place — the helper reads
+                // `CONNECT_OPERATIONS`, which is the list `bootstrap_handler`
+                // advertises. Naming `ping` as a `match` arm beside `hello` /
+                // `authenticate` would key the refusal on *"not hello and not
+                // authenticate"* in one place and on `CONNECT_OPERATIONS` in
+                // another, and the two drift the first time an operation is
+                // added. Measured: with a `"ping" => {}` arm here, mutating the
+                // helper's membership test to `matches!(op, "hello" |
+                // "authenticate")` is **unobservable**.
+                //
+                // So: the helper refuses, or the operation is advertised and we
+                // answer it. The `match` below is a SERVING table, not a second
+                // membership test — it never decides refusal, and its fallback
+                // is §3.3's 501 row, which is the honest answer for an operation
+                // we advertise and do not implement.
+                //
+                // **Pre-verification (0.8.2.6 §4.2 Q2, ruled 2026-09-03).** We
+                // shipped this after `verify_request`, reading §5.1 (*"every
+                // authenticated EXECUTE MUST include `author` and
+                // `capability`"*) as the general rule and §4.2 as its exception.
+                // It is the other way round: §3.3 line 773 excepts the
+                // connection path with **no state qualifier**, and §5.1 is
+                // scoped to *authenticated* EXECUTE — the class that exception
+                // defines. An unauthenticated post-handshake `ping` MUST be
+                // served. `dispatch_request` runs exclusively post-`Established`
+                // on both transports (TCP via `handle_connection`, http-live via
+                // `dispatch_session_envelope`'s `Established` arm), so the
+                // pre-`Established` out-of-order rows are unaffected — they are
+                // refused before the frame ever reaches this function.
+                //
+                // What it cost us while we had it backwards: core-go's
+                // `pingServedOnceEstablished` applicability control pings
+                // unauthenticated, we answered non-200, and their §4.7 409 row
+                // recorded `served=false` and **skipped** against us — a scored
+                // row silently disabled by our own reading.
                 _ => {
                     if let Some(refusal) =
                         unknown_connect_operation_refusal(envelope, local_pid.as_str())
                     {
                         return refusal;
                     }
+                    return match fields.operation.as_str() {
+                        "ping" => build_pong_response(envelope, &fields.request_id),
+                        other => build_error_response(
+                            &fields.request_id,
+                            STATUS_NOT_SUPPORTED,
+                            "unsupported_operation",
+                            &format!(
+                                "system/protocol/connect advertises {:?} and this peer does \
+                                 not implement it (§3.3 501 row)",
+                                other
+                            ),
+                        )
+                        .unwrap_or_else(|_| Envelope::new(envelope.root.clone())),
+                    };
                 }
             }
         }
@@ -1872,23 +1911,20 @@ pub(crate) async fn dispatch_request(
         )
         .unwrap_or_else(|_| Envelope::new(envelope.root.clone()));
     }
-    // EXTENSION-NETWORK §5.1 keepalive: EXECUTE on the connect handler,
-    // operation "ping" → answer with system/network/pong. Handled here as
-    // the third protocol-level connect operation (beside hello/authenticate,
-    // which run pre-Established): the request is signature+capability
-    // VERIFIED above but exempt from the handler-scope grant check below —
-    // neither the V7 §4.4 default connection grants nor NETWORK §3.2 cover
-    // `system/protocol/connect`, yet §12.1 makes the ping/pong exchange
-    // MUST. Interim choice logged in docs/SPEC-AMBIGUITIES.md and routed
-    // upstream; do not silently widen the §4.4 grant set instead.
-    if handler_path == format!("/{}/{}", local_pid.as_str(), entity_protocol::CONNECT_PATH)
-        && verified.operation == "ping"
-    {
-        return build_pong_response(envelope, &verified.request_id);
-    }
-    // RT-6's `authenticate` intercept now runs pre-verification, above — see
-    // the comment there for why (the oracle's replay shape fails generic
-    // verification before ever reaching a post-verification check).
+    // EXTENSION-NETWORK §5.1 keepalive is NOT handled here any more. It used
+    // to sit at this point — signature+capability VERIFIED, then exempted from
+    // the handler-scope grant check below — on the reading that §4.2's
+    // pre-authorization was scoped to the pre-`Established` states. Arch ruled
+    // the other way on 2026-09-03 (0.8.2.6 §4.2 Q2) and the intercept moved
+    // ahead of `verify_request`, into the connect block near the top of this
+    // function. Every connect-path row this function owns is now decided in
+    // that one block, before verification; nothing about the connect surface
+    // is reachable from here.
+    //
+    // RT-6's `authenticate` intercept has run pre-verification since 0.8.1 —
+    // see the comment there for why (the oracle's replay shape fails generic
+    // verification before ever reaching a post-verification check). The ping
+    // move is the same lesson arriving at the neighbouring operation.
     let handler_authorized = verified.capability.grants.iter().any(|grant| {
         entity_capability::matches_scope(
             handler_path,
@@ -2477,14 +2513,7 @@ pub(crate) async fn dispatch_request(
     // produced yet).
     let (exit_status, exit_response_hash) = match &handler_result {
         Ok(r) => (r.status, r.result.content_hash),
-        Err(e) => (
-            match e {
-                HandlerError::InvalidParams(_) => STATUS_BAD_REQUEST,
-                HandlerError::NotSupported(_) => STATUS_NOT_SUPPORTED,
-                HandlerError::Internal(_) => STATUS_INTERNAL_ERROR,
-            },
-            entity_hash::Hash::zero(),
-        ),
+        Err(e) => (handler_error_slot(e).0, entity_hash::Hash::zero()),
     };
     if !shared.dispatch_hooks.is_empty() {
         fire_dispatch_hooks(
@@ -2533,17 +2562,11 @@ pub(crate) async fn dispatch_request(
                 error = %e,
                 "handler error"
             );
-            // Map HandlerError variants to V7 §8.3 status codes:
-            //   InvalidParams  → 400 (client sent malformed data)
-            //   NotSupported   → 501 (operation not implemented by this handler)
-            //   Internal       → 500 (handler-side fault)
-            // Previously all variants returned 500, which masked client errors
-            // as server errors and confused validator expectations of "≥400".
-            let (status, code) = match &e {
-                HandlerError::InvalidParams(_) => (STATUS_BAD_REQUEST, "invalid_params"),
-                HandlerError::NotSupported(_) => (STATUS_NOT_SUPPORTED, "not_supported"),
-                HandlerError::Internal(_) => (STATUS_INTERNAL_ERROR, "handler_error"),
-            };
+            // §3.3's status + code slots. One inventory — see
+            // `handler_error_slot`, which the two dispatch-hook exit records
+            // below also read, so the status a hook observes and the status the
+            // caller receives cannot drift apart.
+            let (status, code) = handler_error_slot(&e);
             match durability_cbor {
                 // EXTENSION-DURABILITY §8 — even on a handler error, a durability marker is
                 // answered observably (the status reports the failure).
@@ -3149,6 +3172,40 @@ fn lookup_operation_output_type(
 /// extension. Gating it would have made the guard compile away for any build
 /// without `compute` — the feature-gate hazard where a cfg'd symbol reads as an
 /// absent surface.
+/// The §3.3 status + `code` slot a `HandlerError` variant lands in — **one
+/// inventory, read by every site that answers a handler error**.
+///
+///   `InvalidParams` → 400 `invalid_params`  (the caller sent malformed data;
+///                                            a DEFINED specific 400 code)
+///   `NotSupported`  → 501 `unsupported_operation`  (§3.3's 501 row default)
+///   `Internal`      → 500 `internal_error`         (§3.3's 500 row default)
+///
+/// **This is the peer's whole generic 500/501 surface.** Every handler in the
+/// workspace that returns `HandlerError::{Internal, NotSupported}` is answered
+/// from here, so a minted spelling in this function is a minted spelling on
+/// every extension at once. It emitted `handler_error` and `not_supported`
+/// until 0.8.2.7, both codes in no spec code set.
+///
+/// **Extracted because there were THREE copies of this match and only one of
+/// them carried the codes** — the other two mapped the status alone for the
+/// dispatch-hook exit record. That is the *"a closed set that decides behaviour
+/// belongs in one constant, read by every site"* rule from `AGENTS.md`, and the
+/// split is precisely why arch's cohort census missed this site: it censused
+/// the `STATUS_INTERNAL_ERROR` spelling and the code here is neither `internal`
+/// nor near that constant. A second copy is what silently absorbs a mutation.
+///
+/// §3.3's 500 row is stated in the spec (§3b) as **not oracle-drivable** — a
+/// conformant peer cannot be made to fail internally on demand over the wire —
+/// so no cross-impl check will ever reach this. `handler_error_slot_is_the_one
+/// _inventory` in `lib.rs` is the only instrument the row will ever have.
+pub(crate) fn handler_error_slot(e: &HandlerError) -> (u32, &'static str) {
+    match e {
+        HandlerError::InvalidParams(_) => (STATUS_BAD_REQUEST, "invalid_params"),
+        HandlerError::NotSupported(_) => (STATUS_NOT_SUPPORTED, "unsupported_operation"),
+        HandlerError::Internal(_) => (STATUS_INTERNAL_ERROR, "internal_error"),
+    }
+}
+
 fn make_error_response_entity(code: &str, message: &str) -> entity_entity::Entity {
     let data = entity_ecf::cbor_map! {
         "code" => entity_ecf::text(code),
@@ -4023,14 +4080,7 @@ pub fn make_execute_fn(
 
                 let (internal_status, internal_response_hash) = match &result {
                     Ok(r) => (r.status, r.result.content_hash),
-                    Err(e) => (
-                        match e {
-                            HandlerError::InvalidParams(_) => STATUS_BAD_REQUEST,
-                            HandlerError::NotSupported(_) => STATUS_NOT_SUPPORTED,
-                            HandlerError::Internal(_) => STATUS_INTERNAL_ERROR,
-                        },
-                        entity_hash::Hash::zero(),
-                    ),
+                    Err(e) => (handler_error_slot(e).0, entity_hash::Hash::zero()),
                 };
                 if !shared.dispatch_hooks.is_empty() {
                     fire_dispatch_hooks(

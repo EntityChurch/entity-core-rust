@@ -126,7 +126,7 @@ impl DispatchOutboundHandler {
                 return HandlerResult::error(
                     STATUS_INTERNAL_ERROR,
                     error_entity(
-                        "internal",
+                        "internal_error",
                         "dispatcher did not wire ctx.execute_fn (§6.13(b) seam missing)",
                     ),
                 )
@@ -257,7 +257,7 @@ impl DispatchOutboundHandler {
             Err(e) => HandlerResult::error(
                 STATUS_INTERNAL_ERROR,
                 error_entity(
-                    "internal",
+                    "internal_error",
                     &format!("build dispatch-outbound result: {}", e),
                 ),
             ),
@@ -412,7 +412,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(r.status, STATUS_INTERNAL_ERROR);
-        assert_eq!(err_code(&r), "internal");
+        assert_eq!(err_code(&r), "internal_error");
     }
 
     #[tokio::test]

@@ -19,7 +19,7 @@ fn spawn_task<F: std::future::Future<Output = ()> + 'static>(f: F) {
 }
 use entity_handler::{
     ExecuteOptions, Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST,
-    STATUS_OK,
+    STATUS_NOT_SUPPORTED, STATUS_OK,
 };
 use entity_store::{ContentStore, LocationIndex};
 
@@ -52,8 +52,11 @@ impl Handler for InboxHandler {
         match ctx.operation.as_str() {
             "receive" => self.handle_receive(ctx).await,
             _ => Ok(HandlerResult::error(
-                STATUS_BAD_REQUEST,
-                make_error_entity("unknown_operation", &format!("unknown: {}", ctx.operation)),
+                STATUS_NOT_SUPPORTED,
+                make_error_entity(
+                    "unsupported_operation",
+                    &format!("unknown: {}", ctx.operation),
+                ),
             )),
         }
     }
@@ -467,11 +470,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_unknown_operation_returns_400() {
+    async fn test_unknown_operation_returns_501() {
         let inbox = make_inbox();
         let ctx = make_ctx(&inbox, "delete", "user/messages");
         let result = inbox.handle(&ctx).await.unwrap();
-        assert_eq!(result.status, STATUS_BAD_REQUEST);
+        assert_eq!(result.status, STATUS_NOT_SUPPORTED);
+        // §3.3's 501 row (0.8.2.7): the unit of conformance is the code SLOT,
+        // so the pair is pinned, not just the status. Asserting the status
+        // alone is what let five synonyms share this slot.
+        assert!(
+            result
+                .result
+                .data
+                .windows(21)
+                .any(|w| w == b"unsupported_operation"),
+            "the 501 slot carries exactly one spelling"
+        );
     }
 
     #[tokio::test]

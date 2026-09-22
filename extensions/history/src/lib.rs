@@ -11,8 +11,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use entity_entity::Entity;
 use entity_handler::{
-    Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST, STATUS_FORBIDDEN,
-    STATUS_NOT_FOUND,
+    Handler, HandlerContext, HandlerError, HandlerResult, STATUS_FORBIDDEN, STATUS_NOT_FOUND,
+    STATUS_NOT_SUPPORTED,
 };
 use entity_hash::Hash;
 use entity_store::{ContentStore, LocationIndex};
@@ -54,9 +54,9 @@ impl Handler for HistoryHandler {
             "query" => self.handle_query(ctx),
             "rollback" => self.handle_rollback(ctx),
             other => Ok(HandlerResult::error(
-                STATUS_BAD_REQUEST,
+                STATUS_NOT_SUPPORTED,
                 error_entity(
-                    "unknown_operation",
+                    "unsupported_operation",
                     &format!("unknown operation: {}", other),
                 ),
             )),

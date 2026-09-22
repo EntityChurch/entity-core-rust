@@ -27,7 +27,7 @@ use entity_ecf::{text, to_ecf, Value};
 use entity_entity::{Entity, TYPE_SIGNATURE};
 use entity_handler::{
     error_entity, Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST,
-    STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_OK,
+    STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_NOT_SUPPORTED, STATUS_OK,
 };
 use entity_hash::{invariant_signature_path, Hash};
 use entity_store::{ContentStore, LocationIndex};
@@ -110,8 +110,8 @@ impl Handler for RoleHandler {
             OP_RE_DERIVE => self.handle_re_derive(ctx).await,
             OP_DELEGATE => self.handle_delegate(ctx).await,
             other => Ok(error(
-                STATUS_BAD_REQUEST,
-                "unknown_operation",
+                STATUS_NOT_SUPPORTED,
+                "unsupported_operation",
                 &format!("unknown role op: {}", other),
             )),
         }

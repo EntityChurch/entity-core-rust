@@ -22,6 +22,7 @@ use entity_ecf::Value;
 use entity_entity::Entity;
 use entity_handler::{
     Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST, STATUS_FORBIDDEN,
+    STATUS_NOT_SUPPORTED,
 };
 use entity_hash::Hash;
 use entity_store::{ContentStore, LocationIndex};
@@ -521,9 +522,9 @@ impl Handler for QueryHandler {
             "find" => self.handle_find(ctx),
             "count" => self.handle_count(ctx),
             _ => Ok(HandlerResult::error(
-                STATUS_BAD_REQUEST,
+                STATUS_NOT_SUPPORTED,
                 make_error_entity(
-                    "unknown_operation",
+                    "unsupported_operation",
                     &format!("unknown operation: {}", ctx.operation),
                 ),
             )),
@@ -1315,7 +1316,18 @@ mod tests {
         });
         ctx.operation = "delete_all".to_string();
         let result = handler.handle(&ctx).await.unwrap();
-        assert_eq!(result.status, STATUS_BAD_REQUEST);
+        assert_eq!(result.status, STATUS_NOT_SUPPORTED);
+        // §3.3's 501 row (0.8.2.7): the unit of conformance is the code SLOT,
+        // so the pair is pinned, not just the status. Asserting the status
+        // alone is what let five synonyms share this slot.
+        assert!(
+            result
+                .result
+                .data
+                .windows(21)
+                .any(|w| w == b"unsupported_operation"),
+            "the 501 slot carries exactly one spelling"
+        );
     }
 }
 

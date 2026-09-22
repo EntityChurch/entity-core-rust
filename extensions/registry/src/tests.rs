@@ -3241,7 +3241,9 @@ async fn stored_domain_control_policy_still_answers_501_on_register() {
         .await
         .unwrap();
     assert_eq!(out.status, 501);
-    assert_eq!(err_code(&out).as_deref(), Some("unsupported_mode"));
+    // 0.8.2.7: `unsupported_mode` is named at §9.1 as a non-conformant
+    // spelling of the 501 row. The status was already right; the slot was not.
+    assert_eq!(err_code(&out).as_deref(), Some("unsupported_operation"));
 }
 
 /// §6a.9.2 — **unset is not a mode.** With no policy stored, `get` answers
@@ -5033,10 +5035,13 @@ async fn pin_bindings_is_a_discriminator_and_not_a_dispatchable_operation() {
         .await
         .unwrap();
     assert_eq!(
-        r.status, 400,
-        "an EXECUTE naming `pin-bindings` MUST be refused — nothing routes to it"
+        r.status, 501,
+        "an EXECUTE naming `pin-bindings` MUST be refused — nothing routes to it. \
+         0.8.2.7 moved this from 400 to the 501 row: the handler IS registered \
+         and does not implement the named operation, which is not the caller \
+         sending something malformed"
     );
-    assert_eq!(err_code(&r).as_deref(), Some("unknown_operation"));
+    assert_eq!(err_code(&r).as_deref(), Some("unsupported_operation"));
 }
 
 /// **R-27 clause 4 `[MUST]`** — capability checks precede config validation, and

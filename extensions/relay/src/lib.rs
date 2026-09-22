@@ -120,8 +120,11 @@ pub const CODE_PUT_BY_MISMATCH: &str = "put_by_mismatch";
 pub const CODE_NO_INBOX_RELAY: &str = "no_inbox_relay";
 /// Standard malformed-request code for relay request decode failures.
 pub const CODE_INVALID_PARAMS: &str = "invalid_params";
-/// Unknown relay operation.
-pub const CODE_UNKNOWN_OPERATION: &str = "unknown_operation";
+/// An operation this relay handler does not implement — **501**, §3.3's 501
+/// row default (0.8.2.7). Was `400 unknown_operation`: a minted synonym in no
+/// spec code set, and a status that told the caller its request was malformed
+/// when the request was fine and this peer simply does not serve the verb.
+pub const CODE_UNSUPPORTED_OPERATION: &str = "unsupported_operation";
 
 // ---------------------------------------------------------------------------
 // Forward-result status strings (§4.2)

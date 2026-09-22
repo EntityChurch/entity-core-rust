@@ -474,7 +474,10 @@ impl CapabilityHandler {
             Err(e) => {
                 return Ok(HandlerResult::error(
                     STATUS_INTERNAL,
-                    error_entity("internal", &format!("failed to decode parent token: {e}")),
+                    error_entity(
+                        "internal_error",
+                        &format!("failed to decode parent token: {e}"),
+                    ),
                 ));
             }
         };
@@ -578,7 +581,10 @@ impl CapabilityHandler {
             Err(e) => {
                 return Ok(HandlerResult::error(
                     STATUS_INTERNAL,
-                    error_entity("internal", &format!("failed to store policy entry: {e}")),
+                    error_entity(
+                        "internal_error",
+                        &format!("failed to store policy entry: {e}"),
+                    ),
                 ));
             }
         };
@@ -634,7 +640,7 @@ impl CapabilityHandler {
             Err(msg) => {
                 return Ok(HandlerResult::error(
                     STATUS_INTERNAL,
-                    error_entity("internal", &msg),
+                    error_entity("internal_error", &msg),
                 ));
             }
         };
@@ -643,7 +649,10 @@ impl CapabilityHandler {
             Err(e) => {
                 return Ok(HandlerResult::error(
                     STATUS_INTERNAL,
-                    error_entity("internal", &format!("failed to store revocation: {e}")),
+                    error_entity(
+                        "internal_error",
+                        &format!("failed to store revocation: {e}"),
+                    ),
                 ));
             }
         };
@@ -696,7 +705,10 @@ impl CapabilityHandler {
             Err(e) => {
                 return Ok(HandlerResult::error(
                     STATUS_INTERNAL,
-                    error_entity("internal", &format!("failed to build token entity: {e}")),
+                    error_entity(
+                        "internal_error",
+                        &format!("failed to build token entity: {e}"),
+                    ),
                 ));
             }
         };
@@ -725,7 +737,7 @@ impl CapabilityHandler {
                 return Ok(HandlerResult::error(
                     STATUS_INTERNAL,
                     error_entity(
-                        "internal",
+                        "internal_error",
                         &format!("failed to build signature entity: {e}"),
                     ),
                 ));
@@ -739,7 +751,7 @@ impl CapabilityHandler {
             return Ok(HandlerResult::error(
                 STATUS_INTERNAL,
                 error_entity(
-                    "internal",
+                    "internal_error",
                     &format!("failed to store granter identity: {e}"),
                 ),
             ));
@@ -747,14 +759,17 @@ impl CapabilityHandler {
         if let Err(e) = self.content_store.put(cap_entity.clone()) {
             return Ok(HandlerResult::error(
                 STATUS_INTERNAL,
-                error_entity("internal", &format!("failed to store token entity: {e}")),
+                error_entity(
+                    "internal_error",
+                    &format!("failed to store token entity: {e}"),
+                ),
             ));
         }
         if let Err(e) = self.content_store.put(sig_entity.clone()) {
             return Ok(HandlerResult::error(
                 STATUS_INTERNAL,
                 error_entity(
-                    "internal",
+                    "internal_error",
                     &format!("failed to store signature entity: {e}"),
                 ),
             ));
@@ -775,7 +790,10 @@ impl CapabilityHandler {
             Err(e) => {
                 return Ok(HandlerResult::error(
                     STATUS_INTERNAL,
-                    error_entity("internal", &format!("failed to build grant entity: {e}")),
+                    error_entity(
+                        "internal_error",
+                        &format!("failed to build grant entity: {e}"),
+                    ),
                 ));
             }
         };

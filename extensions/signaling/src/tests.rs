@@ -21,7 +21,7 @@ use crate::data::{advertisement_from_params, CollectRequest, CollectResult, Offe
 use crate::handler::SignalingHandler;
 use crate::{key, pool, PoolMember, SKEW_FANOUT};
 use crate::{
-    CODE_BUCKET_FULL, CODE_INVALID_PARAMS, CODE_MESSAGE_TOO_LARGE, CODE_UNKNOWN_OPERATION,
+    CODE_BUCKET_FULL, CODE_INVALID_PARAMS, CODE_MESSAGE_TOO_LARGE, CODE_UNSUPPORTED_OPERATION,
     LOBBY_DEFAULT, OP_ADVERTISE, OP_COLLECT, OP_OFFER, RENDEZVOUS_KEY_LEN,
 };
 
@@ -941,8 +941,8 @@ async fn reflect_is_an_unknown_operation_on_the_wrapped_surface() {
         .handle(&ctx("reflect", empty_params()))
         .await
         .unwrap();
-    assert_eq!(res.status, 400);
-    assert_eq!(error_code(&res), CODE_UNKNOWN_OPERATION);
+    assert_eq!(res.status, 501);
+    assert_eq!(error_code(&res), CODE_UNSUPPORTED_OPERATION);
 }
 
 #[tokio::test]
@@ -972,8 +972,8 @@ async fn handler_rejects_malformed_params_and_unknown_operations() {
     assert_eq!(error_code(&res), CODE_INVALID_PARAMS);
 
     let res = handler.handle(&ctx("punch", empty_params())).await.unwrap();
-    assert_eq!(res.status, 400);
-    assert_eq!(error_code(&res), CODE_UNKNOWN_OPERATION);
+    assert_eq!(res.status, 501);
+    assert_eq!(error_code(&res), CODE_UNSUPPORTED_OPERATION);
 }
 
 /// The declared surface is exactly the **three** core verbs (§1, §1.4) and the
@@ -1411,8 +1411,8 @@ async fn the_client_offers_no_reflect_and_a_hand_rolled_one_is_unknown() {
     .await
     .unwrap();
 
-    assert_eq!(res.status, 400);
-    assert_eq!(error_code(&res), CODE_UNKNOWN_OPERATION);
+    assert_eq!(res.status, 501);
+    assert_eq!(error_code(&res), CODE_UNSUPPORTED_OPERATION);
 }
 
 /// The client reads back the node's published limits and lobby constant — the

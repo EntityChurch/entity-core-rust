@@ -23,7 +23,8 @@ use ciborium::Value;
 use entity_entity::Entity;
 use entity_handler::{
     error_entity, Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_GATEWAY,
-    STATUS_BAD_REQUEST, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_UNAVAILABLE,
+    STATUS_BAD_REQUEST, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_NOT_SUPPORTED,
+    STATUS_UNAVAILABLE,
 };
 use entity_hash::Hash;
 
@@ -254,10 +255,10 @@ impl Handler for HttpSubstituteHandler {
     async fn handle(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         match ctx.operation.as_str() {
             "try" => Ok(self.handle_try(ctx).await),
-            other => Ok(bad_request(
-                "unknown_operation",
-                &format!("{} does not support {}", PATTERN_HTTP, other),
-            )),
+            other => Ok(unsupported_operation(&format!(
+                "{} does not support {}",
+                PATTERN_HTTP, other
+            ))),
         }
     }
 
@@ -280,6 +281,17 @@ impl Handler for HttpSubstituteHandler {
 
 fn bad_request(code: &str, msg: &str) -> HandlerResult {
     HandlerResult::error(STATUS_BAD_REQUEST, error_entity(code, msg))
+}
+
+/// §3.3's 501 row (0.8.2.7): a handler IS registered at the path and does not
+/// implement the named operation. Takes no `code` — the default is mandatory
+/// for the generic case and the unit of conformance is the code SLOT, so there
+/// is exactly one spelling and a caller cannot supply a synonym.
+fn unsupported_operation(msg: &str) -> HandlerResult {
+    HandlerResult::error(
+        STATUS_NOT_SUPPORTED,
+        error_entity("unsupported_operation", msg),
+    )
 }
 
 fn field_hash(map: &[(Value, Value)], key: &str) -> Option<Hash> {

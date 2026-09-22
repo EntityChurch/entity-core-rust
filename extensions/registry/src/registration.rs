@@ -233,8 +233,8 @@ impl Handler for RegisterRequestHandler {
             "set-issuer-policy" => Ok(self.handle_set_issuer_policy(ctx)),
             "get-issuer-policy" => Ok(self.handle_get_issuer_policy()),
             other => Ok(error(
-                STATUS_BAD_REQUEST,
-                "unknown_operation",
+                STATUS_NOT_SUPPORTED,
+                "unsupported_operation",
                 &format!("unknown peer-issued op: {}", other),
             )),
         }
@@ -436,9 +436,13 @@ impl RegisterRequestHandler {
             MODE_DOMAIN_CONTROL => {
                 // DEFERRED — the DNS-proof challenge format co-designs with the
                 // web-native dns-txt / well_known_url backends (§6a.10).
+                // §9.1 names `unsupported_mode` non-conformant as a 501-row
+                // spelling (0.8.2.7). Deferred-but-advertised is the same slot
+                // as unknown: a handler is registered and does not implement
+                // what was named. The mode is still named in the message.
                 return error(
                     STATUS_NOT_SUPPORTED,
-                    "unsupported_mode",
+                    "unsupported_operation",
                     "domain-control registration is not yet implemented",
                 );
             }
@@ -978,6 +982,23 @@ impl RegisterRequestHandler {
         // the 400 binds `set-issuer-policy`, which declines to arm the mode
         // at all, while a policy predating that refusal still has to be
         // answered when a request arrives against it.
+        //
+        // **These two 400s keep `unsupported_mode` and that is deliberate.**
+        // 0.8.2.7's §9.1 lists the token among "non-conformant spellings of
+        // this row", and the register-path 501 one function up was swept for
+        // exactly that reason. It does not bind here: `set-issuer-policy` IS
+        // implemented, and what is refused is a *parameter value*, so this is
+        // the 400 row, not the 501 row. It is an undefined 400 spelling — the
+        // class §3a of `ROUTING-2026-09-03-c` explicitly HOLDS pending arch's
+        // per-extension error-code tables (OP-3), because the escape clause
+        // requires a declared site and REGISTRY declares none.
+        //
+        // The token is the one place §9.1's list and §3a's hold overlap, so
+        // the reading is routed rather than assumed. If arch rules the MUST
+        // NOT is on the TOKEN (the `handshake_failed` / `connection_required`
+        // precedent at 0.8.2.5, where the ground was "minted in no spec code
+        // set" — a property of the code wherever it appears) rather than on
+        // the ROW, these two sites and their two pins move together.
         match policy.mode.as_str() {
             MODE_OPEN | MODE_ALLOWLIST | MODE_MANUAL => {}
             MODE_DOMAIN_CONTROL => {

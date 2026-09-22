@@ -27,7 +27,9 @@ use async_trait::async_trait;
 use ciborium::Value;
 use entity_ecf::ValueExt;
 use entity_entity::Entity;
-use entity_handler::{Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST};
+use entity_handler::{
+    Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST, STATUS_NOT_SUPPORTED,
+};
 use entity_hash::Hash;
 use entity_store::{ContentStore, LocationIndex};
 
@@ -442,10 +444,10 @@ impl Handler for SystemContentHandler {
         match ctx.operation.as_str() {
             "get" => Ok(self.handle_get(ctx).await),
             "ingest" => Ok(self.handle_ingest(ctx)),
-            other => Ok(bad_request(
-                "unknown_operation",
-                &format!("system/content does not support {}", other),
-            )),
+            other => Ok(unsupported_operation(&format!(
+                "system/content does not support {}",
+                other
+            ))),
         }
     }
 
@@ -573,6 +575,23 @@ fn has_resource(ctx: &HandlerContext) -> bool {
 
 fn path_required(message: &str) -> HandlerResult {
     bad_request("path_required", message)
+}
+
+/// §3.3's 501 row (0.8.2.7): a handler IS registered at the path and does not
+/// implement the named operation. The default `code` is mandatory for the
+/// generic case and the unit of conformance is the code SLOT, so this is the
+/// one spelling — `unknown_operation`, `not_implemented`, `not_supported`,
+/// `unsupported_mode` and `not_available` are all named non-conformant at §9.1.
+fn unsupported_operation(message: &str) -> HandlerResult {
+    let data = entity_ecf::to_ecf(&Value::Map(vec![
+        (
+            entity_ecf::text("code"),
+            entity_ecf::text("unsupported_operation"),
+        ),
+        (entity_ecf::text("message"), entity_ecf::text(message)),
+    ]));
+    let err = Entity::new("system/protocol/error", data).expect("error entity");
+    HandlerResult::error(STATUS_NOT_SUPPORTED, err)
 }
 
 fn bad_request(code: &str, message: &str) -> HandlerResult {

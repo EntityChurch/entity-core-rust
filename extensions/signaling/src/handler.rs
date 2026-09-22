@@ -25,7 +25,8 @@ use async_trait::async_trait;
 use entity_ecf::{text, to_ecf, Value};
 use entity_entity::Entity;
 use entity_handler::{
-    Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST, STATUS_RATE_LIMITED,
+    Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST, STATUS_NOT_SUPPORTED,
+    STATUS_RATE_LIMITED,
 };
 
 use crate::core::{CoreError, SignalingCore};
@@ -34,7 +35,7 @@ use crate::data::{
 };
 use crate::{
     CODE_BUCKET_FULL, CODE_CAPACITY_EXHAUSTED, CODE_INVALID_PARAMS, CODE_MESSAGE_TOO_LARGE,
-    CODE_UNKNOWN_OPERATION, OPERATIONS, OP_ADVERTISE, OP_COLLECT, OP_OFFER, PATTERN,
+    CODE_UNSUPPORTED_OPERATION, OPERATIONS, OP_ADVERTISE, OP_COLLECT, OP_OFFER, PATTERN,
 };
 
 /// `system/signaling` — the three core verbs over cross-peer `execute`.
@@ -163,8 +164,8 @@ impl Handler for SignalingHandler {
             OP_COLLECT => self.handle_collect(ctx, now),
             OP_ADVERTISE => self.handle_advertise(),
             other => error(
-                STATUS_BAD_REQUEST,
-                CODE_UNKNOWN_OPERATION,
+                STATUS_NOT_SUPPORTED,
+                CODE_UNSUPPORTED_OPERATION,
                 &format!("unknown signaling operation: {}", other),
             ),
         })

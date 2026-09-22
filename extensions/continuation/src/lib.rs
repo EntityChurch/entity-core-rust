@@ -10,8 +10,8 @@ use async_trait::async_trait;
 use entity_entity::{Entity, EntityUri};
 use entity_handler::{
     Bounds, DeliverySpec, ExecuteFn, ExecuteOptions, Handler, HandlerContext, HandlerError,
-    HandlerResult, STATUS_BAD_REQUEST, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_OK,
-    STATUS_RATE_LIMITED,
+    HandlerResult, STATUS_BAD_REQUEST, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_NOT_SUPPORTED,
+    STATUS_OK, STATUS_RATE_LIMITED,
 };
 use entity_hash::Hash;
 use entity_store::{CasError, ContentStore, LocationIndex};
@@ -545,8 +545,8 @@ impl Handler for ContinuationHandler {
             "resume" => self.handle_resume(ctx).await,
             "abandon" => self.handle_abandon(ctx).await,
             _ => Ok(error_result(
-                STATUS_BAD_REQUEST,
-                "unknown_operation",
+                STATUS_NOT_SUPPORTED,
+                "unsupported_operation",
                 &format!("unknown: {}", ctx.operation),
             )),
         }
@@ -1366,6 +1366,13 @@ impl ContinuationHandler {
                 // info, so we classify Internal by string-match; InvalidParams
                 // and NotSupported remain as handler-side codes (delivered
                 // EXECUTE that the receiver rejected for shape reasons).
+                //
+                // Checked against 0.8.2.7's §3.3 code-slot sweep and NOT swept:
+                // `reason` is V7 §6.12's transport-failure vocabulary written
+                // into a §3.10.2 lost-error MARKER, not a `result.data.code` on
+                // the wire. Different field, different closed set — §3.3's rows
+                // do not reach it, and renaming this to `unsupported_operation`
+                // would put a status-code vocabulary into a reason field.
                 let reason: &str = match &e {
                     HandlerError::InvalidParams(_) => "invalid_params",
                     HandlerError::NotSupported(_) => "not_supported",
@@ -4059,7 +4066,18 @@ mod tests {
             reactive_trigger: false,
         };
         let result = h.handle(&ctx).await.unwrap();
-        assert_eq!(result.status, STATUS_BAD_REQUEST);
+        assert_eq!(result.status, STATUS_NOT_SUPPORTED);
+        // §3.3's 501 row (0.8.2.7): the unit of conformance is the code SLOT,
+        // so the pair is pinned, not just the status. Asserting the status
+        // alone is what let five synonyms share this slot.
+        assert!(
+            result
+                .result
+                .data
+                .windows(21)
+                .any(|w| w == b"unsupported_operation"),
+            "the 501 slot carries exactly one spelling"
+        );
     }
 
     #[tokio::test]

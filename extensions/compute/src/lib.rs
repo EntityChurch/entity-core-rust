@@ -21,7 +21,7 @@ use entity_ecf::ValueExt;
 use entity_entity::{Entity, EntityUri};
 use entity_handler::{
     Bounds, ExecuteOptions, Handler, HandlerContext, HandlerError, HandlerResult,
-    STATUS_BAD_REQUEST, STATUS_FORBIDDEN, STATUS_NOT_FOUND,
+    STATUS_BAD_REQUEST, STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_NOT_SUPPORTED,
 };
 #[cfg(test)]
 use entity_hash::Hash;
@@ -692,10 +692,10 @@ impl Handler for ComputeHandler {
             "uninstall" => self.handle_uninstall(ctx),
             other => {
                 let err = make_error_entity(
-                    "unknown_operation",
+                    "unsupported_operation",
                     &format!("Unknown operation: {}", other),
                 );
-                Ok(HandlerResult::error(STATUS_BAD_REQUEST, err))
+                Ok(HandlerResult::error(STATUS_NOT_SUPPORTED, err))
             }
         }
     }

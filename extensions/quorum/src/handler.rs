@@ -17,7 +17,7 @@ use entity_ecf::{text, to_ecf, Value};
 use entity_entity::Entity;
 use entity_handler::{
     error_entity, Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST,
-    STATUS_OK,
+    STATUS_NOT_SUPPORTED, STATUS_OK,
 };
 use entity_hash::Hash;
 use entity_store::{ContentStore, LocationIndex};
@@ -104,8 +104,8 @@ impl Handler for QuorumHandler {
             "publish" => self.handle_publish(ctx).await,
             "verify" => self.handle_verify(ctx).await,
             other => Ok(error(
-                STATUS_BAD_REQUEST,
-                "unknown_operation",
+                STATUS_NOT_SUPPORTED,
+                "unsupported_operation",
                 &format!("unknown quorum op: {}", other),
             )),
         }

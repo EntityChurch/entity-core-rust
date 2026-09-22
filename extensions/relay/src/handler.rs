@@ -17,7 +17,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use entity_ecf::Value;
-use entity_handler::{Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST};
+use entity_handler::{
+    Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST, STATUS_NOT_SUPPORTED,
+};
 use entity_store::{ContentStore, LocationIndex};
 
 use crate::data::{ForwardRequest, ForwardResult, PollRequest, PollResult, PutResult, StoreEntry};
@@ -29,7 +31,7 @@ use crate::{
     advertise_path, inner_store_path, is_valid_namespace, store_entry_path,
     CODE_EXPIRED_ON_ARRIVAL, CODE_INVALID_PARAMS, CODE_INVALID_REQUEST, CODE_NAMESPACE_INVALID,
     CODE_NO_INBOX_RELAY, CODE_NO_ROUTE, CODE_PUT_BY_MISMATCH, CODE_STORAGE_FULL,
-    CODE_TTL_EXHAUSTED, CODE_UNKNOWN_OPERATION, FORWARD_STATUS_FORWARDED,
+    CODE_TTL_EXHAUSTED, CODE_UNSUPPORTED_OPERATION, FORWARD_STATUS_FORWARDED,
     FORWARD_STATUS_QUEUED_FALLBACK,
 };
 
@@ -656,8 +658,8 @@ impl Handler for RelayHandler {
             "poll" => Ok(self.handle_poll(ctx).await),
             "advertise" => Ok(self.handle_advertise(ctx).await),
             other => Ok(error(
-                STATUS_BAD_REQUEST,
-                CODE_UNKNOWN_OPERATION,
+                STATUS_NOT_SUPPORTED,
+                CODE_UNSUPPORTED_OPERATION,
                 &format!("unknown relay op: {}", other),
             )),
         }

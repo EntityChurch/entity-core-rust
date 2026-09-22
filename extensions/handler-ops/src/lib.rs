@@ -29,7 +29,7 @@ use entity_ecf::ValueExt;
 use entity_entity::Entity;
 use entity_handler::{
     Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST, STATUS_FORBIDDEN,
-    STATUS_NOT_FOUND, STATUS_OK,
+    STATUS_NOT_FOUND, STATUS_NOT_SUPPORTED, STATUS_OK,
 };
 use entity_hash::Hash;
 use entity_store::{ContentStore, LocationIndex};
@@ -216,7 +216,10 @@ impl HandlersHandler {
             Err(err) => {
                 return Ok(HandlerResult::error(
                     STATUS_INTERNAL,
-                    error_entity("internal", &format!("build interface entity: {}", err)),
+                    error_entity(
+                        "internal_error",
+                        &format!("build interface entity: {}", err),
+                    ),
                 ))
             }
         };
@@ -243,7 +246,7 @@ impl HandlersHandler {
             Err(err) => {
                 return Ok(HandlerResult::error(
                     STATUS_INTERNAL,
-                    error_entity("internal", &format!("build grant entity: {}", err)),
+                    error_entity("internal_error", &format!("build grant entity: {}", err)),
                 ))
             }
         };
@@ -282,7 +285,7 @@ impl HandlersHandler {
                 return Ok(HandlerResult::error(
                     STATUS_INTERNAL,
                     error_entity(
-                        "internal",
+                        "internal_error",
                         &format!("build handler manifest entity: {}", err),
                     ),
                 ))
@@ -306,7 +309,7 @@ impl HandlersHandler {
                 return Ok(HandlerResult::error(
                     STATUS_INTERNAL,
                     error_entity(
-                        "internal",
+                        "internal_error",
                         &format!("build grant signature entity: {}", err),
                     ),
                 ))
@@ -354,7 +357,7 @@ impl HandlersHandler {
                             return Ok(HandlerResult::error(
                                 STATUS_INTERNAL,
                                 error_entity(
-                                    "internal",
+                                    "internal_error",
                                     &format!("build type entity for {}: {}", type_name, err),
                                 ),
                             ))
@@ -379,7 +382,7 @@ impl HandlersHandler {
                 return Ok(HandlerResult::error(
                     STATUS_INTERNAL,
                     error_entity(
-                        "internal",
+                        "internal_error",
                         &format!("build register-result entity: {}", err),
                     ),
                 ))
@@ -499,7 +502,7 @@ impl HandlersHandler {
         let h = self
             .content_store
             .put(entity)
-            .map_err(|e| error_entity("internal", &format!("content store put: {}", e)))?;
+            .map_err(|e| error_entity("internal_error", &format!("content store put: {}", e)))?;
         self.location_index.set(qualified_path, h);
         Ok(())
     }
@@ -513,9 +516,9 @@ impl Handler for HandlersHandler {
             "register" => self.handle_register(ctx),
             "unregister" => self.handle_unregister(ctx),
             other => Ok(HandlerResult::error(
-                STATUS_BAD_REQUEST,
+                STATUS_NOT_SUPPORTED,
                 error_entity(
-                    "unknown_operation",
+                    "unsupported_operation",
                     &format!("system/handler does not support operation: {}", other),
                 ),
             )),

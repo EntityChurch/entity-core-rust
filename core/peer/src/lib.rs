@@ -4425,6 +4425,51 @@ mod tests {
         assert_eq!(code.as_deref(), Some("handler_not_found"));
     }
 
+    /// §3.3's 500 and 501 rows (0.8.2.6/0.8.2.7): the default `code` is
+    /// **mandatory for the generic case**, and the unit of conformance is the
+    /// code SLOT rather than a spelling.
+    ///
+    /// `connection::handler_error_slot` is the peer's whole generic 500/501
+    /// surface: every handler in the workspace that returns
+    /// `HandlerError::{Internal, NotSupported}` is answered from that one
+    /// function, so a minted spelling there is a minted spelling on every
+    /// extension at once. It emitted `handler_error` and `not_supported` until
+    /// this sweep, both codes in no spec code set — and arch's cohort census
+    /// did not see either, because it censused the `STATUS_INTERNAL_ERROR`
+    /// spelling and these codes sit in neither of the two forms it looked for.
+    ///
+    /// **§3b states in the spec that the 500 row is NOT oracle-drivable** — a
+    /// conformant peer cannot be made to fail internally on demand over the
+    /// wire — so that row is satisfied by source audit and no cross-impl check
+    /// will ever catch a regression here. This is the only instrument it will
+    /// ever have, which is why it asserts all three arms rather than the one
+    /// that moved: the mapping is a single `match`, and a "fix" that collapses
+    /// two arms into one would otherwise be invisible.
+    #[test]
+    fn handler_error_slot_is_the_one_inventory() {
+        use entity_handler::HandlerError;
+        assert_eq!(
+            connection::handler_error_slot(&HandlerError::Internal("x".into())),
+            (500, "internal_error"),
+            "§3.3's 500 row default is mandatory for the generic case. This \
+             emitted `handler_error`, a code in no spec code set, from the one \
+             line that answers every handler-side fault in the workspace"
+        );
+        assert_eq!(
+            connection::handler_error_slot(&HandlerError::NotSupported("x".into())),
+            (501, "unsupported_operation"),
+            "§3.3's 501 row default. This emitted `not_supported`, named at \
+             §9.1 as a non-conformant spelling of exactly this row"
+        );
+        assert_eq!(
+            connection::handler_error_slot(&HandlerError::InvalidParams("x".into())),
+            (400, "invalid_params"),
+            "§3.3's 400 row names `invalid_params` in its DEFINED specific-code \
+             set, so this arm is conformant and was deliberately not swept — \
+             asserted so that collapsing the three arms goes red"
+        );
+    }
+
     /// V7 §6.9 + §3.12: dynamic handler registration via system/handler:register
     /// must succeed and the registered handler must dispatch via tree-walk
     /// (V7 §6.6) — even though no compiled implementation exists in the registry.
@@ -10334,47 +10379,79 @@ mod tests {
             );
 
             // Control B, and it is a MEASUREMENT rather than a comment: send an
-            // actual `ping` and require that the name check let it THROUGH.
+            // actual `ping` and require that it be ANSWERED.
             //
             // `ping` is a connect operation we implement (EXTENSION-NETWORK
-            // §5.1), so row 10's refusal must not reach it. This bare frame
-            // carries no `author`, so it goes on to fail §5.2 verification —
-            // that is fine and is not what the row asserts. What it asserts is
-            // that the refusal is keyed on the **advertised inventory** and not
-            // on "anything that is not hello or authenticate": the latter passes
-            // the row above and kills every keepalive on every established
-            // connection, and the mutation proving it was written as a
-            // `matches!(op, "hello" | "authenticate")` guard.
+            // §5.1), so row 10's refusal must not reach it. A refusal keyed on
+            // "anything that is not hello or authenticate" rather than on
+            // `CONNECT_OPERATIONS` passes every row above and kills every
+            // keepalive on every established connection; the mutation proving it
+            // was written as a `matches!(op, "hello" | "authenticate")` guard.
             //
-            // `a12_keepalive_ping_answers_pong` covers the full ping→pong
-            // round-trip with a real signed client; this row is here so the
-            // discriminator cannot be separated from the claim it discriminates.
-            let (ping_status, ping_code) = pair_of(
-                &round_trip(
-                    &mut client,
-                    entity_entity::Envelope::new(
-                        entity_protocol::build_connect_execute(
-                            "fm2-ping-control",
-                            "ping",
-                            &entity_entity::Entity::new(
-                                "system/network/ping",
-                                entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![])),
-                            )
-                            .expect("ping params"),
+            // **This frame is UNAUTHENTICATED — bare `uri`/`operation`/
+            // `request_id`, no `author`, no `capability`, no signature — and
+            // that is now the whole point of the row rather than an accident of
+            // how it was built.** 0.8.2.6 §4.2 Q2 (ruled 2026-09-03): §3.3 line
+            // 773 excepts the connection path with no state qualifier, and §5.1
+            // is scoped to *authenticated* EXECUTE, so an unauthenticated
+            // post-handshake `ping` MUST be served. We had it the other way
+            // round and answered `401 authentication_failed`.
+            //
+            // The assertion moved with the ruling. It used to read `!(400 &&
+            // invalid_request)` — "not row 10's pair" — which the 401 satisfied,
+            // so the row was green against a peer that refuses every
+            // unauthenticated keepalive. That weak form was correct while the
+            // question was open and is worthless now: it passes under both
+            // readings, which is exactly the discriminator failure this file
+            // keeps re-learning. It asserts the served answer instead.
+            //
+            // §5.2's `timestamp`/`sequence` are supplied for the same reason —
+            // with an empty params map the served path answers `400
+            // invalid_params`, which is a legitimate outcome and would let the
+            // row pass without ever reaching `build_pong_response`.
+            //
+            // `a12_keepalive_ping_answers_pong` covers the same round-trip with
+            // a fully signed client. It passes under BOTH readings and always
+            // did — it is the neighbour that cannot see this class, kept
+            // deliberately so the pair of them shows which one discriminates.
+            let ping_response = round_trip(
+                &mut client,
+                entity_entity::Envelope::new(
+                    entity_protocol::build_connect_execute(
+                        "fm2-ping-control",
+                        "ping",
+                        &entity_entity::Entity::new(
+                            "system/network/ping",
+                            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+                                (
+                                    entity_ecf::text("sequence"),
+                                    entity_ecf::Value::Integer(7u64.into()),
+                                ),
+                                (
+                                    entity_ecf::text("timestamp"),
+                                    entity_ecf::Value::Integer(1_700_000_000_001u64.into()),
+                                ),
+                            ])),
                         )
-                        .expect("connect execute"),
-                    ),
-                )
-                .await,
-            );
-            assert!(
-                !(ping_status == 400 && ping_code == "invalid_request"),
-                "`ping` is an operation this connect handler IMPLEMENTS and \
-                 ADVERTISES, so §4.7 row 10 must not refuse it by name. Got \
-                 ({ping_status}, {ping_code:?}) — a refusal keyed on 'not hello \
-                 and not authenticate' rather than on `CONNECT_OPERATIONS` \
-                 passes every row above and breaks keepalive on every \
-                 established connection"
+                        .expect("ping params"),
+                    )
+                    .expect("connect execute"),
+                ),
+            )
+            .await;
+            let ping_parsed = entity_protocol::parse_execute_response(&ping_response)
+                .expect("the ping is answered with an EXECUTE_RESPONSE");
+            assert_eq!(
+                (ping_parsed.status, ping_parsed.result.entity_type.as_str()),
+                (200, "system/network/pong"),
+                "§4.2 / §3.3 line 773 (0.8.2.6 Q2): `system/protocol/connect` is \
+                 pre-authorized in EVERY state, so an unauthenticated \
+                 post-handshake `ping` MUST be served. We ran the intercept \
+                 AFTER `verify_request`, so this bare frame — which carries no \
+                 `author` — was answered `401 authentication_failed`. That is \
+                 what made core-go's `pingServedOnceEstablished` applicability \
+                 control record `served=false` and SKIP their §4.7 409 row \
+                 against us: a scored row silently disabled by our own reading"
             );
 
             drop(client);
@@ -11104,9 +11181,17 @@ mod tests {
 
     /// EXTENSION-NETWORK §5.1–§5.3: an EXECUTE `ping` on the connect
     /// handler answers 200 with a `system/network/pong` echoing the
-    /// ping's timestamp/sequence plus the responder's clock. The ping
-    /// rides the ordinary signed EXECUTE path (verified), exempt only
-    /// from the handler-scope grant check (see SPEC-AMBIGUITIES).
+    /// ping's timestamp/sequence plus the responder's clock.
+    ///
+    /// This drives a **fully signed** client, so it exercises the pong
+    /// construction and the echo fields, and it passed under both readings of
+    /// §4.2's pre-authorization — before 0.8.2.6 Q2, when the intercept sat
+    /// after `verify_request`, and after, now that it sits before. **It cannot
+    /// see the Q2 defect and is kept that way on purpose.** The row that does
+    /// see it is control B of
+    /// `incompatible_protocol_and_unknown_connect_op_on_both_transports`, which
+    /// sends the bare unauthenticated frame; the two together are what show
+    /// which of them discriminates.
     #[tokio::test]
     async fn a12_keepalive_ping_answers_pong() {
         let disabled = keepalive::KeepaliveConfig {

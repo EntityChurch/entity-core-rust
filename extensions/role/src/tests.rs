@@ -1947,7 +1947,18 @@ async fn unknown_op_returns_400() {
         identity_hash,
     );
     let result = handler.handle(&ctx).await.unwrap();
-    assert_eq!(result.status, 400);
+    assert_eq!(result.status, 501);
+    // §3.3's 501 row (0.8.2.7): the unit of conformance is the code SLOT, so
+    // the pair is pinned. This asserted the status alone, which is what let
+    // five spellings share one slot across the cohort.
+    assert!(
+        result
+            .result
+            .data
+            .windows(21)
+            .any(|w| w == b"unsupported_operation"),
+        "the 501 slot carries exactly one spelling"
+    );
 }
 
 // ===========================================================================

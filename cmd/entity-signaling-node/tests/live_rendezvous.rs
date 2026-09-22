@@ -363,9 +363,13 @@ async fn reflect_is_an_unknown_operation_on_the_wrapped_surface() {
     .expect("reflect dispatch reaches the node");
 
     assert_eq!(
-        resp.status, 400,
+        resp.status, 501,
         "reflect is the unwrapped listener's verb (§1.4); on this surface it is \
-         an unknown operation like any other, not a 501 placeholder"
+         an operation this registered handler does not implement, which IS \
+         §3.3's 501 row. This assertion read `400 ... not a 501 placeholder` \
+         until 0.8.2.7 ruled the opposite: 501 is not a placeholder status, it \
+         is the row for exactly this fact, and 400 told the caller its request \
+         was malformed when the request was fine"
     );
 }
 

@@ -240,10 +240,13 @@ pub const CODE_MESSAGE_TOO_LARGE: &str = "message_too_large";
 pub const CODE_BUCKET_FULL: &str = "bucket_full";
 /// The node is at `max_keys` — 429.
 pub const CODE_CAPACITY_EXHAUSTED: &str = "capacity_exhausted";
-/// Unknown signaling operation — 400. This is what `reflect` gets on the
-/// wrapped surface (§1.4): it is not served here, and "not served here" is an
-/// unknown operation, not a distinct failure mode.
-pub const CODE_UNKNOWN_OPERATION: &str = "unknown_operation";
+/// An operation this signaling handler does not implement — **501**, §3.3's
+/// 501 row default (0.8.2.7). This is what `reflect` gets on the wrapped
+/// surface (§1.4): it is not served here, and "not served here" is precisely
+/// the 501 row — a handler IS registered at the path and does not implement
+/// the named operation. Was `400 unknown_operation`, which is both a minted
+/// synonym and the wrong status.
+pub const CODE_UNSUPPORTED_OPERATION: &str = "unsupported_operation";
 
 // ---------------------------------------------------------------------------
 // Errors

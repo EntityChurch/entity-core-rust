@@ -25,7 +25,7 @@ use entity_crypto::Keypair;
 use entity_entity::{Entity, TYPE_SIGNATURE};
 use entity_handler::{
     Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST, STATUS_FORBIDDEN,
-    STATUS_NOT_FOUND,
+    STATUS_NOT_FOUND, STATUS_NOT_SUPPORTED,
 };
 use entity_hash::Hash;
 use entity_store::{ContentStore, LocationIndex};
@@ -489,8 +489,8 @@ impl Handler for RegistryHandler {
             "set-resolver-config" => Ok(self.handle_set_resolver_config(ctx)),
             "get-resolver-config" => Ok(self.handle_get_resolver_config()),
             other => Ok(error(
-                STATUS_BAD_REQUEST,
-                "unknown_operation",
+                STATUS_NOT_SUPPORTED,
+                "unsupported_operation",
                 &format!("unknown registry op: {}", other),
             )),
         }

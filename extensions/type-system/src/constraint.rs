@@ -15,7 +15,8 @@ use ciborium::Value;
 use entity_ecf::ValueExt;
 use entity_entity::Entity;
 use entity_handler::{
-    Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST, STATUS_OK,
+    error_entity, Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST,
+    STATUS_NOT_SUPPORTED, STATUS_OK,
 };
 use entity_hash::Hash;
 use entity_store::{ContentStore, LocationIndex};
@@ -153,9 +154,9 @@ impl Handler for StandardConstraintHandler {
     async fn handle(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         if ctx.operation != "validate" {
             return Ok(HandlerResult::error(
-                STATUS_BAD_REQUEST,
+                STATUS_NOT_SUPPORTED,
                 error_entity(
-                    "unknown_operation",
+                    "unsupported_operation",
                     &format!(
                         "system/type/constraint/* expects validate, got {}",
                         ctx.operation
@@ -178,7 +179,7 @@ impl Handler for StandardConstraintHandler {
             Err(e) => {
                 return Ok(HandlerResult::error(
                     entity_handler::STATUS_INTERNAL_ERROR,
-                    error_entity("encode_failure", &e),
+                    error_entity("internal_error", &e),
                 ));
             }
         };
@@ -484,16 +485,9 @@ fn collection_size(value: &Value) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
-// Error helper
-// ---------------------------------------------------------------------------
-
-fn error_entity(error_type: &str, message: &str) -> Entity {
-    let data = entity_ecf::to_ecf(&Value::Map(vec![
-        (entity_ecf::text("type"), entity_ecf::text(error_type)),
-        (entity_ecf::text("message"), entity_ecf::text(message)),
-    ]));
-    Entity::new("system/protocol/error", data).expect("error entity")
-}
+// Error helper — see the note in `validate.rs`: this file shadowed
+// `entity_handler::error_entity` and wrote the code under key `type`. Use the
+// canonical helper; a local copy is how the field key drifts.
 
 // ---------------------------------------------------------------------------
 // Tests

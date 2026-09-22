@@ -10,7 +10,7 @@ use entity_capability::{GrantEntry, IdScope, PathScope};
 use entity_entity::EntityUri;
 use entity_handler::{
     error_entity, Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST,
-    STATUS_FORBIDDEN, STATUS_NOT_FOUND,
+    STATUS_FORBIDDEN, STATUS_NOT_FOUND, STATUS_NOT_SUPPORTED,
 };
 use entity_store::{ContentStore, LocationIndex};
 
@@ -216,10 +216,9 @@ impl Handler for LocalFilesHandler {
             "list" => Ok(handle_list(self, ctx).await),
             "delete" => Ok(handle_delete(self, ctx)),
             "watch" => Ok(handle_watch(self, ctx)),
-            other => Ok(bad_request(
-                "unknown_operation",
-                &format!("local/files does not support {other}"),
-            )),
+            other => Ok(unsupported_operation(&format!(
+                "local/files does not support {other}"
+            ))),
         }
     }
 
@@ -282,6 +281,17 @@ impl Handler for LocalFilesHandler {
 
 pub(crate) fn bad_request(code: &str, message: &str) -> HandlerResult {
     HandlerResult::error(STATUS_BAD_REQUEST, error_entity(code, message))
+}
+
+/// §3.3's 501 row (0.8.2.7): a handler IS registered at the path and does not
+/// implement the named operation. Takes no `code` — the default is mandatory
+/// for the generic case and the unit of conformance is the code SLOT, so there
+/// is exactly one spelling and a caller cannot supply a synonym.
+pub(crate) fn unsupported_operation(message: &str) -> HandlerResult {
+    HandlerResult::error(
+        STATUS_NOT_SUPPORTED,
+        error_entity("unsupported_operation", message),
+    )
 }
 
 pub(crate) fn not_found(code: &str, message: &str) -> HandlerResult {
