@@ -2912,14 +2912,23 @@ impl RevisionHandler {
         let head = match decode_fetch_result_head(&fetch_root.data) {
             Some(h) if !h.is_zero() => h,
             Some(_) | None => {
-                return Ok(error_result(
-                    STATUS_INTERNAL_ERROR,
-                    "remote_empty",
-                    &format!(
-                        "remote {} has no versions at prefix {}",
-                        remote, local_prefix
-                    ),
-                ));
+                // §4.4.8 `[MUST]` (v3.13) — **an empty remote is a result, not
+                // an error.** A zero head means the remote has nothing at this
+                // prefix; nothing failed here, and *"a peer that answers `500
+                // remote_empty` tells a caller its own machinery broke when the
+                // honest answer is that the remote has nothing to send."*
+                //
+                // The criterion is the one `EXTENSION-TYPE` Appendix A applies
+                // and the one this seat argued for there — ***can the declared
+                // result type carry the outcome?*** `merge-result.status` is
+                // exactly that field, and `version` is already specified absent
+                // for the outcomes that produce no merge. So the same rule that
+                // keeps `validate` at a 200 keeps `pull` at one, and the same
+                // rule sends `compare`'s unresolvable type to a 404: it is
+                // about the result type, not about how bad the outcome feels.
+                //
+                // Pull-only, per the vocabulary comment on `merge-result`.
+                return Ok(merge_status_result("remote_empty", None, &[], 0, 0, &[]));
             }
         };
 
@@ -5185,8 +5194,22 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Pull (§4.4.8) — basic precondition checks. End-to-end behavior requires
-    // a wire-connected remote peer and is exercised by the cross-impl probe.
+    // Pull (§4.4.8) — precondition checks, plus the outcomes reachable with a
+    // stub `execute_fn`.
+    //
+    // **This block used to say "End-to-end behavior requires a wire-connected
+    // remote peer and is exercised by the cross-impl probe," and that sentence
+    // cost us a shipped defect.** It was true and it was load-bearing: it read
+    // as a reason not to try, so every row here drove a *precondition* failure
+    // and the whole path past the outbound dispatch had no coverage — which is
+    // where §4.4.8's `remote_empty` answered 500 for as long as pull has
+    // existed, under a green `revision 103P/0F`. The named substitute did not
+    // exist either; no probe drove that branch at any seat.
+    //
+    // A stub `execute_fn` returning the envelope a remote would send reaches
+    // these branches in ~15 lines (see the `remote_empty` row). What genuinely
+    // needs a live peer is the multi-round trie walk; say *that*, and name the
+    // branch, rather than deferring the whole operation.
     // -----------------------------------------------------------------------
 
     #[tokio::test]
@@ -5235,6 +5258,83 @@ mod tests {
             .unwrap()
             .to_string();
         assert_eq!(code, "internal_error");
+    }
+
+    /// §4.4.8 `[MUST]` (REVISION v3.13) — **an empty remote is a result, not an
+    /// error.** A remote whose head at the prefix is the zero hash makes `pull`
+    /// answer `200` with `merge-result.status = "remote_empty"` and `version`
+    /// absent; it MUST NOT be a `500`.
+    ///
+    /// We shipped the 500 — and the reason it survived is written two tests up:
+    /// *"End-to-end behavior requires a wire-connected remote peer."* Every pull
+    /// row here drove a **precondition** failure, so the one branch past the
+    /// dispatch had no row at all, and core-go's cross-impl read of our tree
+    /// reported no `500 remote_empty` site existed. It did. What it took to
+    /// reach the branch is a stub `execute_fn` returning the envelope a remote
+    /// with nothing to send would return — cheaper than the comment implies, and
+    /// the comment is why nobody tried.
+    ///
+    /// Mutation: restore the `error_result(STATUS_INTERNAL_ERROR,
+    /// "remote_empty", …)` → RED on the status.
+    #[tokio::test]
+    async fn pull_against_an_empty_remote_is_200_remote_empty_not_500() {
+        let (store, li) = make_stores();
+        let handler = make_handler(store.clone(), li.clone());
+
+        // What a remote with no versions at the prefix sends back: an envelope
+        // whose root is a fetch-result carrying the ZERO head. Driving the zero
+        // hash specifically, not an absent `head` — the spec names the zero
+        // head, and the two reach the same arm for different reasons.
+        let empty_fetch_envelope = entity_ecf::to_ecf(&entity_ecf::cbor_map! {
+            "root" => entity_ecf::cbor_map! {
+                "type" => entity_ecf::text("system/revision/fetch-result"),
+                "data" => entity_ecf::cbor_map! {
+                    "head" => ciborium::Value::Bytes(Hash::zero().to_bytes().to_vec())
+                }
+            }
+        });
+        let envelope = Entity::new(entity_types::TYPE_ENVELOPE, empty_fetch_envelope).unwrap();
+        let execute_fn: entity_handler::ExecuteFn =
+            std::sync::Arc::new(move |_handler, _op, _params, _opts| {
+                let envelope = envelope.clone();
+                Box::pin(async move {
+                    Ok(HandlerResult {
+                        status: STATUS_OK,
+                        result: envelope,
+                        included: std::collections::HashMap::new(),
+                    })
+                })
+            });
+
+        let params = make_params(
+            "data/",
+            vec![("remote", entity_ecf::text("remote-peer-id"))],
+        );
+        let mut ctx = make_ctx("pull", params);
+        ctx.execute_fn = Some(execute_fn);
+
+        let result = handler.handle(&ctx).await.unwrap();
+        assert_eq!(
+            result.status, STATUS_OK,
+            "an empty remote is an outcome the declared result type can carry; \
+             answering 500 tells the caller our machinery broke when the honest \
+             answer is that the remote has nothing to send"
+        );
+        assert_eq!(
+            result.result.entity_type, "system/revision/merge-result",
+            "the outcome rides the declared result type, not an error entity"
+        );
+        let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
+        let fields = val.as_map().unwrap();
+        let status = fields
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("status"))
+            .and_then(|(_, v)| v.as_text());
+        assert_eq!(status, Some("remote_empty"));
+        assert!(
+            !fields.iter().any(|(k, _)| k.as_text() == Some("version")),
+            "§4.4.8 — `version` is absent for an outcome that produces no merge"
+        );
     }
 
     #[tokio::test]

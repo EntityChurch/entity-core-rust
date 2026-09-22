@@ -362,10 +362,7 @@ impl TypeHandler {
             &self.location_index,
         ) {
             Ok(e) => HandlerResult::ok(e),
-            Err(msg) => HandlerResult::error(
-                entity_handler::STATUS_NOT_FOUND,
-                error_entity("not_found", &msg),
-            ),
+            Err(e) => compare_error_result(e),
         }
     }
 
@@ -400,11 +397,37 @@ impl TypeHandler {
             &self.location_index,
         ) {
             Ok(e) => HandlerResult::ok(e),
-            Err(msg) => HandlerResult::error(
-                entity_handler::STATUS_NOT_FOUND,
-                error_entity("not_found", &msg),
-            ),
+            Err(e) => compare_error_result(e),
         }
+    }
+}
+
+/// The §8.5 row for a `compare` / `compatible` failure.
+///
+/// `PROPOSAL-TYPE-OPERATION-ERROR-TAXONOMY` §6a.2 derives the 404 by its own
+/// criterion — *can the declared result type carry the outcome?* —
+/// and `system/type/compatibility-report` cannot say *"that path named
+/// nothing"*, so an unresolvable type is a lookup miss and nothing else.
+/// §6a.3 pins the **code**: `type_not_found`, adopting core-go's spelling
+/// (go was already there; py's bare `not_found` moves too). Ours was the bare
+/// `not_found` that ruling narrows, and it was also answering the encode
+/// failure — see [`CompareError`] for why that half was a wrong status class.
+///
+/// Cited to the **proposal** deliberately, not to `EXTENSION-TYPE` §8.5: the
+/// section is un-folded and its number currently collides with the shipped
+/// `system/type/violation`. This is behaviour, not a published declaration —
+/// nothing here edits a type descriptor, so it lands seat-by-seat without the
+/// first-seat-goes-red hazard that held `concat-args`.
+fn compare_error_result(e: compare::CompareError) -> HandlerResult {
+    match e {
+        compare::CompareError::TypeNotFound(ref msg) => HandlerResult::error(
+            entity_handler::STATUS_NOT_FOUND,
+            error_entity("type_not_found", msg),
+        ),
+        compare::CompareError::Encode(ref msg) => HandlerResult::error(
+            entity_handler::STATUS_INTERNAL_ERROR,
+            error_entity("internal_error", msg),
+        ),
     }
 }
 
@@ -588,3 +611,61 @@ fn classify_reason(reason: &str) -> &'static str {
 // 0.8.2.7 slot sweep had just landed here. `system/protocol/error` declares
 // `code` REQUIRED (`core/types::system_protocol_error`), so the local shape
 // also violated our own published descriptor.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The other half of the `CompareError` split: an **encode** failure
+    /// building the report is `500 internal_error`
+    /// (`PROPOSAL-TYPE-OPERATION-ERROR-TAXONOMY` §3's last row), never the 404
+    /// that its sibling variant takes.
+    ///
+    /// Both arms travelled as `Err(String)` through one `HandlerResult::error`
+    /// call, so this failure — about a type that had already *resolved* —
+    /// reached the caller as *"that type does not exist"*. Wrong status class,
+    /// and the exact shape of the "one representation carrying two meanings"
+    /// rule.
+    ///
+    /// **Why the mapping and not the wire, stated rather than hidden.** The
+    /// `Encode` arm is not reachable through `compare()` with any input this
+    /// suite can build — `Entity::new` refuses data our own encoder does not
+    /// produce — so an integration row for it would be theater. What is
+    /// testable, and is the thing the collapsed `Err(String)` got wrong, is
+    /// **which row each variant takes**. Mutation: point either arm at the
+    /// other's status/code and exactly one assertion below goes RED.
+    #[test]
+    fn compare_error_takes_one_row_per_variant() {
+        let not_found =
+            compare_error_result(compare::CompareError::TypeNotFound("type_b: x".into()));
+        assert_eq!(not_found.status, entity_handler::STATUS_NOT_FOUND);
+        assert_eq!(
+            error_code_of(&not_found).as_deref(),
+            Some("type_not_found"),
+            "§6a.3 — an unresolvable type names which lookup missed"
+        );
+
+        let encode = compare_error_result(compare::CompareError::Encode("not ECF".into()));
+        assert_eq!(
+            encode.status,
+            entity_handler::STATUS_INTERNAL_ERROR,
+            "§3's last row — an encode failure is a 500, not a report that the \
+             type is absent; the type resolved"
+        );
+        assert_eq!(error_code_of(&encode).as_deref(), Some("internal_error"));
+    }
+
+    /// Reads the decoded `code` **key**, never a substring of the body:
+    /// `not_found` is a substring of `type_not_found`, so a byte scan cannot
+    /// tell the pre-fix spelling from the fixed one.
+    fn error_code_of(res: &HandlerResult) -> Option<String> {
+        let v: ciborium::Value = ciborium::from_reader(res.result.data.as_slice()).ok()?;
+        match v {
+            ciborium::Value::Map(m) => m
+                .iter()
+                .find(|(k, _)| k.as_text() == Some("code"))
+                .and_then(|(_, val)| val.as_text().map(str::to_string)),
+            _ => None,
+        }
+    }
+}

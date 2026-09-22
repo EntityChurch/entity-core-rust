@@ -10269,6 +10269,70 @@ mod tests {
             let _ = handshake.await;
         }
 
+        // --- SA-PY-35, the half-open state, and it is the input a cohort
+        //     ledger currently predicts we get wrong.
+        //
+        //     Three connection states, two of them ruled. Pre-`hello` `ping`
+        //     is the 409 row above. `Established` + unsigned `ping` is 200 —
+        //     arch's `0.8.2.6` Q2, which we landed by moving the connect
+        //     intercept ahead of `verify_request`. **Post-`hello`,
+        //     pre-`authenticate` is named by neither**, and py filed it as
+        //     SA-PY-35 with no arch ruling yet. core-go's open-items ledger
+        //     reads the intercept move as making rust *"the live divergence
+        //     risk"* on this input.
+        //
+        //     It does not. The intercept moved into `dispatch_request`, which
+        //     runs exclusively post-`Established`; a half-open frame never
+        //     reaches it and lands on the same per-arm out-of-order refusal as
+        //     the second `hello` above. So we answer 409, identical to go
+        //     (`connect.go` gates `ping` to `Completed`) and to py — the
+        //     cohort is 3-0, not 2-1, and this row is what makes that a
+        //     measurement instead of a reading of our own control flow.
+        //
+        //     Pinned on the ungated TCP path deliberately: a data point that
+        //     only compiles under `http-live` is not available to the
+        //     configuration a divergence would be reported against. ---
+        {
+            let (mut client, server) = crate::transport::memory_transport_pair();
+            let shared_c = shared.clone();
+            let handshake = tokio::spawn(async move {
+                let _ = connection::handle_connection(server, shared_c).await;
+            });
+            let hello_frame = entity_wire::encode_envelope(&hello_offering(&["entity-core/1.0"]));
+            write_frame(&mut client.writer, &hello_frame)
+                .await
+                .expect("hello");
+            let _ = read_frame(&mut client.reader, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("hello response — the connection is now half-open");
+            let ping = entity_wire::encode_envelope(&entity_entity::Envelope::new(
+                entity_protocol::build_connect_execute(
+                    "sa-py-35-half-open-ping",
+                    "ping",
+                    &entity_entity::Entity::new(
+                        "system/network/ping",
+                        entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![])),
+                    )
+                    .expect("ping params"),
+                )
+                .expect("connect execute"),
+            ));
+            write_frame(&mut client.writer, &ping)
+                .await
+                .expect("half-open ping");
+            let response = read_frame(&mut client.reader, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("the half-open ping is answered, not dropped");
+            let env = entity_wire::decode_envelope(&response).expect("decodable");
+            assert_eq!(
+                pair_of(&env),
+                (409, "connection_sequence_error".to_string()),
+                "SA-PY-35: a `ping` after `hello` and before `authenticate` is                  an implemented connect operation in a state that forbids it —                  the out-of-order row, same as the second `hello`. It is NOT                  the 200 that `0.8.2.6` Q2 rules for an ESTABLISHED                  connection: no signer has been verified, so the state Q2                  reasons about does not exist yet. Answering 200 here is the                  divergence go's ledger predicts of us; answering 401 would be                  the pre-`f8e7e83` defect in the other direction"
+            );
+            drop(client);
+            let _ = handshake.await;
+        }
+
         // --- Control A: a hello whose set OVERLAPS ours still establishes.
         //     Fails if row 1 was "fixed" by refusing any advertised set. ---
         {

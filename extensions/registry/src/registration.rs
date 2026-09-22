@@ -434,16 +434,35 @@ impl RegisterRequestHandler {
                 );
             }
             MODE_DOMAIN_CONTROL => {
-                // DEFERRED — the DNS-proof challenge format co-designs with the
-                // web-native dns-txt / well_known_url backends (§6a.10).
-                // §9.1 names `unsupported_mode` non-conformant as a 501-row
-                // spelling (0.8.2.7). Deferred-but-advertised is the same slot
-                // as unknown: a handler is registered and does not implement
-                // what was named. The mode is still named in the message.
+                // §6a.9.2 `[MUST]` — a *stored* `domain-control` policy (seeded
+                // out-of-band, written straight to the tree, or predating
+                // §6a.9.1's refusal) fails live registration **closed**:
+                // `501 unsupported_mode`, and never a fallback to `open`,
+                // `manual` or a `404`. Falling back to `open` would turn an
+                // operator's unenforceable curation into first-come-first-serve,
+                // which is §6a.9's threat model exactly inverted.
+                //
+                // **We had `unsupported_operation` here and it was wrong, on
+                // reasoning 0.8.2.8 overturned.** The 0.8.2.7 sweep read §9.1's
+                // 501 blacklist as owning the whole slot and swept this site
+                // with it. §9.1 (4244) now says the opposite in as many words:
+                // *"A domain code defined for a different failure that also
+                // answers 501 is not a synonym and is not blacklisted"*, and
+                // names **this** row as the worked case — the handler IS
+                // registered and `register` IS implemented, so it is not the
+                // unimplemented-operation row at all. **The test is the failure
+                // named, never the status shared.** REGISTRY v1.22 Appendix A
+                // (1837) pins the pair.
+                //
+                // Distinct from the two 400 `unsupported_mode` sites below,
+                // which refuse to *store* the mode. Same code, two statuses,
+                // two different failures — both are Appendix A rows.
                 return error(
                     STATUS_NOT_SUPPORTED,
-                    "unsupported_operation",
-                    "domain-control registration is not yet implemented",
+                    "unsupported_mode",
+                    "a stored `domain-control` issuer policy cannot be enforced \
+                     (the domain-proof challenge format is deferred, §6a.10); \
+                     registration fails closed rather than falling back",
                 );
             }
             other => {

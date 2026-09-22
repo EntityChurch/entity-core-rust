@@ -13,6 +13,28 @@ use entity_entity::Entity;
 use entity_store::{ContentStore, LocationIndex};
 use entity_types::{TYPE_COMPARE_RES, TYPE_COMPATIBILITY_REPORT};
 
+/// Why `compare` / `compatible` could not produce a report.
+///
+/// **One representation carrying two meanings was the defect.** Both arms
+/// travelled as `Err(String)` and the handler answered `404 not_found` for
+/// every one of them, so an encode failure building the result — a **500**
+/// under `PROPOSAL-TYPE-OPERATION-ERROR-TAXONOMY` §3's last row — reached the
+/// caller as *"that type does not exist"*, a wrong status **class** about a
+/// type that had already resolved. The two are separated here rather than at
+/// the call site so the distinction cannot be a mistake: each variant names
+/// exactly one row of §8.5's table and the handler's `match` is exhaustive.
+#[derive(Debug)]
+pub enum CompareError {
+    /// A named type did not resolve. §6a.3 — **404 `type_not_found`**, the
+    /// spelling adopted from core-go: bare `not_found` is ambiguous with the
+    /// entity-level 404 that `0.8.2.7`'s 404 row carves out, and this lookup
+    /// is a *type* miss with the handler present and dispatching.
+    TypeNotFound(String),
+    /// The result entity could not be encoded. §3's last row — **500
+    /// `internal_error`**. Nothing about the request is wrong.
+    Encode(String),
+}
+
 /// Compare two type definitions structurally.
 pub fn compare(
     type_a_path: &str,
@@ -20,11 +42,15 @@ pub fn compare(
     local_peer_id: &str,
     content_store: &Arc<dyn ContentStore>,
     location_index: &Arc<dyn LocationIndex>,
-) -> Result<Entity, String> {
-    let def_a = resolve(local_peer_id, type_a_path, content_store, location_index)
-        .ok_or_else(|| format!("type_a not resolved: {}", type_a_path))?;
-    let def_b = resolve(local_peer_id, type_b_path, content_store, location_index)
-        .ok_or_else(|| format!("type_b not resolved: {}", type_b_path))?;
+) -> Result<Entity, CompareError> {
+    let def_a =
+        resolve(local_peer_id, type_a_path, content_store, location_index).ok_or_else(|| {
+            CompareError::TypeNotFound(format!("type_a not resolved: {}", type_a_path))
+        })?;
+    let def_b =
+        resolve(local_peer_id, type_b_path, content_store, location_index).ok_or_else(|| {
+            CompareError::TypeNotFound(format!("type_b not resolved: {}", type_b_path))
+        })?;
 
     let fields_a = fields_of(&def_a);
     let fields_b = fields_of(&def_b);
@@ -84,7 +110,7 @@ pub fn compare(
         entries.push((text("incompatible"), array(incompatible)));
     }
     let data = to_ecf(&Value::Map(entries));
-    Entity::new(TYPE_COMPARE_RES, data).map_err(|e| e.to_string())
+    Entity::new(TYPE_COMPARE_RES, data).map_err(|e| CompareError::Encode(e.to_string()))
 }
 
 /// Directional compatibility check.
@@ -95,11 +121,15 @@ pub fn compatible(
     local_peer_id: &str,
     content_store: &Arc<dyn ContentStore>,
     location_index: &Arc<dyn LocationIndex>,
-) -> Result<Entity, String> {
-    let def_a = resolve(local_peer_id, type_a_path, content_store, location_index)
-        .ok_or_else(|| format!("type_a not resolved: {}", type_a_path))?;
-    let def_b = resolve(local_peer_id, type_b_path, content_store, location_index)
-        .ok_or_else(|| format!("type_b not resolved: {}", type_b_path))?;
+) -> Result<Entity, CompareError> {
+    let def_a =
+        resolve(local_peer_id, type_a_path, content_store, location_index).ok_or_else(|| {
+            CompareError::TypeNotFound(format!("type_a not resolved: {}", type_a_path))
+        })?;
+    let def_b =
+        resolve(local_peer_id, type_b_path, content_store, location_index).ok_or_else(|| {
+            CompareError::TypeNotFound(format!("type_b not resolved: {}", type_b_path))
+        })?;
 
     let fields_a = fields_of(&def_a);
     let fields_b = fields_of(&def_b);
@@ -190,7 +220,7 @@ pub fn compatible(
         ));
     }
     let data = to_ecf(&Value::Map(entries));
-    Entity::new(TYPE_COMPATIBILITY_REPORT, data).map_err(|e| e.to_string())
+    Entity::new(TYPE_COMPATIBILITY_REPORT, data).map_err(|e| CompareError::Encode(e.to_string()))
 }
 
 fn resolve(

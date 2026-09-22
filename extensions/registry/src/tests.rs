@@ -3241,9 +3241,59 @@ async fn stored_domain_control_policy_still_answers_501_on_register() {
         .await
         .unwrap();
     assert_eq!(out.status, 501);
-    // 0.8.2.7: `unsupported_mode` is named at §9.1 as a non-conformant
-    // spelling of the 501 row. The status was already right; the slot was not.
-    assert_eq!(err_code(&out).as_deref(), Some("unsupported_operation"));
+    // **This assertion was `unsupported_operation` and it is reversed here by
+    // ruling, not by preference.** 0.8.2.7 read §9.1's 501 blacklist as owning
+    // the whole slot; 0.8.2.8 (§9.1 line 4244) says the opposite and names this
+    // exact row as the worked case — *"A domain code defined for a different
+    // failure that also answers 501 is not a synonym"* — because the handler is
+    // registered and `register` IS implemented. REGISTRY v1.22 Appendix A 1837
+    // pins the pair. py held this reading alone against go+rust and was right.
+    //
+    // A test edited in the same commit as the behaviour witnesses nothing on
+    // its own, so the control is the row below it —
+    // `an_unimplemented_peer_issued_op_is_still_unsupported_operation` — which
+    // requires the OTHER 501 in this same file to keep its spelling. If this
+    // fix were a relabel of the slot rather than a discrimination between two
+    // failures, that row goes red.
+    //
+    // **The control was written as a comment first and it was worthless.** It
+    // cited `pin_bindings_is_a_discriminator_and_not_a_dispatchable_operation`,
+    // which drives the *resolver* handler — relabelling this file's default arm
+    // to `unsupported_mode` left the whole suite green. Measured, then fixed.
+    assert_eq!(err_code(&out).as_deref(), Some("unsupported_mode"));
+}
+
+/// The other 501 in `registration.rs`, and the control for the B2 row above:
+/// an operation the peer-issued handler genuinely does not implement is still
+/// **`unsupported_operation`**, the §3.3 501 row.
+///
+/// 0.8.2.8's ruling is a discrimination, not a relabel — *"the test is the
+/// failure named, never the status shared"* — so the two 501s in this file MUST
+/// disagree. Without this row, swapping the default arm's spelling to
+/// `unsupported_mode` passes the entire suite, which is exactly what the first
+/// draft of the B2 comment claimed a different test prevented.
+#[tokio::test]
+async fn an_unimplemented_peer_issued_op_is_still_unsupported_operation() {
+    let (cs, li) = stores();
+    let registry = IdentityKeypair::Ed25519(Keypair::generate());
+    let handler = reg_handler(&cs, &li, &registry);
+
+    let owner = Keypair::generate();
+    let out = handler
+        .handle(&signed_ctx(
+            "no-such-peer-issued-op",
+            mk_request("billslab.com", owner.peer_id().as_str(), b"n1"),
+            &owner,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(out.status, 501);
+    assert_eq!(
+        err_code(&out).as_deref(),
+        Some("unsupported_operation"),
+        "an op absent from a registered handler's manifest IS the §3.3 501 row; \
+         `unsupported_mode` is a different failure that merely shares the status"
+    );
 }
 
 /// §6a.9.2 — **unset is not a mode.** With no policy stored, `get` answers

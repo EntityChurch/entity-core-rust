@@ -476,8 +476,10 @@ gates by making the TCP path compile on wasm32.
   ever see it. When a routed item is about a hash's *encoding*, run §8.4.5's grep before
   reporting it closed.
 - **A census of a code SLOT must key on the status VALUE, not on a spelling of the status —
-  a local `const` alias hides the sites from the grep that looks for the canonical one.**
-  *(Candidate: bit us once, 2026-09-03, and it is arch's AP-21 one level down.)* 0.8.2.7 makes
+  a local `const` alias hides the sites from the grep that looks for the canonical one. And a
+  census cannot ask the one question that decides a slot sweep: whether a site names a DIFFERENT
+  FAILURE that merely shares the status.** *(Candidate: bit us once, 2026-09-03; the second half
+  added 2026-09-04, `daef7c4`, and it is the cost of the first half's own remedy.)* 0.8.2.7 makes
   the unit of conformance the **code slot** — the set of `code` values emitted at a given
   status — precisely because `grep -c <token>` says nothing about what else occupies the
   token's position. Censusing our own 500 slot against that ruling, arch put our debt at
@@ -528,6 +530,46 @@ gates by making the TCP path compile on wasm32.
   (`validate-peer -category type`: `27P/3W/0F` fixed vs `27P/0W/3F` against the restored local
   helper, peer rebuilt `dirty=true` at HEAD). Note the category: the op rows live in `type`,
   while `type_system` is the descriptor category and scores `438P/8W/0F` under **both** shapes.
+  **The third layer is not a layer of the KEY at all, and it is where a slot sweep does damage:
+  a code is `(status, field, spelling)` — but whether a site BELONGS to the slot is a question
+  about the FAILURE, and no census asks it.** *(2026-09-04, `daef7c4`.)* Our 0.8.2.7 sweep read
+  §9.1's 501 blacklist as owning the whole status and rewrote every 501 in the tree to
+  `unsupported_operation`, including `registry`'s stored-`domain-control` refusal. 0.8.2.8 then
+  ruled the opposite and named that exact row as the worked case: *"A domain code defined for a
+  different failure that also answers 501 is not a synonym and is not blacklisted"* — the handler
+  is registered and `register` **is** implemented, so it was never the unimplemented-operation row.
+  **The sweep was mechanically correct and semantically wrong**, because a census enumerates
+  *sites at a status* and the slot is defined by *the failure named*. Nothing about the grep could
+  have caught it. **Enforcement: a slot sweep is not a rename — for each site, state in one line
+  what failed, and if that sentence is not the slot's own row, the site is out of scope and owes a
+  domain table row instead** (OP-3's whole subject). The tell is a site whose message names a
+  *thing* rather than an *operation*: "mode X cannot be enforced" is a domain failure wearing a
+  shared status; "op X is not implemented" is the row. And when a ruling later un-retires a token,
+  the seats that swept it are the seats that must move — we and go both did, and py, which never
+  swept, was right the whole time.
+- **A comment explaining why a surface is UNTESTED is a standing instruction not to try, and it
+  never expires on its own — re-price it before you believe it.** *(Candidate: bit us once,
+  2026-09-04, `e86f783`; found only because a sibling's packet hedged.)* `handle_pull`'s three
+  test rows sat under *"End-to-end behavior requires a wire-connected remote peer and is exercised
+  by the cross-impl probe."* True when written. The consequence is that every row drove a
+  **precondition** failure — missing `remote`, absent `execute_fn` — and the entire path *past* the
+  outbound dispatch had zero coverage, which is where REVISION §4.4.8's `remote_empty` answered
+  `500` for as long as it has existed, behind `revision 103P/0F` on the wire. What it actually took
+  to reach the branch was a stub `execute_fn` returning the envelope an empty remote sends: about
+  fifteen lines. **The comment was not wrong, it was load-bearing** — it answered the question
+  *"why is this untested?"* convincingly enough that nobody re-asked it, which is the same failure
+  mode as a code comment citing a superseded proposal, one directory over and pointed at the test
+  suite instead of the implementation.
+  Note the second half, because it is what makes this cheap to enforce: **the deferral named a
+  substitute — *"exercised by the cross-impl probe"* — and no probe existed.** A category can be
+  green at 103 rows and touch none of the branch, and the comment is what stops you checking.
+  **Enforcement:** grep the test tree for deferral prose (`requires a wire`, `covered by`,
+  `exercised by`, `end-to-end`, `integration only`) and for each hit answer two questions in the
+  diff you are already writing — *does the named substitute exist and does it drive this branch?*
+  and *what would a stub cost today?* If the substitute cannot be named as a **row**, the surface
+  is untested and the comment should say that instead. Same rule as *"a declared exclusion whose
+  ground is 'nothing installs it' is a gap wearing an exemption"*, applied to a deferral rather
+  than an exclusion.
 - **An operation added to a `Handler` has two registration sites, and the second one is in
   another crate.** `impl Handler::operations()` makes it answerable; `bootstrap_handler(...)` in
   `core/peer/src/lib.rs` writes the **advertised** `system/handler/{pattern}` interface entity
@@ -608,8 +650,9 @@ gates by making the TCP path compile on wasm32.
   `incompatible_protocol_and_unknown_connect_op_on_both_transports`, which fails against the
   `is_connect_path` form while every other row stays green.
 - **A control asserted in a COMMENT is not a control, and a control the code path can MASK is not
-  one either — run the mutation on the control, not just on the row.** *(Candidate: bit us once,
-  2026-09-01, twice in one function.)* §4.7 row 10's obvious implementation is *"not `hello` and
+  one either — run the mutation on the control, not just on the row.** *(**Ratified 2026-09-04**:
+  bit us twice, and the second shape was a control CITED BY NAME rather than described in prose —
+  see the end of this entry.)* §4.7 row 10's obvious implementation is *"not `hello` and
   not `authenticate` → refuse"*, which passes the routed probe and **breaks every §5.1 keepalive**,
   because `ping` is a connect operation we implement. We wrote the control as a paragraph — *"`ping`
   must still be answered"* — and never sent a ping: the mutation **passed**. Then we sent one, and
@@ -638,6 +681,25 @@ gates by making the TCP path compile on wasm32.
   refusal rows' driver closure. Diagnose the shape with `podman top <container>`: a test binary
   with a multi-minute `ELAPSED` at ~0% CPU is a deadlock, not progress, and that is the one check
   that distinguishes them from outside.
+  **Second shape, and it is what ratifies this entry: naming an EXISTING test as your control reads
+  like evidence and is the same prose.** *(2026-09-04, `daef7c4`, caught by running the mutation on
+  the control.)* Landing B2 rewrote a test's own expectation (`unsupported_operation` →
+  `unsupported_mode`), so per the rule below it witnesses nothing alone and owes an untouched
+  control. We cited one **by name** —
+  `pin_bindings_is_a_discriminator_and_not_a_dispatchable_operation`, which does assert
+  `501 unsupported_operation` — and wrote at the test that a slot relabel would redden it. It does
+  not: that row drives the **resolver** handler, and the site we changed is in the *peer-issued*
+  handler, so relabelling that file's own default arm left all 101 tests green. The citation was
+  more convincing than the paragraph version and exactly as worthless. **Enforcement, and it is
+  cheap enough that there is no excuse: mutate the thing the control is supposed to catch and
+  confirm the control is the row that reddens** — not that *something* reddens, and not that the
+  test exists. A control is scoped to the code path its input takes, and a test name does not state
+  that path. The replacement (`an_unimplemented_peer_issued_op_is_still_unsupported_operation`)
+  lives on the same handler as the fix and was verified RED before being described as a control.
+  **Corollary for a discrimination fix specifically:** when a ruling splits one code into two
+  (*"the test is the failure named, never the status shared"*), the control must prove the two
+  **still disagree** — put it on the same handler, ideally the same file, because the failure mode
+  is a relabel and a relabel is file-local.
 - **A fix that gives an input its own coded path can RETIRE a neighbouring test's control without
   touching it — re-run the old mutation, because the control will still be green.** *(Candidate:
   bit us once, 2026-09-01.)* FM-1's anti-rename control sent a frame that was neither `hello` nor
@@ -749,6 +811,22 @@ gates by making the TCP path compile on wasm32.
   — and read every hit for a tolerance keyed on the pre-ruling answer. A red row you predicted
   is a routing item with a one-line fix attached; the same row discovered by the gate is an
   hour of deciding whether to revert.
+  **Fourth level, 2026-09-04, and it is the tolerance's mirror image: a NEW check can classify a
+  conformant absence as a SCORING SKIP, so the gate exits 1 on a category with zero failures.**
+  Same file, same three ops, one commit later. go's `runMissingType404` (`typeext.go`) probes the
+  §7.4–§7.6 MAY ops for `404 type_not_found` and returns `SkipCheck` when the peer answers 501 —
+  and *"a skip counts as a failure"* is the suite's own rule, so we score `27P/3W/0F/3S` →
+  `Result: FAIL (un-allowlisted skips)` while go scores `33P/0F/0S` → `PASS`. **The harness gives
+  the identical response two verdicts in one run:** `classifyOptionalTypeOp` calls the same 501
+  WARN (*"acceptable for the §12.2/§12.3 MAY op"*) on the row directly above. Not a defect of
+  ours and nothing to converge — but a red *gate*, not a red row, and the difference matters when
+  someone cites an exit code. The author is immune for the same structural reason as the
+  tolerance above: go implements all three, so the 501 arm is unreachable against go. **So the
+  rule generalises past tolerances: when a sibling lands a check against a surface you
+  legitimately do not implement, run it before they relay it, and read the disposition their
+  harness assigns your absence — WARN, SKIP-that-scores, and SKIP-that-does-not are three
+  different outcomes and only one of them is "conformant."** The report that clears you will say
+  the check *"SKIPs cleanly"*; the run says whether clean means exit 0.
   **The same holds *inside* a check, and that half is newly earned (`898e55b`).** A
   multi-row check short-circuits at the first failing row, so a FAIL is evidence about **one**
   row and silence about the rest — including rows measuring the *same* defect. go's
@@ -852,6 +930,19 @@ gates by making the TCP path compile on wasm32.
   error and iteration 2 ignores it. **Run the mutation per branch, not per behaviour** — "the
   feature is tested" and "this branch is tested" are different claims, and only the second one is
   what a mutation measures.
+  **And the mutation itself needs scoping, because a MULTI-ROW test short-circuits at its first
+  failing assertion — an older row will absorb the mutation and tell you nothing about the row you
+  just added.** *(Candidate: bit us once, 2026-09-04, caught in the same minute it happened.)*
+  Adding the SA-PY-35 half-open `ping` row to
+  `incompatible_protocol_and_unknown_connect_op_on_both_transports`, the obvious mutation —
+  exempt `ping` from `out_of_order_connect_operation_refusal` — went RED on the **pre-hello**
+  `ping` row three blocks earlier and stopped. The run reddened, and it was evidence about a row
+  that already existed. The scoped mutation (`fields.operation == "ping" && expected ==
+  "authenticate"`) isolates the new arm and reddens exactly it. This is the sibling's
+  short-circuit rule (below) turned on our own suite: **a mutation is only evidence about the
+  first assertion it reaches, so mutate the narrowest thing the new row depends on and check the
+  failure message names *your* row** — a green neighbour list is part of the result, not a
+  formality.
 - **A declared exclusion whose ground is "nothing installs it" is a gap wearing an exemption —
   register the surface and let the wire tell you what it was hiding.** *(Candidate: bit us once,
   2026-08-22.)* `CONFORMANCE-EXCLUSIONS.md`'s substitute entry rested on two grounds: Ruling 4
@@ -1036,8 +1127,9 @@ Cross-impl wire fidelity. Same-side round-trip tests pass with the **wrong** sha
     is deliberately kept **green under the same mutation** as the standing proof that the
     value assertion cannot see this class.
   - **Sibling *rulings in one fold* — when a routing relays a spec VERSION, the boundary is
-    that version's diff, not the relay's worklist.** *(Candidate: bit us once, 2026-09-02,
-    caught before reporting the item closed.)* Arch's relay named one item (FM-2e, the
+    that version's diff, not the relay's worklist.** *(**Ratified 2026-09-04**: bit us twice,
+    the second time through a cross-impl validation report rather than a fold relay — see the
+    second half below.)* Arch's relay named one item (FM-2e, the
     `protocols` absent/empty arm) and added *"rows 1 and 10 as you built them are conformant;
     **nothing you shipped moves**."* Both sentences were true and neither is a statement about
     a row we had **never shipped**. `0.8.2.4` folded six normative changes; reading the fold
@@ -1058,6 +1150,23 @@ Cross-impl wire fidelity. Same-side round-trip tests pass with the **wrong** sha
     Same shape as the *"a routed work item is a delta against the sibling's tree"* rule below,
     one level up: there the routing under-described the work, here it under-described the
     ruling.
+    **Second shape, 2026-09-04, and it is what ratifies this: the clearing sentence came from a
+    CROSS-IMPL REPORT, and the item it did not name was in the SAME proposal one section over.**
+    core-go's type-op 404 report is addressed to us as *"informational — the ops are a
+    §12.2/§12.3 MAY; if you do not build them the check SKIPs cleanly, **no action owed**"*, and
+    every word is true of `converge`/`adopt`/`reconcile`, which we do not build. But
+    `PROPOSAL-TYPE-OPERATION-ERROR-TAXONOMY` §6a.3's closing sentence — *"rust's row-4 `404
+    not_found` narrows to `type_not_found`"* — is about `compare`/`compatible`, the SHOULD ops
+    all three seats **have** built. A sibling gates what they had a divergence on; the ruling
+    binds whatever it binds. **The tell is the same reassuring grammar as the fold relay, so
+    treat "no action owed" exactly like "nothing you shipped moves": it is a claim about the
+    surface the author measured, and it is at its most confident precisely where its scope is
+    narrowest.** And the boundary here is cheaper to enumerate than a fold's — the proposal is
+    one document: read the ruling itself before accepting a report's summary of it, and grep it
+    for your own seat's name (`grep -n -i rust <proposal>`), which returns the sentences written
+    *about* you rather than the ones the sender happened to gate. Landed as `29a6f5a`, and it was
+    hiding a second defect (a `404` answering an encode failure) that no report would ever have
+    named because no seat can see it from outside.
   - **Sibling *inputs* reaching one call site — a MUST NOT on a CODE binds everywhere that
     code is written, and the routing will scope it to the input somebody measured.**
     *(Candidate: bit us once, 2026-09-02, caught before reporting the item closed.)* `0.8.2.5`
