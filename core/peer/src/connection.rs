@@ -69,6 +69,36 @@ pub async fn handle_connection(
     // `authenticate` to `build_hello_response_envelope` and reports the failure
     // as `400 handshake_failed`. Same refusal as the http-live path — one
     // helper, because both transports carried the identical defect.
+    //
+    // Ordered below the row-10 refusal, which is checked first; the two are
+    // disjoint (`authenticate` is an implemented operation) so this is
+    // presentation, not precedence.
+
+    // CE-1 (§4.2 rule 3 / §5.2a, restated by 0.8.2.5): a frame that is not a
+    // connect EXECUTE at all. FIRST, because it is the only one of the four
+    // that looks at the URI's AUTHORITY — the three below all read a
+    // re-qualified path and so read `entity://{them}/system/protocol/connect`
+    // as our own connect surface.
+    if let Some(refusal) =
+        pre_establishment_execute_refusal(&hello_envelope, shared.keypair.peer_id().as_str())
+    {
+        let frame = encode_envelope(&refusal);
+        let _ = write_frame(&mut writer, &frame).await;
+        return Err(PeerError::ConnectionError(
+            "EXECUTE before the connection was established".into(),
+        ));
+    }
+    // §4.7 row 10 (FM-2): an operation this connect handler does not implement
+    // is refused by NAME, ahead of the state match, in every state.
+    if let Some(refusal) =
+        unknown_connect_operation_refusal(&hello_envelope, shared.keypair.peer_id().as_str())
+    {
+        let frame = encode_envelope(&refusal);
+        let _ = write_frame(&mut writer, &frame).await;
+        return Err(PeerError::ConnectionError(
+            "unknown connect operation on the first frame".into(),
+        ));
+    }
     if let Some(refusal) = prehello_authenticate_refusal(&hello_envelope) {
         let frame = encode_envelope(&refusal);
         let _ = write_frame(&mut writer, &frame).await;
@@ -76,11 +106,29 @@ pub async fn handle_connection(
             "authenticate before hello: no nonce has been issued on this connection".into(),
         ));
     }
+    // §4.7 out-of-order row → 409. Third and last, because both refusals above
+    // claim inputs that would otherwise land here: an unimplemented name is not
+    // out of order, and a pre-hello `authenticate` is pinned to 401 by row 6.
+    // What reaches this in `AwaitingHello` is `ping` — implemented, and a
+    // keepalive for a connection that does not exist yet.
+    if let Some(refusal) = out_of_order_connect_operation_refusal(
+        &hello_envelope,
+        shared.keypair.peer_id().as_str(),
+        "hello",
+    ) {
+        let frame = encode_envelope(&refusal);
+        let _ = write_frame(&mut writer, &frame).await;
+        return Err(PeerError::ConnectionError(
+            "connect operation out of order where hello was expected".into(),
+        ));
+    }
 
     let hello_response = match build_hello_response_envelope(&hello_envelope, &mut conn) {
         Ok(env) => env,
         Err(e) => {
-            let err_env = handshake_error_envelope(&hello_envelope, &e, "handshake_failed");
+            // 0.8.2.5 retired `handshake_failed`; the residual class is
+            // §4.7's `invalid_request`. See `handshake_error_envelope`.
+            let err_env = handshake_error_envelope(&hello_envelope, &e, "invalid_request");
             let frame = encode_envelope(&err_env);
             let _ = write_frame(&mut writer, &frame).await;
             return Err(PeerError::ConnectionError(format!("process hello: {}", e)));
@@ -98,6 +146,54 @@ pub async fn handle_connection(
         .map_err(|e| PeerError::ConnectionError(format!("read authenticate: {}", e)))?;
     let auth_envelope = decode_envelope(&frame)
         .map_err(|e| PeerError::ConnectionError(format!("decode authenticate: {}", e)))?;
+
+    // CE-1 again, at the handshake's SECOND frame. `AwaitingAuthenticate` is
+    // still pre-`Established` — a hello has been exchanged but no signer has
+    // been verified — so §4.2 rule 3 binds here exactly as it binds the first
+    // frame. Same order and same reason: the authority check comes first.
+    if let Some(refusal) =
+        pre_establishment_execute_refusal(&auth_envelope, shared.keypair.peer_id().as_str())
+    {
+        let frame = encode_envelope(&refusal);
+        let _ = write_frame(&mut writer, &frame).await;
+        return Err(PeerError::ConnectionError(
+            "EXECUTE where authenticate was expected: the connection is not established".into(),
+        ));
+    }
+    // §4.7 row 10 again, at the handshake's SECOND frame. The unknown-operation
+    // refusal is state-independent, so it binds `AwaitingAuthenticate` exactly
+    // as it binds `AwaitingHello` — and this is the arm that would otherwise
+    // report a nonsense operation name as `401 authentication_failed`, because
+    // `process_authenticate` rejects a non-`authenticate` frame as a failed
+    // authenticate rather than as an unimplemented name.
+    if let Some(refusal) =
+        unknown_connect_operation_refusal(&auth_envelope, shared.keypair.peer_id().as_str())
+    {
+        let frame = encode_envelope(&refusal);
+        let _ = write_frame(&mut writer, &frame).await;
+        return Err(PeerError::ConnectionError(
+            "unknown connect operation where authenticate was expected".into(),
+        ));
+    }
+    // §4.7 out-of-order row → 409, at the handshake's SECOND frame. This is the
+    // state the spec's own example names — "a second `hello` after
+    // `hello_done`" — and the one we answered `400 authentication_failed`,
+    // because `process_authenticate` rejects a non-`authenticate` frame as a
+    // failed authenticate rather than as a misordered one. No carve-out
+    // competes for precedence here: `prehello_authenticate_refusal` is scoped
+    // to `AwaitingHello` by its own contract, and an `authenticate` in THIS
+    // state is exactly the frame we are waiting for.
+    if let Some(refusal) = out_of_order_connect_operation_refusal(
+        &auth_envelope,
+        shared.keypair.peer_id().as_str(),
+        "authenticate",
+    ) {
+        let frame = encode_envelope(&refusal);
+        let _ = write_frame(&mut writer, &frame).await;
+        return Err(PeerError::ConnectionError(
+            "connect operation out of order where authenticate was expected".into(),
+        ));
+    }
 
     let auth_response =
         match build_authenticate_response_envelope(&auth_envelope, &mut conn, &shared) {
@@ -396,6 +492,96 @@ pub async fn handle_connection(
 /// §4.2 / §4.6 step 1 / §4.7 row 6 (FM-1) — the pre-hello `authenticate`
 /// refusal, in ONE place because both transports had the same defect.
 ///
+/// §4.2's third pre-authorization rule + §5.2a — a **non-connect** EXECUTE
+/// arriving before the connection is established is **401
+/// `authentication_failed`**; the same frame naming a **foreign namespace** is
+/// **400 `invalid_request`**.
+///
+/// **Call this only in a pre-`Established` state.** Unlike
+/// [`unknown_connect_operation_refusal`] it is emphatically *not*
+/// state-independent — hoisting it above a state match would refuse every
+/// legitimate authenticated EXECUTE on an established connection with a 401.
+/// The rule's own subject is "arriving before the handshake completes."
+///
+/// **It was ruled at 0.8.1 and every one of the three ground-up seats missed
+/// it for two releases.** We answered `400 handshake_failed`: the frame is not
+/// a connect frame, so none of the three refusals below claim it, and it fell
+/// through to `build_hello_response_envelope`, failed there as a non-hello, and
+/// exited via `handshake_error_envelope`'s catch-all. go answered `403
+/// connection_required` and py `403 capability_denied` — the blanket 403 that
+/// §4.2's F32 amendment *retired* at 0.8.1, replacing it with the auth/authz
+/// discriminator. The input carries no verified signer at all, so §5.2a makes
+/// it **auth-class**: 403 asserts an authorization decision was made about an
+/// authenticated caller, which is simply false about this frame.
+///
+/// `0.8.2.5` restates the rule as a note under §4.7 — a pointer, not a second
+/// registry — because §4.7 is the table an implementer is reading when the
+/// input arrives, and the rule is written in the vocabulary of
+/// *pre-authorization*, which is not reachable from the vocabulary of
+/// *connection state*. That note also names `connection_required` and
+/// `handshake_failed` non-conformant outright; see
+/// [`handshake_error_envelope`] for the second half of that sweep.
+///
+/// **Address before authentication, and the order is the load-bearing part.**
+/// A foreign-namespace EXECUTE is refused *as an address* — §6.5 step 3 calls
+/// that "a gate, not an ordering preference" and says it "never becomes an
+/// authorization question", and §4.7's `invalid_request` paragraph names "an
+/// EXECUTE naming a foreign namespace (§1.4)" as a member of its class on this
+/// very surface. So the peer check runs first and answers `400
+/// invalid_request`; only an EXECUTE addressed to *us* reaches the 401. Both
+/// codes are reachable from this one function on purpose: a test that varies
+/// only the namespace is what distinguishes this fix from a blanket relabel of
+/// the catch-all, which would answer 401 for both.
+///
+/// The peer check also has to precede the connect-path check rather than follow
+/// it, and that is the escalation shape `dispatch_request`'s §1.4 gate is
+/// commented against: `extract_handler_path` drops the authority from
+/// `entity://{them}/system/protocol/connect` and `qualify_path` re-attaches
+/// **ours**, so a foreign-qualified connect URI reads as our own connect
+/// surface to every helper below. Ours is the only pre-`Established` check that
+/// looks at the authority, so it is the only place that can refuse it.
+fn pre_establishment_execute_refusal(envelope: &Envelope, local_pid: &str) -> Option<Envelope> {
+    let fields = entity_protocol::decode_execute_fields(&envelope.root.data).ok()?;
+
+    let target_peer = EntityUri::extract_peer(&fields.uri, local_pid);
+    if target_peer != local_pid {
+        return Some(
+            build_error_response(
+                &fields.request_id,
+                STATUS_BAD_REQUEST,
+                "invalid_request",
+                &format!(
+                    "handler uri targets peer {}, which is not this peer (§1.4; §4.7's \
+                     invalid_request class names the foreign namespace)",
+                    target_peer
+                ),
+            )
+            .unwrap_or_else(|_| Envelope::new(envelope.root.clone())),
+        );
+    }
+
+    // Our own connect surface — §4.7's rows own every refusal on it, including
+    // the three helpers below. This is the sole reason this function returns
+    // `None` for anything addressed to us.
+    if EntityUri::qualify_path(EntityUri::extract_handler_path(&fields.uri), local_pid)
+        == format!("/{}/{}", local_pid, entity_protocol::CONNECT_PATH)
+    {
+        return None;
+    }
+
+    Some(
+        build_error_response(
+            &fields.request_id,
+            STATUS_AUTH_FAILED,
+            "authentication_failed",
+            "EXECUTE on a non-connect path before the connection is established: no \
+             handshake has run, so the request carries no verified signer (§4.2 \
+             pre-authorization rule 3; §5.2a auth-class; §4.7's 0.8.2.5 note)",
+        )
+        .unwrap_or_else(|_| Envelope::new(envelope.root.clone())),
+    )
+}
+
 /// Returns `Some(401 invalid_nonce)` when this frame is a connect-EXECUTE whose
 /// operation is `authenticate`. Call it only where the connection is still
 /// `AwaitingHello`; there, an `authenticate` is definitionally one that arrived
@@ -432,6 +618,159 @@ fn prehello_authenticate_refusal(envelope: &Envelope) -> Option<Envelope> {
             STATUS_AUTH_FAILED,
             "invalid_nonce",
             "authenticate received before a hello nonce was issued on this connection",
+        )
+        .unwrap_or_else(|_| Envelope::new(envelope.root.clone())),
+    )
+}
+
+/// §4.7 row 10, unknown-operation half — **400 `invalid_request`**.
+///
+/// Returns `Some` when this frame is a connect-path EXECUTE naming an operation
+/// outside [`entity_protocol::CONNECT_OPERATIONS`]. State-independent by
+/// construction, which is the whole point: arch's ruling is *"a name the
+/// responder does not implement, **in any state**"*, so this runs ahead of every
+/// state match rather than inside one — the same shape, and the same reason, as
+/// [`prehello_authenticate_refusal`] one function up.
+///
+/// **The two helpers are disjoint and the order between them is immaterial:**
+/// `authenticate` is a known operation, so this never fires on FM-1's input.
+///
+/// We emitted **`400 handshake_failed`** — the same code-with-no-corpus-entry
+/// FM-1 found on the neighbouring row, reached the same way: the frame was
+/// handed to the hello path, failed there as a non-hello, and exited through
+/// `handshake_error_envelope`'s catch-all. Wrong under *every* reading of §4.7.
+///
+/// **On the value, stated because it is contested and we are landing it early.**
+/// §4.7 row 10 as it stands in the landed text (0.8.2.3) names an unknown
+/// connect operation as `connection_sequence_error`. Arch **ruled** that row on
+/// 2026-09-01 (`ROUTING-2026-09-01-c` §2, derived in
+/// `PROPOSAL-CONNECT-SURFACE-RECONCILIATION` §4): the row is two failures, and
+/// an unknown *name* is not an ordering error — `connection_sequence_error`
+/// tells a client its sequencing was wrong when its operation name was, which
+/// fails the contract the table exists to provide. The **ruling** is what this
+/// code implements; the **fold** is FM-2 Edit D, still DRAFT, gated on
+/// confirmations from us and py that have nothing to do with row 10. Our earlier
+/// note here said this row *"gets no discriminating behaviour until it is
+/// ruled"* — that condition is met, and `entity-core-py` and `entity-core-go`
+/// already emits and gates it. (`entity-core-py` does **not** — it answers
+/// `connection_sequence_error`, so it owes this row too; we are the second seat
+/// here, not the last.) If the fold moves the value, one constant below and one
+/// constant in the test change; nothing else does.
+///
+/// `local_pid` is taken rather than assumed because a connect EXECUTE reaches
+/// this in **two spellings**, and the peer-relative one is only the handshake's.
+/// Pre-hello the initiator does not know our peer-id so it sends
+/// `system/protocol/connect`; post-Established a client sends the fully
+/// qualified `/{pid}/system/protocol/connect` (§4.3 permits either). Testing
+/// with `Connection::is_connect_path` — which only strips an `entity://`
+/// scheme — matches the first and **silently misses the second**, so the
+/// post-Established arm would have refused nothing at all. Found by probing
+/// whether a real `ping` reached this function, not by reading it.
+fn unknown_connect_operation_refusal(envelope: &Envelope, local_pid: &str) -> Option<Envelope> {
+    let fields = entity_protocol::decode_execute_fields(&envelope.root.data).ok()?;
+    let qualified =
+        EntityUri::qualify_path(EntityUri::extract_handler_path(&fields.uri), local_pid);
+    if qualified != format!("/{}/{}", local_pid, entity_protocol::CONNECT_PATH)
+        || entity_protocol::CONNECT_OPERATIONS.contains(&fields.operation.as_str())
+    {
+        return None;
+    }
+    Some(
+        build_error_response(
+            &fields.request_id,
+            STATUS_BAD_REQUEST,
+            "invalid_request",
+            &format!(
+                "system/protocol/connect implements no operation {:?} (§4.7 row 10, \
+                 unknown-operation half)",
+                fields.operation
+            ),
+        )
+        .unwrap_or_else(|_| Envelope::new(envelope.root.clone())),
+    )
+}
+
+/// §4.7's out-of-order row — **409 `connection_sequence_error`** — for the
+/// pre-Established handshake states.
+///
+/// Returns `Some` when this frame is a connect-path EXECUTE naming an operation
+/// the responder DOES implement, arriving in a handshake state that forbids it.
+/// `expected` is the one operation this state accepts.
+///
+/// **This is the fold's other half, and nobody routed it.** 0.8.2.4 split the
+/// old out-of-order row in two: the unknown-*name* half became `400
+/// invalid_request` ([`unknown_connect_operation_refusal`], which we landed),
+/// and the state half kept `connection_sequence_error` but its status **moved
+/// 400 → 409**, matching `connection_already_established` in the row directly
+/// above it. The relay we were sent named only the `protocols` item and said
+/// *"rows 1 and 10 as you built them are conformant; nothing you shipped
+/// moves"* — both true, and neither covers this, because we had never shipped
+/// this row at all. It is a §9.1 conformance line ("an operation the responder
+/// implements, arriving in a forbidden state, emits 409
+/// `connection_sequence_error`"), found by recomputing the fold against our own
+/// tree rather than by reading the delta we were handed.
+///
+/// **What we emitted instead was a pair in no row of §4.7.** A second `hello`
+/// arriving where `authenticate` was expected is an operation we implement, so
+/// the row-10 helper passes it through by construction; it then reached
+/// `process_authenticate`, failed there as a non-`authenticate`
+/// (`ProtocolError::Invalid`), and exited through `handshake_error_envelope` —
+/// whose status comes from the error (400) and whose code comes from that call
+/// site's default (`authentication_failed`). **`400 authentication_failed`
+/// appears in no row of the table**, and it reads to the caller as "your
+/// credentials failed" when the credentials were never examined. That is the
+/// identical defect shape FM-1 fixed one row over and the one `entity-core-py`
+/// was corrected for at `400 invalid_nonce`: §4.7 obligates the **pair**, so a
+/// right code under a wrong status is non-conformant too.
+///
+/// **Precedence, and each step of it is pinned by a spec sentence rather than
+/// by convenience.** This runs AFTER both existing refusals and the order is
+/// load-bearing, not presentation:
+///
+/// 1. An operation we do not implement is not out of order at all — "it exists
+///    in no state", so [`unknown_connect_operation_refusal`] wins and answers
+///    `400 invalid_request`. Running this helper first would report a
+///    *sequencing* failure for a frame whose defect is its *name*.
+/// 2. A pre-hello `authenticate` IS an implemented operation in a forbidden
+///    state, so it would land here — and §4.7 says outright it is **not** the
+///    out-of-order row, pinning it to `401 invalid_nonce` (§4.2, §4.6 step 1,
+///    row 6). [`prehello_authenticate_refusal`] therefore keeps precedence, and
+///    this helper is never called in `AwaitingHello` with `authenticate`.
+///    That carve-out is the reason `expected` is a parameter instead of this
+///    function deriving the state itself: the two forbidden-in-`AwaitingHello`
+///    operations take different rows, and only one of them is ours.
+///
+/// Post-Established is not this function's surface — `dispatch_request` owns
+/// those two rows (`connection_already_established` for a second `hello`, `401
+/// invalid_nonce` for a replayed `authenticate`) and already emits both.
+///
+/// The membership test is `CONNECT_OPERATIONS`, the same single inventory the
+/// row-10 helper and `bootstrap_handler` read, so "an operation the responder
+/// implements" has exactly one spelling in this tree.
+fn out_of_order_connect_operation_refusal(
+    envelope: &Envelope,
+    local_pid: &str,
+    expected: &str,
+) -> Option<Envelope> {
+    let fields = entity_protocol::decode_execute_fields(&envelope.root.data).ok()?;
+    let qualified =
+        EntityUri::qualify_path(EntityUri::extract_handler_path(&fields.uri), local_pid);
+    if qualified != format!("/{}/{}", local_pid, entity_protocol::CONNECT_PATH)
+        || fields.operation == expected
+        || !entity_protocol::CONNECT_OPERATIONS.contains(&fields.operation.as_str())
+    {
+        return None;
+    }
+    Some(
+        build_error_response(
+            &fields.request_id,
+            STATUS_CONFLICT,
+            "connection_sequence_error",
+            &format!(
+                "connect operation {:?} is not accepted in this connection state; \
+                 expected {:?} (§4.7 out-of-order row)",
+                fields.operation, expected
+            ),
         )
         .unwrap_or_else(|_| Envelope::new(envelope.root.clone())),
     )
@@ -1025,16 +1364,61 @@ pub(crate) async fn dispatch_session_envelope(
 ) -> Envelope {
     use entity_protocol::ConnectionState;
     let request_id = extract_request_id(envelope).unwrap_or_else(|| "unknown".to_string());
+    // §4.7 row 10 (FM-2): hoisted OUT of the state match, not repeated inside
+    // its arms — the refusal is on the operation's name, which no state makes
+    // implemented. Covers `Established` too, where the connect intercept in
+    // `dispatch_request` would otherwise hand an unknown name to generic §5.2
+    // verification and report `401 authentication_failed` for a caller that had
+    // just authenticated. The TCP path checks at both of its frame reads.
+    if let Some(refusal) =
+        unknown_connect_operation_refusal(envelope, shared.keypair.peer_id().as_str())
+    {
+        return refusal;
+    }
     let result = match conn.state {
         // FM-1: the operation is discriminated ahead of the state match — see
         // `prehello_authenticate_refusal`. The TCP path does the same thing at
         // the same point in its own handshake.
-        ConnectionState::AwaitingHello => match prehello_authenticate_refusal(envelope) {
-            Some(refusal) => return refusal,
-            None => build_hello_response_envelope(envelope, conn),
-        },
+        // The §4.7 out-of-order row (409) is checked per-arm rather than
+        // hoisted like row 10, because "forbidden" is exactly what the state
+        // decides — the expected operation IS the arm. In `AwaitingHello` the
+        // row-6 carve-out keeps precedence over it, same order as the TCP path.
+        //
+        // CE-1 (§4.2 rule 3 / §5.2a) is checked PER-ARM and deliberately NOT
+        // hoisted beside row 10, even though that would be tidier: its subject
+        // is "arriving before the handshake completes", so hoisting it above
+        // this match would refuse every legitimate authenticated EXECUTE on an
+        // `Established` connection with a 401. The two pre-`Established` arms
+        // are its whole surface; `Established` hands the frame to
+        // `dispatch_request`, which runs the §1.4 gate and real verification.
+        ConnectionState::AwaitingHello => {
+            match pre_establishment_execute_refusal(envelope, shared.keypair.peer_id().as_str()) {
+                Some(refusal) => return refusal,
+                None => match prehello_authenticate_refusal(envelope) {
+                    Some(refusal) => return refusal,
+                    None => match out_of_order_connect_operation_refusal(
+                        envelope,
+                        shared.keypair.peer_id().as_str(),
+                        "hello",
+                    ) {
+                        Some(refusal) => return refusal,
+                        None => build_hello_response_envelope(envelope, conn),
+                    },
+                },
+            }
+        }
         ConnectionState::AwaitingAuthenticate => {
-            build_authenticate_response_envelope(envelope, conn, &shared)
+            match pre_establishment_execute_refusal(envelope, shared.keypair.peer_id().as_str()) {
+                Some(refusal) => return refusal,
+                None => match out_of_order_connect_operation_refusal(
+                    envelope,
+                    shared.keypair.peer_id().as_str(),
+                    "authenticate",
+                ) {
+                    Some(refusal) => return refusal,
+                    None => build_authenticate_response_envelope(envelope, conn, &shared),
+                },
+            }
         }
         ConnectionState::Established => {
             let session_peer_id = conn.remote_peer_id.as_ref().map(|p| p.as_str().to_string());
@@ -1050,7 +1434,8 @@ pub(crate) async fn dispatch_session_envelope(
             // (unsupported_key_type, unsupported_content_hash_format)
             // surface via their dedicated registry codes.
             let _ = request_id; // moved into handshake_error_envelope via inbound
-            handshake_error_envelope(envelope, &e, "handshake_failed")
+                                // 0.8.2.5: `invalid_request`, not `handshake_failed`.
+            handshake_error_envelope(envelope, &e, "invalid_request")
         }
     }
 }
@@ -1162,12 +1547,10 @@ pub(crate) async fn dispatch_request(
                 // a wrong status AND a wrong code, and one that reads to the
                 // caller as "your credentials failed" when they did not.
                 //
-                // Scope, stated because the neighbouring row is contested: this
-                // arm fires on `hello` only. §4.7's out-of-order row (an unknown
-                // connect operation, or a second `hello` before `hello_done`) is
-                // `connection_sequence_error`/400 in the table and 409 in
-                // core-go, and is routed as spec-issue 2026-09-01-b — so it gets
-                // no discriminating behaviour here until it is ruled.
+                // Scope: this arm fires on `hello` only. §4.7's row 10 was
+                // routed as spec-issue 2026-09-01-b and RULED on 2026-09-01 —
+                // it is two failures, and the unknown-operation half is the
+                // `_` arm below, not this one.
                 "hello" => {
                     return build_error_response(
                         &fields.request_id,
@@ -1177,7 +1560,36 @@ pub(crate) async fn dispatch_request(
                     )
                     .unwrap_or_else(|_| Envelope::new(envelope.root.clone()));
                 }
-                _ => {}
+                // §4.7 row 10, unknown-operation half — **400 `invalid_request`**
+                // (`unknown_connect_operation_refusal`, which owns the reasoning
+                // and the DRAFT-status caveat).
+                //
+                // The `_` arm previously fell through to generic §5.2
+                // verification, where the bare connect-EXECUTE shape carries no
+                // `author` — so an unimplemented operation name was reported as
+                // `401 authentication_failed`, the same wrong-class answer row 9
+                // was fixed for one arm over.
+                //
+                // **`ping` is deliberately NOT an arm here.** It is
+                // EXTENSION-NETWORK §5.1's keepalive, it IS implemented, and it
+                // must fall through to verification to be answered further down.
+                // Naming it here would work and would be the bug: the refusal
+                // would then be keyed on *"not hello and not authenticate"* in
+                // one place and on `CONNECT_OPERATIONS` in another, and the two
+                // would drift the first time an operation is added. The helper
+                // returns `None` for every advertised operation, so falling
+                // through IS the ping arm — one inventory, read once. Measured:
+                // with a `"ping" => {}` arm here, mutating the helper's
+                // membership test to `matches!(op, "hello" | "authenticate")`
+                // is **unobservable** — this arm masks it, and the row-10
+                // control passes against a peer that refuses every keepalive.
+                _ => {
+                    if let Some(refusal) =
+                        unknown_connect_operation_refusal(envelope, local_pid.as_str())
+                    {
+                        return refusal;
+                    }
+                }
             }
         }
     }
@@ -4261,7 +4673,33 @@ fn decode_policy_grants_at(
 /// error registry (e.g., `400 unsupported_key_type` for v7.66 §4.4
 /// surface 6) rather than collapsing to the generic `default_code`
 /// catch-all. `default_code` is used when the error has no registry
-/// entry (e.g., decode failures during hello → `"handshake_failed"`).
+/// entry — a malformed `hello`, for instance.
+///
+/// **That residual code is `invalid_request`, and it used to be
+/// `handshake_failed` (0.8.2.5).** The note 0.8.2.5 added under §4.7 says
+/// flatly *"Implementations MUST NOT emit `connection_required` or
+/// `handshake_failed`"* — the justification it gives is that both are "minted
+/// codes in no spec code set", which is a property of the code wherever it is
+/// emitted, not of the one input the note was written about. The precedent it
+/// cites is `invalid_signature`, a spelling §4.7 retired everywhere rather
+/// than at one site. So the sweep is the whole call-site set, not just CE-1's.
+///
+/// `invalid_request` is the positive rule for what is left: §4.7 defines it as
+/// *"a well-formed frame whose content the responder cannot act on as a
+/// request"* and §3.3 names it the default 400 code. A `hello` whose params
+/// are not a hello is exactly that.
+///
+/// **This retired a control, and the retirement is the point rather than a
+/// side effect.** `prehello_authenticate_is_invalid_nonce_on_both_transports`
+/// rows 5+6 pinned this default to `handshake_failed` precisely so that
+/// "fixing" a §4.7 row by relabelling the catch-all would go red. That
+/// discriminator is gone — the catch-all and row 10 now share a code because
+/// the ruling says they are the same class — so the rows were rewritten to
+/// assert what still discriminates: the residual is `(400, invalid_request)`
+/// and specifically not row 6's `(401, invalid_nonce)`, not the out-of-order
+/// row's `(409, connection_sequence_error)`, and not CE-1's `(401,
+/// authentication_failed)`. Written down rather than quietly dropped, per the
+/// charter entry on a control a re-route can retire without touching it.
 fn handshake_error_envelope(inbound: &Envelope, err: &PeerError, default_code: &str) -> Envelope {
     let request_id = extract_request_id(inbound).unwrap_or_else(|| "unknown".to_string());
     let (status, code, message) = match err {

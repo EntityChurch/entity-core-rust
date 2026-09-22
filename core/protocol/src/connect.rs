@@ -222,6 +222,45 @@ pub fn default_advertised_key_types() -> Vec<String> {
     vec!["ed25519".to_string(), "ed448".to_string()]
 }
 
+/// The protocol versions this peer speaks (§4.5 `protocols`). One entry today;
+/// the field is a set because §4.5 negotiates it by intersection.
+pub fn default_advertised_protocols() -> Vec<String> {
+    vec!["entity-core/1.0".to_string()]
+}
+
+/// The operations `system/protocol/connect` implements — the closed inventory
+/// §4.7's unknown-operation half is measured against.
+///
+/// This is the **same list** `bootstrap_handler` publishes as the connect
+/// handler's advertised `system/handler/{pattern}` interface, imported there
+/// rather than re-spelled: an operation this peer answers and does not
+/// advertise (or refuses and does advertise) is a divergence from its own
+/// published contract, and two hand-kept lists are how that happens. `ping` is
+/// EXTENSION-NETWORK §5.1's keepalive, dispatched post-Established.
+pub const CONNECT_OPERATIONS: &[&str] = &["authenticate", "hello", "ping"];
+
+/// §4.5 `protocols` negotiation: the intersection MUST be non-empty.
+///
+/// A **pure intersection test** over the §8.4 protocol version identifiers.
+/// The empty initiator set is not this function's question: 0.8.2.4 refuses it
+/// upstream as `400 invalid_request` (see [`Connection::process_hello`]), and
+/// the two failures carry different codes by MUST. So `[]` returns `false`
+/// here as a matter of arithmetic — an empty set intersects nothing — and the
+/// caller never reaches this with one.
+///
+/// **This is the reading arch ruled against us on 2026-09-02 (SA-PY-31, folded
+/// at 0.8.2.4).** We shipped `initiator.is_empty() || …`, arguing that a field
+/// with no default carries no claim to contradict; go shipped the same line for
+/// the same reason. The measurement neither seat had was one tier away —
+/// keystone's `csharp` and `typescript` connect handlers already *required* the
+/// field and passed conformance, so reading 1 was never the cohort default and
+/// ruling it would have made passing peers non-conformant. Both seats had
+/// independently reached the half that survived: `incompatible_protocol` cannot
+/// be told to a caller that named no version.
+pub fn protocols_compatible(initiator: &[String], responder: &[String]) -> bool {
+    initiator.iter().any(|p| responder.iter().any(|r| r == p))
+}
+
 /// §4.5 single-active-value negotiation: the active `content_hash_format`
 /// is the first entry in the **initiator's** preference order that the
 /// **responder** also supports, mapped to its format code. `None` when the
@@ -251,6 +290,11 @@ pub struct Connection {
     pub local_hash_formats: Vec<String>,
     /// This peer's advertised `key_types` accept-set (§4.5).
     pub local_key_types: Vec<String>,
+    /// The protocol versions this peer speaks (§4.5 `protocols`). Both the
+    /// intersection gate in `process_hello` and the set echoed in the hello
+    /// response read this field, so a peer cannot advertise one thing and
+    /// negotiate against another.
+    pub local_protocols: Vec<String>,
     /// This peer's own identity `key_type` label (mutual-verifiability, §4.5).
     pub local_key_type: String,
     /// The negotiated active `content_hash_format` for this connection
@@ -274,6 +318,7 @@ impl Connection {
             remote_identity_hash: None,
             local_hash_formats: default_advertised_hash_formats(entity_hash::HASH_ALGORITHM_SHA256),
             local_key_types: default_advertised_key_types(),
+            local_protocols: default_advertised_protocols(),
             local_key_type: KeyType::Ed25519.label().to_string(),
             active_hash_format: entity_hash::HASH_ALGORITHM_SHA256,
         }
@@ -355,8 +400,10 @@ impl Connection {
         // route `UnsupportedKeyType` to the dedicated `ProtocolError`
         // variant so the wire response carries the
         // `400 unsupported_key_type` registry entry rather than the
-        // generic `handshake_failed` code (which is what
-        // AGILITY-UNKNOWN-1 fails on at the cross-impl boundary).
+        // generic catch-all code (which is what AGILITY-UNKNOWN-1 fails on at
+        // the cross-impl boundary). That catch-all was `handshake_failed` when
+        // this comment was written and is `invalid_request` since 0.8.2.5,
+        // which retired the former outright.
         let remote_pid = PeerId::from(hello.peer_id.as_str());
         remote_pid.validate().map_err(|e| match e {
             entity_crypto::CryptoError::UnsupportedKeyType(b) => {
@@ -364,6 +411,49 @@ impl Connection {
             }
             other => ProtocolError::ConnectionError(format!("invalid remote peer_id: {}", other)),
         })?;
+
+        // §4.5 `protocols` negotiation — the intersection MUST be non-empty
+        // (§4.5's table), and §4.4 requires the refusal to be an explicit coded
+        // response: "The initiator does not need to infer negotiation failure
+        // from silence." Empty intersection → `400 incompatible_protocol`
+        // (§4.7 row 1).
+        //
+        // This ran nowhere until FM-2. We parsed `hello.protocols`, echoed a
+        // hardcoded set back, and validated only key_type / hash_formats /
+        // key_types — so a peer speaking no version we support completed the
+        // handshake and discovered it at its first EXECUTE, as some other
+        // failure. Ruled 2026-09-01: the trigger is normative today (offer only
+        // `entity-core/99.0`) and the row is a gap in all three trees, not the
+        // aspirational multi-version surface it reads as. **The row needs no
+        // spec change** — §4.5 already requires this check, so this is landed
+        // text, not FM-2's DRAFT.
+        //
+        // Ordered here — after the key_type gate, ahead of hash_formats —
+        // matching §4.4's own enumeration ("no common protocols, hash formats,
+        // or key types") and §4.5's table order. Nothing pins it; stated so the
+        // next reader does not read the position as arbitrary.
+        //
+        // FM-2e (0.8.2.4, normative): the absent/empty arm is refused FIRST,
+        // and with a different code. §4.5 — "A hello carrying no `protocols`
+        // field, or an empty list, MUST be rejected with `400 invalid_request`
+        // — it is a malformed request, not a version incompatibility." The
+        // order between these two `if`s is the whole ruling: run the
+        // intersection first and an empty set fails it, which reports
+        // `incompatible_protocol` to a caller that named no version and points
+        // it at the wrong remedy (change your version, rather than send the
+        // field). Absent and empty are one input here because the encoder omits
+        // the key for an empty list (`HelloData::to_entity`) and the decoder
+        // yields `vec![]` for an absent one — the same rule this repo already
+        // applies to optional arrays, arriving at a REQUIRED one.
+        if hello.protocols.is_empty() {
+            return Err(ProtocolError::InvalidRequest(
+                "hello.protocols is required and MUST be a non-empty set of §8.4 protocol \
+                 version identifiers (§4.5)",
+            ));
+        }
+        if !protocols_compatible(&hello.protocols, &self.local_protocols) {
+            return Err(ProtocolError::IncompatibleProtocol);
+        }
 
         // §4.5 hash_formats negotiation (single active value). The active
         // `content_hash_format` is the first entry in the **initiator's**
@@ -395,7 +485,11 @@ impl Connection {
             HelloData {
                 peer_id: self.local_peer_id.as_str().to_string(),
                 nonce: self.local_nonce.clone(),
-                protocols: vec!["entity-core/1.0".to_string()],
+                // The field the gate above reads, not a second hardcoded copy:
+                // a responder that rejects against one set and advertises
+                // another tells the initiator to retry with a version it will
+                // refuse again.
+                protocols: self.local_protocols.clone(),
                 hash_formats: self.local_hash_formats.clone(),
                 key_types: self.local_key_types.clone(),
                 timestamp: None,
@@ -667,6 +761,26 @@ pub fn build_connect_execute(
     operation: &str,
     params_entity: &Entity,
 ) -> Result<Entity, ProtocolError> {
+    build_connect_execute_at(CONNECT_PATH, request_id, operation, params_entity)
+}
+
+/// [`build_connect_execute`] with the `uri` spelled explicitly.
+///
+/// §4.3 permits both a peer-relative `system/protocol/connect` and a fully
+/// qualified `/{peer_id}/system/protocol/connect`; the handshake uses the
+/// former (the initiator does not yet know the responder's peer-id) and an
+/// established client uses the latter. Both address the same handler, so any
+/// rule about connect operations has to answer both — this exists so a test can
+/// drive the qualified spelling that `build_connect_execute` cannot produce.
+///
+/// The ECF key order below is fixed by encoded **key** length, so it is
+/// unaffected by the `uri` value's length.
+pub fn build_connect_execute_at(
+    uri: &str,
+    request_id: &str,
+    operation: &str,
+    params_entity: &Entity,
+) -> Result<Entity, ProtocolError> {
     let params_encoded = entity_wire::encode_entity(params_entity);
 
     // Build EXECUTE data as manually-constructed CBOR.
@@ -680,7 +794,7 @@ pub fn build_connect_execute(
 
     // "uri"
     entity_ecf::encode_cbor_text(&mut data, "uri");
-    entity_ecf::encode_cbor_text(&mut data, CONNECT_PATH);
+    entity_ecf::encode_cbor_text(&mut data, uri);
 
     // "params"
     entity_ecf::encode_cbor_text(&mut data, "params");
@@ -1144,5 +1258,103 @@ mod connect_error_contract_tests {
             .expect("a valid authenticate must still establish the connection");
         assert_eq!(pid, remote.peer_id());
         assert!(conn.is_established());
+    }
+
+    /// §4.5 / §4.7 row 1 (FM-2) — the `protocols` intersection MUST be
+    /// non-empty, and the three ways of getting that wrong are separated.
+    ///
+    /// The gap this closes: `process_hello` parsed `hello.protocols` and
+    /// checked nothing, so a peer speaking only `entity-core/99.0` completed
+    /// the handshake and failed at its first EXECUTE as something else. Arch
+    /// ruled it a live gap in all three trees on 2026-09-01 and noted the row
+    /// needs **no spec change** — §4.5's table already says
+    /// *"Intersection, must be non-empty"*.
+    ///
+    /// **Three rows, because "reject a disjoint set" has three near-misses and
+    /// only the first is what a one-row test measures:**
+    ///
+    /// - *disjoint* is the defect row. Mutation: delete the guard → `(0, "")`,
+    ///   the handshake proceeds.
+    /// - *overlapping* is the row that separates an **intersection** from an
+    ///   equality or a first-entry compare. A peer written as
+    ///   `initiator == responder` or `initiator[0] == responder[0]` passes the
+    ///   disjoint row and fails here — and it would refuse every future peer
+    ///   that advertises a superset, which is the shape §4.5 exists to permit.
+    /// - *omitted* is FM-2e, and it is the row that changed sides. `protocols`
+    ///   is the one negotiated field with **no default** (§4.5's table leaves
+    ///   that column `—` where `hash_formats` and `key_types` have one). We
+    ///   read that as "absence is not a claim to contradict" and accepted it;
+    ///   0.8.2.4 ruled the opposite — with no default there is no floor to fall
+    ///   back to, so absence is *malformed* rather than *unconstrained*. The row
+    ///   still discriminates, just between two codes instead of between accept
+    ///   and reject, which is the sharper test: `invalid_request` for a caller
+    ///   that named nothing, `incompatible_protocol` only for one that named a
+    ///   version we do not speak.
+    #[test]
+    fn hello_protocols_intersection_is_enforced_and_the_empty_set_is_malformed() {
+        fn outcome(offered: &[&str]) -> Result<HelloData, (u32, String)> {
+            let remote = kp(2);
+            let mut conn = Connection::new(kp(1).peer_id());
+            let hello = HelloData {
+                peer_id: remote.peer_id().as_str().to_string(),
+                nonce: vec![42u8; 32],
+                protocols: offered.iter().map(|s| s.to_string()).collect(),
+                hash_formats: vec![],
+                key_types: vec![remote.key_type().label().to_string()],
+                timestamp: None,
+            };
+            let exec =
+                build_connect_execute("row1-hello", "hello", &hello.to_entity().unwrap()).unwrap();
+            conn.process_hello(&Envelope::new(exec))
+                .map(|(response, _)| response)
+                .map_err(|e| {
+                    (
+                        e.wire_status_code(),
+                        e.wire_error_code().unwrap_or("<no registry code>").into(),
+                    )
+                })
+        }
+
+        assert_eq!(
+            outcome(&["entity-core/99.0"]).err(),
+            Some((400, "incompatible_protocol".to_string())),
+            "§4.5: the intersection is empty, so the responder speaks no version \
+             this initiator does. §4.4 requires it to say so with a coded \
+             response — 'The initiator does not need to infer negotiation \
+             failure from silence'"
+        );
+
+        let response = outcome(&["entity-core/99.0", "entity-core/1.0"]).expect(
+            "a NON-EMPTY intersection is compatible — §4.5 negotiates by \
+                     intersection, not by set equality and not on the first entry",
+        );
+
+        // The echo reads the same field the gate did. A responder that rejects
+        // against one set and advertises another tells the initiator to retry
+        // with a version it will refuse again.
+        assert_eq!(
+            response.protocols,
+            default_advertised_protocols(),
+            "the hello response MUST advertise the set the gate is evaluated \
+             against; this row fails if the echo goes back to a hardcoded literal"
+        );
+
+        // FM-2e, and this row asserted the OPPOSITE until 0.8.2.4 folded
+        // SA-PY-31 against the reading two seats had shipped. It is kept as a
+        // discrimination between the two codes rather than rewritten to a bare
+        // `is_err()`: the defect the ruling forecloses is not "the empty set is
+        // accepted", it is "the empty set is answered `incompatible_protocol`",
+        // which is a pair §4.7 assigns to a different input and points the
+        // caller at the wrong remedy. Both mutations are red here — dropping
+        // the guard yields `Ok`, and folding it into `protocols_compatible`
+        // (the one-line "fix") yields `incompatible_protocol`.
+        assert_eq!(
+            outcome(&[]).err(),
+            Some((400, "invalid_request".to_string())),
+            "§4.5 (0.8.2.4): `protocols` is Required with no default, so an \
+             absent or empty list is a malformed hello — `400 invalid_request`, \
+             NOT `incompatible_protocol`, which can only be told to a caller \
+             that named a version"
+        );
     }
 }

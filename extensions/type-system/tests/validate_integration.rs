@@ -463,3 +463,130 @@ fn build_constraint(constraint_type: &str, data: Value) -> Value {
         "type" => text(constraint_type)
     }
 }
+
+// ---------------------------------------------------------------------------
+// PROPOSAL-TYPE-OPERATION-ERROR-TAXONOMY §2 / §3 — the two claims routed to
+// this seat, pinned so the fold has something to cite besides prose.
+// ---------------------------------------------------------------------------
+
+/// §2, the load-bearing half: **a typing verdict is a `200`, never a `400`.**
+///
+/// `system/type/validate-result` carries `valid: bool` + `violations`, so "this
+/// entity does not conform" is the *payload* of a successful analysis, not a
+/// refusal of the request. A peer that answered `400` for `valid: false` would
+/// make the operation useless to a caller doing schema exploration — every
+/// answer it is asking for arrives as an error — and nothing in the landed
+/// `EXTENSION-TYPE` text stops it, because that document declares zero error
+/// codes. The proposal asks whether this is already true here. It is, and both
+/// halves are asserted rather than the first one only.
+///
+/// **The second row is the one worth the proposal's attention.** An
+/// *unresolvable type* is also a `200` with `valid: false` and a `structural`
+/// violation here — NOT the `404 not_found` the proposal's §3 table row 4
+/// proposes. That is a deliberate split against `compare`/`compatible`, which
+/// do answer 404: `validate-result` has a field that can *express* "I could not
+/// resolve the type" as an outcome, and `compatibility-report` has no such
+/// field, so the same input is an outcome on one operation and a lookup miss on
+/// the other. Routed rather than assumed — if the fold takes row 4 as written,
+/// this row is what flips.
+#[test]
+fn a_failed_validation_is_a_200_and_an_unresolvable_type_is_too() {
+    let cs = Arc::new(MemoryContentStore::new());
+    let li = Arc::new(MemoryLocationIndex::new());
+
+    // `app/user` requires `name`; the entity omits it.
+    let type_def = cbor_map! {
+        "name" => text("app/user"),
+        "fields" => Value::Map(vec![
+            (text("name"), cbor_map! { "type_ref" => text("primitive/string") }),
+        ])
+    };
+    store_type_def(&cs, &li, "app/user", type_def);
+
+    let constraint_handler = Arc::new(StandardConstraintHandler::new(PEER_ID.to_string()));
+    let type_handler = TypeHandler::new(
+        PEER_ID.to_string(),
+        cs.clone() as Arc<dyn ContentStore>,
+        li.clone() as Arc<dyn LocationIndex>,
+    );
+
+    let res = run_validate(
+        &type_handler,
+        validate_request("app/user", Value::Map(vec![])),
+        build_execute_fn(constraint_handler.clone()),
+    );
+    let result: Value = ciborium::from_reader(res.result.data.as_slice()).unwrap();
+    assert_eq!(
+        (res.status, result.get("valid").and_then(|v| v.as_bool())),
+        (STATUS_OK, Some(false)),
+        "a validation FAILURE is a successful analysis: 200 with `valid: false`, \
+         never a 4xx. This is the cross-peer-observable divergence the proposal \
+         routes now rather than at fold time"
+    );
+
+    let res = run_validate(
+        &type_handler,
+        validate_request("app/missing", Value::Map(vec![])),
+        build_execute_fn(constraint_handler),
+    );
+    let result: Value = ciborium::from_reader(res.result.data.as_slice()).unwrap();
+    assert_eq!(
+        (res.status, result.get("valid").and_then(|v| v.as_bool())),
+        (STATUS_OK, Some(false)),
+        "an UNRESOLVABLE type is also a 200 with `valid: false` on `validate` — \
+         the result type can carry the outcome, so it is one. `compare` and \
+         `compatible` answer 404 for the same input because their result type \
+         cannot. Proposal §3 row 4 proposes 404 for both; this row is the \
+         measurement it asked for and it disagrees"
+    );
+}
+
+/// The forced rename: **`invalid_request`, never `bad_request`.**
+///
+/// `ENTITY-CORE-PROTOCOL` §4.7 — *"Extension specifications use this code for
+/// the same class and MUST NOT mint a synonym"* — and §3.3, which names
+/// `invalid_request` the default 400 code. `bad_request` appears in no spec code
+/// set. `EXTENSION-TYPE` declares no error codes at all, which is why this seat
+/// had to pick one; that is arch's gap, and the rename is forced independent of
+/// how the taxonomy proposal lands.
+///
+/// Asserting `!bad_request` on the encoded bytes rather than only
+/// `invalid_request`: the error entity carries both a `type` and a `message`,
+/// and a message that still said "bad request" would leave the retired spelling
+/// on the wire for a client keying off it.
+#[test]
+fn a_malformed_validate_request_is_invalid_request_never_bad_request() {
+    let cs = Arc::new(MemoryContentStore::new());
+    let li = Arc::new(MemoryLocationIndex::new());
+    let constraint_handler = Arc::new(StandardConstraintHandler::new(PEER_ID.to_string()));
+    let type_handler = TypeHandler::new(
+        PEER_ID.to_string(),
+        cs.clone() as Arc<dyn ContentStore>,
+        li.clone() as Arc<dyn LocationIndex>,
+    );
+
+    // A `validate-request` with no `entity` field at all — a defect of the
+    // REQUEST, which is the whole (small) set that legitimately carries a code.
+    let params = Entity::new(
+        "system/type/validate-request",
+        entity_ecf::to_ecf(&cbor_map! { "not_entity" => text("x") }),
+    )
+    .unwrap();
+    let res = run_validate(&type_handler, params, build_execute_fn(constraint_handler));
+
+    let has = |needle: &str| {
+        res.result
+            .data
+            .windows(needle.len())
+            .any(|w| w == needle.as_bytes())
+    };
+    assert!(
+        res.status == 400 && has("invalid_request") && !has("bad_request"),
+        "a request defect is 400 `invalid_request`; `bad_request` is a minted \
+         synonym §4.7 forbids. Got status {}, invalid_request={}, \
+         bad_request={}",
+        res.status,
+        has("invalid_request"),
+        has("bad_request")
+    );
+}

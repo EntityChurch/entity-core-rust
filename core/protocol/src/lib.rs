@@ -13,9 +13,10 @@ use thiserror::Error;
 
 // Re-export public API
 pub use connect::{
-    build_authenticate_envelope, build_connect_execute, default_advertised_hash_formats,
-    default_advertised_key_types, negotiate_active_format, AuthenticateData, Connection,
-    ConnectionState, HelloData, CONNECT_PATH,
+    build_authenticate_envelope, build_connect_execute, build_connect_execute_at,
+    default_advertised_hash_formats, default_advertised_key_types, default_advertised_protocols,
+    negotiate_active_format, protocols_compatible, AuthenticateData, Connection, ConnectionState,
+    HelloData, CONNECT_OPERATIONS, CONNECT_PATH,
 };
 pub use response::{
     build_error_response, build_error_response_with_marker, build_execute_response,
@@ -150,6 +151,41 @@ pub enum ProtocolError {
     #[error("no common hash formats in hello negotiation")]
     IncompatibleHashFormat,
 
+    /// V7 §4.5 / §4.7 row 1: the `protocols` negotiation produced an empty
+    /// intersection — the initiator advertised no protocol version this
+    /// responder speaks. §4.5's negotiation table pins `protocols` as
+    /// **"Intersection, must be non-empty"**, and §4.4 requires the responder
+    /// to say so explicitly rather than let the initiator infer it from
+    /// silence. Maps to **400** with wire code `incompatible_protocol`.
+    ///
+    /// Unlike `hash_formats` and `key_types` this field has **no default**, and
+    /// 0.8.2.4 resolved what that means: only a NON-EMPTY initiator set
+    /// disjoint from ours earns this code, and an absent-or-empty list is
+    /// [`Self::InvalidRequest`] instead — not, as we and `entity-core-go` both
+    /// first shipped, unconstrained. The distinction is a MUST because the two
+    /// remedies differ; see `connect::protocols_compatible` for the ruling.
+    #[error("no common protocol version in hello negotiation")]
+    IncompatibleProtocol,
+
+    /// V7 §4.5 / §4.7 — the generic malformed-request code, **400
+    /// `invalid_request`** (declared at core level by 0.8.2.4): "a well-formed
+    /// frame whose *content* the responder cannot act on as a request."
+    ///
+    /// On the connect path this carries FM-2e: a hello with `protocols`
+    /// **absent or empty**. `protocols` is the one negotiated field that is
+    /// Required with **no default** (§4.5's table leaves that column `—`), so
+    /// there is no floor to fall back to and a peer that named no version has
+    /// made no version claim to compare. It is distinct from
+    /// [`Self::IncompatibleProtocol`] by MUST: that code tells the caller *"we
+    /// compared and share nothing"*, and the remedies differ — send the field
+    /// versus change the version — which is the whole reason §4.7 selects a
+    /// code at all.
+    ///
+    /// The message is `&'static str` rather than `String` because every
+    /// construction here is a fixed spec sentence, not a formatted value.
+    #[error("invalid request: {0}")]
+    InvalidRequest(&'static str),
+
     /// V7 §4.7 normative: an inbound peer_id (handshake hello, authenticate,
     /// or cap-chain peer reference) presents a `key_type` byte not in
     /// this impl's supported set. Maps to **400** with wire code
@@ -225,13 +261,16 @@ impl ProtocolError {
     /// AGILITY-UNKNOWN-1 / FORMAT-CODE-INTERPRETATION-1 / CAP-FREEZE-1 vectors
     /// assert on these exact strings. Errors without a dedicated registry
     /// entry surface as the call-site default ("verification_failed",
-    /// "handshake_failed", etc.); only dedicated-registry variants
-    /// override here.
+    /// "invalid_request", etc.); only dedicated-registry variants
+    /// override here. **Not `handshake_failed`** — 0.8.2.5 names that code
+    /// non-conformant outright, as a code appearing in no spec code set.
     pub fn wire_error_code(&self) -> Option<&'static str> {
         match self {
             Self::UnsupportedKeyType(_) => Some("unsupported_key_type"),
             Self::UnsupportedContentHashFormat(_) => Some("unsupported_content_hash_format"),
             Self::IncompatibleHashFormat => Some("incompatible_hash_format"),
+            Self::IncompatibleProtocol => Some("incompatible_protocol"),
+            Self::InvalidRequest(_) => Some("invalid_request"),
             Self::CapabilityRevoked => Some("capability_revoked"),
             // v7.71 §3.3 line 900: capability expiry (§5.6 / §5.2 validity)
             // surfaces as the default `capability_denied` — there is NO
@@ -707,11 +746,17 @@ mod tests {
 
         let mut conn = Connection::new(local_kp.peer_id());
 
-        // Process hello first (wrapped in EXECUTE)
+        // Process hello first (wrapped in EXECUTE). `protocols` is spelled out
+        // because §4.5 gives it no default and 0.8.2.4 refuses the empty set at
+        // `400 invalid_request` — this is a setup step for the authenticate
+        // assertions below, so it has to get past the hello gate rather than
+        // measure it. `hash_formats`/`key_types` stay empty on purpose: those
+        // two DO have defaults, and leaving them so keeps the fixture honest
+        // about which fields carry a floor.
         let remote_hello = HelloData {
             peer_id: remote_kp.peer_id().as_str().to_string(),
             nonce: vec![42u8; 32],
-            protocols: vec![],
+            protocols: default_advertised_protocols(),
             hash_formats: vec![],
             key_types: vec![],
             timestamp: None,

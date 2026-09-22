@@ -6269,3 +6269,50 @@ that isolates step 3 under both readings: *signature valid against the presented
 
 Routed to core-go and arch in
 `docs/validation/reports/2026-09-01-a-4.7-connect-errors-landed-and-the-row-8-probe-measures-ordering.md`.
+
+---
+
+## V7 §4.2 / §5.1 / NETWORK §5.1 — is `system/protocol/connect` still **pre-authorized** AFTER the connection is established, so that a `ping` needs no `author`/`capability`/signature?
+
+**Found 2026-09-02**, by bisecting a cross-impl SKIP rather than by reading. Not a new behaviour
+question — a standing one nobody had a name for, because the row it disables reports as "the peer
+does not implement ping", which is false of us.
+
+**The passages, and they do not resolve each other.**
+
+- §4.2, first bullet: *"`system/protocol/connect` is the sole pre-authorized path."* No state
+  qualifier — the bullet list it heads is titled *Pre-Authorization Rules* and its other bullets
+  are explicitly about the handshake, which cuts both ways.
+- §4.2, second bullet: *"EXECUTE targeting this path MUST be accepted without `author` or
+  `capability` fields."* Again unqualified. Read literally this covers a post-Established `ping`,
+  since `ping` is a connect-path EXECUTE (§4.7 row 10's own vocabulary, and it is in
+  `CONNECT_OPERATIONS`).
+- §5.1: *"Every authenticated EXECUTE MUST include `author` and `capability` in data, plus a valid
+  signature in the envelope."* Conditioned on *authenticated*, which is the word doing all the work
+  and is not defined against a pre-authorized path.
+- `EXTENSION-NETWORK` §12.1 makes the ping/pong exchange a MUST, and neither the §4.4 default
+  connection grants nor NETWORK §3.2 cover `system/protocol/connect` — the adjacent ambiguity
+  already logged in this file, which is about the **grant**, not about whether the frame is
+  verified at all. They are two questions and only one of them was written down.
+
+**Interim choice (ours): a post-Established `ping` is VERIFIED.** The §5.1 intercept sits after
+`verify_request` in `dispatch_request` (`core/peer/src/connection.rs`), exempt from the
+handler-scope grant check but not from signature/capability verification. The reading is that
+§4.2's pre-authorization is scoped to the pre-authorized *state* — the handshake — and that once a
+connection has a verified signer, §5.1's "authenticated EXECUTE" is what the frame is.
+
+**What it costs, measured.** core-go's `connect_ping_before_hello` (§4.7's out-of-order row, 409)
+is gated by an applicability control, `pingServedOnceEstablished`, that completes a handshake and
+pings **unauthenticated**. Against us that answers non-200, the control records `served=false`, and
+the 409 row **skips** — while `keepalive_ping_pong` passes in the same run because it pings
+authenticated. Bisected across `1ded022` → `0494020`: the skip is present at both, so it is
+pre-existing and independent of CE-1. A skip counts as a failure, so this reading is currently
+costing us a §4.7 row we believe we implement.
+
+**Ask.** One sentence in §4.2 saying whether the pre-authorization is scoped to the pre-Established
+states. If it is not — if a connect-path EXECUTE is unauthenticated in every state — the intercept
+moves ahead of `verify_request` here and the row un-skips. Either way core-go's control should say
+which ping it is asking about, since "serves ping" and "serves *unauthenticated* ping" are
+different predicates and only the second one is being measured.
+
+Routed in `docs/status/ROUTING-2026-09-02-g-ce1-landed-and-the-must-not-was-on-the-code-not-the-input.md`.

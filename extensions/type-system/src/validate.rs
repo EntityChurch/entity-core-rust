@@ -12,6 +12,27 @@
 //! - Dispatch fails entirely (no handler matched, internal error) →
 //!   kind="unknown_constraint" with reason capturing the dispatch failure.
 //! - Otherwise valid=false → kind="constraint".
+//!
+//! **Error codes: `invalid_request`, never `bad_request`.** `EXTENSION-TYPE`
+//! declares eight operations and *zero* error codes — grep it for
+//! `invalid_request` / `invalid_params` / `bad_request` / `Errors:` and there
+//! are no hits — so this seat, as the only one that has built these handlers,
+//! had to pick one and picked a code in no spec code set. `ENTITY-CORE-PROTOCOL`
+//! §4.7 forbids that independent of anything TYPE says: *"a well-formed frame
+//! whose content the responder cannot act on as a request … is refused 400
+//! `invalid_request`. … Extension specifications use this code for the same
+//! class and MUST NOT mint a synonym."* §3.3 says the same from the other side —
+//! `invalid_request` is the default 400 code. Eight sites here and in
+//! `constraint.rs`; the rename is forced, not a taxonomy choice.
+//!
+//! **What is NOT an error code here, and it is the load-bearing half:** a
+//! *typing verdict* is a `200`. `system/type/validate-result` carries
+//! `valid: bool` + `violations`, so "this entity does not conform" is the
+//! payload, not a refusal — including the unresolvable-type case, which returns
+//! `valid: false` with a `structural` violation rather than a 404. Error codes
+//! on these operations are reserved for defects of the *request*: the operation
+//! could not be performed at all. Gated by
+//! `a_failed_validation_is_a_200_and_an_unresolvable_type_is_too`.
 
 use std::sync::Arc;
 
@@ -72,14 +93,17 @@ impl TypeHandler {
             Err(e) => {
                 return HandlerResult::error(
                     STATUS_BAD_REQUEST,
-                    error_entity("bad_request", &format!("decode params: {}", e)),
+                    error_entity("invalid_request", &format!("decode params: {}", e)),
                 );
             }
         };
         let (entity_value, type_path_override) = match parse_validate_request(&params_value) {
             Ok(t) => t,
             Err(e) => {
-                return HandlerResult::error(STATUS_BAD_REQUEST, error_entity("bad_request", &e));
+                return HandlerResult::error(
+                    STATUS_BAD_REQUEST,
+                    error_entity("invalid_request", &e),
+                );
             }
         };
 
@@ -89,7 +113,7 @@ impl TypeHandler {
             None => {
                 return HandlerResult::error(
                     STATUS_BAD_REQUEST,
-                    error_entity("bad_request", "entity.type missing"),
+                    error_entity("invalid_request", "entity.type missing"),
                 );
             }
         };
@@ -318,7 +342,7 @@ impl TypeHandler {
             Err(e) => {
                 return HandlerResult::error(
                     STATUS_BAD_REQUEST,
-                    error_entity("bad_request", &format!("decode: {}", e)),
+                    error_entity("invalid_request", &format!("decode: {}", e)),
                 );
             }
         };
@@ -327,7 +351,7 @@ impl TypeHandler {
         if type_a.is_empty() || type_b.is_empty() {
             return HandlerResult::error(
                 STATUS_BAD_REQUEST,
-                error_entity("bad_request", "type_a and type_b required"),
+                error_entity("invalid_request", "type_a and type_b required"),
             );
         }
         match compare::compare(
@@ -351,7 +375,7 @@ impl TypeHandler {
             Err(e) => {
                 return HandlerResult::error(
                     STATUS_BAD_REQUEST,
-                    error_entity("bad_request", &format!("decode: {}", e)),
+                    error_entity("invalid_request", &format!("decode: {}", e)),
                 );
             }
         };
@@ -364,7 +388,7 @@ impl TypeHandler {
         if type_a.is_empty() || type_b.is_empty() {
             return HandlerResult::error(
                 STATUS_BAD_REQUEST,
-                error_entity("bad_request", "type_a and type_b required"),
+                error_entity("invalid_request", "type_a and type_b required"),
             );
         }
         match compare::compatible(

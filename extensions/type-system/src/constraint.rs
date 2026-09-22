@@ -168,7 +168,7 @@ impl Handler for StandardConstraintHandler {
             Err(e) => {
                 return Ok(HandlerResult::error(
                     STATUS_BAD_REQUEST,
-                    error_entity("bad_request", &e),
+                    error_entity("invalid_request", &e),
                 ));
             }
         };

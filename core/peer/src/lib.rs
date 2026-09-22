@@ -1542,13 +1542,20 @@ impl PeerBuilder {
         // op dispatched on established connections and MUST appear in
         // the manifest — behavioral support without advertisement is the
         // D-class declared-surface divergence the validator flags.
+        //
+        // FM-2 gave that obligation a second edge: §4.7 row 10 refuses an
+        // operation this handler does not implement, so the advertised list and
+        // the dispatchable list are now two readings of one inventory — a
+        // divergence would make us answer an op we do not publish, or 400 one we
+        // do. `CONNECT_OPERATIONS` is that inventory, and it is imported rather
+        // than re-spelled here for exactly that reason.
         bootstrap_handler(
             &content_store,
             &notifying_li,
             &pid,
             "connect",
             "system/protocol/connect",
-            &["authenticate", "hello", "ping"],
+            entity_protocol::CONNECT_OPERATIONS,
         )?;
 
         // Bootstrap: register and seed all core types into the tree
@@ -9143,14 +9150,46 @@ mod tests {
     /// the frame's operation, so the frame was processed AS A HELLO and failed
     /// through the catch-all.
     ///
-    /// **The control is what stops this from being a rename.** Row 3 sends a
-    /// frame that is genuinely not a hello and not an `authenticate` either; it
-    /// must still exit through the catch-all as `400 handshake_failed`. Had we
-    /// "fixed" this by relabelling `handshake_error_envelope`'s default, rows 1
-    /// and 2 would pass and row 3 would go red — a conformant pair reached over
-    /// an incorrect path, reporting "invalid nonce" for a malformed `hello` too.
-    /// Status alone cannot separate the readings either, so the CODE is pinned
-    /// on every row.
+    /// **The control is what stops this from being a rename.** Rows 2 and 4 send
+    /// a frame that is genuinely not a hello and not an `authenticate` either.
+    /// Had we "fixed" this by relabelling `handshake_error_envelope`'s default,
+    /// rows 1 and 3 would pass and the controls would go red — a conformant pair
+    /// reached over an incorrect path, reporting "invalid nonce" for a malformed
+    /// `hello` too. Status alone cannot separate the readings either, so the
+    /// CODE is pinned on every row.
+    ///
+    /// **The control's expected value changed with FM-2, and the honest account
+    /// of what that cost is the point of this paragraph.** It read *"must still
+    /// exit through the catch-all as `400 handshake_failed`"*. §4.7 row 10 now
+    /// refuses an unimplemented operation by name as `400 invalid_request`, so
+    /// `goodbye` **no longer reaches the catch-all at all** — and the control
+    /// passed FM-2's change untouched, because it asserted only
+    /// `status == 400 && !invalid_nonce`, which both codes satisfy.
+    ///
+    /// Measured rather than assumed: with the rows below pinning `goodbye` to
+    /// `invalid_request`, relabelling `handshake_error_envelope`'s default to
+    /// `invalid_nonce` **still left this test green**. The anti-rename property
+    /// was gone, not preserved. Rows 5+6 restore it with a frame that does still
+    /// reach the catch-all — a `hello` whose params are not a hello — and that
+    /// mutation now reddens them. Rows 2+4 keep their own (different) job: they
+    /// fail if FM-1's discrimination is re-keyed on connection *state* instead
+    /// of on the frame's *operation*. Row 10's own teeth are in
+    /// `incompatible_protocol_and_unknown_connect_op_on_both_transports`.
+    ///
+    /// **And then 0.8.2.5 retired the control's discriminator outright, which is
+    /// the same lesson arriving from the third direction.** That fold names
+    /// `handshake_failed` a code in no spec code set and forbids emitting it at
+    /// all, so the catch-all is now `invalid_request` — the same code row 10
+    /// emits, because §4.7 says they are the same class. The property rows 5+6
+    /// used to have ("the residual has a private code, so relabelling it is
+    /// visible") is therefore **gone by ruling, not by oversight**, and no
+    /// rewriting of these rows can bring it back. What they assert instead is
+    /// what still discriminates: the residual is `(400, invalid_request)` and is
+    /// specifically none of the three coded pairs that surround it — row 6's
+    /// `(401, invalid_nonce)`, the out-of-order row's `(409,
+    /// connection_sequence_error)`, or CE-1's `(401, authentication_failed)`.
+    /// The `!handshake_failed` term is the new one and it is the teeth for the
+    /// sweep: it fails if either call-site default is put back.
     ///
     /// Both transports, because arch found the second one after the filing seat
     /// named only the first: the TCP handshake reads its first frame in
@@ -9161,7 +9200,7 @@ mod tests {
     async fn prehello_authenticate_is_invalid_nonce_on_both_transports() {
         use entity_wire::{read_frame, write_frame, DEFAULT_MAX_FRAME_SIZE};
 
-        fn pair_of(env: &entity_entity::Envelope) -> (u32, bool, bool) {
+        fn pair_of(env: &entity_entity::Envelope) -> (u32, bool, bool, bool) {
             let status = entity_protocol::parse_execute_response(env)
                 .map(|r| r.status)
                 .unwrap_or(0);
@@ -9171,7 +9210,12 @@ mod tests {
                     .windows(needle.len())
                     .any(|w| w == needle.as_bytes())
             };
-            (status, has("invalid_nonce"), has("handshake_failed"))
+            (
+                status,
+                has("invalid_nonce"),
+                has("invalid_request"),
+                has("handshake_failed"),
+            )
         }
 
         let peer = PeerBuilder::new()
@@ -9228,7 +9272,7 @@ mod tests {
         // --- Row 1: TCP, the pre-hello `authenticate`. ---
         assert_eq!(
             pair_of(&over_tcp(authenticate.clone(), shared.clone()).await),
-            (401, true, false),
+            (401, true, false, false),
             "TCP: a pre-hello `authenticate` MUST be `401 invalid_nonce` (§4.7 \
              row 6). `handle_connection` reads its first frame and handed it to \
              `build_hello_response_envelope`, which rejected it as a non-hello \
@@ -9242,15 +9286,18 @@ mod tests {
         //     on the UNGATED path deliberately, so the anti-rename guard exists
         //     in every feature configuration, not only where `http-live` is on. ---
         {
-            let (status, invalid_nonce, _) =
+            let (status, invalid_nonce, invalid_request, _) =
                 pair_of(&over_tcp(not_a_hello.clone(), shared.clone()).await);
             assert!(
-                status == 400 && !invalid_nonce,
+                status == 400 && !invalid_nonce && invalid_request,
                 "TCP: a connect frame that is neither `hello` nor `authenticate` \
                  must NOT be reported as a nonce failure — it never named the \
                  nonce. Reporting 401 `invalid_nonce` here means the \
                  discrimination is not on the operation at all, and row 1 is then \
-                 passing for a reason that has nothing to do with §4.6 step 1"
+                 passing for a reason that has nothing to do with §4.6 step 1. \
+                 The code is pinned as well as the status: asserting only \
+                 `400 && !invalid_nonce` is satisfied by any 400 code at all, \
+                 which is how this control silently stopped biting"
             );
         }
 
@@ -9266,7 +9313,7 @@ mod tests {
                     .await;
             assert_eq!(
                 pair_of(&env),
-                (401, true, false),
+                (401, true, false, false),
                 "http-live: same input, same pair. This transport reaches the \
                  defect through `dispatch_session_envelope`'s `AwaitingHello` \
                  arm rather than through the TCP first-frame read, so a fix \
@@ -9277,12 +9324,375 @@ mod tests {
             let env =
                 connection::dispatch_session_envelope(&not_a_hello, &mut conn, shared.clone())
                     .await;
-            let (status, invalid_nonce, _) = pair_of(&env);
+            let (status, invalid_nonce, invalid_request, _) = pair_of(&env);
             assert!(
-                status == 400 && !invalid_nonce,
-                "http-live: the control, on this transport's own catch-all — the \
-                 two transports build their error envelopes at two different call \
-                 sites, so a rename at one is invisible to the other's rows"
+                status == 400 && !invalid_nonce && invalid_request,
+                "http-live: the control on this transport — the two transports \
+                 build their error envelopes at two different call sites, so a \
+                 rename at one is invisible to the other's rows"
+            );
+        }
+
+        // --- Rows 5+6: the CATCH-ALL, which rows 2 and 4 stopped reaching when
+        //     §4.7 row 10 gave `goodbye` a coded refusal of its own. A `hello`
+        //     whose params are not a hello is a genuinely malformed frame: it
+        //     passes the operation-name check (`hello` is implemented), passes
+        //     the pre-hello `authenticate` check, passes CE-1 (it IS on the
+        //     connect path), and fails inside `build_hello_response_envelope` —
+        //     which is the only way left to land on `handshake_error_envelope`'s
+        //     default.
+        //
+        //     That default was `handshake_failed` and is `invalid_request` since
+        //     0.8.2.5, which forbids the former as a code in no spec code set.
+        //     So these rows no longer separate the residual from row 10 BY CODE
+        //     — the ruling merged them — and the `!handshake_failed` term is
+        //     what they buy instead: it is the only assertion in this file that
+        //     reddens if either call-site default is reverted. ---
+        let malformed_hello = entity_entity::Envelope::new(
+            entity_protocol::build_connect_execute(
+                "fm1-malformed-hello",
+                "hello",
+                &entity_entity::Entity::new(
+                    "test/v1",
+                    entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![])),
+                )
+                .expect("junk params"),
+            )
+            .expect("connect execute"),
+        );
+        {
+            let (status, invalid_nonce, invalid_request, handshake_failed) =
+                pair_of(&over_tcp(malformed_hello.clone(), shared.clone()).await);
+            assert!(
+                status == 400 && invalid_request && !invalid_nonce && !handshake_failed,
+                "TCP: a malformed `hello` is neither a nonce failure nor an \
+                 unimplemented operation — it is the residual catch-all, which \
+                 0.8.2.5 moved from `handshake_failed` (a code in no spec code \
+                 set, forbidden outright) to §4.7's `invalid_request` class. \
+                 The `!handshake_failed` term is the sweep's teeth: reverting \
+                 either call-site default reddens exactly this row"
+            );
+        }
+        #[cfg(feature = "http-live")]
+        {
+            let mut conn = entity_protocol::Connection::new(shared.keypair.peer_id());
+            let env =
+                connection::dispatch_session_envelope(&malformed_hello, &mut conn, shared.clone())
+                    .await;
+            let (status, _, invalid_request, handshake_failed) = pair_of(&env);
+            assert!(
+                status == 400 && invalid_request && !handshake_failed,
+                "http-live: the same residual, on this transport's own call \
+                 site — the two transports build their error envelopes at two \
+                 different call sites, so the sweep had to touch both"
+            );
+        }
+    }
+
+    /// CE-1 — §4.2's third pre-authorization rule + §5.2a, restated under §4.7
+    /// by **0.8.2.5**: a non-connect EXECUTE arriving before the connection is
+    /// established is **401 `authentication_failed`**.
+    ///
+    /// **All three ground-up seats got this wrong for two releases, in three
+    /// different ways, and none of them was reading the rule that governs it.**
+    /// go answered `403 connection_required`, py `403 capability_denied`, and we
+    /// answered `400 handshake_failed`. The 403s are the blanket 403 that §4.2's
+    /// F32 amendment *retired* at 0.8.1 when it replaced that bullet with the
+    /// auth/authz discriminator; ours was the catch-all, reached because the
+    /// frame is not a connect frame so no connect refusal claimed it. The input
+    /// carries no verified signer at all, which §5.2a makes **auth-class** — a
+    /// 403 asserts an authorization decision was reached about an authenticated
+    /// caller, and none was.
+    ///
+    /// **Row 3 is the control, and it is the row that separates this fix from a
+    /// blanket relabel of the catch-all.** The refusal has to discriminate on
+    /// the URI's *authority*: a foreign-namespace EXECUTE is refused as an
+    /// ADDRESS (`400 invalid_request`, §1.4 / §6.5 step 3 / §4.7's
+    /// `invalid_request` paragraph, which names the foreign namespace in its own
+    /// class list) and never becomes an authorization question, while an EXECUTE
+    /// addressed to *us* reaches the 401. A peer that simply renamed its
+    /// pre-establishment catch-all to `authentication_failed` passes rows 1, 2
+    /// and 4 and fails row 3. core-go's probe deliberately targets the
+    /// responder's own namespace for the same reason from the other side — so
+    /// that the §1.4 gate cannot be the mechanism doing the refusing.
+    ///
+    /// **Row 4 is the other control and it is the expensive one to omit.** The
+    /// helper's job is to refuse a class of frame during the handshake, so the
+    /// failure mode of getting it wrong is refusing the handshake itself. A
+    /// property of the form "X is still allowed" is prose until the test drives
+    /// X, so row 4 runs a real `hello` end-to-end and requires a hello response
+    /// back — the same charter rule the `ping` row earned one packet ago.
+    ///
+    /// Rows 1–4 are on the ungated TCP path; rows 5–7 repeat them through
+    /// `dispatch_session_envelope`, which is `#[cfg(feature = "http-live")]`. A
+    /// control that does not compile in a configuration proves nothing there,
+    /// so the anti-rename row lives on the path every configuration builds.
+    #[tokio::test]
+    async fn pre_establishment_execute_is_401_authentication_failed_on_both_transports() {
+        use entity_wire::{read_frame, write_frame, DEFAULT_MAX_FRAME_SIZE};
+
+        fn pair_of(env: &entity_entity::Envelope) -> (u32, bool, bool, bool) {
+            let status = entity_protocol::parse_execute_response(env)
+                .map(|r| r.status)
+                .unwrap_or(0);
+            let has = |needle: &str| {
+                env.root
+                    .data
+                    .windows(needle.len())
+                    .any(|w| w == needle.as_bytes())
+            };
+            (
+                status,
+                has("authentication_failed"),
+                has("invalid_request"),
+                has("handshake_failed"),
+            )
+        }
+
+        let peer = PeerBuilder::new()
+            .keypair(Keypair::from_seed([96u8; 32]))
+            .build()
+            .unwrap();
+        let shared = peer.shared();
+        let local_pid = shared.keypair.peer_id().as_str().to_string();
+        let fmt = shared.config.home_hash_format;
+
+        let params = entity_entity::Entity::new(
+            "test/v1",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![])),
+        )
+        .expect("params");
+
+        // A genuine, well-formed `hello` — row 4's input. Built the same way
+        // `remote.rs` builds the one it actually dials with, so "the connect
+        // path still works" is measured against the real frame rather than a
+        // stand-in that happens to survive.
+        let a_real_hello = |kp: Keypair, rid: &str| {
+            let hello = entity_protocol::HelloData {
+                peer_id: kp.peer_id().to_string(),
+                nonce: vec![11u8; 32],
+                protocols: vec!["entity-core/1.0".to_string()],
+                hash_formats: entity_protocol::default_advertised_hash_formats(fmt),
+                key_types: entity_protocol::default_advertised_key_types(),
+                timestamp: None,
+            };
+            entity_entity::Envelope::new(
+                entity_protocol::build_connect_execute(
+                    rid,
+                    "hello",
+                    &hello.to_entity().expect("hello entity"),
+                )
+                .expect("hello execute"),
+            )
+        };
+
+        // The routed input: a perfectly ordinary substrate operation, sent as
+        // the first thing on the wire. Peer-relative, so it is unambiguously
+        // addressed to us and the §1.4 gate has nothing to say about it.
+        let execute_relative = |rid: &str| {
+            entity_entity::Envelope::new(
+                entity_protocol::build_connect_execute_at("system/tree", rid, "get", &params)
+                    .expect("execute"),
+            )
+        };
+        // Same operation, fully qualified at OUR peer-id — §4.3 permits either
+        // spelling, and a check written against a scheme-stripping path helper
+        // matches one and silently misses the other. That was the exact defect
+        // in row 10's first landing, so it is driven here rather than assumed.
+        let execute_qualified = |rid: &str| {
+            entity_entity::Envelope::new(
+                entity_protocol::build_connect_execute_at(
+                    &format!("/{}/system/tree", local_pid),
+                    rid,
+                    "get",
+                    &params,
+                )
+                .expect("execute"),
+            )
+        };
+        // The control: a FOREIGN namespace. Refused as an address, never as an
+        // authentication failure.
+        // 46 base58 chars — `EntityUri::is_peer_id` gates on exactly that
+        // length, so a shorter literal would read as an ordinary path segment
+        // and this control would silently become a duplicate of row 1.
+        let foreign = "1BvPHnpAJ4dLpU7dvBqhkVFuGrCGdW8kSHi9pnJDzzZhpK";
+        assert!(
+            entity_entity::EntityUri::is_peer_id(foreign),
+            "the control's foreign authority must parse AS a peer-id"
+        );
+        let execute_foreign = |rid: &str| {
+            entity_entity::Envelope::new(
+                entity_protocol::build_connect_execute_at(
+                    &format!("/{}/system/tree", foreign),
+                    rid,
+                    "get",
+                    &params,
+                )
+                .expect("execute"),
+            )
+        };
+
+        let over_tcp = |frame_env: entity_entity::Envelope, shared: Arc<PeerShared>| async move {
+            let (mut client, server) = crate::transport::memory_transport_pair();
+            let handshake = tokio::spawn(async move {
+                let _ = connection::handle_connection(server, shared).await;
+            });
+            let frame = entity_wire::encode_envelope(&frame_env);
+            write_frame(&mut client.writer, &frame)
+                .await
+                .expect("the dialer can send its first frame");
+            let response = read_frame(&mut client.reader, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect(
+                    "§4.1/§4.6: the refusal MUST surface as a wire \
+                     EXECUTE_RESPONSE, not a bare close",
+                );
+            let _ = handshake.await;
+            entity_wire::decode_envelope(&response).expect("a decodable response")
+        };
+
+        // --- Row 1: TCP, peer-relative. The routed input. ---
+        assert_eq!(
+            pair_of(&over_tcp(execute_relative("ce1-tcp-rel"), shared.clone()).await),
+            (401, true, false, false),
+            "TCP: a non-connect EXECUTE before establishment is auth-class — \
+             no handshake has run, so there is no verified signer (§4.2 rule 3, \
+             §5.2a). We answered `400 handshake_failed`: the frame is not a \
+             connect frame, so none of the connect refusals claimed it and it \
+             fell through to `build_hello_response_envelope`"
+        );
+
+        // --- Row 2: TCP, the same request fully qualified at our own peer-id.
+        //     §4.3 permits both spellings; a refusal that reads only one of
+        //     them is half a refusal. ---
+        assert_eq!(
+            pair_of(&over_tcp(execute_qualified("ce1-tcp-qual"), shared.clone()).await),
+            (401, true, false, false),
+            "TCP: `/{{local}}/system/tree` is the same request as `system/tree` \
+             (§4.3). A check keyed on the peer-relative spelling alone would \
+             pass row 1 and leave the qualified form on the old catch-all"
+        );
+
+        // --- Row 3: THE CONTROL. Foreign namespace → refused as an ADDRESS. ---
+        let (status, auth_failed, invalid_request, _) =
+            pair_of(&over_tcp(execute_foreign("ce1-tcp-foreign"), shared.clone()).await);
+        assert!(
+            status == 400 && invalid_request && !auth_failed,
+            "TCP: a foreign-namespace EXECUTE is `400 invalid_request` — refused \
+             as an address before it can become an authorization question (§6.5 \
+             step 3 calls this a gate, not an ordering preference; §4.7's \
+             `invalid_request` paragraph names it in the class). This is the row \
+             that fails if CE-1 is 'fixed' by relabelling the pre-establishment \
+             catch-all to `authentication_failed`, which passes every other row \
+             here. It also covers the escalation shape: the three connect \
+             refusals re-qualify the path onto OUR peer-id, so only a check that \
+             reads the authority can see this frame at all. Got status {status}, \
+             auth_failed={auth_failed}, invalid_request={invalid_request}"
+        );
+
+        // --- Row 4: THE OTHER CONTROL. A real `hello` still completes. A
+        //     refusal added to the handshake's own entry point can refuse the
+        //     handshake, and "the connect path still works" is prose until it
+        //     is driven.
+        //
+        //     It cannot reuse `over_tcp`, and the reason is worth a line because
+        //     it deadlocked once: every other row's input makes
+        //     `handle_connection` write a refusal and RETURN, so awaiting the
+        //     server task terminates. A hello that succeeds leaves the server in
+        //     Phase 3 blocked on `read_frame` for the authenticate that never
+        //     comes, and `handshake.await` then waits on a task waiting on a
+        //     client this scope is still holding open. Dropping the client first
+        //     is what turns that read into EOF. ---
+        {
+            let (mut client, server) = crate::transport::memory_transport_pair();
+            let shared_for_task = shared.clone();
+            let handshake = tokio::spawn(async move {
+                let _ = connection::handle_connection(server, shared_for_task).await;
+            });
+            let frame = entity_wire::encode_envelope(&a_real_hello(
+                Keypair::from_seed([97u8; 32]),
+                "ce1-hello",
+            ));
+            write_frame(&mut client.writer, &frame)
+                .await
+                .expect("the dialer can send its hello");
+            let response = read_frame(&mut client.reader, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("a hello response");
+            drop(client);
+            let _ = handshake.await;
+            let env = entity_wire::decode_envelope(&response).expect("a decodable response");
+            let resp = entity_protocol::parse_execute_response(&env)
+                .expect("the connect surface still answers");
+            assert_eq!(
+                resp.status, 200,
+                "TCP: CE-1 runs at the handshake's first frame, so a helper that \
+                 over-matches takes the whole connect surface down with it. \
+                 `system/protocol/connect` is the one path §4.2 pre-authorizes \
+                 and it MUST still be served"
+            );
+        }
+
+        // --- Rows 5-7: the http-live transport, whose pre-Established arms are
+        //     a second call site. Gated because `dispatch_session_envelope` is;
+        //     rows 1-4 are not, because a refusal — and the control that proves
+        //     it discriminates — must not be reachable only through a feature
+        //     gate. ---
+        #[cfg(feature = "http-live")]
+        {
+            let mut conn = entity_protocol::Connection::new(shared.keypair.peer_id());
+            let env = connection::dispatch_session_envelope(
+                &execute_relative("ce1-http-rel"),
+                &mut conn,
+                shared.clone(),
+            )
+            .await;
+            assert_eq!(
+                pair_of(&env),
+                (401, true, false, false),
+                "http-live: same input, same pair, reached through the \
+                 `AwaitingHello` arm rather than the TCP first-frame read"
+            );
+
+            // `AwaitingAuthenticate` is still pre-Established — a hello has been
+            // exchanged, but no signer has been verified — so the rule binds
+            // there too. This is the arm a first-frame-only fix would miss.
+            let mut conn = entity_protocol::Connection::new(shared.keypair.peer_id());
+            let hello = a_real_hello(Keypair::from_seed([98u8; 32]), "ce1-http-hello");
+            let _ = connection::dispatch_session_envelope(&hello, &mut conn, shared.clone()).await;
+            assert!(
+                matches!(
+                    conn.state,
+                    entity_protocol::ConnectionState::AwaitingAuthenticate
+                ),
+                "the hello must have advanced the session, or the row below is \
+                 measuring `AwaitingHello` a second time"
+            );
+            let env = connection::dispatch_session_envelope(
+                &execute_relative("ce1-http-await-auth"),
+                &mut conn,
+                shared.clone(),
+            )
+            .await;
+            assert_eq!(
+                pair_of(&env),
+                (401, true, false, false),
+                "http-live: `AwaitingAuthenticate` is pre-Established too. The \
+                 state assertion above is what stops this row silently \
+                 re-testing `AwaitingHello`"
+            );
+
+            let mut conn = entity_protocol::Connection::new(shared.keypair.peer_id());
+            let env = connection::dispatch_session_envelope(
+                &execute_foreign("ce1-http-foreign"),
+                &mut conn,
+                shared.clone(),
+            )
+            .await;
+            let (status, auth_failed, invalid_request, _) = pair_of(&env);
+            assert!(
+                status == 400 && invalid_request && !auth_failed,
+                "http-live: the control on this transport's own call site"
             );
         }
     }
@@ -9535,6 +9945,543 @@ mod tests {
 
         drop(client);
         let _ = handshake.await;
+    }
+
+    /// §4.7 rows 1 and 10 (FM-2) — the two connect-error rows this seat owed,
+    /// over the real wire, on **both** transports.
+    ///
+    /// These are core-go's `connect_incompatible_protocol` and
+    /// `connect_unknown_operation` inputs exactly, so a green row here predicts
+    /// the wire check rather than merely agreeing with our own reading.
+    ///
+    /// **Row 1** — a hello advertising only `entity-core/99.0`. We completed the
+    /// handshake at 200: `process_hello` parsed `protocols` and validated
+    /// nothing, so a peer speaking no version we support got a connection and
+    /// discovered the incompatibility at its first EXECUTE, as some other
+    /// failure. This one is **landed spec** — §4.5's table pins the non-empty
+    /// intersection, §4.7 row 1 pins the pair, and arch confirmed the row needs
+    /// no spec change.
+    ///
+    /// **Row 10** — a connect EXECUTE naming `frobnicate`. We answered `400
+    /// handshake_failed`, a code in no spec document, by handing the frame to
+    /// the hello path and failing it there as a non-hello. The pair asserted is
+    /// arch's 2026-09-01 ruling (`invalid_request`), which supersedes the landed
+    /// table's `connection_sequence_error` for this input and folds as FM-2
+    /// Edit D — see `connection::unknown_connect_operation_refusal` for why we
+    /// land it ahead of the fold. **If the fold moves the value, this constant
+    /// and that one change together and nothing else does.**
+    ///
+    /// **The controls are what stop either row from being a catch-all rename**,
+    /// and they are the reason this test is not four asserts:
+    ///
+    /// - `ping` post-Established must still be answered. It is a connect
+    ///   operation we DO implement (EXTENSION-NETWORK §5.1), and it reaches the
+    ///   same intercept as `frobnicate` — a refusal keyed on "not hello and not
+    ///   authenticate" rather than on the advertised inventory passes row 10 and
+    ///   kills every keepalive on every established connection.
+    /// - a well-formed hello must still establish. A guard that refuses on any
+    ///   non-empty `protocols` set passes row 1 and closes the peer to everyone.
+    ///
+    /// Both rows run on the **ungated TCP path**, with the `http-live` rows
+    /// gated beside them: a §4.7 MUST-emit pair must not be reachable only
+    /// through a feature gate, and `make features` does not build this module.
+    #[tokio::test]
+    async fn incompatible_protocol_and_unknown_connect_op_on_both_transports() {
+        use entity_wire::{read_frame, write_frame, DEFAULT_MAX_FRAME_SIZE};
+
+        fn pair_of(env: &entity_entity::Envelope) -> (u32, String) {
+            let status = entity_protocol::parse_execute_response(env)
+                .map(|r| r.status)
+                .unwrap_or(0);
+            let code = [
+                "incompatible_protocol",
+                "invalid_request",
+                "connection_sequence_error",
+                "handshake_failed",
+                "authentication_failed",
+                "invalid_nonce",
+            ]
+            .iter()
+            .find(|needle| {
+                env.root
+                    .data
+                    .windows(needle.len())
+                    .any(|w| w == needle.as_bytes())
+            })
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "<none of the §4.7 codes>".into());
+            (status, code)
+        }
+
+        let peer = PeerBuilder::new()
+            .keypair(Keypair::from_seed([104u8; 32]))
+            .build()
+            .unwrap();
+        let shared = peer.shared();
+        let fmt = shared.config.home_hash_format;
+        let dialer = IdentityKeypair::from(Keypair::from_seed([105u8; 32]));
+
+        let hello_offering = |versions: &[&str]| {
+            let hello = entity_protocol::HelloData {
+                peer_id: dialer.peer_id().as_str().to_string(),
+                nonce: vec![11u8; 32],
+                protocols: versions.iter().map(|s| s.to_string()).collect(),
+                hash_formats: vec![],
+                key_types: vec![dialer.key_type().label().to_string()],
+                timestamp: None,
+            };
+            entity_entity::Envelope::new(
+                entity_protocol::build_connect_execute(
+                    "fm2-hello",
+                    "hello",
+                    &hello.to_entity().expect("hello entity"),
+                )
+                .expect("connect execute"),
+            )
+        };
+
+        let unknown_op = {
+            let params = entity_entity::Entity::new(
+                "test/v1",
+                entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![])),
+            )
+            .expect("params");
+            entity_entity::Envelope::new(
+                entity_protocol::build_connect_execute("fm2-unknown-op", "frobnicate", &params)
+                    .expect("connect execute"),
+            )
+        };
+
+        // Drive one frame as the FIRST thing a TCP-shaped connection sees —
+        // which is where core-go's probes send both of these.
+        //
+        // The client is dropped BEFORE awaiting the server task, and that is
+        // load-bearing rather than tidiness: control A's hello **succeeds**, so
+        // `handle_connection` goes on to await an `authenticate` this probe
+        // never sends. Awaiting the task first hangs the suite forever. Dropping
+        // the client closes the transport, the server's next `read_frame` gets
+        // EOF, and the task returns.
+        let over_tcp = |frame_env: entity_entity::Envelope, shared: Arc<PeerShared>| async move {
+            let (mut client, server) = crate::transport::memory_transport_pair();
+            let handshake = tokio::spawn(async move {
+                let _ = connection::handle_connection(server, shared).await;
+            });
+            let frame = entity_wire::encode_envelope(&frame_env);
+            write_frame(&mut client.writer, &frame)
+                .await
+                .expect("the dialer can send its first frame");
+            let response = read_frame(&mut client.reader, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect(
+                    "§4.6: the refusal MUST surface as a coded EXECUTE_RESPONSE \
+                     before the close — a bare drop is indistinguishable from a \
+                     network fault and is non-conformant",
+                );
+            drop(client);
+            let _ = handshake.await;
+            entity_wire::decode_envelope(&response).expect("a decodable response")
+        };
+
+        // --- Row 1, TCP. ---
+        assert_eq!(
+            pair_of(&over_tcp(hello_offering(&["entity-core/99.0"]), shared.clone()).await),
+            (400, "incompatible_protocol".to_string()),
+            "§4.5 / §4.7 row 1: an empty `protocols` intersection MUST be \
+             refused at hello. We completed this handshake at 200 and deferred \
+             the failure to the first EXECUTE, where it surfaces as something \
+             else entirely"
+        );
+
+        // --- Row 10, TCP. ---
+        assert_eq!(
+            pair_of(&over_tcp(unknown_op.clone(), shared.clone()).await),
+            (400, "invalid_request".to_string()),
+            "§4.7 row 10 (ruled 2026-09-01): an operation the connect handler \
+             does not implement is an invalid REQUEST, not a sequence error and \
+             not `handshake_failed` — a code that appears nowhere in the corpus"
+        );
+
+        // --- FM-2e, TCP: `protocols` absent/empty is MALFORMED, not a version
+        //     incompatibility. Ruled against the reading we and core-go both
+        //     shipped (SA-PY-31, folded at 0.8.2.4).
+        //
+        //     The pair is the whole assertion. Refusing the empty set is the
+        //     easy half and a one-line `!intersects(...)` gets it — and answers
+        //     `incompatible_protocol`, telling a caller that named no version
+        //     that the comparison failed, and pointing it at "change your
+        //     version" when the remedy is "send the field". §4.7 selects a code
+        //     precisely so the remedy is selectable, so the near-miss here is
+        //     non-conformant in the way that matters and green under any test
+        //     that only asserts `status == 400`.
+        //
+        //     Our own encoder builds this input: `HelloData::to_entity` omits
+        //     the key entirely for an empty list, so absent and empty are one
+        //     frame on the wire and one input to the guard. ---
+        assert_eq!(
+            pair_of(&over_tcp(hello_offering(&[]), shared.clone()).await),
+            (400, "invalid_request".to_string()),
+            "§4.5 (0.8.2.4): `protocols` is Required with NO default, so there \
+             is no floor to fall back to and an absent-or-empty set is a \
+             malformed hello. We accepted it as 'unconstrained' — the reading \
+             keystone's csharp and typescript peers had already refuted by \
+             requiring the field and passing conformance"
+        );
+
+        // --- The §4.7 out-of-order row, TCP: an operation we DO implement,
+        //     arriving in a state that forbids it → **409
+        //     `connection_sequence_error`**.
+        //
+        //     `ping` in `AwaitingHello` is that input: EXTENSION-NETWORK §5.1's
+        //     keepalive, for a connection that does not exist yet. It is the
+        //     input the two neighbouring refusals deliberately do NOT claim —
+        //     row 10 passes it through because we implement it, and the row-6
+        //     carve-out is scoped to `authenticate` — so it lands on this row by
+        //     construction rather than by ordering luck.
+        //
+        //     0.8.2.4 split the old out-of-order row and moved this half's
+        //     status 400 → 409, matching `connection_already_established`
+        //     directly above it. We had never implemented the row at all: the
+        //     frame reached `process_hello`, failed there as a non-hello, and
+        //     exited the catch-all as `400 handshake_failed`. ---
+        assert_eq!(
+            pair_of(
+                &over_tcp(
+                    entity_entity::Envelope::new(
+                        entity_protocol::build_connect_execute(
+                            "fm2-ping-pre-hello",
+                            "ping",
+                            &entity_entity::Entity::new(
+                                "system/network/ping",
+                                entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![])),
+                            )
+                            .expect("ping params"),
+                        )
+                        .expect("connect execute"),
+                    ),
+                    shared.clone(),
+                )
+                .await
+            ),
+            (409, "connection_sequence_error".to_string()),
+            "§4.7 (0.8.2.4): `ping` is implemented and advertised, so this is \
+             not row 10's unknown NAME — it is the same operation arriving in a \
+             state that forbids it, which is a state conflict and takes 409. \
+             The pre-fix answer was `400 handshake_failed`, a pair in no row"
+        );
+
+        // --- The out-of-order row's OTHER state, TCP, and it is the example
+        //     §4.7 names in its own text: "a second `hello` after
+        //     `hello_done`". The handshake is past hello and awaiting
+        //     authenticate; `hello` is implemented, so row 10 passes it
+        //     through, and it is not an `authenticate` so the row-6 carve-out
+        //     does not claim it either. Both pre-established states need their
+        //     own row because this refusal is decided per-arm — "forbidden" is
+        //     precisely what the state decides.
+        //
+        //     What we answered was `400 authentication_failed`: the status came
+        //     from the error and the code from `handshake_error_envelope`'s
+        //     call-site default at the authenticate frame. That PAIR appears in
+        //     no row of §4.7 — the same defect `entity-core-py` was corrected
+        //     for at `400 invalid_nonce`, since the table obligates the pair
+        //     and a plausible code under the wrong status is non-conformant
+        //     too. It also reads to the caller as "your credentials failed"
+        //     about a frame whose credentials were never examined.
+        //
+        //     Its own connection, because the refusal is terminal: like every
+        //     other handshake refusal here it writes the coded response and
+        //     then closes (§4.6 — the response MUST precede the close). Folded
+        //     into the multi-frame block below it just yields a broken pipe. ---
+        {
+            let (mut client, server) = crate::transport::memory_transport_pair();
+            let shared_c = shared.clone();
+            let handshake = tokio::spawn(async move {
+                let _ = connection::handle_connection(server, shared_c).await;
+            });
+            let hello_frame = entity_wire::encode_envelope(&hello_offering(&["entity-core/1.0"]));
+            write_frame(&mut client.writer, &hello_frame)
+                .await
+                .expect("first hello");
+            let _ = read_frame(&mut client.reader, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("hello response");
+            write_frame(&mut client.writer, &hello_frame)
+                .await
+                .expect("second hello");
+            let response = read_frame(&mut client.reader, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("the misordered frame is answered, not dropped");
+            let env = entity_wire::decode_envelope(&response).expect("decodable");
+            assert_eq!(
+                pair_of(&env),
+                (409, "connection_sequence_error".to_string()),
+                "§4.7 (0.8.2.4): a second `hello` where `authenticate` was \
+                 expected is a state conflict — 409, the same status as \
+                 `connection_already_established` in the row above it, and \
+                 never `authentication_failed`, which names a check this frame \
+                 never reached"
+            );
+            drop(client);
+            let _ = handshake.await;
+        }
+
+        // --- Control A: a hello whose set OVERLAPS ours still establishes.
+        //     Fails if row 1 was "fixed" by refusing any advertised set. ---
+        {
+            let (status, _) = pair_of(
+                &over_tcp(
+                    hello_offering(&["entity-core/99.0", "entity-core/1.0"]),
+                    shared.clone(),
+                )
+                .await,
+            );
+            assert_eq!(
+                status, 200,
+                "§4.5 negotiates `protocols` by INTERSECTION: a peer offering a \
+                 superset of ours is compatible. A guard that refuses this \
+                 passes row 1 and closes the peer to every counterparty that \
+                 advertises more than one version"
+            );
+        }
+
+        // --- Control B: `ping`, post-Established, still answered. This is the
+        //     row that fails if row 10's refusal is keyed on "not hello and not
+        //     authenticate" instead of on the advertised inventory. ---
+        {
+            let (mut client, server) = crate::transport::memory_transport_pair();
+            let shared_c = shared.clone();
+            let handshake = tokio::spawn(async move {
+                let _ = connection::handle_connection(server, shared_c).await;
+            });
+            async fn round_trip(
+                client: &mut crate::transport::Connection,
+                env: entity_entity::Envelope,
+            ) -> entity_entity::Envelope {
+                let frame = entity_wire::encode_envelope(&env);
+                write_frame(&mut client.writer, &frame).await.expect("send");
+                let response = read_frame(&mut client.reader, DEFAULT_MAX_FRAME_SIZE)
+                    .await
+                    .expect("a coded response");
+                entity_wire::decode_envelope(&response).expect("decodable")
+            }
+
+            let hello_response =
+                round_trip(&mut client, hello_offering(&["entity-core/1.0"])).await;
+            let nonce = entity_protocol::parse_execute_response(&hello_response)
+                .ok()
+                .and_then(|r| entity_protocol::HelloData::from_entity(&r.result).ok())
+                .map(|h| h.nonce)
+                .expect("the hello response carries the issued nonce");
+            let authenticate = entity_protocol::build_authenticate_envelope(&dialer, &nonce, fmt)
+                .expect("a well-formed authenticate");
+            assert_eq!(
+                entity_protocol::parse_execute_response(
+                    &round_trip(&mut client, authenticate).await
+                )
+                .map(|r| r.status)
+                .unwrap_or(0),
+                200,
+                "the handshake must complete honestly — control B measures the \
+                 POST-established intercept"
+            );
+
+            let (status, code) = pair_of(&round_trip(&mut client, unknown_op.clone()).await);
+            assert_eq!(
+                (status, code.as_str()),
+                (400, "invalid_request"),
+                "row 10 binds post-Established too — arch ruled it 'a name the \
+                 responder does not implement, in ANY state'. This arm fell \
+                 through to generic §5.2 verification, where the bare \
+                 connect-EXECUTE shape has no `author`, and reported `401 \
+                 authentication_failed` for a caller that had just authenticated"
+            );
+
+            // The SAME operation in the FULLY QUALIFIED spelling. §4.3 permits
+            // either form post-Established, and a real client uses this one —
+            // core-go's probe uses the peer-relative form, so a peer whose
+            // refusal recognizes only that spelling passes the wire check and
+            // refuses nothing a client would actually send.
+            //
+            // This row is not decoration: the first cut of the refusal tested
+            // the path with `Connection::is_connect_path`, which strips only an
+            // `entity://` scheme and therefore never matched `/{pid}/...`. Every
+            // assertion above passed and the post-Established arm was dead.
+            let qualified = entity_entity::Envelope::new(
+                entity_protocol::build_connect_execute_at(
+                    &format!(
+                        "/{}/{}",
+                        shared.keypair.peer_id().as_str(),
+                        entity_protocol::CONNECT_PATH
+                    ),
+                    "fm2-unknown-op-qualified",
+                    "frobnicate",
+                    &entity_entity::Entity::new(
+                        "test/v1",
+                        entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![])),
+                    )
+                    .expect("params"),
+                )
+                .expect("connect execute"),
+            );
+            let (q_status, q_code) = pair_of(&round_trip(&mut client, qualified).await);
+            assert_eq!(
+                (q_status, q_code.as_str()),
+                (400, "invalid_request"),
+                "§4.3: `/{{pid}}/system/protocol/connect` and \
+                 `system/protocol/connect` are the same address, so row 10 must \
+                 answer the same pair for both. Recognizing only the \
+                 peer-relative spelling makes this refusal a handshake-only \
+                 check wearing an 'in any state' comment"
+            );
+
+            // Control B, and it is a MEASUREMENT rather than a comment: send an
+            // actual `ping` and require that the name check let it THROUGH.
+            //
+            // `ping` is a connect operation we implement (EXTENSION-NETWORK
+            // §5.1), so row 10's refusal must not reach it. This bare frame
+            // carries no `author`, so it goes on to fail §5.2 verification —
+            // that is fine and is not what the row asserts. What it asserts is
+            // that the refusal is keyed on the **advertised inventory** and not
+            // on "anything that is not hello or authenticate": the latter passes
+            // the row above and kills every keepalive on every established
+            // connection, and the mutation proving it was written as a
+            // `matches!(op, "hello" | "authenticate")` guard.
+            //
+            // `a12_keepalive_ping_answers_pong` covers the full ping→pong
+            // round-trip with a real signed client; this row is here so the
+            // discriminator cannot be separated from the claim it discriminates.
+            let (ping_status, ping_code) = pair_of(
+                &round_trip(
+                    &mut client,
+                    entity_entity::Envelope::new(
+                        entity_protocol::build_connect_execute(
+                            "fm2-ping-control",
+                            "ping",
+                            &entity_entity::Entity::new(
+                                "system/network/ping",
+                                entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![])),
+                            )
+                            .expect("ping params"),
+                        )
+                        .expect("connect execute"),
+                    ),
+                )
+                .await,
+            );
+            assert!(
+                !(ping_status == 400 && ping_code == "invalid_request"),
+                "`ping` is an operation this connect handler IMPLEMENTS and \
+                 ADVERTISES, so §4.7 row 10 must not refuse it by name. Got \
+                 ({ping_status}, {ping_code:?}) — a refusal keyed on 'not hello \
+                 and not authenticate' rather than on `CONNECT_OPERATIONS` \
+                 passes every row above and breaks keepalive on every \
+                 established connection"
+            );
+
+            drop(client);
+            let _ = handshake.await;
+        }
+
+        // --- Rows on http-live, which routes by session state and so reaches
+        //     both refusals by a different path. ---
+        #[cfg(feature = "http-live")]
+        {
+            let mut conn = entity_protocol::Connection::new(shared.keypair.peer_id());
+            let env = connection::dispatch_session_envelope(
+                &hello_offering(&["entity-core/99.0"]),
+                &mut conn,
+                shared.clone(),
+            )
+            .await;
+            assert_eq!(
+                pair_of(&env),
+                (400, "incompatible_protocol".to_string()),
+                "http-live: same input, same pair. The negotiation lives in \
+                 `process_hello`, which both transports share — this row is what \
+                 proves the shared function is where the check landed"
+            );
+
+            let mut conn = entity_protocol::Connection::new(shared.keypair.peer_id());
+            let env =
+                connection::dispatch_session_envelope(&unknown_op, &mut conn, shared.clone()).await;
+            assert_eq!(
+                pair_of(&env),
+                (400, "invalid_request".to_string()),
+                "http-live: the unknown-operation refusal is hoisted OUT of \
+                 `dispatch_session_envelope`'s state match, so it binds every \
+                 arm. Landed inside the `AwaitingHello` arm it would miss the \
+                 other two"
+            );
+
+            // FM-2e on http-live. Same shared `process_hello`, different call
+            // site — the row that would go red if the guard were bolted onto
+            // the TCP handshake loop instead of into the negotiation both
+            // transports run.
+            let mut conn = entity_protocol::Connection::new(shared.keypair.peer_id());
+            let env = connection::dispatch_session_envelope(
+                &hello_offering(&[]),
+                &mut conn,
+                shared.clone(),
+            )
+            .await;
+            assert_eq!(
+                pair_of(&env),
+                (400, "invalid_request".to_string()),
+                "http-live: `protocols` absent/empty is malformed here too"
+            );
+
+            // The out-of-order row on http-live, in BOTH pre-established
+            // states. Unlike row 10 this one is checked per-arm — "forbidden"
+            // is what the state decides — so each arm needs its own row and a
+            // guard landed in one of them would leave the other answering a
+            // pair in no table.
+            let mut conn = entity_protocol::Connection::new(shared.keypair.peer_id());
+            let ping_frame = entity_entity::Envelope::new(
+                entity_protocol::build_connect_execute(
+                    "fm2-ping-pre-hello-live",
+                    "ping",
+                    &entity_entity::Entity::new(
+                        "system/network/ping",
+                        entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![])),
+                    )
+                    .expect("ping params"),
+                )
+                .expect("connect execute"),
+            );
+            let env =
+                connection::dispatch_session_envelope(&ping_frame, &mut conn, shared.clone()).await;
+            assert_eq!(
+                pair_of(&env),
+                (409, "connection_sequence_error".to_string()),
+                "http-live, `AwaitingHello`: an implemented operation in a \
+                 forbidden state is a 409 state conflict"
+            );
+
+            let mut conn = entity_protocol::Connection::new(shared.keypair.peer_id());
+            let established = connection::dispatch_session_envelope(
+                &hello_offering(&["entity-core/1.0"]),
+                &mut conn,
+                shared.clone(),
+            )
+            .await;
+            assert_eq!(
+                pair_of(&established).0,
+                200,
+                "the first hello must succeed — the row below measures the \
+                 state it moves us into, not a rejected handshake"
+            );
+            let env = connection::dispatch_session_envelope(
+                &hello_offering(&["entity-core/1.0"]),
+                &mut conn,
+                shared.clone(),
+            )
+            .await;
+            assert_eq!(
+                pair_of(&env),
+                (409, "connection_sequence_error".to_string()),
+                "http-live, `AwaitingAuthenticate`: §4.7's own example — a \
+                 second `hello` after `hello_done`"
+            );
+        }
     }
 
     /// The §3 advertisement filter, on the real assembly rather than on the

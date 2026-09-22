@@ -522,6 +522,70 @@ gates by making the TCP path compile on wasm32.
   `write` preserves a mode it did not create. When an assertion reads a value the OS, the clock, the
   locale or the filesystem also gets a vote on, run the mutation under **two** settings of it — one
   run cannot tell "the code is right" from "the environment was kind."
+  **Fifth axis, and it is the one where the vector controls everything and still misses: a probe
+  that drives only ONE of a field's legal SPELLINGS measures one spelling.** *(Candidate: bit us
+  once, 2026-09-01, caught before landing.)* §4.7 row 10's refusal has to answer *"an operation the
+  connect handler does not implement, in any state."* §4.3 gives the connect URI two legal forms —
+  peer-relative `system/protocol/connect` (the handshake, before the initiator knows our peer-id)
+  and fully qualified `/{pid}/system/protocol/connect` (what an established client actually sends).
+  We wrote the refusal against `Connection::is_connect_path`, which strips only an `entity://`
+  scheme and **never matches the qualified form**, so the post-Established arm was dead code — and
+  **core-go's `connect_unknown_operation` would have scored us PASS**, because it sends the
+  peer-relative spelling pre-handshake. A green cross-impl row certifying a dead branch is worse
+  than a red one. **Enforcement:** when a rule is about an *address*, enumerate the spellings the
+  spec admits for it and drive each one; in this tree the two path helpers are the tell —
+  `is_connect_path` (scheme-only) and `extract_handler_path` + `qualify_path` (what the dispatcher
+  actually uses), and a check written with the first while the dispatcher uses the second is the
+  defect. Grep `is_connect_path(` on any path that makes a decision. Teeth: the qualified row in
+  `incompatible_protocol_and_unknown_connect_op_on_both_transports`, which fails against the
+  `is_connect_path` form while every other row stays green.
+- **A control asserted in a COMMENT is not a control, and a control the code path can MASK is not
+  one either — run the mutation on the control, not just on the row.** *(Candidate: bit us once,
+  2026-09-01, twice in one function.)* §4.7 row 10's obvious implementation is *"not `hello` and
+  not `authenticate` → refuse"*, which passes the routed probe and **breaks every §5.1 keepalive**,
+  because `ping` is a connect operation we implement. We wrote the control as a paragraph — *"`ping`
+  must still be answered"* — and never sent a ping: the mutation **passed**. Then we sent one, and
+  it **passed again**, because the post-Established dispatch site carried its own hand-written
+  `"ping" => {}` arm that caught the frame before the helper was ever consulted. Two failures of the
+  same kind stacked: the first was a claim with no measurement behind it, the second was a
+  measurement a duplicated inventory made unobservable. **Both halves have an enforcement point.**
+  (a) A control whose property is *"X is still allowed"* must **drive X** and assert on the answer;
+  if the assertion does not name a value the mutation changes, it is prose. (b) A closed set that
+  decides behaviour belongs in **one** constant, read by every site — here `CONNECT_OPERATIONS`,
+  which is now literally the list `bootstrap_handler` advertises, so the dispatchable set and the
+  published interface cannot drift; a `match` arm that re-spells one member is a second copy, and a
+  second copy is what silently absorbs the mutation. Falling through IS the ping arm. Teeth: the
+  ping row in `incompatible_protocol_and_unknown_connect_op_on_both_transports`, verified RED under
+  `matches!(op, "hello" | "authenticate")` only after the duplicate arm was removed.
+  **The "X is still allowed" row does not TEAR DOWN like its neighbours, and in an in-process
+  handshake test that is a hang rather than a failure.** *(Candidate: bit us once, 2026-09-02, cost
+  ~30 min of a `make test` that looked slow.)* Every refusal row in a
+  `memory_transport_pair` + `handle_connection` test makes the server write its refusal and
+  **return**, so the row's `handshake.await` terminates on its own. The control row's input
+  *succeeds* — so the server advances to the next phase and blocks on `read_frame` for a frame the
+  test never sends, while the test awaits that task holding the client end open. Nothing fails;
+  the binary sits at ~0% CPU forever and `make test` reads as a long compile. **Enforcement:** a
+  success-path row over an in-process transport must `drop(client)` before awaiting the server
+  task — the drop is what turns the pending read into EOF — and it therefore cannot reuse the
+  refusal rows' driver closure. Diagnose the shape with `podman top <container>`: a test binary
+  with a multi-minute `ELAPSED` at ~0% CPU is a deadlock, not progress, and that is the one check
+  that distinguishes them from outside.
+- **A fix that gives an input its own coded path can RETIRE a neighbouring test's control without
+  touching it — re-run the old mutation, because the control will still be green.** *(Candidate:
+  bit us once, 2026-09-01.)* FM-1's anti-rename control sent a frame that was neither `hello` nor
+  `authenticate` and required it to exit through `handshake_error_envelope`'s catch-all, so that
+  "fixing" FM-1 by relabelling that default would go red. FM-2's row 10 then gave exactly that frame
+  a coded refusal of its own — so the control **no longer reached the catch-all at all**, and its
+  assertion (`status == 400 && !invalid_nonce`) was satisfied by the new code just as well as the
+  old. Nothing failed; nothing was edited; the property was simply gone. **Measured, not inferred:
+  relabelling the default to `invalid_nonce` left the whole FM-1 test GREEN.** This is the inverse
+  of the usual hazard — not a test edited to match new behaviour, but a test left untouched while
+  the behaviour moved out from under it, which no diff review can see because there is no diff.
+  **Enforcement:** when a change re-routes an input away from a shared fallback, re-run the
+  mutations of every test that used that fallback as its control; a control is scoped to the path
+  its input takes, and that path is not stated in the assertion. The repair is a *new* input that
+  still reaches the fallback (here a `hello` whose params are not a hello), never a widening of the
+  old one — teeth in `prehello_authenticate_is_invalid_nonce_on_both_transports` rows 5+6.
 - **N impls agreeing is evidence only if each one measured the stated condition — check that the
   harness transmits the vector's preconditions before you read agreement as convergence.**
   *(Candidate: bit us once, 2026-08-22, caught before the report went out.)* The 362-vector
@@ -880,6 +944,52 @@ Cross-impl wire fidelity. Same-side round-trip tests pass with the **wrong** sha
     `get`+`set` and zero CAS calls. Its neighbour `a_losing_cas_does_not_disturb_the_indexes`
     is deliberately kept **green under the same mutation** as the standing proof that the
     value assertion cannot see this class.
+  - **Sibling *rulings in one fold* — when a routing relays a spec VERSION, the boundary is
+    that version's diff, not the relay's worklist.** *(Candidate: bit us once, 2026-09-02,
+    caught before reporting the item closed.)* Arch's relay named one item (FM-2e, the
+    `protocols` absent/empty arm) and added *"rows 1 and 10 as you built them are conformant;
+    **nothing you shipped moves**."* Both sentences were true and neither is a statement about
+    a row we had **never shipped**. `0.8.2.4` folded six normative changes; reading the fold
+    commit's own diff against our tree found that the same edit splitting row 10 had also
+    moved the *state* half's status **400 → 409** and given it `connection_sequence_error` — a
+    §9.1 conformance line we answered `400 handshake_failed` pre-hello and `400
+    authentication_failed` at the second frame, **neither of which is a pair in any row of
+    §4.7**. A relay is written from the seat that landed the fold, so it names the items that
+    seat had open; a fold is a diff against the *spec*, and every seat's delta against it is
+    its own. **The trap is specific to the reassuring sentence:** "nothing you shipped moves"
+    scopes to what you shipped, and a missing row is not in that set — the more confidently a
+    relay clears you, the more precisely it is talking about the code you have.
+    **Enforcement:** when a routing cites a version bump, `git show <fold-commit> -- specs/…`
+    in `entity-core-protocol` and enumerate the normative changes yourself before scoping the
+    work — the fold commit's own message lists them, and the §9.1 conformance-profile block is
+    where a new obligation gets a line a check can read. Then diff *that* list against your
+    tree, and report the items the relay did not name rather than closing the one it did.
+    Same shape as the *"a routed work item is a delta against the sibling's tree"* rule below,
+    one level up: there the routing under-described the work, here it under-described the
+    ruling.
+  - **Sibling *inputs* reaching one call site — a MUST NOT on a CODE binds everywhere that
+    code is written, and the routing will scope it to the input somebody measured.**
+    *(Candidate: bit us once, 2026-09-02, caught before reporting the item closed.)* `0.8.2.5`
+    ruled CE-1 and, in the same note, said flatly *"Implementations MUST NOT emit
+    `connection_required` or `handshake_failed`"* — with the ground *"both are minted codes in
+    no spec code set"*, which is a property of the code wherever it appears, and the precedent
+    `invalid_signature`, a spelling §4.7 retired everywhere rather than at one site. The relay
+    routed only CE-1's input. But `handshake_failed` was a **call-site default**, and the input
+    the relay named was not the only one arriving there: a `hello` whose params are not a hello
+    reached the same two defaults and had nothing to do with CE-1. Fixing the routed input alone
+    leaves a MUST NOT violation behind a green gate. **The tell is grammatical**: read whether
+    the MUST NOT's object is the *input* ("this frame is refused X") or the *token* ("MUST NOT
+    emit X"). The second one's boundary is `grep -rn '"<code>"'`, and it is the whole tree.
+    **And the sweep will cost you a control, which is the second half of this entry.** Rows 5+6
+    of `prehello_authenticate_is_invalid_nonce_on_both_transports` existed to pin that residual
+    to its private code, so relabelling the catch-all went red. After the sweep the catch-all and
+    §4.7 row 10 share `invalid_request` **because the ruling says they are the same class** — the
+    property is gone by ruling, not by oversight, and no rewrite brings it back. That is the
+    inverse of the "a fix can retire a neighbouring control" entry below: there a re-route moved
+    an input off a shared fallback, here a ruling merged the fallback's code with a coded row's.
+    Same remedy: say at the test which property died and assert what still discriminates (here
+    the pair against the three coded pairs around it, plus a `!handshake_failed` term that is
+    now the only assertion in the tree that reddens if either default is reverted).
   Also check every **form** the value arrives in: a kind-based predicate (`is_error`) makes
   the enum variant and the entity variant one fact, so a site fixed for one is not fixed.
   And when a swept site turns out to be **fine**, prove it and say so at the code rather than

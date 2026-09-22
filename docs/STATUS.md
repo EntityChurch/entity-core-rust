@@ -1,6 +1,6 @@
 # entity-core-rust — status
 
-_Updated: 2026-08-22 · public: v0.8.0 (master)_
+_Updated: 2026-09-01 · public: v0.8.0 (master)_
 
 > **A note on the citations below.** Entries name the handoff, routing note or
 > validation report that produced them — files under `docs/status/` and
@@ -41,6 +41,45 @@ and tree semantics are interop-validated against the Go and Python peers, not
 just self-tested.
 
 ## Where we left off
+
+_2026-09-01 (b) — **§4.7's last two connect-error rows are closed, and building them found two
+defects no conformance probe would have reached.**_
+
+**Row 1 (`incompatible_protocol`) was a live gap here, and it was landed-spec conformance the
+whole time.** The hello handler decoded `protocols`, never intersected it, and echoed a hardcoded
+`["entity-core/1.0"]` back — so a peer speaking only `entity-core/99.0` completed the handshake at
+200 and discovered the incompatibility at its first request, as some other failure. §4.5 has
+required the non-empty intersection all along (*"Intersection, must be non-empty"*); no
+implementation in any of the three reference trees performed it. The responder now advertises a
+`protocols` set and rejects a **non-empty** disjoint one with `400 incompatible_protocol`; an
+omitted list stays unconstrained, because `protocols` is the one negotiated hello field the spec
+gives no default.
+
+**Row 10 (an unknown connect operation) answered `400 handshake_failed`** — a code that appears
+nowhere in the specification — by handing the frame to the hello path and failing it there. It is
+now `400 invalid_request`, distinct from the `409` state-conflict rows.
+
+**Two defects surfaced only from building the rows, not from the checks that motivated them.**
+First, the obvious way to refuse an unknown operation — *"anything that is not hello or
+authenticate"* — passes every conformance probe and **disables keepalive on every established
+connection**, because `ping` is a connect operation the peer implements and advertises. The refusal
+now reads the same constant the peer publishes as its handler interface, so the dispatchable set
+and the advertised set cannot disagree. Second, the first cut of that refusal recognized only the
+peer-relative spelling of the connect address and silently missed the fully-qualified one that an
+established client actually sends — so the post-handshake half was dead code that every test and
+every probe scored green. Both are pinned by rows that were verified to fail against the earlier
+behaviour.
+
+**Measured on the wire, not only in-tree:** `connectivity 30/30 · 0F` against the go oracle's
+checks, and the full six-pass cross-impl gate re-run clean (`1618 · 0F`, all six passes exit 0)
+because a refusal added to the first frame of every connection is worth ruling out a regression on.
+
+**A third finding was about the tests rather than the code.** Giving the unknown-operation input its
+own coded path quietly retired a neighbouring test's control: that control had required the same
+input to exit through a shared fallback, and it no longer reached the fallback at all. Nothing
+failed and nothing was edited — the property simply stopped existing. It was caught by re-running
+the old mutation rather than by reading the diff, and restored with an input that still reaches the
+fallback.
 
 _2026-08-22 (b) — **the release gate exits 0 for the first time, and the one line that got it there
 uncovered four shipping conformance defects.**_
