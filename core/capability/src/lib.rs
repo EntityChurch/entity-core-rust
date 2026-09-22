@@ -1015,6 +1015,54 @@ pub fn resolve_granter_peer_id<'a>(
         .canonical_peer_id()
 }
 
+/// §5.2's **pattern-subject** exclude rule — the grant-exclude half of
+/// `check_resource_scope`'s pattern arm, factored out because §6.3 now routes a
+/// second subject through the identical rule `[MUST]` (0.8.2.22).
+///
+/// A pattern subject cannot be tested against a grant exclude the way a concrete
+/// path is: `matches_pattern` is a **literal** comparison, so `/{p}/app/*` does
+/// not "match" the exclude `/{p}/app/secret` and re-spells straight past an
+/// exclusion it **spans**. The rule is therefore coverage, not matching — every
+/// grant exclude that `patterns_overlap`s the subject is uncovered unless the
+/// **caller's own** exclude already carves it out, and an uncovered one DENIES.
+///
+/// `caller_exclude` is the caller's `resource.exclude` at `check_resource_scope`
+/// and **empty** at `check_path_permission`, where there is no `resource` in
+/// scope — §6.3 says so in as many words. Empty is not a special case: with no
+/// caller exclude, `is_covered_by` is false for every overlap, so *every*
+/// overlapping grant exclude denies, which is exactly the sentence §6.3 states.
+///
+/// ⛔ **The sentinel arm is FIRST and that is a control-flow obligation, not a
+/// line** (§5.4, 0.8.2.22). `patterns_overlap(subject, NEVER_MATCH)` is `false`
+/// for every real pattern — `strip_wildcard` leaves the path-shaped sentinel
+/// intact and neither string prefixes the other — so a sentinel check written
+/// after the overlap test `continue`s past itself and is never reached. This
+/// tree shipped the arm in the right order at `9beb723` as a **routed departure**
+/// from `0.8.2.21`, which had called the pattern arm *"fail-closed by accident"*;
+/// `0.8.2.22` ratified the departure and now states the ordering rule generally.
+/// Keeping it in one function is what stops the two consumers drifting back.
+fn pattern_subject_survives_grant_excludes(
+    canonical_subject: &str,
+    grant_exclude: &[String],
+    caller_exclude: &[String],
+    local_peer_id: &str,
+    granter_peer_id: &str,
+) -> bool {
+    for ge in grant_exclude {
+        let cge = canonicalize(ge, granter_peer_id);
+        if cge == NEVER_MATCH {
+            return false;
+        }
+        if !patterns_overlap(canonical_subject, &cge) {
+            continue;
+        }
+        if !is_covered_by(&cge, caller_exclude, local_peer_id) {
+            return false;
+        }
+    }
+    true
+}
+
 /// Check resource scope — caller's requested targets must fit within grant scope (§5.2).
 ///
 /// Two canonicalization frames (V7 §5.5 / PR-8): the **request target** and the
@@ -1078,17 +1126,22 @@ pub fn check_resource_scope(
             // `the_pattern_arm_is_not_fail_closed_by_accident` fails against a
             // build of this function without this `if`. Spec-literal here is
             // fail-OPEN on the third of the three sites 0.8.2.21 enumerates.
-            for ge in grant_exclude {
-                let cge = canonicalize(ge, granter_peer_id);
-                if cge == NEVER_MATCH {
-                    return false;
-                }
-                if !patterns_overlap(&ct, &cge) {
-                    continue;
-                }
-                if !is_covered_by(&cge, caller_exclude, local_peer_id) {
-                    return false;
-                }
+            //
+            // **0.8.2.22 ratified that departure and added a SECOND consumer**
+            // (§6.3's pattern subject), so the rule moved into
+            // [`pattern_subject_survives_grant_excludes`] rather than being
+            // copied. The body is unchanged — sentinel first, then overlap, then
+            // caller-exclude coverage — and the only thing this call site still
+            // decides is whose exclude set plays the caller's part. Here it is
+            // the caller's own; at §6.3 there is none.
+            if !pattern_subject_survives_grant_excludes(
+                &ct,
+                grant_exclude,
+                caller_exclude,
+                local_peer_id,
+                granter_peer_id,
+            ) {
+                return false;
             }
         } else {
             // Concrete target: must not be in grant exclude (granter frame).
@@ -1269,7 +1322,7 @@ pub fn check_path_permission(
             operation,
             &grant.operations.include,
             &grant.operations.exclude,
-        ) && matches_scope(
+        ) && path_scope_admits_subject(
             // ⛔ **A FOURTH site of 0.8.2.21's fail-open, which the ruling does
             // not enumerate because all three of its sites are in §5.2 — and
             // this one is OURS, not the spec's.** §6.3's own pseudocode reads
@@ -1289,12 +1342,80 @@ pub fn check_path_permission(
             // already absolute — canonicalizing an absolute path is identity — so
             // passing `granter_peer_id` puts the grant's patterns in the granter
             // frame without moving the path into it.
+            //
+            // ⛔ **And a fifth shape at the same line: the subject may be a
+            // PATTERN, and `matches_scope` answers the wrong question for one**
+            // (§6.3, 0.8.2.22 — J3). `matches_scope`'s exclude test is
+            // `matches_pattern`, a literal comparison, so a subject of
+            // `/{p}/app/*` does not "match" the exclude `/{p}/app/secret` and is
+            // ALLOWED — while the set it names plainly contains the excluded
+            // path. See [`path_scope_admits_subject`] for the split.
             &canonical_path,
-            &grant.resources.include,
-            &grant.resources.exclude,
+            &grant.resources,
+            local_peer_id,
             granter_peer_id,
         )
     })
+}
+
+/// The resources dimension of §6.3, which is `matches_scope` for a **concrete**
+/// subject and §5.2's pattern-target rule for a **pattern** one `[MUST]`
+/// (0.8.2.22).
+///
+/// Two subjects, two questions that read alike:
+///
+/// - a **concrete** path asks *is this path in the scope?* — an exclude either
+///   matches it or does not, and [`matches_scope`] answers it (with 0.8.2.21's
+///   sentinel arm, which is why this function calls it rather than re-deriving);
+/// - a **pattern** asks *is every path this could name in the scope?* — and a
+///   literal exclude test answers the first question about the second subject,
+///   which is a fail-OPEN. `/{p}/app/*` is not literally equal to the exclude
+///   `/{p}/app/secret`, so it passes; the set it names contains `secret`.
+///
+/// §6.3 pins the pattern reading to §5.2's — *"a pattern subject is authorized
+/// exactly as §5.2 authorizes a pattern target, with the caller-exclude set
+/// empty"* — so this is the same [`pattern_subject_survives_grant_excludes`]
+/// that `check_resource_scope`'s pattern arm calls, with `&[]` for the caller
+/// exclude because §6.3 has no `resource` in scope to supply one.
+///
+/// ⚠ **Reachability, stated rather than implied, because an unreachable arm and
+/// an overlooked one look identical from outside.** Neither production consumer
+/// of [`check_path_permission`] passes a pattern today: `core/tree` passes
+/// effective targets and listing/extract entries, `extensions/query` passes a
+/// `candidate.path` — all concrete. The arm is written anyway because this is a
+/// `pub fn` whose return value is a security verdict, and §6.3 names a
+/// caller-facing rule that routes a pattern into it (`EXTENSION-SUBSCRIPTION`
+/// §2.3's `include_payload` read check). In this tree that check does not go
+/// through here — `extensions/subscription` routes it through
+/// [`check_permission`], which reaches `check_resource_scope`'s pattern arm and
+/// is therefore already conformant — so the hole was latent rather than live.
+/// **An invariant that lives in the callers is one the next caller does not
+/// inherit**, and the next caller is the one this arm is for.
+fn path_scope_admits_subject(
+    canonical_subject: &str,
+    scope: &PathScope,
+    local_peer_id: &str,
+    granter_peer_id: &str,
+) -> bool {
+    if !is_pattern(canonical_subject) {
+        return matches_scope(
+            canonical_subject,
+            &scope.include,
+            &scope.exclude,
+            granter_peer_id,
+        );
+    }
+    // The include half is the same coverage test under either subject shape —
+    // `matches_scope` runs `matches_pattern(value, include_pattern)` and so does
+    // `is_covered_by`. Only the exclude half differs, which is the whole of J3.
+    is_covered_by(canonical_subject, &scope.include, granter_peer_id)
+        && pattern_subject_survives_grant_excludes(
+            canonical_subject,
+            &scope.exclude,
+            &[],
+            local_peer_id,
+            granter_peer_id,
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -3666,6 +3787,134 @@ mod tests {
                 &format!("/{}/public", LOCAL_PEER)
             ),
             "CONTROL: and a working exclusion is not a check that denies everything"
+        );
+    }
+
+    /// ⛔ **§6.3's PATTERN SUBJECT (0.8.2.22 — J3): a pattern re-spells past a
+    /// concrete grant exclude it SPANS, because `matches_scope`'s exclude test
+    /// is a literal comparison.**
+    ///
+    /// The two subjects ask different questions in the same call:
+    ///
+    /// | subject | question | a concrete exclude `/{p}/app/secret` |
+    /// |---|---|---|
+    /// | `/{p}/app/secret` | *is this path in scope?* | matches → DENY ✓ |
+    /// | `/{p}/app/*` | *is every path this names in scope?* | does not literally equal it → **ALLOW** ✗ |
+    ///
+    /// Row 1 below is that fail-open. The subject `/{p}/app/*` names a set that
+    /// plainly contains `/{p}/app/secret`, the grant excludes exactly that path,
+    /// and the literal test answered ALLOW — authorizing a subject strictly
+    /// wider than the grant. §6.3 pins the correct reading to §5.2's: *"a pattern
+    /// subject is authorized exactly as §5.2 authorizes a pattern target, with
+    /// the caller-exclude set empty"*, so every **overlapping** grant exclude is
+    /// uncovered and denies.
+    ///
+    /// **The controls are the load-bearing half, because the fix is one edit away
+    /// from "deny every pattern".** Row 3 is a pattern subject under a grant whose
+    /// exclude does NOT overlap it — that MUST still be allowed, and it is the row
+    /// that fails if the pattern arm is written as a blanket refusal. Row 4 is the
+    /// concrete subject the same grant covers, which pins that routing patterns
+    /// through a second arm did not disturb the concrete one.
+    ///
+    /// ⚠ **Latent, not live, and the distinction is recorded rather than left to
+    /// be rediscovered.** Neither production consumer passes a pattern here today
+    /// (see [`path_scope_admits_subject`]); `EXTENSION-SUBSCRIPTION` §2.3's
+    /// `include_payload` check — §6.3's own worked case for a pattern subject —
+    /// routes through [`check_permission`] in this tree and so reaches
+    /// `check_resource_scope`'s pattern arm, which has had the rule since
+    /// `9beb723`. Row 5 drives that path to pin the equivalence, so the two
+    /// consumers cannot answer the same question differently.
+    ///
+    /// **Mutation-verified, and the result corrects what was written here before
+    /// it was run.** Forcing `path_scope_admits_subject` to take the
+    /// `matches_scope` branch for every subject reddens **row 1 only** — rows 2
+    /// through 5 stay green.
+    ///
+    /// Row 2 staying green is the useful part, not a gap: `matches_scope` carries
+    /// 0.8.2.21's sentinel arm itself (site 1, `9beb723`), so an unmatchable
+    /// exclude denies a pattern subject under **either** implementation. Row 2 is
+    /// therefore a **containment pin** rather than a discriminator — it fails if
+    /// the new pattern arm is ever written without the sentinel, which is the one
+    /// way this refactor could have lost a rule it was supposed to inherit. The
+    /// prediction that it would redden was a guess about which of two guards
+    /// catches the input, and two guards that refuse the same input tell you
+    /// nothing about each other — the same no-op-mutation shape this repo has
+    /// already recorded once.
+    ///
+    /// The single-row result is also why row 1 is written with a **concrete**
+    /// exclude rather than a sentinel one: only a well-formed exclude that the
+    /// literal test misses can separate the two readings.
+    #[test]
+    fn a_pattern_subject_is_authorized_as_a_pattern_not_matched_as_a_literal() {
+        let app_star = format!("/{}/app/*", LOCAL_PEER);
+        let secret = format!("/{}/app/secret", LOCAL_PEER);
+
+        let cap = |exclude: Vec<String>| {
+            make_token(vec![GrantEntry {
+                handlers: PathScope::new(vec!["system/tree".into()]),
+                resources: PathScope::with_exclude(vec![format!("/{}/app/*", LOCAL_PEER)], exclude),
+                operations: IdScope::new(vec!["get".into()]),
+                peers: None,
+                constraints: None,
+                allowances: None,
+            }])
+        };
+        let check = |token: &CapabilityToken, path: &str| {
+            check_path_permission("get", path, token, "system/tree", LOCAL_PEER, LOCAL_PEER)
+        };
+
+        let spanning = cap(vec![secret.clone()]);
+        let disjoint = cap(vec![format!("/{}/other/thing", LOCAL_PEER)]);
+
+        let mut mismatches: Vec<String> = Vec::new();
+        let mut row = |label: &str, got: bool, expected: bool| {
+            if got != expected {
+                mismatches.push(format!("[{label}]: got {got}, expected {expected}"));
+            }
+        };
+
+        row(
+            "row 1 — a pattern subject SPANNING a concrete grant exclude denies",
+            check(&spanning, &app_star),
+            false,
+        );
+        row(
+            "row 2 — and an UNMATCHABLE grant exclude denies a pattern subject too \
+             (the sentinel arm, which sits before the overlap test)",
+            check(&cap(vec!["*/secret".into()]), &app_star),
+            false,
+        );
+        row(
+            "row 3 CONTROL — a pattern subject under a NON-overlapping exclude is \
+             still ALLOWED; this is the row a blanket pattern refusal fails",
+            check(&disjoint, &app_star),
+            true,
+        );
+        row(
+            "row 4 CONTROL — the concrete arm is undisturbed: the excluded path \
+             itself still denies",
+            check(&spanning, &secret),
+            false,
+        );
+        row(
+            "row 5 — §5.2's pattern-target arm answers identically, which is what \
+             says the two consumers share one rule rather than two copies",
+            check_resource_scope(
+                &ResourceTarget {
+                    targets: vec![app_star.clone()],
+                    exclude: vec![],
+                },
+                &PathScope::with_exclude(vec![format!("/{}/app/*", LOCAL_PEER)], vec![secret]),
+                LOCAL_PEER,
+                LOCAL_PEER,
+            ),
+            false,
+        );
+
+        assert!(
+            mismatches.is_empty(),
+            "§6.3 pattern subject (0.8.2.22 J3):\n  {}",
+            mismatches.join("\n  ")
         );
     }
 

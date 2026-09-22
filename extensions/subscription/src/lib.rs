@@ -240,13 +240,25 @@ impl SubscriptionHandler {
         // pattern by design (§3 pattern subscriptions), so §3.3's
         // `malformed_resource` arm — "a resource-REQUIRING operation takes a
         // concrete path" — does not bind here. The arity arms do.
+        // §3.3's two empties (0.8.2.24) do NOT split here, and the reason is the
+        // rule's own scope: it separates them only for an operation that does
+        // **not** require a resource. `subscribe` requires one — the pattern IS
+        // the subject — so §3.3's untouched *"an empty effective list IS the
+        // absent case"* sentence still governs and both empties answer
+        // `path_required`. Written as two arms rather than a `_` so that the
+        // next reader can see the distinction was considered and declined.
         let pattern = match entity_handler::single_effective_target(
             ctx.resource_target.as_ref(),
             &self.local_peer_id,
             "system/subscription:subscribe (the subscription pattern)",
         ) {
-            Ok(Some(p)) => p,
-            Ok(None) => {
+            Ok(entity_handler::ResourceSubject::One(p)) => p,
+            Ok(entity_handler::ResourceSubject::SelfExcluded) => {
+                return Ok(entity_handler::self_excluded_refusal(
+                    "system/subscription:subscribe",
+                ))
+            }
+            Ok(entity_handler::ResourceSubject::Absent) => {
                 return Ok(error_result(
                     STATUS_BAD_REQUEST,
                     "path_required",

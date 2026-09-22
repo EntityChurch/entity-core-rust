@@ -204,7 +204,22 @@ impl PublishRootEngine {
             self.write_context(),
         );
 
-        // Bind the head pointer last (MANIFEST_GET reads it).
+        // ⛔ **THE ORDER IS LOAD-BEARING — signature first, head last (NETWORK
+        // §1.1: the PUBLISHER-SIDE window of the published-root verify race).**
+        // `MANIFEST_GET` reads this binding, and a consumer that gets head *N*
+        // back immediately fetches *N*'s signature. Bind the head before its
+        // signature and there is a window in which the peer is serving a head
+        // whose signature **does not yet exist**: the consumer's second fetch
+        // 404s, and an unsigned-looking root is the one thing it must refuse.
+        // The two writes are separate `set` calls with no transaction between
+        // them, so ordering is the entire defence.
+        //
+        // The consumer-side window of the same race is closed at
+        // `http_live::scope::ClosureScope::refresh` (the retained-anchor ring);
+        // core-py measured that BOTH windows redden `published_root.v5_outbound_dial`
+        // and neither alone leaves it green, so neither fix is the other's spare.
+        // Pinned by `publish_binds_the_signature_before_the_head`, which fails if
+        // these two blocks are ever swapped.
         let _ = self
             .location_index
             .set_with_context(&self.head_path(), hash, self.write_context());
@@ -800,6 +815,156 @@ mod tests {
     }
 
     // ----- Publisher -----
+
+    /// ⛔ **The PUBLISHER-SIDE window of the published-root verify race
+    /// (NETWORK §1.1): the signature MUST be bound before the head.**
+    ///
+    /// A consumer's verify cycle is two fetches — `MANIFEST_GET` returns head
+    /// *N*, then it fetches *N*'s signature and verifies before walking
+    /// anything. `publish` performs two independent `set`s with no transaction
+    /// between them, so **ordering is the entire defence**: bind the head first
+    /// and there is a window in which this peer serves a head whose signature
+    /// does not yet exist, and the consumer's second fetch 404s. It cannot tell
+    /// that from a publisher serving an unsigned root — the one thing the
+    /// signature exists to rule out — so it fails the cycle rather than
+    /// retrying.
+    ///
+    /// core-py measured both windows of this race against
+    /// `published_root.v5_outbound_dial`, and **neither fix alone leaves it
+    /// green**; the consumer-side half is `ClosureScope::refresh`'s retained-
+    /// anchor ring. core-go carries both, which is what made this a grep at our
+    /// seat rather than a report.
+    ///
+    /// **Observed at the moment of the write, not after it.** Asserting that
+    /// both bindings exist once `publish` returns is true under either order and
+    /// measures nothing; the decorator samples whether the signature already
+    /// resolves *as the head is being set*, which is exactly the consumer's
+    /// vantage point.
+    ///
+    /// **Mutation RUN:** swap the two blocks in `publish` (head bound before the
+    /// signature) → this row reddens with `signature_bound_when_head_was_set =
+    /// false`, and every other row in this module stays green — they all run
+    /// after both writes and cannot see the order.
+    #[test]
+    fn publish_binds_the_signature_before_the_head() {
+        /// Samples the signature binding at the instant the head path is set.
+        struct WatchHeadWrite {
+            inner: Arc<MemoryLocationIndex>,
+            head_path: String,
+            sig_path_prefix: String,
+            /// `Some(true)` once the head was set with its signature already
+            /// bound; `Some(false)` if it was set without one.
+            observed: Mutex<Option<bool>>,
+        }
+        impl WatchHeadWrite {
+            fn sample(&self, path: &str) {
+                if path != self.head_path {
+                    return;
+                }
+                let sig_bound = self
+                    .inner
+                    .list(&self.sig_path_prefix)
+                    .iter()
+                    .any(|e| e.path.starts_with(&self.sig_path_prefix));
+                *self.observed.lock().unwrap() = Some(sig_bound);
+            }
+        }
+        impl LocationIndex for WatchHeadWrite {
+            fn set(&self, path: &str, hash: Hash) {
+                self.sample(path);
+                self.inner.set(path, hash)
+            }
+            fn set_with_context(
+                &self,
+                path: &str,
+                hash: Hash,
+                ctx: entity_store::EmitContext,
+            ) -> entity_store::CascadeResult {
+                // `publish` writes through this one, not through `set`.
+                self.sample(path);
+                self.inner.set_with_context(path, hash, ctx)
+            }
+            fn get(&self, path: &str) -> Option<Hash> {
+                self.inner.get(path)
+            }
+            fn has(&self, path: &str) -> bool {
+                self.inner.has(path)
+            }
+            fn remove(&self, path: &str) -> Option<Hash> {
+                self.inner.remove(path)
+            }
+            fn list(&self, prefix: &str) -> Vec<entity_store::LocationEntry> {
+                self.inner.list(prefix)
+            }
+            fn len_prefix(&self, prefix: &str) -> usize {
+                self.inner.len_prefix(prefix)
+            }
+            // Forward the CAS trio: the defaults are a non-atomic get+set, and a
+            // decorator that declines to mention a method silently supplies
+            // them in front of a correct backend. Not load-bearing for `publish`
+            // — which writes through `set_with_context` — and forwarded anyway,
+            // because "this wrapper happens not to need it" is how that defect
+            // reached production once already.
+            fn compare_and_swap(
+                &self,
+                path: &str,
+                expected: Hash,
+                new_hash: Hash,
+            ) -> Result<(), entity_store::CasError> {
+                self.inner.compare_and_swap(path, expected, new_hash)
+            }
+            fn compare_and_remove(
+                &self,
+                path: &str,
+                expected: Hash,
+            ) -> Result<Hash, entity_store::CasError> {
+                self.inner.compare_and_remove(path, expected)
+            }
+            fn compare_and_create(
+                &self,
+                path: &str,
+                new_hash: Hash,
+            ) -> Result<(), entity_store::CasError> {
+                self.inner.compare_and_create(path, new_hash)
+            }
+        }
+
+        let store: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
+        let keypair = kp();
+        let peer_id = keypair.peer_id().as_str().to_string();
+        let watcher = Arc::new(WatchHeadWrite {
+            inner: Arc::new(MemoryLocationIndex::new()),
+            head_path: published_root_head_path(&peer_id),
+            sig_path_prefix: format!("/{}/system/signature/", peer_id),
+            observed: Mutex::new(None),
+        });
+        let li: Arc<dyn LocationIndex> = watcher.clone();
+
+        let mut bindings = BTreeMap::new();
+        bindings.insert("a".to_string(), store.put(leaf_entity("a")).unwrap());
+        let root_hash = build_trie(store.as_ref(), &bindings).unwrap();
+
+        let engine = PublishRootEngine::new(
+            store.clone(),
+            li.clone(),
+            keypair.clone_identity(),
+            peer_id.clone(),
+            dummy_identity_hash(),
+            format!("/{}/", peer_id),
+        );
+        let head = engine.publish(root_hash).unwrap();
+
+        let observed = *watcher.observed.lock().unwrap();
+        assert_eq!(
+            observed,
+            Some(true),
+            "signature_bound_when_head_was_set — the head was bound while no \
+             signature resolved, which serves a head a consumer cannot verify"
+        );
+        // And the ordinary post-condition, which is true under BOTH orders and
+        // is here only so a reader does not mistake it for the assertion above.
+        assert!(li.get(&invariant_signature_path(&peer_id, &head)).is_some());
+    }
 
     #[test]
     fn url_construction_matches_http_live_routes() {

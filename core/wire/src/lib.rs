@@ -309,11 +309,13 @@ pub fn decode_envelope(data: &[u8]) -> Result<Envelope, WireError> {
                     // must be spelled as its own field, not as a key that does
                     // not match its value.
                     if hash != entity.content_hash {
-                        return Err(WireError::CborDecode(format!(
-                            "envelope.included entry is filed under a hash that is not its \
-                             own: key {} vs entity {}",
-                            hash, entity.content_hash
-                        )));
+                        // Typed, not stringly — the caller has to tell this
+                        // apart from un-parseable bytes to answer it. See
+                        // `WireError::IncludedKeyMismatch`.
+                        return Err(WireError::IncludedKeyMismatch {
+                            key: hash.to_string(),
+                            actual: entity.content_hash.to_string(),
+                        });
                     }
                     included.insert(hash, entity);
                     inc_cursor = entity_end;
@@ -326,6 +328,39 @@ pub fn decode_envelope(data: &[u8]) -> Result<Envelope, WireError> {
 
     let root = root.ok_or_else(|| WireError::CborDecode("missing 'root' field".into()))?;
     Ok(Envelope::with_included(root, included))
+}
+
+/// Decode **only** an envelope's `root` entity, ignoring `included` entirely.
+///
+/// For one caller and one purpose: answering a [`WireError::IncludedKeyMismatch`]
+/// with a coded response instead of a silent drop. §5.2a's decode-boundary
+/// corollary says such a peer answers `400 hash_mismatch`, and an answer needs
+/// the `request_id`, which lives in the root — the part of a mis-keyed envelope
+/// that is *not* in question.
+///
+/// ⚠ **Not an alternative decode path, and deliberately not `pub`-adjacent to
+/// one.** The root it returns has been through no security pass: `content_hash`
+/// is verbatim from the wire (§5.4 byte fidelity) and nothing here validates it.
+/// The only field any caller may read from it is `request_id`, to address a
+/// refusal. Using it to *dispatch* would re-open the hole
+/// [`decode_envelope`] closes, one function over.
+pub fn decode_envelope_root(data: &[u8]) -> Result<Entity, WireError> {
+    let (major, count, head_size) = parse_cbor_head(data, 0)?;
+    if major != 5 {
+        return Err(WireError::CborDecode(format!(
+            "expected CBOR map for envelope, got major={major}"
+        )));
+    }
+    let mut cursor = head_size;
+    for _ in 0..count {
+        let (key, value_start) = decode_cbor_text(data, cursor)?;
+        let value_end = cbor_item_end(data, value_start)?;
+        if key == "root" {
+            return decode_entity(&data[value_start..value_end]);
+        }
+        cursor = value_end;
+    }
+    Err(WireError::CborDecode("missing 'root' field".into()))
 }
 
 /// Extract the raw on-wire CBOR byte slice of `key`'s value from a top-level
@@ -549,6 +584,20 @@ pub enum WireError {
 
     #[error("CBOR decode error: {0}")]
     CborDecode(String),
+
+    /// An `included` entry filed under a hash that is not its own — §1.8's
+    /// resolution-integrity refusal, taken at the decode boundary (0.8.2.23).
+    ///
+    /// ⛔ **Typed, and separate from [`WireError::CborDecode`], because the
+    /// two get different answers.** Un-parseable bytes have no `request_id` to
+    /// reply to and the frame is dropped; a mis-keyed envelope is *structurally
+    /// fine* — the root decodes, the request_id is right there — so §4.1's
+    /// *"every EXECUTE receives a response"* binds, and §5.2a names the answer:
+    /// a peer refusing at the decode boundary answers **`400 hash_mismatch`**.
+    /// Folding this into the generic decode error is what made our refusal
+    /// silent: fail-closed, and indistinguishable from a lost frame.
+    #[error("envelope.included entry is filed under a hash that is not its own: key {key} vs entity {actual}")]
+    IncludedKeyMismatch { key: String, actual: String },
 }
 
 #[cfg(test)]

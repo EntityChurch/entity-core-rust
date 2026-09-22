@@ -17,7 +17,7 @@
 //! anything you don't want to serve, never return an error that the
 //! caller might leak as 4xx vs 5xx.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -536,7 +536,24 @@ fn grant_allows_tree_get(grant: &entity_capability::GrantEntry, local_peer_id: &
 /// once per candidate child, and re-deriving it per query would make a single
 /// listing O(children × tree).
 pub struct ClosureScope {
-    cache: Mutex<Option<ClosureSnapshot>>,
+    cache: Mutex<ClosureCache>,
+}
+
+/// How many superseded heads keep their §1.1 verify-cycle anchors in scope.
+///
+/// A serving-window policy, not a wire value — core-go retains 16 and
+/// core-py 64, and the cohort deliberately did not converge them. 16 is taken
+/// here for go's reason: a head advance retains two hashes, so the whole ring is
+/// 32 anchors, and a consumer that has not finished a two-fetch cycle across 16
+/// republishes is not in a race, it is stalled.
+const RETAINED_HEADS: usize = 16;
+
+#[derive(Default)]
+struct ClosureCache {
+    current: Option<ClosureSnapshot>,
+    /// Superseded head hashes, oldest first, bounded by [`RETAINED_HEADS`].
+    /// See [`ClosureScope::refresh`] for what this is defending.
+    retired_heads: VecDeque<Hash>,
 }
 
 struct ClosureSnapshot {
@@ -551,7 +568,7 @@ impl ClosureScope {
     /// A closure scope tracking this listener's published-root head.
     pub fn new() -> Self {
         Self {
-            cache: Mutex::new(None),
+            cache: Mutex::new(ClosureCache::default()),
         }
     }
 
@@ -559,6 +576,34 @@ impl ClosureScope {
     /// Cheap when the head is unchanged (one LocationIndex lookup + a compare);
     /// re-walks the trie only on head advance. Clears the cache when nothing is
     /// published (the route then serves nothing — identical 404, T4).
+    ///
+    /// ⛔ **A head advance must not evict the anchors of the head a consumer is
+    /// mid-cycle on (NETWORK §1.1 — the CONSUMER-SIDE window of the
+    /// published-root verify race).** A consumer's verify cycle is **two**
+    /// fetches: `MANIFEST_GET` returns head *N*, then it fetches *N*'s signature
+    /// and verifies before walking anything. Recomputing this closure on root
+    /// change (Amendment 10) used to replace the snapshot wholesale, so a
+    /// republish landing between those two fetches dropped *N*'s signature —
+    /// and *N* itself — out of scope and the second fetch 404'd. The consumer
+    /// cannot distinguish that from a publisher serving an unsigned root, which
+    /// is the one thing the signature exists to rule out, so it fails the cycle
+    /// rather than retrying.
+    ///
+    /// The defence is a bounded ring of superseded heads whose two anchors stay
+    /// in `members`. Because `paths` is *projected* from `members` by the index
+    /// scan below, this covers **both faces** in one place — the content face
+    /// (`content/{hex}`) and the tree-path face, which is the one that actually
+    /// bites here: `signature_url` addresses the signature at the invariant
+    /// pointer path `/{peer}/system/signature/{hex}`, not by content hash.
+    ///
+    /// ⚠ **What this does NOT retain, stated rather than left to be
+    /// rediscovered:** the superseded head's *trie closure*. Structural sharing
+    /// means the great majority of a previous root's nodes are still members of
+    /// the new one, so a consumer walking the HAMT is very unlikely to miss —
+    /// but "unlikely" is not "cannot," and retaining whole closures is unbounded
+    /// memory for a serving window. core-go's `recentSigs` carries the same
+    /// residual; it is the anchors that are the measured failure, and this is
+    /// the same shape both other seats ship.
     fn refresh(&self, shared: &Arc<PeerShared>) {
         let peer_id = shared.peer_id.as_str();
         let head = shared
@@ -568,12 +613,24 @@ impl ClosureScope {
         let head = match head {
             Some(h) => h,
             None => {
-                *cache = None;
+                // The retired ring is deliberately KEPT. Nothing published is a
+                // reason to serve no *current* root; it is not a reason to
+                // strand a consumer who is mid-cycle on the head that was there
+                // a moment ago.
+                cache.current = None;
                 return;
             }
         };
-        if cache.as_ref().map(|s| s.head) == Some(head) {
+        if cache.current.as_ref().map(|s| s.head) == Some(head) {
             return;
+        }
+        if let Some(previous) = cache.current.as_ref().map(|s| s.head) {
+            if !cache.retired_heads.contains(&previous) {
+                cache.retired_heads.push_back(previous);
+                while cache.retired_heads.len() > RETAINED_HEADS {
+                    cache.retired_heads.pop_front();
+                }
+            }
         }
         let mut members = HashSet::new();
         members.insert(head); // the published-root entity itself
@@ -586,11 +643,16 @@ impl ClosureScope {
             }
         }
         // The authenticating signature, carried at the §5.2 invariant pointer.
-        if let Some(sig_hash) = shared
-            .location_index
-            .get(&entity_hash::invariant_signature_path(peer_id, &head))
-        {
-            members.insert(sig_hash);
+        // The current head and every retired one: the two fetches of one verify
+        // cycle are what the ring exists to keep together.
+        for anchor in std::iter::once(&head).chain(cache.retired_heads.iter()) {
+            members.insert(*anchor);
+            if let Some(sig_hash) = shared
+                .location_index
+                .get(&entity_hash::invariant_signature_path(peer_id, anchor))
+            {
+                members.insert(sig_hash);
+            }
         }
 
         // Project the content-face onto the path space: every binding that
@@ -615,7 +677,7 @@ impl ClosureScope {
             paths.insert("/".to_string());
         }
 
-        *cache = Some(ClosureSnapshot {
+        cache.current = Some(ClosureSnapshot {
             head,
             members,
             paths,
@@ -635,6 +697,7 @@ impl ScopePredicate for ClosureScope {
         self.refresh(shared);
         let cache = self.cache.lock().unwrap();
         Ok(cache
+            .current
             .as_ref()
             .map(|s| s.members.contains(hash))
             .unwrap_or(false))
@@ -647,7 +710,7 @@ impl ScopePredicate for ClosureScope {
     ) -> Result<bool, ScopeError> {
         self.refresh(shared);
         let cache = self.cache.lock().unwrap();
-        let snapshot = match cache.as_ref() {
+        let snapshot = match cache.current.as_ref() {
             Some(s) => s,
             None => return Ok(false),
         };

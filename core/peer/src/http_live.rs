@@ -687,6 +687,49 @@ async fn handle_execute_post(
     // §1.6 TCP length prefix MUST NOT be applied.
     let envelope = match decode_envelope(body_bytes.as_ref()) {
         Ok(e) => e,
+        // ⛔ A mis-keyed `included` map gets the §5.2a decode-boundary answer —
+        // a **coded** `400 hash_mismatch` in an ECF error envelope — on this
+        // transport too (0.8.2.23). It was answering a text/plain body with no
+        // `code` field at all, which is unreadable to any conformant client and
+        // scores as a different defect from the one it is.
+        //
+        // The transport differs and the answer must not: a rule about what a
+        // peer emits binds every face that emits it. Same finding as the TCP
+        // path in `connection.rs`, which was dropping the frame outright.
+        Err(e @ entity_wire::WireError::IncludedKeyMismatch { .. }) => {
+            let request_id = entity_wire::decode_envelope_root(body_bytes.as_ref())
+                .ok()
+                .and_then(|root| {
+                    let value: ciborium::Value =
+                        ciborium::from_reader(root.data.as_slice()).ok()?;
+                    value.as_map()?.iter().find_map(|(k, v)| {
+                        (k.as_text() == Some("request_id"))
+                            .then(|| v.as_text().map(String::from))
+                            .flatten()
+                    })
+                })
+                .unwrap_or_default();
+            tracing::warn!(
+                error = %e,
+                request_id = %request_id,
+                "http_live: refusing envelope — included entry filed under a foreign hash (§1.8)"
+            );
+            return match entity_protocol::build_error_response(
+                &request_id,
+                entity_handler::STATUS_BAD_REQUEST,
+                "hash_mismatch",
+                &e.to_string(),
+            ) {
+                Ok(resp) => Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header(hyper::header::CONTENT_TYPE, "application/cbor")
+                    .body(Full::new(Bytes::from(encode_envelope(&resp))))
+                    .unwrap_or_else(|_| {
+                        text_response(StatusCode::INTERNAL_SERVER_ERROR, "response build".into())
+                    }),
+                Err(_) => text_response(StatusCode::BAD_REQUEST, e.to_string()),
+            };
+        }
         Err(e) => {
             tracing::warn!(error = %e, "http_live: envelope decode failed");
             return text_response(

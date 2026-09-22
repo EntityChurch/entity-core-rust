@@ -412,6 +412,72 @@ pub async fn handle_connection(
                     &frame,
                     remote_peer_id.as_str(),
                 );
+
+                // ⛔ **A mis-keyed `included` map is ANSWERED, not dropped**
+                // (§5.2a decode-boundary corollary + §4.1, 0.8.2.23).
+                //
+                // Every other decode failure lands in the `continue` below and
+                // that is right: un-parseable bytes carry no `request_id`, so
+                // there is nothing to address a refusal to. This one is
+                // different and was being treated the same. The envelope is
+                // structurally *fine* — the root decodes, the request_id is
+                // sitting in it — and only the `included` keying is wrong, so
+                // §4.1's "every EXECUTE receives a response" binds and §5.2a
+                // names the answer.
+                //
+                // What we shipped instead was a **silent drop**: no response, no
+                // close, the caller blocked until its own timeout. That is
+                // fail-closed and unobservable, which is the weaker of the two
+                // dispositions core-go's `ROUTING-2026-09-13-f` finding (1) asks
+                // arch to choose between — their peer at least closes the
+                // connection. A caller cannot tell a refusal from a lost frame,
+                // and no conformance vector can score a peer that answers
+                // nothing.
+                //
+                // The connection stays up deliberately. The far side sent one
+                // bad envelope, not a bad stream; tearing down a multiplexed
+                // connection would take every unrelated in-flight request with
+                // it, and §5.2a's corollary contemplates a coded answer
+                // precisely so it need not.
+                if let entity_wire::WireError::IncludedKeyMismatch { .. } = e {
+                    // Root-only decode: the part of the envelope that is not in
+                    // question. Nothing but `request_id` is read from it —
+                    // `decode_envelope_root` says why at its own definition.
+                    let request_id = entity_wire::decode_envelope_root(&frame)
+                        .ok()
+                        .and_then(|root| {
+                            let value: ciborium::Value =
+                                ciborium::from_reader(root.data.as_slice()).ok()?;
+                            value.as_map()?.iter().find_map(|(k, v)| {
+                                (k.as_text() == Some("request_id"))
+                                    .then(|| v.as_text().map(String::from))
+                                    .flatten()
+                            })
+                        })
+                        .unwrap_or_default();
+                    tracing::warn!(
+                        remote_peer = %remote_peer_id,
+                        request_id = %request_id,
+                        error = %e,
+                        "refusing envelope: included entry filed under a foreign hash (§1.8)"
+                    );
+                    if let Ok(resp) = build_error_response(
+                        &request_id,
+                        STATUS_BAD_REQUEST,
+                        "hash_mismatch",
+                        &e.to_string(),
+                    ) {
+                        // Through the serial writer channel, like every other
+                        // response on this connection — the socket itself is
+                        // owned by the writer task. A closed channel means the
+                        // writer is gone, which is the end of the connection.
+                        if resp_tx.send(encode_envelope(&resp)).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    continue;
+                }
+
                 tracing::warn!(remote_peer = %remote_peer_id, error = %e, "failed to decode envelope");
                 continue;
             }
@@ -2076,7 +2142,51 @@ pub(crate) async fn dispatch_request(
             // same string by the time this line runs. The handler still sees
             // absolute targets; what changed is that the narrowing no longer
             // *performs* the qualification, it inherits it.
-            rt.targets = entity_capability::effective_targets(Some(&rt), pid.as_str());
+            //
+            // ⛔ **But the projection MUST NOT be lossy about its own EMPTINESS
+            // `[MUST]` (§3.3, 0.8.2.24 — N6), and THIS is the site where that
+            // bites, not the handler.** Narrowing `targets:[P] exclude:[P]` to
+            // `[]` destroys the one fact N6 turns into a branch: downstream it is
+            // then indistinguishable from a caller who sent no `resource` at all,
+            // and the handler takes the ABSENT-CASE behaviour — on `system/tree:get`
+            // the §4.10 listing arm, in answer to a request for one excluded path.
+            //
+            // **Measured, and it is why a handler-only fix is not implementable
+            // here:** with `core/tree` already splitting the two empties, a wire
+            // EXECUTE carrying `targets:[qA] exclude:[qA]` still answered `200` —
+            // the handler's `SelfExcluded` arm was **unreachable**, because this
+            // line had already erased its input. 0.8.2.20's structural boundary
+            // narrowing and 0.8.2.24's two-empties split are the same field read
+            // twice, and the first silently deletes the second unless the empty
+            // case is exempted here. Any seat that adopted the boundary narrowing
+            // has this; a seat that only ever narrowed inside the handler does not.
+            //
+            // So: narrow when narrowing leaves something, keep the pair when it
+            // would not. The effective set is identical either way —
+            // `effective_targets` is idempotent and is what both
+            // `check_resource_scope` and `entity_handler::single_effective_target`
+            // call — so nothing downstream computes a different subject. What
+            // changes is only that the handler can still tell WHICH empty it has.
+            //
+            // ⚠ The residual, stated rather than implied: in the all-excluded case
+            // a NON-conformant handler indexing `targets[0]` sees the excluded
+            // path. That is the `F68`/`CP-12a` shape this boundary exists to
+            // prevent — and it is bounded to the one case where the only
+            // conformant answer is a refusal, which every consumer of the single
+            // derivation now gives without reading a target at all. Narrowing to
+            // `[]` does not close it either: a handler willing to index
+            // `targets[0]` unguarded would read `targets[0]` of an empty vec and
+            // panic, or fall through to an absent-case it was never asked for.
+            // The enforcement is `entity_handler::single_effective_target`, and
+            // this line is defence in depth for the arity cases above it.
+            //
+            // Pinned END TO END by `core/peer/tests/two_empties_vector.rs`, which
+            // crosses a real socket — the in-process rows in `core/tree` cannot
+            // see this line at all.
+            let effective = entity_capability::effective_targets(Some(&rt), pid.as_str());
+            if !effective.is_empty() {
+                rt.targets = effective;
+            }
             Some(rt)
         }
         None => None,
@@ -4308,14 +4418,59 @@ pub fn make_execute_fn(
                             qualified.push(q);
                         }
                         rt.targets = qualified;
-                        // §5.2 subject rule (0.8.2.20) — same narrowing as the
-                        // wire path above. It runs on the sub-dispatch seam
-                        // too because the effective set is a property of the
-                        // REQUEST, not of whether a capability was checked: a
-                        // reduction that lived only in the authorizer would
-                        // give the same request a different arity answer
-                        // depending on whether one was presented.
-                        rt.targets = entity_capability::effective_targets(Some(&rt), pid.as_str());
+                        // §5.2 subject rule (0.8.2.20) — the same narrowing the
+                        // boundary has always applied here, because the effective
+                        // set is a property of the REQUEST, not of whether a
+                        // capability was checked: a reduction that lived only in
+                        // the authorizer would give the same request a different
+                        // arity answer depending on whether one was presented.
+                        // It is the second of the two layers
+                        // `the_dispatch_boundary_hands_the_handler_only_the_effective_targets`
+                        // exists to observe, and it is unchanged.
+                        //
+                        // ⛔ **But the projection MUST NOT be lossy about its own
+                        // EMPTINESS `[MUST]` (§3.3, 0.8.2.24 — N6).** Narrowing
+                        // `targets:[P] exclude:[P]` to `[]` destroys the one fact
+                        // N6 turns into a branch: it is then indistinguishable
+                        // from a caller who named nothing, and the handler takes
+                        // the ABSENT-CASE behaviour — on `tree:get`, a listing of
+                        // the tree in answer to a request for one excluded path.
+                        //
+                        // **This seam and the INBOUND WIRE one are the same
+                        // defect, and both are exempted identically.** A first
+                        // pass here claimed the wire path was safe because
+                        // `extract_resource_target` returns the raw pair — that
+                        // read stopped one statement short. `dispatch_request`
+                        // narrows again immediately after qualifying, and the
+                        // wire vector proved it: with `core/tree`'s split already
+                        // landed, a real EXECUTE carrying `targets:[qA]
+                        // exclude:[qA]` still answered `200`, because the
+                        // handler's `SelfExcluded` arm was unreachable. The two
+                        // sites are kept in step deliberately; a seam that
+                        // narrows and one that does not is how the same request
+                        // gets two answers depending on which door it came in.
+                        //
+                        // So: narrow when narrowing leaves something, and leave
+                        // the pair intact when it would not. The effective set is
+                        // identical either way — `effective_targets` is what both
+                        // `check_resource_scope` and
+                        // `entity_handler::single_effective_target` call, and it
+                        // is idempotent — so nothing downstream computes a
+                        // different subject. What changes is only that the
+                        // handler can still tell WHICH empty it has.
+                        //
+                        // ⚠ The residual is the same one stated at the inbound
+                        // site, and is bounded the same way: a non-conformant
+                        // consumer indexing `targets[0]` sees the excluded path,
+                        // in the one case whose only conformant answer is a
+                        // refusal. `entity_handler::single_effective_target` is
+                        // the enforcement; this is defence in depth for the
+                        // arity cases.
+                        let effective =
+                            entity_capability::effective_targets(Some(&rt), pid.as_str());
+                        if !effective.is_empty() {
+                            rt.targets = effective;
+                        }
                         Some(rt)
                     }
                     None => None,

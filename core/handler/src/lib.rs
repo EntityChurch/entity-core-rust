@@ -688,6 +688,48 @@ impl HandlerResult {
 // §3.3 resource selection — the ONE arity+selection site (0.8.2.20)
 // ---------------------------------------------------------------------------
 
+/// What a request's `resource` names, for the operations whose `resource` is
+/// **optional** (§3.3, 0.8.2.24).
+///
+/// ⛔ **The two empties are different requests, and `Option<String>` cannot say
+/// so.** Until 0.8.2.24 this derivation returned `Option<String>`, and its
+/// `None` had to mean *"the caller named nothing — take this operation's own
+/// absent-case behaviour"* for one reading and *"the caller named a target and
+/// then excluded it"* for the other. Both are correct readings of "empty," and
+/// the spec now rules they get **different answers**: the first takes the
+/// absent-case behaviour, the second is refused `400 path_required` and **MUST
+/// NOT** be served the absent case. On `system/tree:get` the collapsed form
+/// answered a request for **one excluded path** with a **listing of the tree** —
+/// §5.2's subject rule (*a handler MUST NOT widen the set*) reached through the
+/// front door.
+///
+/// This is the same remedy as [`entity_capability`]'s `DispatchCeiling`, for the
+/// same reason and one dimension over: **reach for the enum the moment you catch
+/// yourself writing "`None` here means…" twice with different answers**, and let
+/// the compiler enumerate the call sites.
+///
+/// **`SelfExcluded` is keyed on the RAW target list, not on `Option::is_some`.**
+/// A `resource` present with `targets: []` named nothing, so it is
+/// [`Absent`](ResourceSubject::Absent) — the same ratified rule that makes an
+/// optional array's absent and empty one fact. The wire decoder
+/// (`connection::extract_resource_target`) already collapses that shape to a
+/// bare `None`, so on the inbound path the third state cannot arise; keying on
+/// the list rather than on the `Option` is what makes the in-process seam agree
+/// with it instead of depending on that decoder's choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResourceSubject {
+    /// No `resource`, or one naming no targets. Take the operation's own
+    /// absent-case behaviour — for `system/tree:get`, the root listing.
+    Absent,
+    /// A `resource` named at least one target and the caller's own `exclude`
+    /// covers every one of them. **Not** the absent case: `400 path_required`.
+    SelfExcluded,
+    /// Exactly one effective target, canonicalized. May be a pattern — the
+    /// `malformed_resource` arm belongs to the callers that require a concrete
+    /// path, not here.
+    One(String),
+}
+
 // `HandlerResult` is 176 bytes (a status plus an `Entity`) and these three
 // return it as the `Err` arm, which is the point: a §3.3 refusal is a
 // *response*, not a transport error. Boxing to satisfy
@@ -735,6 +777,12 @@ pub fn require_single_resource_path(
 ) -> Result<String, HandlerResult> {
     match optional_single_resource_path(resource_target, local_peer_id, what)? {
         Some(path) => Ok(path),
+        // Both empties, deliberately: §3.3's *"an empty effective list IS the
+        // absent case ... for an operation that REQUIRES a resource"* is
+        // untouched by 0.8.2.24, which splits them only for the operations that
+        // do NOT require one. `optional_single_resource_path` has already
+        // answered `SelfExcluded` above; this arm is the genuinely-absent one
+        // and it answers the same code.
         None => Err(HandlerResult::error(
             STATUS_BAD_REQUEST,
             error_entity(
@@ -746,8 +794,15 @@ pub fn require_single_resource_path(
 }
 
 /// [`require_single_resource_path`] for an operation whose `resource` is
-/// **optional** — the empty effective list is `Ok(None)` rather than
+/// **optional** — a genuinely absent resource is `Ok(None)` rather than
 /// `path_required`.
+///
+/// ⛔ **Only the GENUINELY ABSENT empty is `Ok(None)` `[MUST]` (§3.3,
+/// 0.8.2.24).** A `resource` that named targets and whose effective list is
+/// empty — the caller's own `exclude` removed every one of them — is
+/// [`ResourceSubject::SelfExcluded`] and is refused `400 path_required` here.
+/// It is NOT the absent case and MUST NOT be served the absent-case behaviour;
+/// see [`ResourceSubject`] for why the two are different requests.
 ///
 /// The subject rule still binds for the present case, which is the whole point
 /// of having this rather than `targets.first()`: an optional resource that IS
@@ -761,8 +816,9 @@ pub fn optional_single_resource_path(
     what: &str,
 ) -> Result<Option<String>, HandlerResult> {
     match single_effective_target(resource_target, local_peer_id, what)? {
-        None => Ok(None),
-        Some(path) => {
+        ResourceSubject::Absent => Ok(None),
+        ResourceSubject::SelfExcluded => Err(self_excluded_refusal(what)),
+        ResourceSubject::One(path) => {
             // §3.3 (0.8.2.20): a resource-requiring operation takes a CONCRETE
             // path. A lone pattern target is `malformed_resource` — distinct
             // from `invalid_path` (structurally invalid anywhere) and from
@@ -807,11 +863,18 @@ pub fn single_effective_target(
     resource_target: Option<&entity_capability::ResourceTarget>,
     local_peer_id: &str,
     what: &str,
-) -> Result<Option<String>, HandlerResult> {
+) -> Result<ResourceSubject, HandlerResult> {
+    // §3.3 (0.8.2.24) — which empty this is, decided here and nowhere else.
+    // `named_a_target` is read from the RAW target list, not from
+    // `resource_target.is_some()`: a resource naming no targets is the absent
+    // case (an optional array's absent and empty are the same fact, already
+    // ratified in this tree), and a resource that named one is not.
+    let named_a_target = resource_target.is_some_and(|rt| !rt.targets.is_empty());
     let mut effective = entity_capability::effective_targets(resource_target, local_peer_id);
     match effective.len() {
-        0 => Ok(None),
-        1 => Ok(Some(entity_capability::canonicalize(
+        0 if named_a_target => Ok(ResourceSubject::SelfExcluded),
+        0 => Ok(ResourceSubject::Absent),
+        1 => Ok(ResourceSubject::One(entity_capability::canonicalize(
             &effective.remove(0),
             local_peer_id,
         ))),
@@ -823,6 +886,22 @@ pub fn single_effective_target(
             ),
         )),
     }
+}
+
+/// The §3.3 refusal for a [`ResourceSubject::SelfExcluded`] request, shared by
+/// every consumer so the code and the reason cannot drift apart at four sites.
+#[allow(clippy::result_large_err)]
+pub fn self_excluded_refusal(what: &str) -> HandlerResult {
+    HandlerResult::error(
+        STATUS_BAD_REQUEST,
+        error_entity(
+            "path_required",
+            &format!(
+                "{what}: every resource target this request named is covered by \
+                 its own exclude — the effective set is empty"
+            ),
+        ),
+    )
 }
 
 /// Build a `system/protocol/error` entity carrying `code` and `message`.

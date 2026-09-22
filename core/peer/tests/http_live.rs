@@ -567,6 +567,139 @@ async fn poll_closure_scope_serves_signed_root_closure() {
     handle.abort();
 }
 
+/// ⛔ **The CONSUMER-SIDE window of the published-root verify race (NETWORK
+/// §1.1): a republish MUST NOT strand a consumer mid-verify-cycle.**
+///
+/// The cycle is **two** fetches — `MANIFEST_GET` returns head *N*, then the
+/// consumer fetches *N*'s signature and verifies it against the pinned key
+/// before walking anything (`PublishedRootClient::fetch_root`). Recomputing the
+/// served closure on root change (Amendment 10) used to replace the snapshot
+/// wholesale, so a republish landing **between those two fetches** dropped *N*
+/// and *N*'s signature out of scope and the second fetch 404'd. The consumer
+/// cannot distinguish that from a publisher serving an unsigned root — the one
+/// thing the signature exists to rule out — so it fails rather than retries.
+///
+/// This row **sequences the race deliberately instead of sampling it**, which is
+/// core-py's own suggested class fix for `published_root.v5_outbound_dial`: that
+/// check only catches this when the race happens to land, and a green run there
+/// is not evidence.
+///
+/// **Both faces are driven, and the tree-path one is the face that actually
+/// bites:** `published_root::signature_url` addresses the signature at the
+/// invariant pointer `/{peer}/system/signature/{hex}`, a *tree path*, not by
+/// content hash. The fix retains anchors in `members`, and `paths` is projected
+/// from `members` by the same index scan, so one change covers both — and this
+/// row asserts both rather than trusting that projection.
+///
+/// **Mutation RUN:** drop the retained-anchor ring (retire nothing on head
+/// advance) → the two post-republish assertions redden with `404`, and the
+/// pre-republish assertions and every other row in this file stay green.
+#[tokio::test]
+async fn a_republish_does_not_stranded_a_consumer_mid_verify_cycle() {
+    use entity_peer::http_live::ClosureScope;
+    use std::collections::BTreeMap;
+
+    let server = PeerBuilder::new()
+        .keypair(Keypair::from_seed([93u8; 32]))
+        .build()
+        .expect("peer builds");
+    let peer_id = server.peer_id().to_string();
+    let shared = server.shared();
+    server.start_engines(&shared);
+
+    let publish = |tag: &'static str| {
+        let shared = shared.clone();
+        let peer_id = peer_id.clone();
+        move || {
+            let entity = Entity::new("test/blob", tag.as_bytes().to_vec()).expect("entity");
+            let leaf_hash = entity.content_hash;
+            shared.content_store.put(entity).expect("put leaf");
+            let key = format!(
+                "system/content/public/{}",
+                hex_encode(&leaf_hash.to_bytes())
+            );
+            shared
+                .location_index
+                .set(&format!("/{}/{}", peer_id, key), leaf_hash);
+            let mut bindings = BTreeMap::new();
+            bindings.insert(key, leaf_hash);
+            entity_tree::trie::build_trie(shared.content_store.as_ref(), &bindings)
+                .expect("build trie")
+        }
+    };
+
+    let head_n = server.publish_root(publish("first")()).expect("publish N");
+    let sig_path_n = entity_hash::invariant_signature_path(&peer_id, &head_n);
+    let sig_hash_n = shared
+        .location_index
+        .get(&sig_path_n)
+        .expect("signature bound at invariant pointer");
+
+    let listener = HttpLiveListener::bind_poll("127.0.0.1:0", "")
+        .await
+        .expect("poll listener binds")
+        .with_scope(Arc::new(ClosureScope::new()));
+    let url = format!("http://{}", listener.bound_addr());
+    let shared_clone = shared.clone();
+    let handle = tokio::spawn(async move {
+        let _ = listener.serve(shared_clone).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+    let client = reqwest::Client::new();
+    let status = |u: String| {
+        let c = client.clone();
+        async move { c.get(u).send().await.expect("request").status().as_u16() }
+    };
+    let content_url = |h: &Hash| format!("{}/content/{}", url, hex_encode(&h.to_bytes()));
+
+    // FETCH 1 of the cycle: the consumer has head N in hand. Both faces of N's
+    // signature resolve — this is the pre-condition, and it is what makes the
+    // post-republish rows a claim about retention rather than about the peer
+    // never having served them.
+    assert_eq!(status(content_url(&sig_hash_n)).await, 200);
+    assert_eq!(status(format!("{}{}.bin", url, sig_path_n)).await, 200);
+
+    // THE RACE, sequenced: the head advances to N+1 while the consumer is
+    // between its two fetches.
+    let head_n1 = server
+        .publish_root(publish("second")())
+        .expect("publish N+1");
+    assert_ne!(
+        head_n, head_n1,
+        "the fixture must actually advance the head, \
+         or both rows below pass for the wrong reason"
+    );
+
+    // FETCH 2 of the cycle, now against a peer whose head has moved.
+    assert_eq!(
+        status(content_url(&sig_hash_n)).await,
+        200,
+        "content face: N's signature must still resolve after the head advanced \
+         — a consumer mid-cycle reads a 404 here as an unsigned root"
+    );
+    assert_eq!(
+        status(format!("{}{}.bin", url, sig_path_n)).await,
+        200,
+        "tree-path face: `signature_url` addresses the invariant pointer, so \
+         this is the face the real consumer fetches"
+    );
+    assert_eq!(
+        status(content_url(&head_n)).await,
+        200,
+        "the superseded published-root entity itself is an anchor of the same \
+         cycle — a consumer that re-reads it by hash must not 404 either"
+    );
+
+    // CONTROL — retention is not "serve everything." A hash that was never in
+    // any closure is still the identical 404 (T4), so the rows above are the
+    // ring working and not the scope predicate having been opened up.
+    let stray = Hash::compute("test/stray", b"never in any closure");
+    assert_eq!(status(content_url(&stray)).await, 404);
+
+    handle.abort();
+}
+
 /// The §6.5.3.1 listing routes under closure scope — `{prefix}.list`,
 /// `{peer_id}.list`, and the universal `peers.list`.
 ///

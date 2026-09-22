@@ -4757,6 +4757,184 @@ mod tests {
         );
     }
 
+    /// ⛔ **A mis-keyed `included` map is ANSWERED `400 hash_mismatch`, not
+    /// dropped** (§5.2a decode-boundary corollary + §4.1, 0.8.2.23).
+    ///
+    /// This tree takes §1.8 mechanism **(a)**, bind the key, at three sites, and
+    /// the outermost is `decode_envelope` — the constructor, which is the right
+    /// place for it. What nobody had checked is what a **caller** sees when that
+    /// refusal fires, and the answer was **nothing at all**: the TCP message loop
+    /// treated it as an ordinary decode failure and `continue`d, so the frame was
+    /// dropped with no response and no close, and the caller blocked until its own
+    /// timeout. Fail-closed and *unobservable* — a caller cannot tell a refusal
+    /// from a lost frame, and no conformance vector can score a peer that answers
+    /// nothing.
+    ///
+    /// The distinction the old code missed is that a mis-keyed envelope is not
+    /// malformed bytes. Un-parseable input has no `request_id` to reply to and
+    /// dropping it is correct; here the root decodes, the `request_id` is right
+    /// there, and §4.1's *"every EXECUTE receives a response"* binds.
+    ///
+    /// **This row is also this seat's answer to `ROUTING-2026-09-13-f` finding
+    /// (1)**, which asks whether a key-binding peer MUST emit a coded status or
+    /// may fail closed by a connection close. We answer **coded**, on a
+    /// connection that stays up — and we answer it having found that our previous
+    /// behaviour was neither of the two options arch is choosing between.
+    ///
+    /// **Why the control is not optional here.** The refusal must not take the
+    /// connection with it: a multiplexed connection carries unrelated in-flight
+    /// requests, and "refuses the envelope" and "kills the stream" produce the
+    /// same result for *this* request. Row 2 drives a well-formed EXECUTE over
+    /// the **same** connection afterwards, so row 1 is the envelope being refused
+    /// and not the socket being poisoned.
+    ///
+    /// **Mutation-verified:** restoring the bare `continue` for this error makes
+    /// row 1 fail as a request **timeout** rather than an assertion — which is
+    /// precisely the shape that let the defect ship, so the row asserts on the
+    /// decoded `code` key and the test carries a short timeout rather than
+    /// waiting out the default.
+    #[tokio::test]
+    async fn a_miskeyed_included_map_is_answered_with_a_coded_400_not_dropped() {
+        use remote::RemoteEndpoint as _;
+        use transport::{MemoryConnector, MemoryListener, MemoryTransportRegistry};
+        let registry = MemoryTransportRegistry::new();
+
+        let server = PeerBuilder::new()
+            .identity_keypair(entity_crypto::IdentityKeypair::Ed25519(
+                entity_crypto::Keypair::from_seed([91u8; 32]),
+            ))
+            .build()
+            .unwrap();
+        let server_pid = server.peer_id().to_string();
+        let listener = MemoryListener::bind(server_pid.clone(), registry.clone()).unwrap();
+        let shared = server.shared();
+        server.start_engines(&shared);
+        let shared_clone = shared.clone();
+        let server_handle = tokio::spawn(async move {
+            let _ = server::run(listener, shared_clone).await;
+        });
+        tokio::task::yield_now().await;
+
+        let client =
+            entity_crypto::IdentityKeypair::Ed25519(entity_crypto::Keypair::from_seed([92u8; 32]));
+        let conn = MemoryConnector::new(registry.clone())
+            .connect(&format!("memory://{}", server_pid))
+            .await
+            .unwrap();
+        let remote = remote::perform_connect(conn, &client, entity_hash::HASH_ALGORITHM_SHA256)
+            .await
+            .expect("handshake");
+
+        let params = entity_entity::Entity::new(
+            "system/params",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![])),
+        )
+        .unwrap();
+
+        // A well-formed authenticated EXECUTE, then ONE entry of its `included`
+        // map re-filed under a foreign hash. Everything else — the root, the
+        // signature, the capability, the request_id — is exactly what a valid
+        // request carries, so the only thing the server can be reacting to is
+        // the key binding.
+        let request_id = "miskeyed-probe-1".to_string();
+        let envelope = remote::build_authenticated_execute(
+            &client,
+            &remote.capability,
+            &remote.auth_included,
+            &std::collections::HashMap::new(),
+            &request_id,
+            &format!("/{}/system/tree", server_pid),
+            "get",
+            &params,
+            None,
+            None,
+            None,
+        )
+        .expect("build execute");
+
+        let victim = *envelope
+            .included
+            .keys()
+            .next()
+            .expect("an authenticated execute carries an included map");
+        let entity = envelope.included.get(&victim).unwrap().clone();
+        let mut included = envelope.included.clone();
+        included.remove(&victim);
+        // A hash that is not this entity's own. Nothing else about the entity
+        // changes — it is self-consistent, `validate()` passes on it, and the
+        // ONLY defect is the address it is filed under.
+        let foreign = entity_hash::Hash::compute("test/foreign", b"not-this-entitys-hash");
+        assert_ne!(foreign, entity.content_hash, "fixture precondition");
+        included.insert(foreign, entity);
+        let miskeyed = entity_entity::Envelope::with_included(envelope.root.clone(), included);
+
+        // Encoded directly: `encode_envelope` writes the map keys as given, which
+        // is what lets this fixture exist at all. `Envelope::include` would
+        // recompute and repair it — that is its own rule (§3.1's sender half) and
+        // it is why this test builds the map rather than calling `include`.
+        let frame = entity_wire::encode_envelope(&miskeyed);
+
+        let resp = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            remote.dispatch_raw(request_id.clone(), frame),
+        )
+        .await
+        .expect(
+            "row 1: the peer must ANSWER a mis-keyed envelope — a timeout here is \
+             the silent-drop defect, which is fail-closed and unobservable",
+        )
+        .expect("row 1: the answer must be a response, not a transport error");
+
+        assert_eq!(
+            resp.status, 400,
+            "row 1: §5.2a's decode-boundary corollary answers 400"
+        );
+        // The decoded `code` KEY, never a substring of the body — a code is
+        // `(status, field, spelling)` and a byte scan measures only the last.
+        let val: ciborium::Value =
+            ciborium::from_reader(resp.result.data.as_slice()).expect("error body decodes");
+        let code = val
+            .as_map()
+            .and_then(|m| m.iter().find(|(k, _)| k.as_text() == Some("code")))
+            .and_then(|(_, v)| v.as_text())
+            .map(String::from);
+        assert_eq!(
+            code.as_deref(),
+            Some("hash_mismatch"),
+            "row 1: §5.2a names this code — `EXTENSION-CONTENT` §6.3 and \
+             `EXTENSION-TREE` Appendix A already define the same code for the \
+             same condition"
+        );
+
+        // CONTROL — the connection is still usable. Without this row, "refuses
+        // the envelope" and "kills the connection" are indistinguishable, and
+        // only one of them is conformant.
+        let ok = remote::send_execute(
+            &remote,
+            &client,
+            &format!("/{}/system/tree", server_pid),
+            "get",
+            &params,
+            Some(&entity_capability::ResourceTarget {
+                targets: vec![format!("/{}/system/type/", server_pid)],
+                exclude: vec![],
+            }),
+            None,
+            None,
+            &std::collections::HashMap::new(),
+            None,
+        )
+        .await
+        .expect("row 2 CONTROL: the connection must survive the refusal");
+        server_handle.abort();
+        assert!(
+            ok.status < 400,
+            "row 2 CONTROL: a well-formed request on the same connection is still \
+             served, got {}",
+            ok.status
+        );
+    }
+
     /// ⛔ **A `*/`-leading resource target used to PANIC the connection task, from
     /// any authenticated peer, before `check_permission` ran.**
     ///
@@ -5006,6 +5184,51 @@ mod tests {
             format!("{secret}|{public}"),
             "CONTROL: with no caller exclusion the effective set is the whole list, \
              in order"
+        );
+
+        // ⛔ **THE EMPTY CASE IS NOT NARROWED, and that is N6 (§3.3, 0.8.2.24).**
+        //
+        // `targets:[P] exclude:[P]` has an empty effective set. Narrowing the
+        // list to `[]` here would make it indistinguishable from a caller who
+        // named nothing, and the handler would then take the operation's
+        // ABSENT-CASE behaviour — on `system/tree:get`, a listing of the tree in
+        // answer to a request for one excluded path. The wire seam never had
+        // that problem (`extract_resource_target` passes the raw pair through),
+        // so before this the same request answered `400 path_required` over the
+        // wire and disclosed a listing in-process.
+        //
+        // The two rows above and this one are the whole contract of the
+        // boundary: narrow when narrowing leaves something, keep the pair when
+        // it would not. **Mutation RUN:** narrow unconditionally
+        // (`rt.targets = effective`) → this row reddens with `<empty>` and the
+        // two rows above stay green, which is what makes it a distinct claim
+        // rather than a restatement of the case-D row.
+        let got = peer
+            .execute_with_options(
+                "app/echo",
+                "probe",
+                entity_entity::Entity::new(
+                    "primitive/null",
+                    entity_ecf::to_ecf(&entity_ecf::Value::Null),
+                )
+                .unwrap(),
+                entity_handler::ExecuteOptions {
+                    resource: Some(entity_capability::ResourceTarget {
+                        targets: vec![secret.clone()],
+                        exclude: vec![secret.clone()],
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("dispatch returns a result");
+        let echoed: String = ciborium::from_reader(got.result.data.as_slice()).unwrap();
+        assert_eq!(
+            echoed, secret,
+            "a self-excluded resource must reach the handler with its targets \
+             INTACT, so the one derivation can answer `SelfExcluded` rather than \
+             `Absent` — narrowing it to an empty list is the third state being \
+             destroyed at the seam"
         );
     }
 

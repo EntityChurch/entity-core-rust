@@ -911,31 +911,49 @@ impl Handler for TreeHandler {
 impl TreeHandler {
     fn handle_get(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         // §5.2's subject rule (0.8.2.20): the subject is `effective_targets[0]`,
-        // never `resource.targets[0]`. An EMPTY effective list — absent
-        // `resource`, or one whose only target the caller excluded — is not an
-        // error for `get`: it falls through to the URI-suffix form, which is a
-        // legitimate listing. That is exactly why §6.3's handler-level check
-        // below is the enforcement rather than a second opinion: on this arm no
-        // dispatch-level resource check ran at all.
+        // never `resource.targets[0]`.
         //
         // `single_effective_target` and not `require_single_resource_path`,
-        // deliberately: a `tree:get` subject MAY be a prefix (a trailing-slash
-        // listing) so §3.3's "a resource-requiring operation takes a concrete
-        // path" clause does not bind `get`. The arity arm does — two targets is
-        // `ambiguous_resource`, which this function previously answered by
-        // silently using the first.
-        let selected = match entity_handler::single_effective_target(
+        // deliberately: `get` does **not** require a resource — EXTENSION-TREE
+        // §4.10's own operation row is its specification and reads *"Path ending
+        // with `/` **or empty**: listing"*, which is the omitted-resource case —
+        // and a `tree:get` subject MAY be a prefix, so §3.3's "a
+        // resource-requiring operation takes a concrete path" clause does not
+        // bind here either. The arity arm does: two targets is
+        // `ambiguous_resource`, which this function once answered by silently
+        // using the first.
+        //
+        // ⛔ **The two empties are NOT the same request `[MUST]` (§3.3 +
+        // EXTENSION-TREE §4.10, 0.8.2.24), and that is the whole of N6.** This
+        // arm read a single `None` and fell through to the URI-suffix form for
+        // both of them, so `targets:[qA] exclude:[qA]` — a request for **one**
+        // path, which the caller then excluded — was answered with a **listing
+        // of the tree**. §5.2's subject rule forbids a handler widening the set;
+        // the unqualified "empty effective list IS the absent case" sentence
+        // licensed exactly that widening through the front door, and `get`'s own
+        // "empty → listing" grammar is what made it land somewhere expensive.
+        // The absent case still gets the listing — that half was always right,
+        // and refusing it would break every legitimate root listing.
+        let target_path = match entity_handler::single_effective_target(
             ctx.resource_target.as_ref(),
             &self.local_peer_id,
             "system/tree:get",
         ) {
-            Ok(s) => s,
             Err(e) => return Ok(e),
-        };
-        let target_path = match selected {
-            Some(p) => p,
-            None if ctx.suffix.is_empty() => ctx.pattern.clone(),
-            None => format!("{}{}", ctx.pattern, ctx.suffix),
+            Ok(entity_handler::ResourceSubject::One(p)) => p,
+            Ok(entity_handler::ResourceSubject::SelfExcluded) => {
+                return Ok(entity_handler::self_excluded_refusal("system/tree:get"))
+            }
+            // Genuinely absent — §4.10's own absent-case behaviour. That is
+            // exactly why §6.3's handler-level check below is the enforcement
+            // rather than a second opinion: on this arm no dispatch-level
+            // resource check ran at all.
+            Ok(entity_handler::ResourceSubject::Absent) if ctx.suffix.is_empty() => {
+                ctx.pattern.clone()
+            }
+            Ok(entity_handler::ResourceSubject::Absent) => {
+                format!("{}{}", ctx.pattern, ctx.suffix)
+            }
         };
 
         // §6.3 / §6.7 (act-neutral, 0.8.2.20) — authorize the path we are about
@@ -1274,17 +1292,27 @@ impl TreeHandler {
         // rather than `require_single_resource_path` because a snapshot prefix is
         // a prefix, and because the empty case has a legitimate `params.prefix`
         // fallback below.
-        let selected = match entity_handler::single_effective_target(
+        //
+        // §3.3's two empties (0.8.2.24), same rule as `handle_get`: the
+        // `params.prefix` fallback IS this operation's absent-case behaviour, so
+        // a caller who named a target and excluded it must not be handed it.
+        // Routed as wider than N6's own worklist, which names `get` only — the
+        // normative sentence is §3.3's and it binds *"an operation that does NOT
+        // require"* a resource, which is the whole of this file's optional-
+        // resource set.
+        let prefix = match entity_handler::single_effective_target(
             ctx.resource_target.as_ref(),
             &self.local_peer_id,
             "system/tree:snapshot",
         ) {
-            Ok(s) => s,
             Err(e) => return Ok(e),
-        };
-        let prefix = match selected {
-            Some(p) => p,
-            None => params
+            Ok(entity_handler::ResourceSubject::One(p)) => p,
+            Ok(entity_handler::ResourceSubject::SelfExcluded) => {
+                return Ok(entity_handler::self_excluded_refusal(
+                    "system/tree:snapshot",
+                ))
+            }
+            Ok(entity_handler::ResourceSubject::Absent) => params
                 .as_ref()
                 .and_then(|p| {
                     let map = p.as_map()?;
@@ -1929,18 +1957,22 @@ impl TreeHandler {
         // fallback comes through *un-qualified* — we absolutize it here so
         // that bare prefixes (e.g. `foo/`) resolve against the LI's absolute
         // bindings.
-        // §5.2's subject rule (0.8.2.20) — the effective set.
-        let selected = match entity_handler::single_effective_target(
+        // §5.2's subject rule (0.8.2.20) — the effective set, and §3.3's two
+        // empties (0.8.2.24) exactly as `handle_snapshot` above. `extract`
+        // returns an ENVELOPE OF EVERY BOUND ENTITY under the prefix, so serving
+        // the `params.prefix` fallback to a self-excluded request is the widest
+        // instance of the class in this file.
+        let prefix = match entity_handler::single_effective_target(
             ctx.resource_target.as_ref(),
             &self.local_peer_id,
             "system/tree:extract",
         ) {
-            Ok(s) => s,
             Err(e) => return Ok(e),
-        };
-        let prefix = match selected {
-            Some(p) => p,
-            None => params
+            Ok(entity_handler::ResourceSubject::One(p)) => p,
+            Ok(entity_handler::ResourceSubject::SelfExcluded) => {
+                return Ok(entity_handler::self_excluded_refusal("system/tree:extract"))
+            }
+            Ok(entity_handler::ResourceSubject::Absent) => params
                 .as_ref()
                 .and_then(|p| {
                     let map = p.as_map()?;
@@ -2595,6 +2627,19 @@ mod tests {
             .as_text()
             .unwrap_or_default()
             .to_string()
+    }
+
+    /// [`error_code`] made **total**, for a row that collects rather than
+    /// asserts. `error_code` panics on a non-error body, and a collecting row's
+    /// whole job is to survive the answer it did not expect and report it — a
+    /// mutation that turns a 400 into a 200 would otherwise die inside the
+    /// helper and name no row at all (measured: it did, on the first run of
+    /// `the_two_empties_split_on_every_resource_optional_tree_op`).
+    fn describe_outcome(result: &HandlerResult) -> String {
+        if result.result.entity_type != entity_types::TYPE_ERROR {
+            return format!("(non-error body: {})", result.result.entity_type);
+        }
+        error_code(result)
     }
 
     // -----------------------------------------------------------------------
@@ -4094,6 +4139,167 @@ mod tests {
             !tree.has(&qp("app/secret")),
             "nothing may be bound at a path the authorizer never evaluated"
         );
+    }
+
+    /// ⛔ **N6 — THE TWO EMPTIES ARE NOT THE SAME REQUEST `[MUST]`** (§3.3 +
+    /// `EXTENSION-TREE` §4.10, 0.8.2.24), across all three of this handler's
+    /// resource-optional operations.
+    ///
+    /// The row above pins the **resource-REQUIRING** half (`put`), where §3.3's
+    /// *"an empty effective list IS the absent case"* is untouched and both
+    /// empties answer `path_required`. This is the other half, and it is where
+    /// that same sentence, read unqualified, did damage: `get` does not require
+    /// a resource, its absent case is a **listing**, and so
+    /// `targets:[qA] exclude:[qA]` — a request for exactly one path, which the
+    /// caller then excluded — was answered with **a listing of the tree**. The
+    /// caller named a target; the exclusion removed it; answering the wider
+    /// thing is §5.2's subject rule (*a handler MUST NOT widen the set*) reached
+    /// through the front door.
+    ///
+    /// **Rows collected, not asserted inline**, because they fail in opposite
+    /// directions: the refusal rows fail if the split is missing, and the
+    /// control rows fail if the split swallowed the absent case too. An inline
+    /// first row short-circuits and reports nothing about the second.
+    ///
+    /// **Mutations RUN, and which rows reddened is the record — all three at
+    /// the one derivation point in `entity_handler::single_effective_target`,
+    /// because that is the site the rule lives at and mutating a caller would
+    /// make a per-site claim this test does not support:**
+    /// - **restore the collapse** (`SelfExcluded` → the absent arm) → the three
+    ///   refusal rows redden as `200`: `get` → `system/tree/listing`,
+    ///   `snapshot` → `system/tree/snapshot`, `extract` → `system/envelope`.
+    ///   The three controls stay **green**, and that green is the point — an
+    ///   implementation that refuses *every* empty scores identically to a
+    ///   correct one on the refusal rows alone, and the root listing is not an
+    ///   edge case, it is how a peer is browsed.
+    /// - **invert it** (`Absent` → refuse) → the three controls redden with
+    ///   `400 path_required` and the three refusal rows stay green — disjoint
+    ///   from the first, which is what separates *split the empties* from
+    ///   *refuse more*. It additionally reddens
+    ///   `a_resource_naming_no_targets_is_the_absent_case` and the untouched
+    ///   neighbour `test_handler_snapshot_full_tree`, which is worth recording:
+    ///   the absent case is load-bearing well beyond the rows written for it.
+    /// - **key `SelfExcluded` on `resource_target.is_some()`** instead of on the
+    ///   raw target list → **nothing in THIS row reddens.** That is not a
+    ///   toothless test, it is the wrong observer: the state only differs for a
+    ///   resource present with `targets: []`, which no fixture here builds. The
+    ///   row that observes it is
+    ///   `a_resource_naming_no_targets_is_the_absent_case`, which reddens alone.
+    ///   Recorded here so the next reader does not re-derive this greenness as a
+    ///   defect.
+    #[tokio::test]
+    async fn the_two_empties_split_on_every_resource_optional_tree_op() {
+        let peer = test_peer_id();
+        let mut failures: Vec<String> = Vec::new();
+
+        for op in ["get", "snapshot", "extract"] {
+            // --- the discriminator: a resource that NAMED a target and excluded it
+            let tree = make_tree();
+            tree.put(&qp("app/a"), make_entity("t", "a")).unwrap();
+            tree.put(&qp("app/b"), make_entity("t", "b")).unwrap();
+            let mut ctx = make_handler_context(op, None, Some(vec![qp("app/a")]));
+            if let Some(rt) = ctx.resource_target.as_mut() {
+                rt.exclude = vec![qp("app/a")];
+            }
+            // The suffix is what makes `get`'s pre-fix answer the DISCLOSURE
+            // rather than a miss, and the fixture has to carry it or the row
+            // measures something milder than the defect. Without it the
+            // collapsed form fell through to `pattern` — a point read at
+            // `/{p}/system/tree` — and answered `404 not_found`, which reddens
+            // the row and understates it by a lot. With it the fall-through is
+            // `/{p}/system/tree/`, §4.10's listing arm, and the mutation shows
+            // the actual harm: a request for ONE excluded path answered with an
+            // enumeration. (Measured both ways; this is the first run's finding.)
+            ctx.suffix = "/".to_string();
+            let result = tree.handle(&ctx).await.unwrap();
+            // `error_code` panics on a non-error body, and the whole point of
+            // the mutation is that this row comes back a 200 — so the row must
+            // report the answer it got, not die inside a helper on the way.
+            let code = describe_outcome(&result);
+            if result.status != STATUS_BAD_REQUEST || code != "path_required" {
+                failures.push(format!(
+                    "{op}: a self-excluded resource must be 400 path_required, got {} {code}",
+                    result.status,
+                ));
+            }
+
+            // --- the control: a GENUINELY absent resource still takes the
+            // operation's own absent-case behaviour. `get` falls through to the
+            // URI-suffix form — `entity://{p}/system/tree/`, §4.10's
+            // "path ending with `/` → listing"; `snapshot`/`extract` fall back
+            // to `params.prefix`, absent here, so they cover the whole tree.
+            // All three answer 200.
+            let mut ctx = make_handler_context(op, None, None);
+            ctx.suffix = "/".to_string();
+            let result = tree.handle(&ctx).await.unwrap();
+            if result.status != STATUS_OK {
+                failures.push(format!(
+                    "{op}: an ABSENT resource must still take the absent-case behaviour, got {} {}",
+                    result.status,
+                    describe_outcome(&result)
+                ));
+            }
+        }
+
+        // `get`'s absent case specifically, because it is the one the collapse
+        // turned into a disclosure: assert it is the LISTING, not merely a 200.
+        let tree = make_tree();
+        tree.put(&qp("app/a"), make_entity("t", "a")).unwrap();
+        let mut listing_ctx = make_handler_context("get", None, None);
+        listing_ctx.suffix = "/".to_string();
+        let listing = tree.handle(&listing_ctx).await.unwrap();
+        if listing.result.entity_type != entity_types::TYPE_TREE_LISTING {
+            failures.push(format!(
+                "get: the absent case is §4.10's root listing, got {}",
+                listing.result.entity_type
+            ));
+        }
+
+        let _ = peer;
+        assert!(
+            failures.is_empty(),
+            "N6 rows failed:\n{}",
+            failures.join("\n")
+        );
+    }
+
+    /// The third state the wire cannot carry, pinned so the choice is measured
+    /// rather than inherited from a decoder.
+    ///
+    /// `SelfExcluded` is keyed on the **raw target list**, not on
+    /// `resource_target.is_some()`. A `resource` present with `targets: []`
+    /// named nothing, so it is the ABSENT case — the same already-ratified rule
+    /// that makes an optional array's absent and empty one fact.
+    /// `connection::extract_resource_target` enforces that at the wire boundary
+    /// by returning `None` for an empty target list, so this state is
+    /// unreachable from outside; it IS reachable in-process, and keying on the
+    /// list rather than on the `Option` is what makes the two seams agree
+    /// instead of one depending on the other's choice.
+    ///
+    /// **Mutation RUN:** key on `resource_target.is_some()` → this row reddens
+    /// (400 `path_required` where a 200 listing is owed) and every row of
+    /// `the_two_empties_split_on_every_resource_optional_tree_op` stays green.
+    #[tokio::test]
+    async fn a_resource_naming_no_targets_is_the_absent_case() {
+        let tree = make_tree();
+        tree.put(&qp("app/a"), make_entity("t", "a")).unwrap();
+        let mut ctx = make_handler_context("get", None, Some(vec![]));
+        ctx.suffix = "/".to_string();
+        // `make_handler_context` builds `Some(rt)` from `Some(vec![])`, which is
+        // exactly the shape under test: present, naming nothing.
+        assert!(
+            ctx.resource_target.is_some(),
+            "fixture must carry a PRESENT resource, or this row measures nothing"
+        );
+        if let Some(rt) = ctx.resource_target.as_mut() {
+            rt.exclude = vec![qp("app/a")];
+        }
+        let result = tree.handle(&ctx).await.unwrap();
+        assert_eq!(
+            result.status, STATUS_OK,
+            "a resource naming no targets is the absent case, not a self-exclusion"
+        );
+        assert_eq!(result.result.entity_type, entity_types::TYPE_TREE_LISTING);
     }
 
     /// §3.3's arity arm on `get`, which this handler answered by silently using

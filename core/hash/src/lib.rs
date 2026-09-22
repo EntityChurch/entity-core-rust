@@ -164,6 +164,19 @@ impl Hash {
         &self.digest[..self.len as usize]
     }
 
+    /// This hash's `content_hash_format` byte — the leading varint that is
+    /// intrinsic to the hash (V7 §1.2, v7.67).
+    ///
+    /// Exposed so a caller that must **recompute** a hash over the same content
+    /// can do it under the format the hash already declares, rather than under
+    /// the process default. The one caller that needs this is
+    /// `Envelope::include`, which keys the `included` map by a recomputed hash
+    /// per §3.1's sender MUST (0.8.2.23); keying under `default_hash_format()`
+    /// there would silently re-address every entity on a SHA-384 connection.
+    pub fn format_code(&self) -> u8 {
+        self.algorithm
+    }
+
     /// Whether this hash's `content_hash_format` is one this build supports.
     /// V7 §1.2 (v7.67 format-code interpretation): the leading varint is
     /// intrinsic to the hash. Sites finding an unsupported format MUST

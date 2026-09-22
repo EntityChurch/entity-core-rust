@@ -199,8 +199,43 @@ impl Envelope {
     }
 
     /// Add an entity to the included map, keyed by its content hash.
+    ///
+    /// ⛔ **The key is RECOMPUTED from `{type, data}`, not read off the entity's
+    /// `content_hash` field `[MUST]` (§3.1, 0.8.2.23).** §3.1's keying is now
+    /// normative in **both** directions — *"a sender MUST key each entry by the
+    /// content hash of the entity it holds"* — and this is the one site in this
+    /// tree that keys the map, so it is the one site that has to hold it.
+    ///
+    /// The field and the content can disagree, and exactly one path produces
+    /// that: `decode_entity` takes `content_hash` from the wire **verbatim**,
+    /// because §5.4 byte fidelity forbids a decode+re-encode. Our own decoder
+    /// refuses a mis-keyed `included` entry, but a mis-stamped **root** is
+    /// admitted there and validated later — so any path that receives an
+    /// envelope and forwards one of its entities onward (a relay, a mirror, a
+    /// `follow` leg) could re-emit it under the stamped lie. Keying by the field
+    /// would have made *us* the sender that violates §3.1.
+    ///
+    /// **Recomputed under the hash's OWN declared format**, not the process
+    /// default: on a SHA-384 connection the default would re-address every
+    /// entity in the map. An unallocated format cannot be recomputed at all, so
+    /// that case keys by the stamped hash unchanged — the receiver refuses it
+    /// with `unsupported_content_hash_format` (§4.7), which is the right defect
+    /// and a better one than anything this function could invent.
+    ///
+    /// Note what this deliberately does **not** do: it does not repair the
+    /// entity's own `content_hash`. The map becomes content-addressed, which is
+    /// the property §3.1 protects; the entity stays self-inconsistent, and the
+    /// receiver's §1.8 item-1 validation answers `hash_mismatch` **about the
+    /// entity** rather than about the map. Self-consistency and correct
+    /// addressing are different properties and each keeps its own error.
     pub fn include(&mut self, entity: Entity) {
-        self.included.insert(entity.content_hash, entity);
+        let key = Hash::compute_format(
+            &entity.entity_type,
+            &entity.data,
+            entity.content_hash.format_code(),
+        )
+        .unwrap_or(entity.content_hash);
+        self.included.insert(key, entity);
     }
 
     /// Find an included entity by its content hash.
@@ -838,6 +873,85 @@ mod tests {
         let mut env = Envelope::new(root);
         env.include(extra);
         assert!(env.validate_all().is_err());
+    }
+
+    /// ⛔ **§3.1's SENDER MUST (0.8.2.23): the `included` key is the content
+    /// hash of the entity under it, and `include` recomputes rather than
+    /// trusting the stamped field.**
+    ///
+    /// §3.1 stated the map's shape in the indicative for seven revisions and
+    /// obliged nothing; 0.8.2.23 makes it normative in **both** directions. The
+    /// receiver half this tree has enforced since `0fc01ad` (three sites). This
+    /// is the sender half, and it is one function because `include` is the only
+    /// site that keys the map.
+    ///
+    /// **The fixture carries a value the codec cannot emit**, which is the only
+    /// way to tell the two implementations apart: `Entity::new` computes the
+    /// hash, so for any honestly-built entity `key = entity.content_hash` and
+    /// `key = recompute(entity)` are the **same address** and no assertion can
+    /// separate them. A mis-stamped entity — content changed under a stamp that
+    /// was correct for the old content, which is exactly what `decode_entity`
+    /// admits from the wire — is the discriminator.
+    ///
+    /// Row 2 is the property, not the mechanism: whatever key was chosen, the
+    /// map must be **content-addressed**, i.e. every key equals the hash of its
+    /// value's content. That is the sentence a receiver checks, so it is the
+    /// sentence asserted.
+    ///
+    /// Row 3 is the control, and it is the one that fails if "recompute" is
+    /// implemented as "recompute under the process default": an honest entity
+    /// must still land under its own hash, unmoved.
+    ///
+    /// **Mutation-verified:** restoring `self.included.insert(entity.content_hash,
+    /// entity)` reddens rows 1 and 2 and leaves row 3 green. Row 2 was confirmed
+    /// **separately, with row 1 neutered** — row 1 is an `assert!` and
+    /// short-circuits, so a single run is evidence about row 1 only. Two runs,
+    /// because "the test went red" and "this row went red" are different claims.
+    #[test]
+    fn include_keys_by_recomputed_content_not_by_the_stamped_field() {
+        let root = Entity::new("test/root", make_data("root")).unwrap();
+
+        // Self-inconsistent by construction: the stamp is correct for "before",
+        // the content is "after". `Entity::new` cannot produce this; only the
+        // wire decoder can, and it does — `content_hash` is taken verbatim there
+        // because §5.4 byte fidelity forbids a decode+re-encode.
+        let mut mis_stamped = Entity::new("test/extra", make_data("before")).unwrap();
+        let stamped = mis_stamped.content_hash;
+        mis_stamped.data = make_data("after");
+        let true_hash =
+            Hash::compute_format("test/extra", &mis_stamped.data, stamped.format_code()).unwrap();
+        assert_ne!(stamped, true_hash, "fixture precondition: the stamp lies");
+
+        let honest = Entity::new("test/honest", make_data("honest")).unwrap();
+        let honest_hash = honest.content_hash;
+
+        let mut env = Envelope::new(root);
+        env.include(mis_stamped);
+        env.include(honest);
+
+        assert!(
+            env.included.contains_key(&true_hash) && !env.included.contains_key(&stamped),
+            "row 1: the entry is filed under the hash of its CONTENT, not under \
+             the hash it claims — a sender that keys by the field emits a map \
+             every conformant receiver refuses"
+        );
+        for (key, entity) in env.included.iter() {
+            let recomputed =
+                Hash::compute_format(&entity.entity_type, &entity.data, key.format_code()).unwrap();
+            assert_eq!(
+                *key, recomputed,
+                "row 2: the map is content-addressed — every key is the hash of \
+                 its value, which is the property §3.1 obliges and the one a \
+                 receiver checks"
+            );
+        }
+        assert!(
+            env.included.contains_key(&honest_hash),
+            "row 3 CONTROL: an honestly-built entity is UNMOVED — it lands under \
+             its own hash. This fails if the recomputation uses the process \
+             default format instead of the hash's own, which would silently \
+             re-address every entity on a non-floor connection."
+        );
     }
 
     #[test]

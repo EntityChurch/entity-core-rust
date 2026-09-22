@@ -577,7 +577,45 @@ impl QueryHandler {
                         "get",
                         &candidate.path,
                         cap,
-                        &ctx.pattern,
+                        // ⛔ **The frame is the handler that OWNS the operation,
+                        // never the handler running the check `[MUST]` (§6.3,
+                        // 0.8.2.23 — K4/K5).** This line passed `ctx.pattern`,
+                        // which is `system/query`: the running handler. What is
+                        // being authorized is a **tree read** — `get` on a tree
+                        // path — so the authority being spent is `system/tree`,
+                        // and whether the caller reaches it through the query
+                        // surface is their route, not a second grant they must
+                        // separately hold.
+                        //
+                        // The frame runs UPSTREAM of every dimension, so a wrong
+                        // one is indistinguishable from a broken matcher, and it
+                        // was wrong in **both** directions here:
+                        //
+                        // - it **refused** a conformant caller — a capability
+                        //   split `{system/query: find}` + `{system/tree: get}`
+                        //   had the `get` grant discarded unread, because no
+                        //   grant naming `system/tree` survives a `handlers`
+                        //   test against `system/query`, and the surviving
+                        //   `{system/query: find}` grant then fails `operations`
+                        //   on `get`. Every result was dropped.
+                        // - it **admitted** one it should not — a caller holding
+                        //   `{handlers:[system/query], operations:[find, get],
+                        //   resources:[/{p}/*]}` was authorized for tree reads
+                        //   through this surface while holding no tree grant at
+                        //   all.
+                        //
+                        // `system/tree` is the literal every worked example in
+                        // the corpus passes (`EXTENSION-QUERY` §5.5 step 6b's own
+                        // pseudocode, `EXTENSION-HISTORY` §4.2,
+                        // `EXTENSION-COMPUTE` §7.2, `EXTENSION-SUBSCRIPTION`
+                        // §2.3) and the literal core-go passes at the same site
+                        // (`ext/query/handler.go:605`). The other three
+                        // frame-bearing sites in this tree were already correct:
+                        // `core/tree` passes `ctx.pattern` and is conformant
+                        // because there owner **is** runner — which §6.3 names
+                        // explicitly, so a literal here and `ctx.pattern` there
+                        // are the same rule, not two.
+                        "system/tree",
                         &self.local_peer_id,
                         granter,
                     ),
@@ -1387,6 +1425,130 @@ mod tests {
         assert!(
             mismatches.is_empty(),
             "§5.2 step 6b + 0.8.2.21 H1:\n  {}",
+            mismatches.join("\n  ")
+        );
+    }
+
+    /// ⛔ **§6.3's handler FRAME (0.8.2.23 — K4/K5): `handler_pattern` is the
+    /// handler that OWNS the operation, never the handler running the check.**
+    ///
+    /// Step 6b authorizes a **tree read**, so the frame is `system/tree`. This
+    /// line passed `ctx.pattern` — `system/query`, the running handler — and the
+    /// frame is tested UPSTREAM of every other dimension, so a wrong one is
+    /// indistinguishable from a broken matcher. Both directions are driven here
+    /// because it was wrong in both:
+    ///
+    /// - **row 1 — the wrong frame REFUSED a conformant caller.** A capability
+    ///   split across `{system/query: find}` + `{system/tree: get}` is the exact
+    ///   shape §6.3's own note measured: the `get` grant is discarded unread
+    ///   (its `handlers` names `system/tree`, which no `system/query` frame
+    ///   matches), and the surviving query grant then fails `operations` on
+    ///   `get`. Every result dropped, with no dimension to attribute it to.
+    /// - **row 2 — the wrong frame ADMITTED one it should not.** A caller whose
+    ///   only grant names `system/query` — holding no tree grant at all — was
+    ///   authorized for tree reads through this surface.
+    ///
+    /// **Why the pre-existing rows could not see it:** every other capability
+    /// test in this module grants `handlers: ["*"]`, which covers `system/query`
+    /// and `system/tree` alike. The two frames only disagree when the grant
+    /// **names** a handler, which is why both rows below spell one out.
+    ///
+    /// **Mutation-verified, three mutations RUN, and the two rows are disjoint:**
+    ///
+    /// | mutation | row 1 | row 2 |
+    /// |---|---|---|
+    /// | `&ctx.pattern` (the defect) | RED — `[]` vs `["users/alice"]` | RED — `["users/alice"]` vs `[]` |
+    /// | `"*"` (§6.3's forbidden permissive default) | RED — `[]` vs `["users/alice"]` | green |
+    /// | — (the fix) | green | green |
+    ///
+    /// The defect's two rows redden in **opposite directions**, which is what
+    /// says the fix discriminates rather than widens — a frame that merely
+    /// widened would redden row 2 alone.
+    ///
+    /// ⚠ The `"*"` row is recorded because the prediction written here before it
+    /// was run said the opposite (*"passes row 1 and fails row 2"*). It is wrong
+    /// for a reason worth keeping: `"*"` is not a permissive frame at this
+    /// matcher at all — `canonicalize("*")` is `/{local}/*`, and `matches_scope`
+    /// compares it as a **value** against each grant's include patterns, so it
+    /// matches a grant whose `handlers` is `*` and NO grant that names a handler.
+    /// It fails closed here, not open. §6.3's "MUST NOT treat an absent or empty
+    /// `handler_pattern` as match-all" is therefore a rule about a matcher that
+    /// special-cases the value, which this one does not — stated so the next
+    /// reader does not add a special case in order to have something to forbid.
+    ///
+    /// The rows are collected rather than asserted inline for the same reason a
+    /// multi-row mutation is scoped: an inline row 1 short-circuits and reports
+    /// nothing about row 2.
+    #[tokio::test]
+    async fn the_tree_read_filter_is_framed_by_the_owning_handler_not_the_running_one() {
+        let (indexes, cs, li, handler) = setup();
+        put_entity(&cs, &li, &indexes, "users/alice", "app/user", "alice");
+
+        // The frame the running handler would supply, in the canonical form the
+        // dispatcher resolves it to. Spelled absolutely so the two candidate
+        // frames differ only in their last segment.
+        const RUNNING: &str = "/test_peer/system/query";
+
+        let grant = |handlers: &str, ops: Vec<&str>| entity_capability::GrantEntry {
+            handlers: entity_capability::PathScope::new(vec![handlers.into()]),
+            resources: entity_capability::PathScope::new(vec!["/test_peer/users/*".into()]),
+            operations: entity_capability::IdScope::new(
+                ops.into_iter().map(String::from).collect(),
+            ),
+            peers: None,
+            constraints: None,
+            allowances: None,
+        };
+
+        let drive = |grants: Vec<entity_capability::GrantEntry>| {
+            let mut ctx = external_find_ctx(
+                entity_ecf::cbor_map! { "type_filter" => entity_ecf::text("app/user") },
+                grants,
+            );
+            ctx.pattern = RUNNING.to_string();
+            ctx
+        };
+
+        // Both rows are collected rather than asserted in place: a multi-row
+        // test short-circuits at its first failing assertion, and these two
+        // redden in OPPOSITE directions under the same mutation. Asserting
+        // inline would make the run report row 1 and stay silent about row 2,
+        // which is the half that says the fix discriminates rather than widens.
+        let rows: Vec<(&str, Vec<entity_capability::GrantEntry>, Vec<String>)> = vec![
+            (
+                // The caller holds the tree read in a SEPARATE grant, which is
+                // the conformant way to hold it. Only the owning-handler frame
+                // reaches it.
+                "row 1 — `{system/query: find}` + `{system/tree: get}` is a conformant \
+                 split and the `system/tree` grant MUST be the one consulted; under \
+                 the running-handler frame it is discarded unread",
+                vec![
+                    grant(RUNNING, vec!["find"]),
+                    grant("system/tree", vec!["get"]),
+                ],
+                vec!["users/alice".to_string()],
+            ),
+            (
+                // The caller holds NO tree grant. The running-handler frame lets
+                // a query-only grant authorize a tree read; the owning frame refuses.
+                "row 2 — a grant naming only `system/query` authorizes no tree read, \
+                 however wide its `resources`; under the running-handler frame it did",
+                vec![grant(RUNNING, vec!["find", "get"])],
+                Vec::new(),
+            ),
+        ];
+
+        let mut mismatches: Vec<String> = Vec::new();
+        for (label, grants, expected) in rows {
+            let result = handler.handle(&drive(grants)).await.unwrap();
+            let got = match_paths(&result);
+            if got != expected {
+                mismatches.push(format!("[{label}]: got {got:?}, expected {expected:?}"));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "§6.3 handler frame (0.8.2.23):\n  {}",
             mismatches.join("\n  ")
         );
     }

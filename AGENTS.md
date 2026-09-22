@@ -870,6 +870,51 @@ gates by making the TCP path compile on wasm32.
   mutation-verified as the **only** row the key-presence reading reddens — the five partial rows
   beside it stay green under it, because under that reading they are still partial.
 
+- **A STRUCTURAL fix landed for an earlier ruling can make a later ruling's branch UNREACHABLE —
+  when a new rule turns a field into a decision, enumerate every seam that TRANSFORMS that field
+  before implementing it at the site the worklist names.** *(Candidate: bit us once, 2026-09-14,
+  found by the wire vector after the in-tree rows were green.)* `0.8.2.24`'s `N6` splits the two
+  empties of `resource`: a **genuinely absent** one takes the operation's absent-case behaviour, a
+  **present** one whose effective list is empty is `400 path_required`. Landed exactly where the
+  routing names it — `core/tree`'s three resource-optional ops, plus the one derivation they share
+  — with 108 in-tree rows green and three mutations reddening disjoint sets. **Over a real socket
+  it answered `200` anyway.** `0.8.2.20`'s structural boundary narrowing (`rt.targets =
+  effective_targets(...)` in `dispatch_request`, the fix that made the subject rule *structural
+  rather than an obligation re-discharged at ~20 handlers*) had already rewritten the request to
+  `targets: []` — which is the absent case — so the new `SelfExcluded` arm was **dead code at the
+  only door that matters**. Two rulings, one field, and the earlier one's fix silently deletes the
+  later one's input.
+  **Three transferable parts.**
+  (a) **The tell is a PROJECTION that is lossy about its own emptiness.** Narrowing `[P]` with
+  `exclude:[P]` to `[]` is not a smaller answer, it is a *different fact*. The remedy is not to
+  revert the narrowing — it is a defence, and `the_dispatch_boundary_hands_the_handler_only_the_
+  effective_targets` exists because a cross-impl oracle cannot attribute which of the two layers
+  earned its green. It is to exempt the case that would erase the distinction: **narrow when
+  narrowing leaves something, keep the pair when it would not.** The effective set is identical
+  either way (`effective_targets` is idempotent and every consumer calls it), so nothing downstream
+  computes a different subject.
+  (b) **There were TWO seams, and the first read stopped one statement short.** The inbound wire
+  path and the in-process sub-dispatch path both narrow. Reading `extract_resource_target` — which
+  does hand back the raw pair — and concluding the wire seam was safe was wrong by two lines:
+  `dispatch_request` narrows immediately after qualifying. A comment asserting that asymmetry was
+  written, and the wire run deleted it. **Grep the field, not the function you happened to open**
+  (`grep -rn 'effective_targets(' --include=*.rs` — the transform sites are the inventory), and
+  keep the seams in step: a seam that narrows and one that does not is how the same request gets
+  two answers depending on which door it came in.
+  (c) **This is the third instance of *an in-process row is a floor under a vector, not one*, and
+  the first where the floor was green while the peer was non-conformant.** The earlier two were
+  about what a row *proves*; this one is about what it *cannot see* — every layer between the
+  socket and the branch gets a vote, and a `HandlerContext` built by hand skips all of them.
+  **Enforcement: any ruling that turns a request field into a branch owes a row that crosses a
+  socket, written BEFORE the item is reported closed** — `core/peer/tests/two_empties_vector.rs`
+  is the shape, and the mutation to run is *narrow unconditionally at the boundary*, which reddens
+  the wire row and **nothing** in the handler's own suite.
+  **Cohort note, and it is why this was routed rather than just fixed:** the boundary narrowing is
+  `0.8.2.20`'s recommended structural shape, so **any seat that adopted it has this defect and a
+  handler-only `N6` does not close it** — while a seat that only ever narrowed inside the handler
+  is unaffected and will read the item as done. The two populations cannot tell each other apart
+  from a green category.
+
 - **An authorization check evaluates the target it was GIVEN; a handler acts on the set that target
   DERIVES — and where those differ, the dimension does not bind however correct the check is.**
   *(Candidate: bit us once, 2026-09-10, found by recomputing arch's `CP-12a` against our tree rather
@@ -1199,6 +1244,175 @@ gates by making the TCP path compile on wasm32.
   runs `NamespaceScope`, not `CapTokenScope`. Three surfaces, three greens, three vector asks —
   the same shape as `CORE-TREE-LISTING-1`, which we had already filed against ourselves.
 
+- **An authorization call has a parameter that decides WHOSE AUTHORITY is being spent, it is
+  tested upstream of every dimension, and a wrong one is indistinguishable from a broken
+  matcher.** *(**Ratified 2026-09-13**: this is the third instance of *a correct predicate asked
+  the wrong question*, and the first where the wrong argument is wrong in **both** directions at
+  once.)* §6.3's `handler_pattern` is **the handler that OWNS the operation being authorized,
+  never the handler running the check** (0.8.2.23). `extensions/query`'s step-6b filter passed
+  `ctx.pattern` — `system/query` — while authorizing a **tree read**. Every worked example in the
+  corpus and core-go's own line (`ext/query/handler.go:605`) pass the literal `"system/tree"`.
+  **The two-direction part is what earns the ratification**, because a one-direction error is a
+  bug and a two-direction one is an argument nobody owns: the wrong frame **refused** the
+  conformant split `{system/query: find}` + `{system/tree: get}` (the tree grant is discarded
+  unread — no grant naming `system/tree` survives a `handlers` test against `system/query` — and
+  the surviving query grant then fails `operations` on `get`, so **every result is dropped**),
+  **and admitted** a caller holding only `{handlers:[system/query], operations:[find, get]}` and
+  no tree grant at all. Note the tell: the symptom of the first direction is *"the filter returns
+  nothing"*, which reads as a **scope** defect and sends you to the matcher.
+  **The other three frame-bearing sites here were already right, and one of them proves the rule
+  is not "always pass a literal":** `core/tree` passes `ctx.pattern` and is **conformant**, because
+  there owner *is* runner — which §6.3 names explicitly. A literal in query and `ctx.pattern` in
+  tree are one rule. "Hard-code `system/tree` everywhere" is a different and wrong rule.
+  **Enforcement.** For every `check_path_permission` / `check_permission` call, answer at the call
+  site *which handler's namespace does this access land in?* — and if the answer is not the
+  running handler, the frame is a **literal**, written out, with the owning handler named. Grep
+  `ctx.pattern` on any path that authorizes something: the hits that are correct are the ones where
+  the handler is authorizing its **own** surface. This is the same family as the §11
+  `map_operation` bite (`74e2afb`) — *a correct predicate asked the wrong question is a fail-open
+  with nothing wrong at the site* — with the argument being *whose authority* rather than *which
+  permission*.
+  **And the reporting half, which is the larger finding and was MEASURED: no vector in the cohort
+  can see this.** Frame defect restored, **peer rebuilt** (`dirty=true` at HEAD, label checked),
+  re-scored: `query` **48P/0F**, `security` **31P/0F**, `capability` **18P/0F**, `tree_operations`
+  **64P/0F** — 161 rows, four categories, none of which reddens. The cause is the one already
+  ratified here: every grant those categories delegate either names **both** `system/query` and
+  `system/tree` (`query.go:679` — both frames allow) or omits `get` (`query.go:744` — both frames
+  deny), so **the two frames agree on every row that exists**. *Whenever an outcome is reachable
+  from more than one source of authority, a check set that never makes the sources disagree
+  measures their union.* The discriminating pair is the two rows above, and they must redden in
+  **opposite** directions — that is what separates a wrong frame from a merely narrow one. Teeth:
+  `the_tree_read_filter_is_framed_by_the_owning_handler_not_the_running_one`, three mutations RUN.
+  **Corollary on the cohort:** all three seats reported K4/K5 as conforming by **reading four call
+  sites at the line**. That is honest and it is not a measurement, and neither is a green category —
+  say which one you have.
+  **And the half that was owed onward, landed 2026-09-13: "we have the vector built" was a
+  claim about an IN-PROCESS test, and a vector is defined by the boundary it crosses.** The
+  packet offered the discriminating rows to arch and keystone on the strength of
+  `the_tree_read_filter_is_framed_by_the_owning_handler_not_the_running_one` — which sets
+  `ctx.pattern` and `ctx.caller_capability` **by hand** on a constructed `HandlerContext`. That
+  proves the filter's logic and says nothing about whether a real capability, carried on a real
+  envelope through `verify_request` and the §5.2 dispatch check, **arrives** at the filter as
+  the authority the rule names — which is the entire question when the artifact is a check three
+  seats will be scored against. **An in-process row and a vector are different artifacts with
+  the same assertions, and the word "built" hides the difference.** Landed as
+  `core/peer/tests/handler_frame_vector.rs`: a peer, a handshake, a capability minted and signed
+  by the server and presented on the EXECUTE, and an assertion on the decoded `matches` key.
+  Both mutations were RUN against the wire rows and reproduce the in-process table exactly —
+  `&ctx.pattern` reddens **both** rows in **opposite** directions (row 1 `[]`; row 2 disclosed
+  the qualified path under a capability holding no tree grant), `"*"` reddens **row 1 only**
+  (it fails closed at this matcher, per the prediction-was-backwards note above). Two fixture
+  obligations the build earned, both of which would have made the rows lie: **put before bind**
+  — `IndexingLocationIndex` reads the entity out of the content store to learn its type, so a
+  bind preceding the put indexes nothing and *every* row goes trivially empty, passing row 2 for
+  no reason — and **an empty 200 is not a 403**, so `drive` returns the refusal status as a
+  distinct outcome rather than folding it into "disclosed nothing," which is what stops row 2
+  passing because the request never reached the filter (the same unmeasurability the §7a.1
+  fixture-guard entry records). **Enforcement: when offering a row to the cohort as a vector,
+  state the boundary it crosses in the same sentence — and if the answer is "a `HandlerContext`
+  we built," it is a floor under a vector, not one.**
+
+- **Two written mutation predictions in one session were both WRONG, in opposite ways — so the
+  rule is not "run the mutation", it is "do not write the sentence until the run is in the
+  transcript, and when the answer surprises you, keep the surprise."** *(**Ratified 2026-09-13**:
+  the *"a mutation WRITTEN DOWN but not RUN is prose"* entry has now bitten a fourth and fifth
+  time, both inside one commit, so the enforcement moves from *run it* to *the recorded result is
+  the artifact*.)* Both wrong predictions were about **which of two guards catches an input**, and
+  both taught something the correct prediction would not have:
+  - *"a `"*"` frame passes row 1 and fails row 2"* — **backwards.** `"*"` fails closed at this
+    matcher: `canonicalize("*")` is `/{local}/*`, and `matches_scope` compares it **as a value**
+    against each grant's include patterns, so it matches a grant whose `handlers` is `*` and **no**
+    grant that names a handler. §6.3's *"MUST NOT treat an absent or empty `handler_pattern` as
+    match-all"* is therefore a rule about a matcher that **special-cases the value**, which ours
+    does not — worth writing down so the next reader does not add a special case in order to have
+    something to forbid.
+  - *"the J3 mutation reddens rows 1 and 2"* — **row 1 only.** Row 2 stays green because
+    `matches_scope` carries `0.8.2.21`'s sentinel arm **itself**, so an unmatchable exclude denies a
+    pattern subject under either implementation. That makes row 2 a **containment pin**, not a
+    discriminator: it fails only if the new pattern arm is ever written without the sentinel, which
+    is the one way that refactor could have silently dropped a rule it was meant to inherit.
+  **Two guards that refuse the same input tell you nothing about each other** — already recorded
+  once, and it is the cause of both misses.
+  **Enforcement, sharpened:** a doc comment naming a mutation states **which rows reddened and
+  which stayed green**, and a green row gets a sentence saying *why* it is green — unreachable, or
+  caught by a second guard, or a containment pin. A row recorded only as "verified" is
+  indistinguishable from one nobody ran. And **a multi-row test collects rather than asserts
+  inline** when its rows can fail in opposite directions: an inline first row short-circuits and
+  reports nothing about the second, which is exactly what hid the *admits-what-it-should-not*
+  half of the frame defect on the first run. Same for `assert!` rows — the §3.1 sender test's row 2
+  needed a **second run with row 1 neutered** before "row 2 reddens" was a claim rather than a hope.
+
+- **A spec rule that goes normative in a direction it had only described binds the SENDER too, and
+  the sender site is the constructor.** *(Candidate: bit us once, 2026-09-13.)* §3.1 stated the
+  `included` map's keying in the indicative for seven revisions; `0.8.2.23` makes it normative in
+  **both** directions. We had enforced the **receiver** half at three sites since `0fc01ad` and
+  keyed the map, at `Envelope::include`, from the entity's **stamped** `content_hash`. Only
+  `decode_entity` can produce an entity whose stamp disagrees with its content — §5.4 byte fidelity
+  forbids a decode+re-encode — so any path that receives an envelope and forwards one of its
+  entities onward (a relay, a mirror, a `follow` leg) could re-emit it under the lie, making **us**
+  the sender that violates §3.1. core-go closed the same shape at their `Envelope.Include`.
+  **Two things the fix had to get right and a test had to pin.** (a) Recompute under the hash's
+  **own declared format**, not `default_hash_format()` — the default silently re-addresses every
+  entity on a SHA-384 connection, which is what the *unmoved honest entity* control exists to
+  catch. (b) Do **not** repair the entity's own `content_hash`: the map becomes content-addressed,
+  which is the property §3.1 protects, while the entity stays self-inconsistent and the receiver's
+  §1.8 item-1 validation answers `hash_mismatch` **about the entity**. Self-consistency and correct
+  addressing are different properties and each keeps its own error — the same distinction that made
+  `validate()` the wrong check for the forgery in the first place.
+  **Enforcement:** when a rule goes from indicative to normative, grep for the site that
+  **constructs** the thing, not only the sites that consume it — and the fixture must carry a value
+  **the codec cannot emit** (here a mis-stamped entity), because for any honestly-built entity
+  `key = entity.content_hash` and `key = recompute(entity)` are the **same address** and no
+  assertion can separate the two implementations. Teeth:
+  `include_keys_by_recomputed_content_not_by_the_stamped_field`.
+
+- **A fail-closed refusal placed UPSTREAM of the point where a response can be built answers
+  nobody — and "drops the frame" reads in the code exactly like "refuses the request."**
+  *(Candidate: bit us once, 2026-09-13, found by being asked what our disposition was.)* Our §1.8
+  binding sits at `decode_envelope`, the constructor, which is the right place for the **check**.
+  What nobody had asked is what a **caller** sees when it fires, and the answer was **nothing**:
+  the TCP message loop treated `WireError::CborDecode` as one thing and `continue`d, so a mis-keyed
+  envelope was dropped with no response and no close, and the caller blocked until its own timeout.
+  http-live answered a `text/plain` 400 with no `code` field. Neither is §5.2a's `400
+  hash_mismatch`, and the drop is weaker than the connection close core-go answers with — a caller
+  cannot tell a refusal from a lost frame, and **no vector can score a peer that answers nothing**.
+  **The distinction the code collapsed is worth stating generally: un-parseable bytes and a
+  structurally-fine envelope that fails a SEMANTIC check are not the same error.** The first has no
+  `request_id` to reply to and dropping it is correct. The second has one sitting in a root that
+  decodes fine, so §4.1's *"every EXECUTE receives a response"* binds. Folding them into one
+  stringly error is what made the refusal silent, which is why the new variant is **typed** —
+  the caller has to tell them apart to answer.
+  **Enforcement:** for every refusal that fires **before** dispatch, name what the caller receives,
+  in the test, driven over the wire. The tell in a diff is a `continue` or an early `return` in a
+  read loop on a path whose error is about *meaning* rather than *framing*. And the test must carry
+  a **short explicit timeout**: the mutation here fails as `Elapsed(())` — a request timeout, not an
+  assertion — which is precisely the shape that let the defect ship, and against the default
+  request timeout it would read as a slow suite. Also assert the **connection survives** (a
+  multiplexed connection carries unrelated in-flight requests, so "refuses the envelope" and "kills
+  the stream" are indistinguishable from one request's point of view). Teeth:
+  `a_miskeyed_included_map_is_answered_with_a_coded_400_not_dropped`.
+
+- **A ruling can re-commit, one section later, the very defect it corrected — and the seats it
+  outlaws are the ones that are IMMUNE.** *(Candidate: bit us once as readers, 2026-09-13.)*
+  `0.8.2.23` §1.8 states resolution integrity as a **property with two conformant mechanisms**,
+  explicitly *"because a mechanism-shaped MUST would have outlawed the one implementation that is
+  immune by construction"*, and K1.7's correction says the flat form *"specified the
+  structurally-immune seat into non-conformance."* §5.2's J4 delta, in the same fold, then says a
+  received `scope` whose declared `type` contradicts its dimension **MUST be refused `403
+  capability_denied`** — which **neither go nor rust can implement**, because both drop the field
+  at decode by construction (go has no `Type` field; our `decode_grant_entry` keys scope type by
+  **dimension name** into distinct `PathScope`/`IdScope` types). A peer that never reads the field
+  cannot detect a contradiction and so cannot refuse one.
+  **The remedy is never to implement the refusal.** Adding a decode of a field we deliberately
+  ignore, in order to reject it, is a worse tree and a new attack surface — it is the shape our own
+  charter already forbids as *a pluggable mechanism to paper over a gap*. Route it and say which
+  sentence of the same document contradicts it.
+  **Enforcement:** when a ruling in a fold states a MUST as *"refuse X"*, ask whether a conformant
+  implementation could be **unable to observe X**. If yes, the rule is mechanism-shaped and the
+  fix is the §1.8 form — *a peer MUST NOT do Y; a peer that retains the input MUST refuse; a peer
+  that discards it satisfies this by construction*. And check the **same fold** for the form done
+  right, because a document that gets it right once has already written your routing argument.
+
 - **An operation added to a `Handler` has two registration sites, and the second one is in
   another crate.** `impl Handler::operations()` makes it answerable; `bootstrap_handler(...)` in
   `core/peer/src/lib.rs` writes the **advertised** `system/handler/{pattern}` interface entity
@@ -1421,6 +1635,35 @@ gates by making the TCP path compile on wasm32.
   `v1_retention_clamp_beyond_ceiling_live` and `v2_retention_clamp_null_takes_ceiling_live`.
   The entry stays because the check that caught it — read the ROWS, not the exit code — is
   the transferable part.)**
+  **⚠ RE-OPENED 2026-09-13 and CORRECTED the same day. The re-opening was WRONG, and the
+  way it was wrong is the entry's most useful level: a row name belongs to a PASS, and the
+  same row is DECLARED in several passes where SKIP is the correct answer.** The re-opening
+  reported both §8.1 rows as `SKIP [excluded from scoring]` and concluded PASS 4 exits 0
+  trivially. Driven at `155a6b8` (image label `dirty=false` at HEAD, `ps` confirming
+  `--relay-store-retention-ms 3600000` on the peer): `relay_store_bounds` scores **2P/0W/0F/0S**
+  standalone, and in a full `validate-complete.sh rust` run **PASS 4 scores 2P/0F/0S** while the
+  whole gate exits `PASS 0..5, all 0`. The two `SKIP … [excluded from scoring]` lines are real
+  and are **PASS 1's** — the log's only two, at line 4305 of 10295, between the `==> PASS 1/2`
+  and `==> PASS 1b` banners, where the gate excludes the category **by design**
+  (`PASS4_ONLY="relay_store_bounds"`, whose own comment says *"the surface is UNARMED on this
+  target, not covered"*). The 2026-09-03 closure was correct the whole time; what the
+  re-opening actually found was its own grep crossing a pass boundary.
+  **So the rule the previous entry drew — *"a closure note is a claim with an expiry date"* —
+  is true and was the wrong lesson to draw from this evidence, and drawing it is what made a
+  correct gate read as a live defect for a day.** The rule that survives is one level finer
+  than *read the rows, not the exit code*: **a row is `(pass, check, verdict)`, and a
+  `grep <check_name>` returns every pass that DECLARED it — including the passes whose whole
+  purpose is to leave it unarmed.** Enforcement, and it is one command:
+  `grep -n '^==> PASS' <log>` first, then attribute each row to the banner above it; a
+  posture-gated category will legitimately SKIP in every pass but its own, so *finding* a SKIP
+  for it proves nothing and only the row under **its** banner is evidence. And before
+  attributing a harness observation to your peer at all, reproduce it standalone —
+  `peer-manager start --type <impl> <the posture flags>` + `validate-peer -category <one>` is
+  ~2 minutes and it is what separates *"our peer does not enforce this"* from *"I read the
+  wrong twenty lines."* **The transferable half of the original entry is unchanged: never cite
+  a posture-gated pass's exit code.** The half about closure notes is withdrawn as unearned
+  here — it was inferred from a misread, and an anti-pattern entry grounded on a
+  misattribution is worse than none.
   **Fifth level, and it is the one a green run actively conceals: a sibling's check may be a
   `[self]` check, measuring the harness's own implementation inside a run nominally scoring
   YOURS.** *(Candidate: bit us once, 2026-09-10 — caught by reading the row's marker while
