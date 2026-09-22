@@ -266,6 +266,11 @@ pub async fn handle_connection(
     // inbound EXECUTE_RESPONSE frames into that table. `get_or_connect`
     // falls back to this endpoint when the peer has no dialable transport.
     let reentry_pending = crate::remote::new_pending();
+    // Held as the concrete type as well as the trait object: the teardown below
+    // must tell *this* endpoint its connection is over, which is an inherent
+    // call. `RemoteEndpoint` deliberately grows no teardown method — nothing
+    // outside the loop that owns a connection may declare it finished.
+    let mut reentry_concrete: Option<Arc<crate::remote::InboundReentryEndpoint>> = None;
     let reentry_endpoint: Option<Arc<dyn crate::remote::RemoteEndpoint>> = {
         // `remote_identity_hash` hoisted above (guaranteed Some after auth).
         // Placeholder connection cap (never read on the reentry path —
@@ -281,14 +286,15 @@ pub async fn handle_connection(
         };
         match placeholder_cap {
             Some(cap) => {
-                let endpoint: Arc<dyn crate::remote::RemoteEndpoint> =
-                    Arc::new(crate::remote::InboundReentryEndpoint::new(
-                        remote_peer_id.to_string(),
-                        remote_identity_hash,
-                        cap,
-                        resp_tx.clone(),
-                        reentry_pending.clone(),
-                    ));
+                let concrete = Arc::new(crate::remote::InboundReentryEndpoint::new(
+                    remote_peer_id.to_string(),
+                    remote_identity_hash,
+                    cap,
+                    resp_tx.clone(),
+                    reentry_pending.clone(),
+                ));
+                let endpoint: Arc<dyn crate::remote::RemoteEndpoint> = concrete.clone();
+                reentry_concrete = Some(concrete);
                 shared
                     .remote
                     .register_inbound(remote_peer_id.as_str(), endpoint.clone());
@@ -305,34 +311,63 @@ pub async fn handle_connection(
     };
     // Tear down the reentry endpoint whenever this connection loop exits
     // (clean EOF, read error, or task abort). Two responsibilities:
-    //   1. Deregister *our* endpoint — identity-checked so a second inbound
-    //      connection from the same peer that overwrote the map entry is not
-    //      clobbered by this (older) connection's teardown.
+    //   1. `connection_over()` — drop the endpoint's writer handle, so a
+    //      reentry dispatch arriving AFTER the loop ends fails at once instead
+    //      of at the request deadline, and the socket's write half is released
+    //      (that handle is what keeps the writer task, and the write half it
+    //      owns, alive).
     //   2. Clear `reentry_pending` so any in-flight reentry caller resolves
-    //      immediately with a connection error instead of blocking to the
-    //      request timeout (mirrors the dialer-side `spawn_reader_loop`).
+    //      immediately with a connection error. Mirrors the dialer-side
+    //      `spawn_reader_loop`, which marks and clears in the same order and
+    //      covers the same two cases.
+    //
+    // **It deliberately does NOT deregister the endpoint any more**, and that
+    // reversal is the fix, not an omission. This teardown is the acceptor's
+    // half of a §6.5 link — the offerer rule decides which side dials, so one
+    // vanished counterpart is a dead `RemoteConnection` on one browser and a
+    // dead accepted connection on the other. Deregistering here evicted the
+    // binding, and `demote_peer_on_transport_error` fires only while the failed
+    // endpoint is *still* bound: the eviction disarmed the demotion the next
+    // dispatch was about to trigger, and with the registration gone
+    // `get_or_connect` then missed the inbound fallback and failed at
+    // resolution, with no endpoint to demote either. Nothing ever wrote
+    // `suspect`. Measured in `entity-browser-rust`'s `make e2e-webrtc-vanish`:
+    // the acceptor half never noticed at all while the dialer half noticed in
+    // 0.5s — bimodal by handshake role.
+    //
+    // Leaving it registered is safe because it now fails fast: the next
+    // dispatch gets a transport error, the §A1 seam evicts and demotes, and the
+    // one after that re-establishes. `register_inbound` is an unconditional
+    // insert, so a reconnect from the same peer replaces it — which is also why
+    // dropping the old `Arc::ptr_eq` teardown check costs nothing: the state is
+    // now per-endpoint, so an older connection's teardown cannot touch a newer
+    // connection the way a map removal could.
+    //
+    // Stated cost: a peer that dialed us, went away, and is never dispatched at
+    // again leaves one endpoint husk in the registry until it reconnects. It
+    // holds no channel and no socket — see `connection_over` — and it is the
+    // same bargain the outbound pool already makes with a dead
+    // `RemoteConnection`.
     struct ReentryGuard {
-        shared: Arc<PeerShared>,
-        peer_id: String,
-        endpoint: Option<Arc<dyn crate::remote::RemoteEndpoint>>,
+        endpoint: Option<Arc<crate::remote::InboundReentryEndpoint>>,
         pending: crate::remote::Pending,
     }
     impl Drop for ReentryGuard {
         fn drop(&mut self) {
+            // Mark first, then clear — the two halves must not leave a gap for
+            // a caller that lands between them.
             if let Some(ep) = &self.endpoint {
-                self.shared.remote.remove_inbound(&self.peer_id, ep);
+                ep.connection_over();
             }
             self.pending.lock().unwrap().clear();
         }
     }
     // §6.5 mutual minting: keep a handle to the reentry endpoint so the message
     // loop's `reentry-grant` intercept can install the reciprocal capability the
-    // dialer mints for us. Cloned before the guard moves the original.
-    let reentry_ep_handle = reentry_endpoint.clone();
+    // dialer mints for us.
+    let reentry_ep_handle = reentry_endpoint;
     let _reentry_guard = ReentryGuard {
-        shared: shared.clone(),
-        peer_id: remote_peer_id.to_string(),
-        endpoint: reentry_endpoint,
+        endpoint: reentry_concrete,
         pending: reentry_pending.clone(),
     };
 

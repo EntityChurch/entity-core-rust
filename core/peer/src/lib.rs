@@ -8599,6 +8599,192 @@ mod tests {
         server_handle.abort();
     }
 
+    /// THE ACCEPTOR'S HALF of "the other person closed their tab": the peer that
+    /// dialed **us** vanishes, and we must stop saying `connected`.
+    ///
+    /// §6.5 opens ONE data channel per pair and the offerer rule decides which
+    /// side dialed, so the same vanished counterpart is a dead
+    /// `RemoteConnection` on one browser and a dead **accepted** connection on
+    /// the other. Measured in `entity-browser-rust`'s `make e2e-webrtc-vanish`:
+    /// the dialer half noticed in 0.5s and the acceptor half **never noticed at
+    /// all** — bimodal by handshake role, which reads as a flaky rig until you
+    /// print which role you got.
+    ///
+    /// The cause was `handle_connection`'s teardown deregistering its reentry
+    /// endpoint. `demote_peer_on_transport_error` fires only while the failed
+    /// endpoint is *still* bound, so the eviction disarmed the demotion — and
+    /// with the registration gone, the next `get_or_connect` missed the inbound
+    /// fallback, failed at resolution instead of at a send, and had no endpoint
+    /// to demote either. Nothing ever wrote `suspect`.
+    ///
+    /// **Established over the §6.5 rendezvous, and that is load-bearing, not
+    /// scene-setting.** An acceptor holds originating authority only once the
+    /// dialer's reciprocal grant lands; without it `send_execute` refuses
+    /// *locally* before touching the transport, the seam demotes on that, and
+    /// the gate goes green with the whole defect present. The precondition is
+    /// asserted rather than assumed for exactly that reason.
+    ///
+    /// **What this does NOT measure, stated because its neuter told me so.**
+    /// Removing `InboundReentryEndpoint`'s closed check leaves this green: over
+    /// a memory (or TCP) transport the writer task breaks on a failed
+    /// `write_frame` and drops `resp_rx`, so `writer_tx.send` supplies the
+    /// fast-fail by itself. No native rig here has a write half that keeps
+    /// accepting bytes, which is precisely what a `MessagePort` does and
+    /// precisely why this defect lived in the browser. So this gate measures
+    /// the *registration* decision; the flag's own gate is
+    /// `a_reentry_dispatch_after_the_accept_loop_ends_fails_now_not_at_the_request_deadline`,
+    /// which holds the receiver open to reproduce that.
+    #[tokio::test]
+    async fn an_acceptor_notices_the_dialer_that_vanished() {
+        use transport::{MemoryListener, MemoryTransportRegistry};
+
+        let registry = MemoryTransportRegistry::new();
+
+        // S — the browser that stayed.
+        let server = PeerBuilder::new()
+            .keypair(Keypair::from_seed([0x70u8; 32]))
+            .build()
+            .unwrap();
+        let server_pid = server.peer_id().to_string();
+        let server_shared = server.shared();
+        let listener = MemoryListener::bind(server_pid.clone(), registry.clone()).unwrap();
+        server.start_engines(&server_shared);
+        let server_shared_for_task = server_shared.clone();
+        let server_handle = tokio::spawn(async move {
+            let _ = server::run(listener, server_shared_for_task).await;
+        });
+        tokio::task::yield_now().await;
+
+        let client_kp = Keypair::from_seed([0x71u8; 32]);
+        let client_pid = client_kp.peer_id().to_string();
+        let client_hash = client_kp.peer_identity_hash();
+
+        {
+            // C — the browser that closes its tab. Scoped so every handle to it
+            // is gone below.
+            let mut client = PeerBuilder::new()
+                .keypair(Keypair::from_seed([0x71u8; 32]))
+                .build()
+                .unwrap();
+            client.local_only();
+            client.set_live_establish(std::sync::Arc::new(StubEstablisher::rendezvous(
+                registry.clone(),
+                server_pid.clone(),
+            )));
+            let client_shared = client.shared();
+            client.start_engines(&client_shared);
+
+            remote::get_or_connect(
+                &client_shared.remote,
+                &server_pid,
+                &client_shared.keypair,
+                client_shared.content_store.as_ref(),
+                client_shared.location_index.as_ref(),
+                &client_pid,
+                client_shared.connector.as_ref(),
+                client_shared.config.home_hash_format,
+                Some(client_shared.clone()),
+            )
+            .await
+            .expect("§10.3: the rendezvous seam should have produced a live connection");
+
+            // PRECONDITION, asserted not assumed: S holds a reentry binding for
+            // C *with originating authority*, and believes C is connected. "Not
+            // connected" is also what a peer that never connected says.
+            let mut ready = false;
+            for _ in 0..200 {
+                if let Some(e) = server_shared.remote.get_inbound(&client_pid) {
+                    if e.originating_capability().is_some() {
+                        ready = true;
+                        break;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(
+                ready,
+                "precondition: S must hold C's reentry binding WITH the §6.5 reciprocal \
+                 grant — without it S refuses locally and this gate proves nothing"
+            );
+            assert_eq!(
+                crate::liveness::read_peer_status(
+                    server_shared.content_store.as_ref(),
+                    server_shared.location_index.as_ref(),
+                    server_shared.peer_id.as_str(),
+                    &client_hash,
+                )
+                .expect("S wrote a status entity for C at the handshake")
+                .status,
+                crate::peer_status::PEER_STATUS_CONNECTED,
+                "precondition: S must believe C is connected before C vanishes"
+            );
+
+            // The tab closes. Dropping the pooled binding closes C's half of the
+            // duplex, which is what S's accept loop reads as EOF.
+            client_shared.remote.remove(&server_pid);
+        }
+
+        // S keeps trying to reach C, as the app's delivery poll does. Each
+        // attempt must fail at the transport *now*, so the §A1 seam at the
+        // §10-step-1 send site can evict and write `suspect`.
+        //
+        // The budget is far below DEFAULT_REQUEST_TIMEOUT (30s) on purpose: the
+        // question is "immediately or at the deadline", and a per-attempt
+        // timeout keeps a regression reporting the budget instead of hanging.
+        let params = entity_entity::Entity::new(
+            "system/params",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![])),
+        )
+        .unwrap();
+        let uri = format!("/{}/system/tree", client_pid);
+        let started = std::time::Instant::now();
+        let mut demoted = None;
+        while started.elapsed() < std::time::Duration::from_secs(5) {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                server.execute(&uri, "get", params.clone()),
+            )
+            .await;
+            let status = crate::liveness::read_peer_status(
+                server_shared.content_store.as_ref(),
+                server_shared.location_index.as_ref(),
+                server_shared.peer_id.as_str(),
+                &client_hash,
+            )
+            .expect("the status entity must not vanish");
+            if status.status != crate::peer_status::PEER_STATUS_CONNECTED {
+                demoted = Some(status);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let status = demoted.expect(
+            "S still says C is `connected` after C vanished — the acceptor half of the \
+             vanished-peer defect: either the accepted connection kept swallowing \
+             dispatches to the request deadline, or its teardown deregistered the \
+             endpoint and disarmed the §A1 demotion",
+        );
+        assert_eq!(
+            status.status,
+            crate::peer_status::PEER_STATUS_SUSPECT,
+            "one transport failure is `suspect`; escalation to `disconnected` is §5.4's"
+        );
+        assert_eq!(
+            status.reason.as_deref(),
+            Some(crate::peer_status::PEER_STATUS_REASON_TRANSPORT_ERROR),
+            "the demotion must name the transport, not a keepalive that never ran"
+        );
+        assert!(
+            server_shared.remote.get_inbound(&client_pid).is_none(),
+            "the seam must evict the dead reentry binding, or `get_or_connect` keeps \
+             preferring it over re-establishment (the inbound fallback is consulted \
+             BEFORE the §10.3 seam)"
+        );
+
+        server_handle.abort();
+    }
+
     /// The §6.5 (b) **Contents** ruling (arch `f8f736a`, 2026-08-05) measured on
     /// both directions of one peer: the reciprocal grant C mints for S is the
     /// grant C would issue S **as an inbound dialer** — the assembled §4.4 set,

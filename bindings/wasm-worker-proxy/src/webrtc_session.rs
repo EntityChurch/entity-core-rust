@@ -47,8 +47,8 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::{
     Event, MessageChannel, MessageEvent, MessagePort, RtcConfiguration, RtcDataChannel,
     RtcDataChannelEvent, RtcDataChannelInit, RtcDataChannelState, RtcDataChannelType,
-    RtcIceCandidate, RtcIceCandidateInit, RtcPeerConnection, RtcPeerConnectionIceEvent, RtcSdpType,
-    RtcSessionDescriptionInit,
+    RtcIceCandidate, RtcIceCandidateInit, RtcPeerConnection, RtcPeerConnectionIceEvent,
+    RtcPeerConnectionState, RtcSdpType, RtcSessionDescriptionInit,
 };
 
 /// Sessions live per control port, because `negotiation_id` is allocated per
@@ -233,6 +233,68 @@ fn post_inbound(port: &MessagePort, frame: &JsValue, dc: &RtcDataChannel) {
     }
 }
 
+/// Is this `RTCPeerConnection` state terminal for the transport riding on it?
+///
+/// **`Disconnected` is deliberately NOT terminal**, and that is the whole
+/// subtlety. The WebRTC spec makes `disconnected` *transient*: ICE may still
+/// recover the same connection, and a peer behind a flaky link passes through it
+/// routinely. Tearing the byte stream down there would destroy connections that
+/// were about to come back — the same mistake as evicting on wake instead of
+/// probing. A `disconnected` that does not recover escalates to `failed` on its
+/// own via ICE consent freshness (RFC 7675), so nothing is lost by waiting for
+/// the state that actually means it.
+///
+/// `New`/`Connecting` are pre-open and never reach here (the port pair is only
+/// wired after the channel opens); they are listed rather than defaulted so a
+/// future state has to be classified deliberately.
+fn terminal_for_transport(state: RtcPeerConnectionState) -> bool {
+    match state {
+        RtcPeerConnectionState::Failed | RtcPeerConnectionState::Closed => true,
+        RtcPeerConnectionState::New
+        | RtcPeerConnectionState::Connecting
+        | RtcPeerConnectionState::Connected
+        | RtcPeerConnectionState::Disconnected => false,
+        // MUST-ignore-unknown: a state this web-sys does not model is not
+        // grounds for killing a working connection.
+        _ => false,
+    }
+}
+
+/// Tell the worker's `Connection` that this transport is over.
+///
+/// **A dead data channel is invisible until somebody writes to it**, and that is
+/// the hole this closes. The bytes cross a `MessagePort`, which has no close
+/// event and no error — so when the channel underneath dies, the worker's
+/// `read_exact` simply waits, and the peer keeps the pooled binding and keeps
+/// dispatching over it. Until now the two places that observe the death
+/// (`PortPump::fail`, and the `close` listener in `wait_open`) wrote a console
+/// line and closed the `RTCDataChannel`, neither of which the worker can see.
+///
+/// A zero-length frame is the close sentinel `PortReader` already surfaces as
+/// EOF (`core/peer`'s `transport.rs`: *"MessagePort has no explicit close, so
+/// this is how we signal half-close"*). Reaching EOF ends the reader, which
+/// fails the in-flight request as a transport error and — crucially — is what
+/// the §A1 seam at the dispatch caller demotes and evicts on. So this reports
+/// *evidence*; it does not write liveness, which stays the kernel's to do.
+///
+/// **Idempotent by construction:** once the reader has EOF'd, the connection is
+/// torn down and a second sentinel lands nowhere. That matters because both the
+/// channel `close` and a `failed` peer connection legitimately fire for one
+/// death, and neither can know whether the other already ran.
+fn signal_transport_eof(port: &MessagePort, why: &str) {
+    web_sys::console::log_1(&JsValue::from_str(&format!(
+        "webrtc: transport is over ({why}) — signalling EOF to the worker so the \
+         connection fails now rather than on the next 30s request deadline"
+    )));
+    if let Err(e) = port.post_message(&Uint8Array::new_with_length(0)) {
+        // Non-fatal and worth saying: the worker then falls back to the
+        // request deadline, which is the behaviour we had before this existed.
+        web_sys::console::error_1(&JsValue::from_str(&format!(
+            "webrtc: could not post the EOF sentinel — {e:?}"
+        )));
+    }
+}
+
 /// `RTCPeerConnection.sctp.maxMessageSize` — the largest message this
 /// connection agreed to carry, i.e. the minimum of what we can send and what
 /// the remote advertised in its SDP `a=max-message-size`.
@@ -290,8 +352,9 @@ pub(crate) struct WebRtcSession {
     /// life: dropping it closes the port and tears down the pump the instant
     /// `wait_open` returns.
     kept_ports: RefCell<Vec<MessagePort>>,
-    /// Data-channel event listeners installed by `wait_open` —
-    /// `bufferedamountlow`, `error`, `close`.
+    /// Event listeners installed by `wait_open` — the data channel's
+    /// `bufferedamountlow`, `error` and `close`, plus the peer connection's
+    /// `connectionstatechange`.
     ///
     /// Parked on the session rather than on the [`PortPump`] they drive: each
     /// holds an `Rc<PortPump>`, so a closure stored inside the pump would be a
@@ -634,9 +697,9 @@ impl WebRtcSession {
         dc.add_event_listener_with_callback("bufferedamountlow", on_low.as_ref().unchecked_ref())
             .map_err(|e| format!("bufferedamountlow listener: {e:?}"))?;
 
-        // Diagnostics only — nothing branches on these. They exist because the
-        // two ways this transport dies (`error`, and a `close` nobody asked
-        // for) previously produced no output whatsoever on either side.
+        // `error` stays diagnostics-only — it reports a fault on a channel that
+        // may still be open, and is not by itself the end of the transport.
+        // `close` is different and no longer merely logged: see below.
         let dc_for_err = dc.clone();
         let on_error = Closure::<dyn FnMut(Event)>::new(move |ev: Event| {
             web_sys::console::error_1(&JsValue::from_str(&format!(
@@ -648,15 +711,44 @@ impl WebRtcSession {
         dc.add_event_listener_with_callback("error", on_error.as_ref().unchecked_ref())
             .map_err(|e| format!("error listener: {e:?}"))?;
 
+        // A closed data channel never reopens, so this IS the end of the byte
+        // stream — and every existing failure path already funnels here, because
+        // `PortPump::fail` and `post_inbound` both end in `dc.close()`. Putting
+        // the EOF on the close event rather than at each of those call sites is
+        // the difference between a rule and a step someone has to remember: a
+        // teardown added tomorrow inherits it without knowing it exists.
         let dc_for_close = dc.clone();
+        let ours_for_close = ours.clone();
         let on_close = Closure::<dyn FnMut(Event)>::new(move |_: Event| {
+            let buffered = dc_for_close.buffered_amount();
             web_sys::console::log_1(&JsValue::from_str(&format!(
-                "webrtc: data channel closed (buffered {} still unsent)",
-                dc_for_close.buffered_amount()
+                "webrtc: data channel closed (buffered {buffered} still unsent)"
             )));
+            signal_transport_eof(&ours_for_close, "data channel closed");
         });
         dc.add_event_listener_with_callback("close", on_close.as_ref().unchecked_ref())
             .map_err(|e| format!("close listener: {e:?}"))?;
+
+        // The idle death this file previously could not see at all. A NAT
+        // mapping that expires, or a network that goes away, kills the
+        // connection without anybody closing the channel and without any send
+        // being attempted — so the data channel can sit in `open` over a
+        // transport that is gone. ICE consent freshness (RFC 7675) is what
+        // notices, and it surfaces here as `failed`.
+        //
+        // Both this and the `close` handler fire for a single death in the
+        // ordinary case; `signal_transport_eof` is idempotent precisely so
+        // neither has to know about the other.
+        let pc_for_state = self.pc.clone();
+        let ours_for_state = ours.clone();
+        let on_conn_state = Closure::<dyn FnMut(Event)>::new(move |_: Event| {
+            let state = pc_for_state.connection_state();
+            if terminal_for_transport(state) {
+                signal_transport_eof(&ours_for_state, &format!("peer connection is {state:?}"));
+            }
+        });
+        self.pc
+            .set_onconnectionstatechange(Some(on_conn_state.as_ref().unchecked_ref()));
 
         // Retain the closures AND our end of the channel for the session's
         // life. Dropping `ours` here would close the port and tear down the
@@ -668,6 +760,7 @@ impl WebRtcSession {
         hooks.push(on_low);
         hooks.push(on_error);
         hooks.push(on_close);
+        hooks.push(on_conn_state);
         drop(hooks);
 
         Ok(for_worker)

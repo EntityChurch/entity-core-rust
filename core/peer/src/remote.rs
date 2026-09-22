@@ -5,7 +5,7 @@
 //! authenticated EXECUTE, and cache connections for reuse.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -213,6 +213,18 @@ pub trait RemoteEndpoint: Send + Sync {
     }
 }
 
+/// The transport error a dispatch over a connection whose reader has ended
+/// reports. Named so the §A1 demotion it triggers carries a `last_error` that
+/// says *why* rather than repeating a deadline that never elapsed.
+///
+/// **One string for both roles, on purpose.** §6.5 opens ONE data channel per
+/// pair and the offerer rule decides which side dialed, so the same link is a
+/// [`RemoteConnection`] here and an [`InboundReentryEndpoint`] on the
+/// counterpart. Two spellings of *the reader that would answer this has ended*
+/// would let the two roles drift apart, which is exactly how this defect
+/// survived: the dialer's half was found and the acceptor's half was not.
+pub const READER_ENDED_ERROR: &str = "connection is over: the transport reader ended";
+
 /// Pending response demultiplexer table — keyed by `request_id`.
 ///
 /// Public so the accept-side message loop can share one table with an
@@ -265,6 +277,25 @@ pub struct RemoteConnection {
     /// write half is dropped).
     #[allow(dead_code)]
     reader_task: ReaderTaskHandle,
+    /// Set by the reader task as it exits — this connection's read half is
+    /// finished, so it can never answer another request.
+    ///
+    /// **The asymmetry this closes.** [`InboundReentryEndpoint`] gets this for
+    /// free: its send is a channel push, and the accept loop dropping the
+    /// receiver makes the next `writer_tx.send` fail *immediately*. A dialed
+    /// connection writes into a socket / `MessagePort` write half, which happily
+    /// accepts bytes nobody will ever read — so a dispatch issued after the
+    /// reader died used to register its demux entry, write, and block the full
+    /// [`DEFAULT_REQUEST_TIMEOUT`] before anyone learned anything. The reader
+    /// already clears `pending` on exit, which fails the requests that were
+    /// **in flight**; this flag is what fails the ones that arrive **after**.
+    ///
+    /// It is a *report*, not a demotion: the §A1 seam discipline puts the
+    /// liveness write at the dispatch caller that holds `peer_id`, never inside
+    /// a transport primitive. This makes the transport error observable at once;
+    /// `liveness::demote_peer_on_transport_error` at the §10-step-1 send site
+    /// still owns the eviction and the `suspect` write.
+    reader_ended: Arc<AtomicBool>,
     /// Wall-clock ms of the last successful response on this connection
     /// (see `RemoteEndpoint::last_activity_ms`). 0 = none yet.
     last_activity_ms: AtomicU64,
@@ -326,6 +357,22 @@ impl RemoteEndpoint for RemoteConnection {
                 p.insert(request_id.clone(), tx);
             }
 
+            // The reader owns the read half; once it has ended, nothing will
+            // ever route a response back into `pending` and writing more bytes
+            // at the far side is pointless. Fail now rather than at the request
+            // deadline (see the `reader_ended` field).
+            //
+            // Checked AFTER registering the demux entry, which is what makes it
+            // race-free in both directions: a reader that ended *before* this
+            // insert is caught here, and one that ends *after* it drops our
+            // sender in its own `pending.clear()`, resolving the await below at
+            // once. Ordering the check first would leave the window between the
+            // check and the insert uncovered.
+            if self.reader_ended.load(Ordering::Acquire) {
+                self.pending.lock().unwrap().remove(&request_id);
+                return Err(PeerError::ConnectionError(READER_ENDED_ERROR.to_string()));
+            }
+
             let write_res = {
                 let mut writer = self.writer.lock().await;
                 write_frame(&mut *writer, &frame).await
@@ -378,7 +425,12 @@ impl RemoteEndpoint for RemoteConnection {
 /// same writer channel the message loop drains.
 pub struct InboundReentryEndpoint {
     /// Shared writer channel — the accept loop's serial frame writer.
-    writer_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    ///
+    /// **`None` once that loop has torn down, and that absence IS the closed
+    /// state** (see [`InboundReentryEndpoint::connection_over`]). Interior-
+    /// mutable because the endpoint is shared as `Arc<dyn RemoteEndpoint>` and
+    /// the teardown reaches it from outside.
+    writer_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>,
     /// Shared demux table — the accept read loop delivers EXECUTE_RESPONSE
     /// frames here, keyed by `request_id`.
     pending: Pending,
@@ -422,7 +474,7 @@ impl InboundReentryEndpoint {
         pending: Pending,
     ) -> Self {
         Self {
-            writer_tx,
+            writer_tx: Mutex::new(Some(writer_tx)),
             pending,
             remote_peer_id,
             remote_identity_hash,
@@ -431,6 +483,28 @@ impl InboundReentryEndpoint {
             held_grant: Mutex::new(None),
             request_seq: AtomicU64::new(0),
         }
+    }
+
+    /// The accept loop that answers this endpoint has torn down. Drop the
+    /// writer handle: later dispatches fail at once instead of at the request
+    /// deadline, and the socket's write half is released.
+    ///
+    /// **Dropping the sender rather than raising a flag beside it, and the
+    /// difference is not cosmetic.** This endpoint's `resp_tx` clone is what
+    /// keeps the accept loop's writer task parked, and that task owns the
+    /// connection's write half — so an endpoint that outlives its loop while
+    /// still holding a sender holds a half-open socket open with it. Measured:
+    /// a peer whose server task had been killed took the full 30s
+    /// [`DEFAULT_REQUEST_TIMEOUT`] to fail, because the counterpart's socket was
+    /// never closed and no EOF ever reached it. One piece of state means *this
+    /// connection is over*, and releasing it is the same act as recording it.
+    ///
+    /// Called by the accept loop's teardown guard, which deliberately does NOT
+    /// deregister the endpoint: `demote_peer_on_transport_error` fires only
+    /// while the failed endpoint is still the bound one, so deregistering here
+    /// would disarm the §A1 demotion the next dispatch is about to trigger.
+    pub fn connection_over(&self) {
+        self.writer_tx.lock().unwrap().take();
     }
 }
 
@@ -482,10 +556,21 @@ impl RemoteEndpoint for InboundReentryEndpoint {
                 p.insert(request_id.clone(), tx);
             }
 
+            // The accept loop that would route our response is finished. Same
+            // placement and same race reasoning as
+            // `RemoteConnection::dispatch_raw`: checked after the insert, so a
+            // loop that ended before it is caught here and one that ends after
+            // it drops our sender in the teardown's own `pending.clear()`.
+            let writer = self.writer_tx.lock().unwrap().clone();
+            let Some(writer) = writer else {
+                self.pending.lock().unwrap().remove(&request_id);
+                return Err(PeerError::ConnectionError(READER_ENDED_ERROR.to_string()));
+            };
+
             // Push the outbound EXECUTE frame onto the accept loop's serial
             // writer channel. The accept-side read loop will route the
             // matching EXECUTE_RESPONSE back into `pending`.
-            if self.writer_tx.send(frame).is_err() {
+            if writer.send(frame).is_err() {
                 self.pending.lock().unwrap().remove(&request_id);
                 return Err(PeerError::ConnectionError(
                     "reentry: accept-side writer channel closed".to_string(),
@@ -798,18 +883,6 @@ impl RemoteState {
     /// Look up a reentry endpoint for an accepted connection from `peer_id`.
     pub fn get_inbound(&self, peer_id: &str) -> Option<Arc<dyn RemoteEndpoint>> {
         self.inbound.lock().unwrap().get(peer_id).cloned()
-    }
-
-    /// Drop the reentry endpoint for `peer_id` (accept loop exited / closed),
-    /// but only if the currently-registered endpoint IS `endpoint`.
-    ///
-    /// The identity check (`Arc::ptr_eq`) makes teardown safe when the same
-    /// peer holds more than one inbound connection: a second connection
-    /// overwrites the map entry via `register_inbound`, and when the first
-    /// (older) connection later closes it MUST NOT clobber the second's live
-    /// endpoint. Each connection removes only the endpoint it registered.
-    pub fn remove_inbound(&self, peer_id: &str, endpoint: &Arc<dyn RemoteEndpoint>) {
-        self.evict_inbound_if_bound(peer_id, endpoint);
     }
 
     /// Evict `endpoint` from the outbound pool iff it is still the bound
@@ -2135,6 +2208,7 @@ pub async fn perform_connect_with_dispatch(
     // also drops the `Arc`, which (when no callers hold the conn)
     // triggers the same path.
     let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+    let reader_ended = Arc::new(AtomicBool::new(false));
     let writer = Arc::new(tokio::sync::Mutex::new(writer));
     // §6.11(b) dialer-side reentry: hand the reader a write handle + dispatch
     // context so it can answer inbound EXECUTEs over this same connection.
@@ -2143,8 +2217,13 @@ pub async fn perform_connect_with_dispatch(
     // abort — the reader ends at stream EOF), so this binding is a unit value
     // there; it is still stored as the `reader_task` field on both targets.
     #[allow(clippy::let_unit_value)]
-    let reader_task =
-        spawn_reader_loop(reader, pending.clone(), remote_peer_id.clone(), reentry_ctx);
+    let reader_task = spawn_reader_loop(
+        reader,
+        pending.clone(),
+        reader_ended.clone(),
+        remote_peer_id.clone(),
+        reentry_ctx,
+    );
 
     Ok(RemoteConnection {
         writer,
@@ -2155,6 +2234,7 @@ pub async fn perform_connect_with_dispatch(
         remote_identity_hash,
         request_seq: AtomicU64::new(0),
         reader_task,
+        reader_ended,
         last_activity_ms: AtomicU64::new(0),
         reciprocal_grant_sent,
     })
@@ -2278,11 +2358,23 @@ pub(crate) fn reciprocal_cap_hash(grant: &Envelope) -> Option<Hash> {
 ///
 /// Exits on first read error or decode failure — terminating the task
 /// drops the `Pending` map's senders, so all in-flight callers' awaits
-/// resolve with `RecvError` (translated to a connection error).
+/// resolve with `RecvError` (translated to a connection error), and raises
+/// `ended` so dispatches issued *after* the exit fail at once instead of at
+/// the request deadline (see [`RemoteConnection::reader_ended`]).
+///
+/// It raises a flag and drops senders; it does **not** evict the pooled
+/// binding and does **not** write liveness. Both would be the §A1 seam
+/// discipline inverted — and evicting here is worse than doing nothing:
+/// `demote_peer_on_transport_error`'s no-clobber guard fires only while the
+/// failed endpoint is *still* the binding, so an eviction from in here
+/// disarms the very demotion the failure is about to trigger, and
+/// `escalate_unbound_suspect` (which escalates only from `suspect`) then
+/// finds nothing owed. The status entity would sit on `connected` for good.
 #[allow(clippy::type_complexity)]
 fn spawn_reader_loop(
     mut reader: Box<dyn AsyncRead + Unpin + Send>,
     pending: Pending,
+    ended: Arc<AtomicBool>,
     remote_peer_id: String,
     reentry: Option<(
         Arc<crate::PeerShared>,
@@ -2406,6 +2498,15 @@ fn spawn_reader_loop(
                 }
             }
         }
+        // Raise the flag BEFORE clearing, so the two halves cannot leave a
+        // gap: a caller that registered its entry just before the clear is
+        // failed by the clear, and one that arrives just after it is failed by
+        // the flag it is guaranteed to see.
+        ended.store(true, Ordering::Release);
+        tracing::debug!(
+            remote_peer = %remote_peer_id,
+            "reader: connection is over — later dispatches will fail immediately"
+        );
         // On exit, drop the pending senders so any remaining awaiters
         // resolve immediately with a connection-broken error.
         let mut p = pending.lock().unwrap();
@@ -3962,9 +4063,11 @@ mod tests {
         )
         .unwrap();
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let reader_ended = Arc::new(AtomicBool::new(false));
         let reader_task = spawn_reader_loop(
             client_read,
             pending.clone(),
+            reader_ended.clone(),
             "memory:test".to_string(),
             None,
         );
@@ -3977,6 +4080,7 @@ mod tests {
             remote_identity_hash: Hash::zero(),
             request_seq: AtomicU64::new(0),
             reader_task,
+            reader_ended,
             last_activity_ms: AtomicU64::new(0),
             // No handshake ran on this pipe, so nothing was minted.
             reciprocal_grant_sent: false,
@@ -4182,5 +4286,199 @@ mod tests {
         assert_eq!(r2.unwrap().unwrap().status, 200);
 
         server.await.unwrap();
+    }
+
+    // -----------------------------------------------------------------
+    // A vanished peer — the reader ends, and dispatch must find out NOW
+    //
+    // The counterpart closes its tab. Bytes cross a `MessagePort` (or a
+    // half-closed socket), so the WRITE half keeps accepting everything we
+    // hand it; the only signal is that the READ half is finished. Both
+    // fixtures below therefore pair a duplex read half with `io::sink()` as
+    // the write half — a duplex's own write half errors once the far end
+    // drops, which would fail the dispatch for a reason the real transport
+    // never supplies and hide the thing being measured.
+    // -----------------------------------------------------------------
+
+    /// Wait for the reader task to observe EOF. Polled, not slept: the reader
+    /// is a spawned task, so "the far side dropped" and "the reader processed
+    /// that" are different instants and a fixed sleep is a race either way.
+    async fn await_reader_end(conn: &RemoteConnection) {
+        for _ in 0..200 {
+            if conn.reader_ended.load(Ordering::Acquire) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the reader task did not end within 2s of the far side vanishing");
+    }
+
+    /// A dispatch issued AFTER the reader ended must fail at once.
+    ///
+    /// The reader clearing `pending` already fails whatever was in flight at
+    /// the moment the connection died; every request issued after it used to
+    /// register a demux entry nobody would ever route to, write into a void,
+    /// and block the full [`DEFAULT_REQUEST_TIMEOUT`]. That is the ~30s a
+    /// vanished peer took to be noticed, and only when something happened to
+    /// dispatch — and it is why the app-visible symptom was a counterpart that
+    /// kept rendering "Connected".
+    ///
+    /// The 2s budget is not a tuned threshold: it is far below the 30s
+    /// deadline and far above any honest cost of this path, so the assertion
+    /// is "now" vs "the deadline", not a stopwatch.
+    #[tokio::test]
+    async fn a_dispatch_after_the_reader_ends_fails_now_not_at_the_request_deadline() {
+        let (client_stream, server_stream) = tokio::io::duplex(1024);
+        let conn =
+            make_test_remote_connection(Box::new(client_stream), Box::new(tokio::io::sink()));
+
+        drop(server_stream); // the other person closed the tab
+        await_reader_end(&conn).await;
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(2),
+            conn.dispatch_raw("req-after-the-end".to_string(), vec![0xa0]),
+        )
+        .await
+        .expect(
+            "a dispatch over a finished connection blocked past 2s — it is waiting out \
+             DEFAULT_REQUEST_TIMEOUT, which is the vanished-peer defect",
+        )
+        .err()
+        .expect("a finished connection answered a request");
+
+        assert!(
+            err.to_string().contains(READER_ENDED_ERROR),
+            "the failure must NAME the ended reader — a caller that cannot tell this from a \
+             deadline cannot report it either. got: {err}"
+        );
+    }
+
+    /// The ACCEPTOR's twin: a reentry dispatch after the accept loop ends must
+    /// fail at once too.
+    ///
+    /// **The held receiver is the entire fixture**, in the same way `io::sink()`
+    /// is above. Drop it and `send` fails on its own, which is exactly what a
+    /// socket transport does and exactly why no native rig had ever exhibited
+    /// this: over a `MessagePort` the writer task never errors, so it never
+    /// breaks and never drops the receiver, and every send "succeeds" into a
+    /// channel nobody reads. Holding it open reproduces that, and it is what
+    /// makes the neuter of `connection_over` red instead of green.
+    #[tokio::test]
+    async fn a_reentry_dispatch_after_the_accept_loop_ends_fails_now_not_at_the_request_deadline() {
+        let (writer_tx, _writer_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let endpoint = InboundReentryEndpoint::new(
+            "memory:test".to_string(),
+            Hash::zero(),
+            Entity::new("test/cap", b"\xa0".to_vec()).unwrap(),
+            writer_tx,
+            new_pending(),
+        );
+
+        // The accept loop exits — its teardown guard says so.
+        endpoint.connection_over();
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(2),
+            endpoint.dispatch_raw("reentry-after-the-end".to_string(), vec![0xa0]),
+        )
+        .await
+        .expect(
+            "a reentry dispatch over a finished accepted connection blocked past 2s — it is \
+             waiting out DEFAULT_REQUEST_TIMEOUT, which is the acceptor half of the \
+             vanished-peer defect",
+        )
+        .err()
+        .expect("a finished accepted connection answered a request");
+
+        assert!(
+            err.to_string().contains(READER_ENDED_ERROR),
+            "both roles must report the SAME transport error, or the two halves of one \
+             §6.5 link drift apart. got: {err}"
+        );
+    }
+
+    /// …and the pooled binding is left ALONE, so the §A1 seam can still act.
+    ///
+    /// The tempting fix is to have the reader evict its own binding. It is
+    /// worse than doing nothing: `demote_peer_on_transport_error` fires only
+    /// while the failed endpoint is *still* bound (the no-clobber guard), so
+    /// an eviction from inside the reader disarms the demotion the failure is
+    /// about to trigger — and `escalate_unbound_suspect` escalates only from
+    /// `suspect`, so the keepalive loop finds nothing owed and exits. The
+    /// status entity would then read `connected` forever, which is the
+    /// production symptom with no remaining mechanism to clear it.
+    ///
+    /// So this pins the whole chain in one place: reader ends → the binding
+    /// survives → the dispatch fails fast → the seam evicts and writes
+    /// `suspect`.
+    #[tokio::test]
+    async fn the_reader_ending_leaves_the_binding_for_the_a1_seam_to_evict() {
+        use crate::peer_status::{PeerStatusData, PEER_STATUS_CONNECTED, PEER_STATUS_SUSPECT};
+
+        let (client_stream, server_stream) = tokio::io::duplex(1024);
+        let conn = Arc::new(make_test_remote_connection(
+            Box::new(client_stream),
+            Box::new(tokio::io::sink()),
+        ));
+        let endpoint: Arc<dyn RemoteEndpoint> = conn.clone();
+
+        let peer = crate::PeerBuilder::new()
+            .keypair(Keypair::from_seed([0x71; 32]))
+            .build()
+            .unwrap();
+        let shared = peer.shared();
+        let remote_pid = endpoint.remote_peer_id().to_string();
+        let remote_hash = endpoint.remote_identity_hash();
+        shared.remote.insert_endpoint(&remote_pid, endpoint.clone());
+        crate::liveness::write_peer_status(
+            shared.content_store.as_ref(),
+            shared.location_index.as_ref(),
+            shared.peer_id.as_str(),
+            &remote_hash,
+            &PeerStatusData::bare(&remote_pid, PEER_STATUS_CONNECTED),
+        );
+
+        drop(server_stream);
+        await_reader_end(&conn).await;
+
+        let bound = shared.remote.get(&remote_pid).expect(
+            "the reader's death evicted the pooled binding — the §A1 demotion below can no \
+             longer fire, and nothing else will ever move this peer off `connected`",
+        );
+        assert!(Arc::ptr_eq(&bound, &endpoint));
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(2),
+            endpoint.dispatch_raw("req-after-the-end".to_string(), vec![0xa0]),
+        )
+        .await
+        .expect("the dispatch blocked past 2s")
+        .err()
+        .expect("a finished connection answered a request");
+
+        // What the §10-step-1 send site does with that error.
+        crate::liveness::demote_peer_on_transport_error(
+            &shared,
+            &remote_pid,
+            &endpoint,
+            &err.to_string(),
+        );
+
+        let status = crate::liveness::read_peer_status(
+            shared.content_store.as_ref(),
+            shared.location_index.as_ref(),
+            shared.peer_id.as_str(),
+            &remote_hash,
+        )
+        .expect("status entity vanished");
+        assert_eq!(
+            status.status, PEER_STATUS_SUSPECT,
+            "a peer whose connection is over is still being rendered as connected"
+        );
+        assert!(
+            shared.remote.get(&remote_pid).is_none(),
+            "the seam must evict the dead binding so the next dispatch re-establishes"
+        );
     }
 }

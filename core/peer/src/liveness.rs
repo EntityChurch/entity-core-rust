@@ -160,7 +160,7 @@ pub(crate) fn now_ms() -> u64 {
 /// dead connection from the pool so the next dispatch redials.
 ///
 /// No-clobber / idempotency (§A1 — behavioral, ruled per ask C; the
-/// `Arc::ptr_eq` precedent at `remove_inbound`): the eviction and the
+/// `Arc::ptr_eq` precedent at `evict_inbound_if_bound`): the eviction and the
 /// demotion fire only if `failed` is still the connection currently
 /// bound for this peer — the pooled outbound conn, or the §6.11(b)
 /// inbound-reentry conn for the no-published-profile path. If a
