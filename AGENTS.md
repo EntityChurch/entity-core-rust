@@ -25,6 +25,35 @@ never push to the `codeberg` mirror (append-only, ADR-0014) — `origin` is the 
 target. Ask only when a push would be non-fast-forward, or when the work is genuinely
 unfinished.
 
+## Routing packets — every one opens with an addressee block
+
+A packet under `docs/status/ROUTING-*.md` **MUST** open with three fields, each on its own line,
+**before** the prose title does any addressing:
+
+```
+**To:** `entity-system-architecture`
+**From:** `entity-core-rust`
+**cc:** `entity-core-go`, `entity-core-py`
+```
+
+**Delivery in this polyrepo is: you commit a document to your own tree and the other seat reads
+it.** There is no queue and no notification, so a packet nobody can *enumerate* is a packet nobody
+receives. Naming recipients in the title line — which is what this repo did through
+`ROUTING-2026-09-15-d` — parses as **`unaddressed`**, and arch's `spec inbound` then files it as
+**UNKNOWN rather than "not ours"**: our four `.26` asks reached the architecture seat only because
+`entity-core-go` relayed them. `To:` names **repositories**, never people; a brace list
+(`entity-core-{go,py}`) is fine.
+
+⚠ **The canonical text of this convention is `AGENTS-STANDARD.md`'s *Routing packets* section,
+which our copy does not have.** Measured 2026-09-16: of the seven trees carrying the standard,
+**two** (`entity-system-architecture`, `entity-system-generator`) have the section and **five**
+(`entity-core-{rust,go,py}`, `entity-core-keystone`, `entity-core-protocol`) do not — so this is a
+cohort-wide gap, not ours, and arch has named the root cause as theirs. Our copy is also stale on
+the 2026-09-08 operator direction that a repo **MAY** edit the standard locally between releases
+and the meta DevOps seat reconciles the divergence at the release boundary. **Do not re-sync the
+overlay file unilaterally** — it is owned at the boundary; this block exists so the convention
+binds here in the meantime, and it comes out when the re-synced file carries it.
+
 ## How we work here — tier **CORE**
 
 This repo runs the entity-OS methodology at the **Core** tier — the framework is
@@ -1033,6 +1062,34 @@ gates by making the TCP path compile on wasm32.
   whether the narrowing happened, so the only observer is a deliberately non-conformant one. Report
   the per-site result, never the category total — *"6/6 and here is which layer each row is
   attributable to"* is a different and more useful sentence than *"6/6."*
+  **Ratified 2026-09-15, and the second bite is the inverse of the first: there the two sites were
+  REDUNDANT and a green row could not say which earned it; here the two sites were
+  COMPLEMENTARY — one per connection PHASE — and a green suite could not say that one of them was
+  never entered.** §4.11's pre-admission refusal has two emission sites in this tree, because the
+  serial writer task does not exist until the handshake completes: `write_preadmission_refusal` at
+  the two hello/authenticate frame reads, and `send_preadmission_refusal` through `resp_tx` in the
+  message loop. They share the `(status, code)` table — `preadmission_disposition`, one function,
+  deliberately — and that shared half is exactly what made the split invisible. Six rows drove the
+  handshake site; restoring the **exact pre-`0.8.2.25` bare close** on the message loop's read arm
+  left all six **green**.
+  **The tell is that a "shared helper" makes two sites look like one.** A single `fn` answering
+  *what code* reads as the whole rule, and the half it does not answer — *who puts it on the wire,
+  and on which socket half* — is the half with the phase-specific bug in it. Factor the decision,
+  never the delivery, and then ask per delivery site what drives it.
+  **Enforcement, and it is the same rule pointed at coverage rather than at attribution: a mutation
+  that reddens NOTHING is a finding about the test set, not a no-op.** The first instinct on a green
+  mutation is *"the two guards must be equivalent"* — which was true the last time this shape
+  appeared (`extensions/tree`'s double refusal) and false here. Resolve it by naming the input that
+  reaches each site and checking a row drives it; if no row can, build the driver. Here that meant a
+  **tapping proxy** (`core/peer/tests/preadmission_refusal_vector.rs::tapped_pair`): a byte-level
+  man-in-the-middle between a real dialer and a real acceptor, so a **forged length prefix** — which
+  `dispatch_raw` cannot express, because it frames what it is handed — can be written at an
+  **established** connection and the acceptor's answer read back. That is the raw-frame injection
+  `entity-core-go` records as owed by their validate harness, and it is ~60 lines. Two fixture traps
+  it cost, both of which silently pass a conformant peer: **a dropped half of a `tokio::io::split`
+  signals no EOF at all**, so `drop(writer)` where `shutdown().await` is meant turns *"EOF part-way
+  through a frame"* into *"a slow sender"* and the row times out against correct code — and a proxy
+  must **propagate** that EOF rather than merely stopping its copy loop.
 
 - **A pair of helpers implementing one §1.4 rule will drift in their DISPOSITION, and the one that
   panics is reachable from the wire.** *(**Ratified 2026-09-11**: bit us twice in one day, the
@@ -1130,6 +1187,43 @@ gates by making the TCP path compile on wasm32.
   narrower one, say so at the `fn` with both citations, and route** — do not pick. The cost of
   picking wrong here is silently re-opening a closed disclosure, which no oracle can see because
   both readings produce a well-formed response.
+  **⭐ Ratified 2026-09-15, and the second bite makes the enforcement CHEAPER rather than harder,
+  because the table CITED the section it contradicts.** `EXTENSION-TREE` v4.11 §2.2a declares, per
+  operation, whether a resource-optional op's absent case is **BROAD** (refuse the self-excluded
+  case `400 path_required`) or an **optional FILTER** (answer it empty) — the field `0.8.2.25` says
+  three implementations were each inferring privately, and it is a genuinely good rule. Three of its
+  eight rows are wrong against the same document:
+  - `diff` is declared `resource` **required**, and **§4.2 — the section the row cites — says *"the
+    `resource` field is optional; when omitted, handler-scope authorization (§11) suffices."***
+    `diff` compares two *content-addressed snapshot roots*; it has no path subject to name.
+  - `create` and `destroy` are declared **required**, and §7.2/§7.3 give them `params` of
+    `system/tree/config` (a `tree_id`) and `primitive/string` (a `tree_id`) — no path — while §7.4's
+    own authorization table, untouched by v4.11, reads *"Handler scope only"* for both.
+  Measured before reporting rather than read: **core-go's `handleDiff` requires no resource either**
+  (`core/tree/operations.go`, and their `path_required` sites are `get`/`snapshot`/`extract` only),
+  so implementing the column verbatim would have made *us* the one seat refusing `diff` — including
+  the `snapshot`→`diff` composition our own `exclude_matrix` leak fix depends on, and go's
+  `convergence.extractAndMerge`. **The three BROAD rows are right and we already conform; it is the
+  `required` column that was filled in by symmetry.**
+  **So the enforcement gets a first step that is cheaper than the grep:** a classifying table's rows
+  usually carry a **section reference**, and the reference is the reconciliation target — read the
+  cited section *before* the rest of the document. A row whose own citation contradicts it is the
+  easiest possible catch and the one most likely to be skipped, precisely because the citation reads
+  as provenance rather than as a claim. Second step unchanged: the sentence elsewhere that answers
+  the same question for the same subject (here §7.4's table, which v4.11 did not touch). And the
+  disposition is the entry's existing one and it held: **hold the narrower reading, implement
+  nothing from the disputed column, and route it** — a table with three bad rows out of eight is
+  not a thing to implement selectively on your own reading of which three.
+  **Corollary, and it is the larger half of this bite: an obligation stated in CORE but discharged
+  in EXTENSIONS is landed in exactly one extension on the day it lands.** §3.3 now requires *every*
+  resource-optional operation to declare BROAD or FILTER. `EXTENSION-TREE` §2.2a does, for its
+  eight. The other **25** extension specs do not (`grep -l 'BROAD' specs/extensions/*.md` → one
+  file), while 26 files in `extensions/` here read a resource target — so the field the ruling says
+  must stop being inferred is still inferred everywhere but one handler. It also leaves
+  `CORE-RESOURCE-TWO-EMPTIES-1` arm **(c)** — the optional-FILTER arm — with **no declared subject
+  anywhere in the corpus**, so that arm is undrivable rather than merely unimplemented. **Check the
+  denominator before scoping a per-operation obligation**, and report the count upward: one
+  extension conforming is the start of the work, not the end of it.
 
 - **A spec rule that relocates an authorization check makes you read a field that was ATTRIBUTION
   until that moment — and the propagated caller capability is the one with a comment saying so.**
@@ -2029,6 +2123,43 @@ gates by making the TCP path compile on wasm32.
   item is a claim with an expiry date, and the comment will never tell you it expired** — when a
   ruling lands on a surface, grep the tree for the superseded item's identifier, not just for the
   behaviour.
+- **⭐ RATIFIED 2026-09-16 — *a validator with no consumer* has now bitten three times in three
+  different disguises, and the third one was WEARING A GREEN CROSS-IMPL GATE.** The first was a
+  handler built, tested and unreachable from any peer binary (`storage-substitute-http`). The
+  second was a `LocationIndex` decorator declining to forward the CAS trio. The third is the
+  sharpest and is the one that promotes this to a discipline: `is_canonical_ecf` — a complete
+  strict-ECF validator with an explicit major-type-6 arm, shipped since the initial release,
+  carrying its own F29/F30 unit suite — **had zero callers on any protocol boundary.** Its only
+  consumer was `cmd/wire-conformance`, scoring `decode_reject` *vectors*. So
+  `ENTITY-CBOR-ENCODING` §6.3's *"MUST reject any received protocol frame containing a CBOR tag on
+  a data field"* was unimplemented in the peer for the whole life of the tree, behind a suite that
+  tested the validator and a cohort gate that scored its output.
+  **Three transferable parts, and the third is new.**
+  (a) **The enforcement point is a question asked of the VALIDATOR, not of the rule.** For every
+  `fn` in this tree whose name or doc says *validate / canonical / reject / is_\**, grep its call
+  sites and ask **which of them is on a path a remote caller reaches**. A validator whose only
+  callers are `cmd/`, `tests/`, or a conformance emitter is a validator the peer does not run, and
+  the rule it implements is unimplemented however good the function is. `grep -rn 'fn is_canonical\|fn validate_' --include=*.rs`
+  then `grep -rn '<name>(' --include=*.rs` per hit; a hit list with no `core/peer` or `core/wire`
+  entry **is** the finding.
+  (b) **A fix in one direction can move you from one half of a two-sided MUST NOT to the other.**
+  §6.3 forbids **both** *"silently strip"* and *"preserve through forwarding"*. Before the §5.4
+  byte-fidelity fix (`23513a0`) `to_ecf`'s `Value::Tag(_, inner)` arm stripped tags on the forward
+  path; after it, `data` rides raw and we preserved them. **The tree was on one side or the other
+  of that sentence the entire time, the fix swapped sides without touching the file, and the suite
+  was green for both** — because no row drove a tag. When a rule forbids two dispositions, a
+  change that alters which one you have is not a fix, and the only thing that can tell them apart
+  is a row that drives the input.
+  (c) ⛔ **A conformance category driven from an EMISSION FILE scores the emitter, not the peer —
+  and that is invisible from inside a green run.** go's `tag_reject` gate
+  (`cmd/internal/validate/conformance.go`) collects each impl's `decode_results` / `decode_codes`
+  and asserts *"rejected by all N impls with code `non_canonical_ecf`"*. Every seat emits those
+  from its **conformance CLI**, so three seats passed a tag gate while at least two peers admitted
+  the frame. This is the `[self]`-check rule one level out: there the check measured the harness's
+  own implementation, here the check measures an **artifact the peer does not produce**.
+  **Before citing a conformance category as evidence about your peer, ask what the harness
+  actually drove — a socket, or a file your CLI wrote.** If it is a file, the category is a
+  statement about your emitter and the peer is unmeasured.
 - **A byte-fidelity rule the TYPE cannot express is a rule every site re-decides, and every site
   will get it wrong the same way — find the missing primitive, not the missing call.** *(Candidate:
   bit us once, 2026-09-15, at **eight** sites simultaneously; found by a sibling's read of one of
@@ -2274,6 +2405,25 @@ Cross-impl wire fidelity. Same-side round-trip tests pass with the **wrong** sha
     *about* you rather than the ones the sender happened to gate. Landed as `29a6f5a`, and it was
     hiding a second defect (a `404` answering an encode failure) that no report would ever have
     named because no seat can see it from outside.
+    **Third shape, 2026-09-16, and it is the one a CLARITY revision produces: when a ruling
+    WITHDRAWS a prohibition, it hands the withdrawn input to some OTHER rule — and the question
+    you owe is not *"does this delta oblige me?"* but *"do I implement the rule it just handed the
+    input to?"*** `0.8.2.26` opens *"not one delta adds an obligation to a conformant peer … eight
+    of the nine withdraw a prohibition"*, scores `DR-3` **"no — a prohibition was withdrawn"**, and
+    `entity-core-go` relayed it as *"nothing in either of your trees moves."* All of that is
+    accurate. What `DR-3` withdrew is §4.11's ban on answering `non_canonical_ecf` on the framing
+    arm, and what it did with the input was **partition** it: tagged-but-decodable bytes move to
+    `ENTITY-CBOR-ENCODING` §6.3, a rule older than the fold and one we had never implemented. The
+    delta obliged nothing; the rule on the far side of the partition obliged everything, and a
+    reader tracking obligations-added sees zero.
+    ⚠ **The tell is the word *partition* — or *"is not this arm, it is that one"*, or a table row
+    that MOVES rather than appears.** A withdrawal is a redirection, so read the destination.
+    **Enforcement: for every delta a fold scores as a withdrawal or a clarification, name the rule
+    the input now lands on and grep your tree for that rule's enforcement point** — not the fold's.
+    Here that was one grep (`grep -rn 'non_canonical_ecf' --include=*.rs`), and the answer was five
+    hits of which **none was an emission site**: four comments explaining why the code does *not*
+    apply, and one `cmd/` conformance harness. A code with no emission site is a rule with no
+    implementation, whatever the comments around it say.
   - **Sibling *inputs* reaching one call site — a MUST NOT on a CODE binds everywhere that
     code is written, and the routing will scope it to the input somebody measured.**
     *(Candidate: bit us once, 2026-09-02, caught before reporting the item closed.)* `0.8.2.5`

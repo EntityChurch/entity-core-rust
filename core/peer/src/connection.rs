@@ -10,7 +10,7 @@ use entity_entity::{EntityUri, Envelope};
 use entity_handler::{
     ExecuteFn, ExecuteOptions, HandlerContext, HandlerError, STATUS_AUTH_FAILED,
     STATUS_BAD_REQUEST, STATUS_CONFLICT, STATUS_FORBIDDEN, STATUS_INTERNAL_ERROR, STATUS_NOT_FOUND,
-    STATUS_NOT_SUPPORTED,
+    STATUS_NOT_SUPPORTED, STATUS_PAYLOAD_TOO_LARGE,
 };
 use entity_protocol::{
     build_error_response, build_execute_response, build_execute_response_full, Connection,
@@ -18,6 +18,147 @@ use entity_protocol::{
 use entity_wire::{
     decode_envelope, encode_envelope, read_frame, write_frame, DEFAULT_MAX_FRAME_SIZE,
 };
+
+/// Put a **§4.11 pre-admission refusal** on the wire (0.8.2.25).
+///
+/// A pre-admission refusal is the refusal of an inbound frame *before it becomes
+/// an admitted request*, so §4.9(c)'s deliver-or-signal rule — scoped to *"every
+/// request the peer admits"* — reaches none of them, and §4.11 states the
+/// obligation separately:
+///
+/// > A peer that refuses a frame pre-admission **MUST** put a coded
+/// > EXECUTE_RESPONSE on the wire, correlated by `request_id` where the id is
+/// > available and otherwise as a best-effort coded frame carrying no
+/// > correlation. Whether the peer closes afterwards is its own choice.
+///
+/// # ⛔ One function, because the class had FIVE homes and FOUR strengths
+///
+/// That is the finding 0.8.2.25 is built on: §4.6 forbade the bare close, §5.2a
+/// forbade the drop *and* the close, §4.10(a) permitted the close, §3.3
+/// **required** it with no coded frame at all, and the framing arm was stated
+/// nowhere — three of them giving the same reason in nearly the same words, none
+/// cross-referencing another, and three independent implementations producing
+/// three different caller-observable answers to one input. **Patching the
+/// instances is what produced the divergence**, so the emission lives here once
+/// and every arm calls it. A `match` arm that hand-rolls its own refusal is a
+/// second copy, and a second copy is how the four strengths happened.
+///
+/// # The code belongs to the CAUSE, not to the class
+///
+/// Callers pass `(status, code)`; this function has no opinion on them and must
+/// not acquire one. §4.11 is explicit that a single code for the class *"would
+/// answer an honest caller under the wrong reason and send them to the wrong
+/// layer"* — `413` says shrink the payload, `400 invalid_request` says fix the
+/// bytes, `400 hash_mismatch` says re-key the `included` map, `401` says
+/// re-authenticate. Four remedies.
+///
+/// # Best-effort, and the failure mode is deliberate
+///
+/// Goes out through the serial writer channel like every other response on this
+/// connection — the socket is owned by the writer task. A closed channel means
+/// the writer is already gone, i.e. the connection is over, and there is nothing
+/// to answer to; a failure to *build* the envelope likewise leaves nothing to
+/// send. Both are swallowed on purpose: this is the best-effort half of §4.11,
+/// and a refusal that panicked while refusing would be worse than the drop it
+/// replaces.
+fn send_preadmission_refusal(
+    resp_tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    request_id: &str,
+    status: u32,
+    code: &str,
+    message: &str,
+) {
+    if let Ok(resp) = build_error_response(request_id, status, code, message) {
+        let _ = resp_tx.send(encode_envelope(&resp));
+    }
+}
+
+/// The §4.11 refusal for the **pre-`Established`** phase, written straight at
+/// the socket (0.8.2.25).
+///
+/// Same obligation, different plumbing, and the difference is why this exists as
+/// a second function rather than a second copy of the emission. The serial
+/// writer task — and therefore `resp_tx` — is only created once the handshake
+/// completes, so the two hello/authenticate frame reads have nothing to send
+/// through and must write the half they own directly. Everything a caller
+/// decides is still `(status, code)`.
+///
+/// ⚠ **The handshake frames are in the class.** §4.11's table lists the
+/// connect-auth arm as a member (§4.6: *"a bare close is non-conformant"*), and
+/// a frame that does not decode at all is the same class one step earlier — the
+/// initiator is mid-handshake, so a silent EOF reads to it as *"this peer is
+/// down"* rather than *"your hello was malformed"*. Both of these sites
+/// bare-closed until 0.8.2.25.
+///
+/// Arm (f) does not arise here: pre-`Established` there are no admitted requests
+/// to destroy, so the caller closes afterwards and §4.11 leaves that to it.
+async fn write_preadmission_refusal<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    request_id: &str,
+    status: u32,
+    code: &str,
+    message: &str,
+) {
+    if let Ok(resp) = build_error_response(request_id, status, code, message) {
+        let _ = write_frame(writer, &encode_envelope(&resp)).await;
+    }
+}
+
+/// The `(status, code)` §4.11 assigns a [`entity_wire::WireError`] arising at a
+/// frame read or an envelope decode — the class's two mechanical arms.
+///
+/// Shared by the handshake sites and the message loop so the two phases cannot
+/// answer the same bytes differently, which is the intra-implementation form of
+/// the very divergence §4.11 was written to close. `IncludedKeyMismatch` is
+/// deliberately **absent**: §5.2a's arm is only reachable post-handshake and
+/// carries a real `request_id`, so it is answered at its own site with the
+/// correlation this function cannot supply.
+/// Is this the one read failure §4.11 does **not** reach — EOF at a frame
+/// boundary?
+///
+/// ⚠ **The distinction is made in `read_frame` and can only be made there.**
+/// `read_exact` reports "the peer hung up between frames" and "the peer sent
+/// three bytes of a length prefix and vanished" as the same `UnexpectedEof`, and
+/// once the error is in the caller's hands the phase is gone. So `read_frame`
+/// returns [`entity_wire::WireError::TruncatedFrame`] for the second and a plain
+/// `Io(UnexpectedEof)` only for the first, and this predicate reads that
+/// verdict rather than re-deriving it. Widening it to *"any `UnexpectedEof`"*
+/// would silently restore the bare close on every truncated frame, which is the
+/// mutation the truncation row exists to catch.
+fn is_clean_eof(e: &entity_wire::WireError) -> bool {
+    matches!(e, entity_wire::WireError::Io(io) if io.kind() == std::io::ErrorKind::UnexpectedEof)
+}
+
+fn preadmission_disposition(e: &entity_wire::WireError) -> (u32, &'static str) {
+    match e {
+        // §4.10(a). Detected at the length prefix — nothing was buffered.
+        entity_wire::WireError::FrameTooLarge { .. } => {
+            (STATUS_PAYLOAD_TOO_LARGE, "payload_too_large")
+        }
+        // §4.11 arm (5a) — the **tag-policy** row (0.8.2.26 `DR-3`).
+        //
+        // ⚠ This arm is what the comment below used to deny. Pre-`.26` §4.11's
+        // framing row read *"un-parseable, truncated or **non-canonical**
+        // CBOR"* and then forbade `non_canonical_ecf` on it by name, so one
+        // input satisfied two MUSTs incompatibly: a tag on a data field is
+        // non-canonical, is detected at decode, and never becomes an Envelope.
+        // `.26` partitions them instead of ranking them — **bytes that do not
+        // decode at all** are the framing arm, **bytes that decode and carry a
+        // forbidden tag** are §6.3's — and says the second *"is a
+        // pre-admission refusal governed by this section's frame obligation
+        // like any other member"*, which is why it routes through this same
+        // function and not through a private emission.
+        entity_wire::WireError::CborTag { .. } => (STATUS_BAD_REQUEST, "non_canonical_ecf"),
+        // §4.11's framing row, and the code is `invalid_request` **because the
+        // bytes did not decode** — not merely because nothing else matched.
+        // The neighbouring code `non_canonical_ecf` is the arm directly above:
+        // `ENTITY-CBOR-ENCODING` §6.3 defines it for CBOR tag-policy
+        // violations, and *"your bytes are truncated"* is not *"re-encode
+        // without the tag."* The code selects the caller's remedy, so a code in
+        // the right family is still the wrong code.
+        _ => (STATUS_BAD_REQUEST, "invalid_request"),
+    }
+}
 
 /// Handle a single connection: handshake then message loop.
 ///
@@ -53,11 +194,28 @@ pub async fn handle_connection(
 
     // --- Phase 1+2: Receive remote hello → send our hello response ---
     tracing::debug!("awaiting remote hello");
-    let frame = read_frame(&mut reader, DEFAULT_MAX_FRAME_SIZE)
-        .await
-        .map_err(|e| PeerError::ConnectionError(format!("read hello: {}", e)))?;
-    let hello_envelope = decode_envelope(&frame)
-        .map_err(|e| PeerError::ConnectionError(format!("decode hello: {}", e)))?;
+    // §4.11 (0.8.2.25): both halves of this read are pre-admission refusals and
+    // both bare-closed before. A clean EOF at the frame boundary is NOT one —
+    // that is a caller that connected and went away, and it owes nothing — which
+    // is the distinction `read_frame` now makes for us via `TruncatedFrame`.
+    let frame = match read_frame(&mut reader, DEFAULT_MAX_FRAME_SIZE).await {
+        Ok(f) => f,
+        Err(e) => {
+            if !is_clean_eof(&e) {
+                let (status, code) = preadmission_disposition(&e);
+                write_preadmission_refusal(&mut writer, "", status, code, &e.to_string()).await;
+            }
+            return Err(PeerError::ConnectionError(format!("read hello: {}", e)));
+        }
+    };
+    let hello_envelope = match decode_envelope(&frame) {
+        Ok(e) => e,
+        Err(e) => {
+            let (status, code) = preadmission_disposition(&e);
+            write_preadmission_refusal(&mut writer, "", status, code, &e.to_string()).await;
+            return Err(PeerError::ConnectionError(format!("decode hello: {}", e)));
+        }
+    };
 
     // v7.66 §4.4 surface 6 — handshake errors MUST surface as a wire
     // EXECUTE_RESPONSE (e.g., `400 unsupported_key_type` for an unknown
@@ -141,11 +299,34 @@ pub async fn handle_connection(
 
     // --- Phase 3+4: Receive authenticate → send authenticate response ---
     tracing::debug!("awaiting remote authenticate");
-    let frame = read_frame(&mut reader, DEFAULT_MAX_FRAME_SIZE)
-        .await
-        .map_err(|e| PeerError::ConnectionError(format!("read authenticate: {}", e)))?;
-    let auth_envelope = decode_envelope(&frame)
-        .map_err(|e| PeerError::ConnectionError(format!("decode authenticate: {}", e)))?;
+    // §4.11 again, at the handshake's SECOND frame — same reason and same shape
+    // as the hello read above. `AwaitingAuthenticate` is still pre-`Established`,
+    // so the initiator is still in a state where a silent close is
+    // indistinguishable from the peer being down.
+    let frame = match read_frame(&mut reader, DEFAULT_MAX_FRAME_SIZE).await {
+        Ok(f) => f,
+        Err(e) => {
+            if !is_clean_eof(&e) {
+                let (status, code) = preadmission_disposition(&e);
+                write_preadmission_refusal(&mut writer, "", status, code, &e.to_string()).await;
+            }
+            return Err(PeerError::ConnectionError(format!(
+                "read authenticate: {}",
+                e
+            )));
+        }
+    };
+    let auth_envelope = match decode_envelope(&frame) {
+        Ok(e) => e,
+        Err(e) => {
+            let (status, code) = preadmission_disposition(&e);
+            write_preadmission_refusal(&mut writer, "", status, code, &e.to_string()).await;
+            return Err(PeerError::ConnectionError(format!(
+                "decode authenticate: {}",
+                e
+            )));
+        }
+    };
 
     // CE-1 again, at the handshake's SECOND frame. `AwaitingAuthenticate` is
     // still pre-`Established` — a hello has been exchanged but no signer has
@@ -378,8 +559,49 @@ pub async fn handle_connection(
                 tracing::debug!(remote_peer = %remote_peer_id, "remote disconnected (EOF)");
                 return Ok(()); // Clean disconnect
             }
-            Err(e) => {
+            // ⛔ **§4.11 pre-admission refusal, the two arms that DESYNC the
+            // stream** (0.8.2.25). Both owe a coded frame before the close;
+            // what they cannot have is the `continue` the decode arm below
+            // gets, because in each case the bytes the length prefix promised
+            // were never consumed and the next read would land mid-frame.
+            //
+            // Until 0.8.2.25 both of these were a bare `Err` — a **bare
+            // close**, which §4.11 names as one of the class's two distinct
+            // non-conformances: it is indistinguishable from a network fault,
+            // so the caller cannot tell a defect in its own request from a
+            // defect in the path, and the two remedies are opposite.
+            //
+            // The code is the CAUSE's, never the class's: an oversize frame is
+            // §4.10(a)'s `413 payload_too_large` and a truncated one is the
+            // framing arm's `400 invalid_request`. `413` on a truncated frame
+            // would send an honest caller to shrink a payload that was the
+            // right size, and that is the mistake §4.11 exists to forbid.
+            // A genuine transport break — reset, broken pipe, TLS failure. NOT a
+            // §4.11 member: the class is about frames *this peer refuses*, and
+            // there is no refusal here and nobody left to answer. Kept as its own
+            // arm rather than folded into the refusal below, because answering a
+            // dead socket with `400 invalid_request` would blame the caller's
+            // bytes for the network's failure — and would swallow the error the
+            // caller of `handle_connection` uses to distinguish the two.
+            Err(entity_wire::WireError::Io(e)) => {
                 return Err(PeerError::ConnectionError(format!("read frame: {}", e)));
+            }
+            Err(e) => {
+                let (status, code) = preadmission_disposition(&e);
+                tracing::warn!(
+                    remote_peer = %remote_peer_id,
+                    error = %e,
+                    status, code,
+                    "pre-admission refusal at the frame read (§4.11)"
+                );
+                // Uncorrelated by construction, for BOTH arms. The oversize arm
+                // refuses at the length prefix, so the body — and the
+                // `request_id` inside it — was never read; the truncated arm
+                // never got a whole body to look in. §4.11 provides for exactly
+                // this with its *"otherwise a best-effort coded frame carrying no
+                // correlation"*.
+                send_preadmission_refusal(&resp_tx, "", status, code, &e.to_string());
+                return Ok(());
             }
         };
 
@@ -461,24 +683,70 @@ pub async fn handle_connection(
                         error = %e,
                         "refusing envelope: included entry filed under a foreign hash (§1.8)"
                     );
-                    if let Ok(resp) = build_error_response(
+                    // Through `send_preadmission_refusal` like every other arm of
+                    // the class (0.8.2.25). This arm predates §4.11 and had its
+                    // own inlined emission; §4.11's whole finding is that the
+                    // class was specified five times at four strengths because
+                    // each instance answered locally, so the emission is one
+                    // function now and the arms differ only in `(status, code)`.
+                    send_preadmission_refusal(
+                        &resp_tx,
                         &request_id,
                         STATUS_BAD_REQUEST,
                         "hash_mismatch",
                         &e.to_string(),
-                    ) {
-                        // Through the serial writer channel, like every other
-                        // response on this connection — the socket itself is
-                        // owned by the writer task. A closed channel means the
-                        // writer is gone, which is the end of the connection.
-                        if resp_tx.send(encode_envelope(&resp)).is_err() {
-                            return Ok(());
-                        }
-                    }
+                    );
                     continue;
                 }
 
-                tracing::warn!(remote_peer = %remote_peer_id, error = %e, "failed to decode envelope");
+                // ⛔ **§4.11's framing arm — the SILENT DROP this seat shipped**
+                // (0.8.2.25). The comment above used to end here with *"every
+                // other decode failure lands in the `continue` below and that is
+                // right: un-parseable bytes carry no `request_id`, so there is
+                // nothing to address a refusal to."* The premise is true and the
+                // conclusion does not follow. §4.11 answers it directly: where
+                // the id is unavailable the refusal goes out as a **best-effort
+                // coded frame carrying no correlation** — an uncorrelated answer
+                // is worth strictly more than none, because a drop is
+                // unobservable to the caller until its own §6.11(c) deadline and
+                // unobservable to every instrument forever.
+                //
+                // This was the *silent* half of the three-way split arch measured
+                // across the ground-up seats: go bare-closed, we dropped, py
+                // answered. §4.11 makes the drop and the bare close two distinct
+                // non-conformances rather than one, and ours was the weaker of
+                // the two precisely because nothing surfaces it.
+                //
+                // The code comes from `preadmission_disposition`, which reads the
+                // **cause** rather than the arm: `invalid_request` where the
+                // bytes did not decode, and **`non_canonical_ecf` where they did
+                // and carried a CBOR tag** (§4.11 arm (5a), 0.8.2.26 `DR-3` —
+                // that arm reaches here too, because a tagged frame is consumed
+                // whole and is therefore `(a1)`-shaped). Specifically **not**
+                // `hash_mismatch` (that is the arm three blocks up — nothing on
+                // the framing path was ever hashed): *"your bytes are
+                // truncated"* is not *"re-key the map"* and is not *"re-encode
+                // without the tag"* either.
+                //
+                // ⚠ The connection SURVIVES, and that is arm (f) of
+                // `CORE-PREADMISSION-REFUSAL-1` — the arm nothing else implies.
+                // The frame was read WHOLE (the length prefix was honoured and
+                // `len` bytes were consumed), so the stream is still synchronized
+                // on the next boundary; only the payload is garbage. Tearing the
+                // connection down here would fail every unrelated **admitted**
+                // request in flight on this multiplexed connection, which §4.9(c)
+                // forbids for each of them independently. Contrast the two
+                // `read_frame` arms above, which close because the stream there
+                // is genuinely desynchronized.
+                let (status, code) = preadmission_disposition(&e);
+                tracing::warn!(remote_peer = %remote_peer_id, error = %e, status, code, "refusing undecodable frame (§4.11 framing arm)");
+                send_preadmission_refusal(
+                    &resp_tx,
+                    "",
+                    status,
+                    code,
+                    &format!("frame is not a decodable ECF envelope: {e}"),
+                );
                 continue;
             }
         };
@@ -534,6 +802,58 @@ pub async fn handle_connection(
                     continue;
                 }
             }
+        }
+
+        // ⛔ **§3.3 / §4.11 arm (b) — a root that is neither EXECUTE nor
+        // EXECUTE_RESPONSE is REFUSED, and the refusal is coded** (0.8.2.25).
+        //
+        // §3.3 is the sentence that moved: it used to read *"a frame whose root
+        // entity is neither EXECUTE nor EXECUTE_RESPONSE is invalid and the peer
+        // MUST close the connection"* — a bare close **mandated**, with no coded
+        // frame anywhere in it — and 0.8.2.25 rewrites it to *"MUST answer `400
+        // invalid_request` before closing"*, with §4.11 as its normative home and
+        // the close demoted to the peer's own choice.
+        //
+        // We had **no gate here at all**, which is a third disposition again: a
+        // third-typed root fell through to `dispatch_request`, where
+        // `decode_execute_fields` fails on a root carrying no `uri`/`operation`
+        // and the answer comes back as whatever the verification path happens to
+        // mint. A code that is *merely in the right family* is still wrong —
+        // §4.11's own words for the adjacent arm — and arm (b) of
+        // `CORE-PREADMISSION-REFUSAL-1` reads the decoded `code` key.
+        //
+        // Placement is load-bearing: **after** the EXECUTE_RESPONSE reentry
+        // branch and the `reentry-grant` intercept, both of which `continue` out
+        // above, so the three admissible shapes on an established connection are
+        // exactly the ones already consumed. It is also **before** dispatch, so
+        // no third-typed root ever reaches verification.
+        //
+        // The connection survives, for the same reason and with the same
+        // authority as the framing arm above: this frame decoded WHOLE, so the
+        // stream is synchronized and §4.9(c) forbids spending the in-flight
+        // admitted requests on it.
+        if envelope.root.entity_type != entity_types::TYPE_EXECUTE {
+            tracing::warn!(
+                remote_peer = %remote_peer_id,
+                root_type = %envelope.root.entity_type,
+                "refusing frame whose root is neither EXECUTE nor EXECUTE_RESPONSE (§3.3)"
+            );
+            // Best-effort correlation: the root DID decode here, unlike the
+            // framing arm, so a `request_id` may be sitting in it and a
+            // correlated refusal is worth more to the caller than an
+            // uncorrelated one. §4.11 asks for the id "where it is available".
+            let request_id = extract_request_id(&envelope).unwrap_or_default();
+            send_preadmission_refusal(
+                &resp_tx,
+                &request_id,
+                STATUS_BAD_REQUEST,
+                "invalid_request",
+                &format!(
+                    "root entity is `{}`, which is neither EXECUTE nor EXECUTE_RESPONSE",
+                    envelope.root.entity_type
+                ),
+            );
+            continue;
         }
 
         // Spawn dispatch — the §4.8 invariant fix. Each frame's handler runs

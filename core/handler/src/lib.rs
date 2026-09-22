@@ -44,6 +44,11 @@ pub const STATUS_CONFLICT: u32 = 409;
 /// elsewhere, no double-execution. Only used within EXTENSION-DURABILITY §5/§8;
 /// V7 v7.46 does not reserve 412 at the core level.
 pub const STATUS_PRECONDITION_FAILED: u32 = 412;
+/// Inbound envelope exceeds the peer's configured maximum size — §4.10(a)'s
+/// `payload_too_large`, and a §4.11 **pre-admission refusal**: the peer MUST
+/// put this on the wire before any close, because the caller cannot otherwise
+/// distinguish "shrink your payload" from a network fault (0.8.2.25).
+pub const STATUS_PAYLOAD_TOO_LARGE: u32 = 413;
 pub const STATUS_RATE_LIMITED: u32 = 429;
 pub const STATUS_INTERNAL_ERROR: u32 = 500;
 pub const STATUS_NOT_SUPPORTED: u32 = 501;

@@ -35,13 +35,44 @@ pub async fn write_frame<W: AsyncWrite + Unpin>(
 /// Read a length-prefixed frame.
 ///
 /// Returns the payload bytes. Enforces `max_frame_size` to bound memory allocation.
+///
+/// # A clean EOF and a truncated frame are different facts (§4.11, 0.8.2.25)
+///
+/// `read_exact` reports both as [`std::io::ErrorKind::UnexpectedEof`], and the
+/// caller cannot tell them apart afterwards — the phase is only knowable here.
+/// §4.11 gives them **opposite dispositions**: EOF at a frame boundary is an
+/// ordinary disconnect and owes nothing, while a frame that started and did not
+/// finish is a pre-admission refusal owing a coded `400 invalid_request`. So the
+/// prefix is read a byte at a time up to the first one rather than with
+/// `read_exact`: reading **zero** bytes is the boundary, reading one to three is
+/// a truncated prefix. Everything past that point is
+/// [`WireError::TruncatedFrame`].
 #[tracing::instrument(level = "debug", skip_all, fields(bytes = tracing::field::Empty))]
 pub async fn read_frame<R: AsyncRead + Unpin>(
     reader: &mut R,
     max_frame_size: u32,
 ) -> Result<Vec<u8>, WireError> {
     let mut len_buf = [0u8; 4];
-    reader.read_exact(&mut len_buf).await?;
+    let mut got = 0usize;
+    while got < 4 {
+        // `read` rather than `read_exact`: a 0 return is EOF, and at got == 0
+        // that is the clean frame boundary the caller must NOT answer.
+        let n = reader.read(&mut len_buf[got..]).await?;
+        if n == 0 {
+            if got == 0 {
+                return Err(WireError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "clean EOF at frame boundary",
+                )));
+            }
+            return Err(WireError::TruncatedFrame {
+                phase: "length prefix",
+                read: got,
+                expected: 4,
+            });
+        }
+        got += n;
+    }
     let len = u32::from_be_bytes(len_buf);
     if len > max_frame_size {
         return Err(WireError::FrameTooLarge {
@@ -50,7 +81,18 @@ pub async fn read_frame<R: AsyncRead + Unpin>(
         });
     }
     let mut payload = vec![0u8; len as usize];
-    reader.read_exact(&mut payload).await?;
+    let mut filled = 0usize;
+    while filled < payload.len() {
+        let n = reader.read(&mut payload[filled..]).await?;
+        if n == 0 {
+            return Err(WireError::TruncatedFrame {
+                phase: "payload",
+                read: filled,
+                expected: payload.len(),
+            });
+        }
+        filled += n;
+    }
     tracing::Span::current().record("bytes", len);
     Ok(payload)
 }
@@ -579,8 +621,45 @@ fn cbor_item_end(data: &[u8], offset: usize) -> Result<usize, WireError> {
             Ok(cursor)
         }
         6 => {
-            // tag — head + exactly one child item
-            cbor_item_end(data, after_head)
+            // ⛔ **The tag-policy refusal, and it lives HERE rather than at N
+            // call sites** (`ENTITY-CBOR-ENCODING` §6.3; §4.11 arm (5a),
+            // 0.8.2.26). §6.3: *"Implementations MUST reject any received
+            // protocol frame containing a CBOR tag on a data field … Detection
+            // is at decode time … covers any CBOR major-type-6 item appearing
+            // anywhere within an entity's `data` field at any nesting depth …
+            // MUST NOT silently strip tags, MUST NOT preserve them through
+            // forwarding, and MUST NOT attempt to interpret them."*
+            //
+            // This arm used to `cbor_item_end(data, after_head)` — walk past
+            // the tag head and carry on — which is *"preserve"*, one of the two
+            // dispositions that sentence forbids. Before the §5.4 byte-fidelity
+            // fix (`23513a0`) the other one applied instead: `to_ecf`'s
+            // `Value::Tag(_, inner)` arm dropped the tag on the forward path,
+            // which is *"silently strip"*. **The tree has been on one side or
+            // the other of that MUST NOT the whole time, and the §5.4 fix moved
+            // us from the first to the second without touching this file.**
+            //
+            // ⭐ **Why this function and not a scan in `decode_entity`.** Every
+            // inbound decode in the peer — TCP, http-live, http-connection,
+            // relay-forwarder — reaches `decode_envelope` / `decode_entity`,
+            // and both resolve each field's extent through *this* function,
+            // recursing to the bottom of `data` already. So the check is
+            // structural, total over every nesting depth §6.3 names, and costs
+            // **no additional traversal**: the walk was happening regardless,
+            // and only the disposition of one arm changes. A scan bolted onto
+            // `decode_entity` would be a second walk, would have to be repeated
+            // at each ingress, and is the shape §1.8 calls out as the one that
+            // cannot be reviewed at a single site.
+            //
+            // ⚠ **Detection is wider than §6.3's "data-field position", and
+            // that is §6.3's own instruction, not a liberty:** *"The envelope
+            // and entity-wrapper CBOR shapes are fixed maps and contain no
+            // positions where a tag could legally be placed; any tag
+            // encountered in those structures is a structurally invalid frame
+            // rejected by ordinary decoder validation."* There is no position
+            // in a protocol frame where a tag is legal, so a total refusal is
+            // the rule, not a superset of it.
+            Err(WireError::CborTag { offset })
         }
         7 => {
             // float / simple — head_size already includes the float payload
@@ -655,6 +734,48 @@ pub enum WireError {
     /// silent: fail-closed, and indistinguishable from a lost frame.
     #[error("envelope.included entry is filed under a hash that is not its own: key {key} vs entity {actual}")]
     IncludedKeyMismatch { key: String, actual: String },
+
+    /// A CBOR **major-type-6 (tag)** item inside a protocol frame — the
+    /// tag-policy refusal, `400 non_canonical_ecf`
+    /// (`ENTITY-CBOR-ENCODING` §6.3; `ENTITY-CORE-PROTOCOL` §4.11 arm (5a),
+    /// 0.8.2.26).
+    ///
+    /// ⛔ **Typed, and separate from [`WireError::CborDecode`], because
+    /// `0.8.2.26` `DR-3` partitions the input those two used to share.** The
+    /// framing arm is *bytes that do not decode at all* → `400
+    /// invalid_request`. These bytes **do** decode — a tag is well-formed CBOR
+    /// — and are refused by policy, so the code is §6.3's and the caller's
+    /// remedy is *re-encode without the tag*, not *your frame is broken*.
+    /// §4.11's own rule is that a code merely in the right family is still the
+    /// wrong code, because the code selects the remedy.
+    ///
+    /// Both are **pre-admission refusals** and both owe a coded frame; the
+    /// stream is synchronized either way here, so the close stays the peer's
+    /// choice (this is never the `(a2)` truncated shape).
+    #[error("CBOR tag (major type 6) at byte {offset}: tags are not part of ECF (ENTITY-CBOR-ENCODING §6.3)")]
+    CborTag { offset: usize },
+
+    /// EOF arrived **part-way through a frame** — after at least one byte of
+    /// the length prefix, or with fewer than `expected` payload bytes read.
+    ///
+    /// ⛔ **Typed, and separate from [`WireError::Io`], because §4.11 gives the
+    /// two opposite dispositions** (0.8.2.25). A clean EOF *at a frame
+    /// boundary* is an ordinary disconnect and nothing is owed. A frame that
+    /// started and did not finish is the **framing population** of the
+    /// pre-admission refusal class: the caller owes a coded `400
+    /// invalid_request` before it closes. `read_exact` reports both as
+    /// `UnexpectedEof`, so the distinction cannot be recovered by the caller
+    /// and has to be made here, where the phase is known.
+    ///
+    /// The stream is **desynchronized** when this fires (the frame the prefix
+    /// promised never arrived), which is why its disposition is *answer, then
+    /// close* rather than the `continue` that [`WireError::CborDecode`] gets.
+    #[error("truncated frame: EOF after {read} of {expected} bytes ({phase})")]
+    TruncatedFrame {
+        phase: &'static str,
+        read: usize,
+        expected: usize,
+    },
 }
 
 #[cfg(test)]
@@ -706,6 +827,108 @@ mod tests {
             reencoded,
             noncanonical.to_vec(),
             "fixture must be a value the codec cannot author, or this test is a tautology"
+        );
+    }
+
+    // --- tag policy (ENTITY-CBOR-ENCODING §6.3; §4.11 arm (5a), 0.8.2.26) ---
+
+    /// Every one of §6.3's positions, refused with the **typed** error the
+    /// caller needs in order to answer `400 non_canonical_ecf` rather than
+    /// `400 invalid_request`.
+    ///
+    /// The four fixtures are the cohort's own `tag_reject` corpus shapes
+    /// (`cmd/wire-conformance`'s F30 set), re-pointed at the production decoder
+    /// instead of at `is_canonical_ecf` — which is the whole finding: that
+    /// validator carries a complete major-6 arm and has **zero callers on any
+    /// protocol boundary**, so the corpus scored a function the peer never ran.
+    ///
+    /// ⚠ **The last row is the one that fails a shallow implementation.** A
+    /// check at the top of `data` — the natural reading of *"a data-field
+    /// position"*, and the cheap one given that `decode_entity` holds `data` as
+    /// a single opaque slice — passes rows 1–3 and misses row 4. §6.3 says
+    /// *"any nesting depth"* and means it.
+    #[test]
+    fn a_cbor_tag_is_refused_at_every_position_in_a_frame() {
+        // {"a": 0("x")}  — tag at the top of a data field.
+        let shallow = [0xa1u8, 0x61, b'a', 0xc0, 0x61, b'x'];
+        // 0({})  — tag wrapping the whole item (the `d9d9f7` self-describe shape).
+        let wrapper = [0xc0u8, 0xa0];
+        // ["x", 0("y")]  — tag as a later array element.
+        let in_array = [0x82u8, 0x61, b'x', 0xc0, 0x61, b'y'];
+        // {"a": [{"b": 0("x")}]}  — depth 4.
+        let deep = [0xa1u8, 0x61, b'a', 0x81, 0xa1, 0x61, b'b', 0xc0, 0x61, b'x'];
+
+        for (label, bytes) in [
+            ("shallow", &shallow[..]),
+            ("wrapper", &wrapper[..]),
+            ("in_array", &in_array[..]),
+            ("deep", &deep[..]),
+        ] {
+            let err = cbor_item_end(bytes, 0).expect_err(label);
+            assert!(
+                matches!(err, WireError::CborTag { .. }),
+                "{label}: a tag MUST surface as the TYPED CborTag — folded into \
+                 `CborDecode` it becomes the framing arm's `invalid_request`, \
+                 which is the pre-fix answer and the wrong remedy: got {err:?}"
+            );
+        }
+    }
+
+    /// The control, and it is the half that makes the rows above mean anything:
+    /// **an untagged twin of each fixture still decodes.** A refusal that fires
+    /// on every input is not a tag check, and this is the assertion that fails
+    /// if the `6 =>` arm is ever widened to a neighbouring major type.
+    #[test]
+    fn the_untagged_twins_still_decode() {
+        for (label, bytes) in [
+            ("shallow", &[0xa1u8, 0x61, b'a', 0x61, b'x'][..]),
+            ("wrapper", &[0xa0u8][..]),
+            ("in_array", &[0x82u8, 0x61, b'x', 0x61, b'y'][..]),
+            (
+                "deep",
+                &[0xa1u8, 0x61, b'a', 0x81, 0xa1, 0x61, b'b', 0x61, b'x'][..],
+            ),
+        ] {
+            assert_eq!(
+                cbor_item_end(bytes, 0).expect(label),
+                bytes.len(),
+                "{label}: the twin differs from its fixture in the tag head and \
+                 nothing else, so it must decode whole"
+            );
+        }
+    }
+
+    /// The finding, recorded as a row rather than as prose: **a tagged entity
+    /// used to decode**, so the peer admitted a frame `ENTITY-CBOR-ENCODING`
+    /// §6.3 obliges it to refuse, and answered on the frame's merits.
+    ///
+    /// This is the test whose pre-fix state is the measurement. Restoring
+    /// `6 => cbor_item_end(data, after_head)` turns the `expect_err` into a
+    /// successful decode and reddens exactly this row plus the two above —
+    /// **and nothing else in the 133-suite set**, which is the other half of
+    /// the finding: no in-tree row anywhere drove a tag through the production
+    /// decoder.
+    #[test]
+    fn a_tagged_entity_does_not_decode_and_the_untagged_one_does() {
+        let mk = |inner: &[u8]| {
+            let base = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+                entity_ecf::text("a"),
+                entity_ecf::text("placeholder"),
+            )]));
+            let data = cbor_map_set_raw(&base, "a", inner).unwrap();
+            encode_entity(&Entity::new("test/v1", data).unwrap())
+        };
+
+        assert!(
+            matches!(
+                decode_entity(&mk(&[0xc0, 0x61, b'x'])),
+                Err(WireError::CborTag { .. })
+            ),
+            "§6.3: a tag inside `data` is a decode-time rejection condition"
+        );
+        assert!(
+            decode_entity(&mk(&[0x61, b'x'])).is_ok(),
+            "control: the same entity without the tag head is ordinary ECF"
         );
     }
 

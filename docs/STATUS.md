@@ -1,6 +1,6 @@
 # entity-core-rust — status
 
-_Updated: 2026-09-15 · public: v0.8.0 (master)_
+_Updated: 2026-09-16 · public: v0.8.0 (master)_
 
 > **A note on the citations below.** Entries name the handoff, routing note or
 > validation report that produced them — files under `docs/status/` and
@@ -41,6 +41,106 @@ and tree semantics are interop-validated against the Go and Python peers, not
 just self-tested.
 
 ## Where we left off
+
+_2026-09-16: **`.26` was relayed to us as "nothing in your tree moves." Three of the four asks
+confirm that exactly. The fourth withdrew a prohibition, and the rule it handed the input to had
+never been implemented here at all.**_
+
+Arch's `.26` fold is a clarity revision — *"not one delta adds an obligation to a conformant
+peer; eight of the nine withdraw a prohibition"* — and `entity-core-go` relayed the rust section
+faithfully. Recomputed against this tree rather than accepted, the scoring holds for three:
+**`DR-1`** folded `EXTENSION-TREE` to **v4.12** with §2.2a's `resource` column now three-valued
+and `diff`/`create`/`destroy` moved to *no path subject*, which vindicates the hold we took and
+is a no-op here (our `path_required` arm is on exactly `get`/`snapshot`/`extract` and on none of
+those three); **`DR-7`** ruled permissive, so our deliberate zero-bound stays; **`DR-6`** ruled,
+with arch correcting our *"26 files"* denominator to 9 and then, by opening all of them, to
+**zero** — no resource-optional operation exists outside `EXTENSION-TREE`. `DR-2`'s `(a1)`/`(a2)`
+split and `DR-10`'s class-vs-code ruling were checked too and are already carried in code, as is
+`CQ-22` (every signing site passes the full `content_hash`, format byte included).
+
+**`DR-3` is the one that moved, and the way it moved is the finding.** It withdrew §4.11's ban on
+`non_canonical_ecf` at the framing arm — scored *"no, a prohibition was withdrawn"* — and what it
+did with the input was **partition** it: bytes that decode and carry a CBOR tag go to
+`ENTITY-CBOR-ENCODING` §6.3, a rule older than the fold. Measured before any edit, **this peer
+ran no tag check on any inbound path.** `cbor_item_end` walked past major type 6 as an ordinary
+item and `decode_entity` holds `data` as a raw slice, so a tagged frame decoded and was admitted.
+*The delta obliged nothing; the rule on the far side of the partition obliged everything.*
+
+⭐ **And the reason no gate could see it: `is_canonical_ecf` — a complete strict-ECF validator
+with an explicit major-6 arm, shipped since the initial release, with its own F29/F30 suite —
+had zero callers on any protocol boundary.** Its only consumer is `cmd/wire-conformance`. That is
+the third instance of *a validator with no consumer* and it ratifies the entry. Worse for the
+cohort: go's `tag_reject` gate compares each impl's **emission file**, so three seats have been
+passing a tag gate that scores their conformance CLI rather than their peer — `entity-core-py`
+found the identical thing about itself this week, independently.
+
+⭐ **Our own §5.4 fix two commits back moved which half of §6.3 we violate, without touching the
+file.** §6.3 forbids *both* "silently strip" and "preserve through forwarding." Before `23513a0`,
+`to_ecf` dropped tags on the forward path; after it, `data` rides raw and we preserved them.
+Green suite both ways, because no row anywhere drove a tag.
+
+Fixed at the primitive rather than at N call sites: `cbor_item_end` already recurses to the
+bottom of every `data` field to resolve its extent and every inbound decode reaches it, so the
+check is total over every nesting depth §6.3 names at **no additional traversal**. Typed
+`WireError::CborTag`, so the caller can pick between the two halves of the partition. Driven over
+the connection stack: tagged frame `400 invalid_request` → **`400 non_canonical_ecf`**, with the
+untagged twin as control — pre-fix the two gave the *same* answer, which is what made it
+invisible. Both mutations run with `--no-fail-fast` and **disjoint by site**: restoring the
+walk-past reddens 4 rows in 2 suites and **nothing else in 2774 tests**; deleting the disposition
+arm reddens only the 2 wire-crossing rows.
+
+**Not re-pinned:** `S-1`/`S-2`. `conformance/MANIFEST.md` still carries `9695b1f1…` and now
+explains why that digest is unblessed on the `signature` category and what gates the move to
+`16861cd0…`. Nothing is owed from us until the cross-bless and the protocol land.
+
+Gate: `make test` **131 suites / 2774P/0F** · clippy · fmt · wasm · godot 263P/0F. `5dac802`.
+`docs/status/ROUTING-2026-09-16-a-*`.
+
+_2026-09-15 (c): **`0.8.2.25` §4.11 landed. Arch named one site; it was four — and one mutation
+that reddened nothing was the most useful result of the session.**_
+
+No routing was addressed to us for `.25`, so the fold diff was read directly
+(`entity-core-protocol` `1a8e0c1`). §4.11 states the pre-admission refusal once: a coded
+EXECUTE_RESPONSE is mandatory, the close is optional, and a **silent drop and a bare close are
+two distinct non-conformances**. Arch's `951bc1b` recorded us as the silent seat at
+`connection.rs:481`. Accurate, and one of four — the other three were the oversize/truncated
+arms (bare close, in the message loop *and* at both handshake frame reads), §3.3's wrong-root
+type (no gate at all), and the dialer-side `reader()`, which `break`s on an undecodable frame
+and so ends the demux for **every** response in flight.
+
+`read_frame` had to change underneath all of it: `read_exact` reports "hung up between frames"
+and "sent three bytes and vanished" as the same `UnexpectedEof`, and §4.11 gives those opposite
+dispositions. Any seat whose frame reader uses a read-exactly primitive has this and cannot see
+it from the caller.
+
+**The session's real finding was a green mutation.** Restoring the exact pre-`.25` bare close on
+the message loop's read arm left all six original wire rows green — they drove the *handshake*
+emission site, and the `(status, code)` table is one shared function while the emission is two.
+A shared helper makes two sites look like one. Closing it took a **tapping proxy** (byte-level
+MITM between a real dialer and a real acceptor) so a forged length prefix can be written at an
+*established* connection — the raw-frame injection `entity-core-go` records as owed by their
+harness. 8 rows now, 8 mutations run, reddening by arm-group with no mutation crossing a group.
+
+**Wire-measured**, peer rebuilt (`dirty=true` at HEAD): go's two new `.25` arms driven against
+us — `resolution_integrity` **3P/1F → 4P/0F** across the fix (the pre-fix `20.006s` elapsed is
+their harness waiting out our drop; post-fix the category runs in `0s`), and
+`resource_effective` **9P/0F** including their new extract N6 arm. That half-discharges the
+3-way drive go recorded as owed; **py is still open.**
+
+**Held and routed, not implemented:** `EXTENSION-TREE` v4.11 §2.2a's `required` column. Its
+`diff` row contradicts **§4.2 — the section the row cites** (*"the `resource` field is
+optional"*), and its `create`/`destroy` rows contradict §7.4's untouched authorization table
+(*"Handler scope only"*); all three take no path subject. core-go's `handleDiff` requires no
+resource either, so implementing the column verbatim would make us the only seat refusing
+`diff`. The **BROAD** column is right and we already conform to it. Three further asks went with
+it: the per-operation declaration exists in **1 of 26** extension specs (so
+`CORE-RESOURCE-TWO-EMPTIES-1` arm (c) has no subject anywhere and is undrivable), §4.11's
+"non-canonical CBOR → `invalid_request`" collides with `ENTITY-CBOR-ENCODING` §5.4's
+`non_canonical_ecf` MUST on the same bytes at the same boundary, and §4.11 mandates an emission
+per refused frame while bounding nothing — with arm (f) pressuring every seat toward `continue`.
+`docs/status/ROUTING-2026-09-15-d-*`.
+
+Gate: `make test` 2769P/0F · clippy · fmt · wasm · features · godot 263P/0F. `cfde6b5`.
 
 _2026-09-15 (b): **a live §5.4 byte-fidelity violation at eight sites. The `tree:merge` lead we had
 answered as "narrow" was the visible corner of a rule our own type system could not express.**_

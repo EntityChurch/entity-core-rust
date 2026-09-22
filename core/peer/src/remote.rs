@@ -2470,12 +2470,39 @@ fn spawn_reader_loop(
             let envelope = match decode_envelope(&frame) {
                 Ok(e) => e,
                 Err(e) => {
+                    // ⛔ **§4.11 arm (f) on the DIALER side** (0.8.2.25). This
+                    // was `break`, and `break` here is the most expensive
+                    // disposition in the class: this task is the **demux** for
+                    // every response in flight on this connection, so ending it
+                    // fails all of them — a peer that sends us one undecodable
+                    // frame cancels N unrelated admitted requests. §4.9(c)
+                    // forbids that for each of them independently, and §4.10's
+                    // *"MUST NOT … degrade service to in-flight requests"*
+                    // forbids it again.
+                    //
+                    // The frame was read WHOLE (the length prefix was honoured),
+                    // so the stream is synchronized on the next boundary and
+                    // there is nothing to resynchronize by closing. `read_frame`
+                    // above still `break`s, and correctly: `TruncatedFrame` and a
+                    // transport error both leave the stream unusable.
+                    //
+                    // ⚠ **No coded frame goes back from here, and that is a
+                    // deliberate divergence from `entity-core-go`** — routed
+                    // rather than quietly taken. §4.11's emission is an
+                    // EXECUTE_RESPONSE, and this half of the connection is the
+                    // *client*: the only thing we could put on the wire is an
+                    // EXECUTE_RESPONSE with an empty `request_id` travelling
+                    // client→server, which the server's own loop routes to its
+                    // reentry demux, finds no waiter for, and drops. That is a
+                    // frame nobody can correlate answering a frame we cannot
+                    // correlate. The half of §4.11 that has a caller here is the
+                    // survival half, and it is the half we implement.
                     tracing::warn!(
                         remote_peer = %remote_peer_id,
                         error = %e,
-                        "reader: decode_envelope failed, terminating reader task"
+                        "reader: undecodable frame refused; keeping the demux alive (§4.11 arm (f))"
                     );
-                    break;
+                    continue;
                 }
             };
             // §6.11(b) dialer-side reentry: an inbound EXECUTE (not a
