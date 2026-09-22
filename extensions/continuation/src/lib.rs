@@ -4820,16 +4820,18 @@ mod tests {
         let install_ctx = make_install_ctx(author, &path, install_params, install_included);
         assert_eq!(h.handle(&install_ctx).await.unwrap().status, STATUS_OK);
 
-        // Mock tree:put that mirrors production: returns Err(InvalidParams)
-        // when entity is bytes-not-map (decode_entity_from_cbor failure).
-        // The advance MUST still return 200 — the spec pins handler-level
-        // errors as completed-dispatch, not propagated Err.
+        // Mock tree:put returning a propagated Err. The advance MUST still
+        // return 200 — the spec pins handler-level errors as completed
+        // dispatch, not propagated Err, and this is the arm that proves the
+        // advance survives a callee that ignores that.
+        //
+        // It no longer mirrors production for the decode failure it names:
+        // EXTENSION-TREE v4.4 gave `put` its Appendix A rows, so the real
+        // handler answers a bytes-not-map entity with a *completed* dispatch
+        // carrying `400 invalid_request` (`core/tree`, `handle_put`). Kept as
+        // a generic Err source, which is what this row is actually testing.
         let mock: ExecuteFn = Arc::new(|_uri, _op, _params, _opts| {
-            Box::pin(async {
-                Err(HandlerError::InvalidParams(
-                    "invalid_entity: bytes not a map".into(),
-                ))
-            })
+            Box::pin(async { Err(HandlerError::InvalidParams("bytes not a map".into())) })
         });
 
         let phantom = Hash::compute("test", b"validator-phantom");

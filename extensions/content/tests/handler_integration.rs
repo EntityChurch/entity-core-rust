@@ -141,6 +141,32 @@ fn ingest_without_resource_returns_path_required() {
     assert_error_kind(&res, STATUS_BAD_REQUEST, "path_required");
 }
 
+/// `invalid_entity` was our own spelling, defined in no spec code set (zero
+/// occurrences in either spec corpus). ENTITY-CORE-PROTOCOL §3.3 (0.8.2.9)
+/// pins the consequence: an undefined spelling falls back to the status
+/// default, and the absence of an error table for the operation — which is
+/// what EXTENSION-CONTENT has for `ingest`, its one named 400 being
+/// `path_required` — is not an unfilled slot.
+///
+/// This is the same token and the same ruling as the tree `put` decode row;
+/// the sweep is the token, not the handler that happened to be measured.
+/// Mutation verified: restoring `bad_request("invalid_entity", …)` reddens
+/// this row and nothing else in the suite.
+#[test]
+fn ingest_rejects_an_undecodable_entity_with_the_defined_400_default() {
+    let (handler, store) = make_handler();
+    let params = Entity::new(
+        "system/content/ingest-request",
+        // `entity` present but not a map — fails `decode_core_entity`, which
+        // is a structurally-invalid submission and nothing more specific.
+        entity_ecf::to_ecf(&cbor_map! { "entity" => text("not a map") }),
+    )
+    .unwrap();
+    let res = run(&handler, "ingest", params, /*with_resource=*/ true);
+    assert_error_kind(&res, STATUS_BAD_REQUEST, "invalid_request");
+    assert_eq!(store.len(), 0, "nothing was stored");
+}
+
 #[test]
 fn ingest_entity_mode_stores_and_returns_hash() {
     let (handler, store) = make_handler();

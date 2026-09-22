@@ -4007,11 +4007,18 @@ mod tests {
         let peer = PeerBuilder::new().keypair(test_keypair()).build().unwrap();
 
         let build_put_ctx = |path: &str, entity: &entity_entity::Entity| {
-            // Build an inline entity {data, type} map for params.entity.
+            // Build an inline entity {content_hash, data, type} map for
+            // params.entity — all three keys, per §6.3's structural admission
+            // step. A two-key fixture is refused `400 invalid_request` since
+            // 0.8.2.11 and no longer exercises the tracker at all.
             let inner: ciborium::Value = ciborium::from_reader(entity.data.as_slice()).unwrap();
             let params = entity_ecf::Value::Map(vec![(
                 entity_ecf::text("entity"),
                 entity_ecf::Value::Map(vec![
+                    (
+                        entity_ecf::text("content_hash"),
+                        entity_ecf::Value::Bytes(entity.content_hash.to_bytes()),
+                    ),
                     (entity_ecf::text("data"), inner),
                     (
                         entity_ecf::text("type"),
@@ -4758,17 +4765,21 @@ mod tests {
         )
         .unwrap();
         let params = entity_entity::Entity::new(
-            "system/tree/put/params",
+            "system/tree/put-request",
             entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
                 entity_ecf::text("entity"),
                 entity_ecf::Value::Map(vec![
                     (
-                        entity_ecf::text("type"),
-                        entity_ecf::text(&body.entity_type),
+                        entity_ecf::text("content_hash"),
+                        entity_ecf::Value::Bytes(body.content_hash.to_bytes()),
                     ),
                     (
                         entity_ecf::text("data"),
                         entity_ecf::text("mirrored-from-them"),
+                    ),
+                    (
+                        entity_ecf::text("type"),
+                        entity_ecf::text(&body.entity_type),
                     ),
                 ]),
             )])),
@@ -5605,13 +5616,19 @@ mod tests {
 
         // Execute a tree put via the handler dispatch path (needs resource target)
         let path = qp("test/event-path");
+        let body = entity_entity::Entity::new(
+            "test/type",
+            entity_ecf::to_ecf(&entity_ecf::text("event-test")),
+        )
+        .unwrap();
         let params_data = entity_ecf::to_ecf(&entity_ecf::cbor_map! {
             "entity" => entity_ecf::cbor_map!{
+                "content_hash" => entity_ecf::Value::Bytes(body.content_hash.to_bytes()),
                 "data" => entity_ecf::text("event-test"),
                 "type" => entity_ecf::text("test/type")
             }
         });
-        let params = entity_entity::Entity::new("system/tree/put/params", params_data).unwrap();
+        let params = entity_entity::Entity::new("system/tree/put-request", params_data).unwrap();
         let opts = entity_handler::ExecuteOptions {
             resource: Some(entity_capability::ResourceTarget {
                 targets: vec![path.clone()],
@@ -5645,15 +5662,18 @@ mod tests {
         peer.start_engines(&shared);
 
         let put_one = |path: String, entity_type: &'static str, data: entity_ecf::Value| {
-            let inner: ciborium::Value =
-                ciborium::from_reader(entity_ecf::to_ecf(&data).as_slice()).unwrap();
+            let encoded = entity_ecf::to_ecf(&data);
+            let body = entity_entity::Entity::new(entity_type, encoded.clone()).unwrap();
+            let inner: ciborium::Value = ciborium::from_reader(encoded.as_slice()).unwrap();
             let params_data = entity_ecf::to_ecf(&entity_ecf::cbor_map! {
                 "entity" => entity_ecf::cbor_map!{
+                    "content_hash" => entity_ecf::Value::Bytes(body.content_hash.to_bytes()),
                     "data" => inner,
                     "type" => entity_ecf::text(entity_type)
                 }
             });
-            let params = entity_entity::Entity::new("system/tree/put/params", params_data).unwrap();
+            let params =
+                entity_entity::Entity::new("system/tree/put-request", params_data).unwrap();
             let opts = entity_handler::ExecuteOptions {
                 resource: Some(entity_capability::ResourceTarget {
                     targets: vec![path],
@@ -5752,16 +5772,27 @@ mod tests {
         peer.start_engines(&shared);
 
         const N: u32 = 1100;
+        // Every iteration puts the same body, so its `content_hash` is hoisted
+        // out of the timed region deliberately: computing it per-iteration
+        // would fold 1100 SHA-256s of the submitter's own authoring step into
+        // a number that exists to measure the PEER's per-put cost.
+        let body_hash =
+            entity_entity::Entity::new("test/type", entity_ecf::to_ecf(&entity_ecf::text("x")))
+                .unwrap()
+                .content_hash
+                .to_bytes();
         let start = std::time::Instant::now();
         for i in 0..N {
             let path = qp(&format!("perf/path-{}", i));
             let params_data = entity_ecf::to_ecf(&entity_ecf::cbor_map! {
                 "entity" => entity_ecf::cbor_map!{
+                    "content_hash" => entity_ecf::Value::Bytes(body_hash.clone()),
                     "data" => entity_ecf::text("x"),
                     "type" => entity_ecf::text("test/type")
                 }
             });
-            let params = entity_entity::Entity::new("system/tree/put/params", params_data).unwrap();
+            let params =
+                entity_entity::Entity::new("system/tree/put-request", params_data).unwrap();
             let opts = entity_handler::ExecuteOptions {
                 resource: Some(entity_capability::ResourceTarget {
                     targets: vec![path.clone()],
@@ -5811,16 +5842,27 @@ mod tests {
         peer.start_engines(&shared);
 
         const N: u32 = 1100;
+        // Every iteration puts the same body, so its `content_hash` is hoisted
+        // out of the timed region deliberately: computing it per-iteration
+        // would fold 1100 SHA-256s of the submitter's own authoring step into
+        // a number that exists to measure the PEER's per-put cost.
+        let body_hash =
+            entity_entity::Entity::new("test/type", entity_ecf::to_ecf(&entity_ecf::text("x")))
+                .unwrap()
+                .content_hash
+                .to_bytes();
         let start = std::time::Instant::now();
         for i in 0..N {
             let path = qp(&format!("perf/path-{}", i));
             let params_data = entity_ecf::to_ecf(&entity_ecf::cbor_map! {
                 "entity" => entity_ecf::cbor_map!{
+                    "content_hash" => entity_ecf::Value::Bytes(body_hash.clone()),
                     "data" => entity_ecf::text("x"),
                     "type" => entity_ecf::text("test/type")
                 }
             });
-            let params = entity_entity::Entity::new("system/tree/put/params", params_data).unwrap();
+            let params =
+                entity_entity::Entity::new("system/tree/put-request", params_data).unwrap();
             let opts = entity_handler::ExecuteOptions {
                 resource: Some(entity_capability::ResourceTarget {
                     targets: vec![path.clone()],
@@ -7252,10 +7294,14 @@ mod tests {
         let delivery_path = format!("/{}/app/relay-mp2", c_pid);
 
         let put_params = entity_entity::Entity::new(
-            "system/tree/put/params",
+            "system/tree/put-request",
             entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
                 entity_ecf::text("entity"),
                 entity_ecf::Value::Map(vec![
+                    (
+                        entity_ecf::text("content_hash"),
+                        entity_ecf::Value::Bytes(payload.content_hash.to_bytes()),
+                    ),
                     (entity_ecf::text("data"), payload_value),
                     (
                         entity_ecf::text("type"),
@@ -7492,10 +7538,14 @@ mod tests {
         let delivery_path = format!("/{}/app/relay-srcr", d_pid);
 
         let put_params = entity_entity::Entity::new(
-            "system/tree/put/params",
+            "system/tree/put-request",
             entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
                 entity_ecf::text("entity"),
                 entity_ecf::Value::Map(vec![
+                    (
+                        entity_ecf::text("content_hash"),
+                        entity_ecf::Value::Bytes(payload.content_hash.to_bytes()),
+                    ),
                     (entity_ecf::text("data"), payload_value),
                     (
                         entity_ecf::text("type"),

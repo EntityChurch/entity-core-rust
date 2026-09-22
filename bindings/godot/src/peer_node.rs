@@ -2347,7 +2347,11 @@ impl EntityPeer {
         };
         // Mirror sdk.rs::build_put_params: data must be decoded CBOR Value,
         // not Value::Bytes — handler re-encodes whatever Value it extracts;
-        // sending Value::Bytes(raw) double-wraps and corrupts.
+        // sending Value::Bytes(raw) double-wraps and corrupts. And all THREE
+        // entity keys go on the wire, `content_hash` included (§6.3 admission
+        // / `SDK-OPERATIONS` §3.2): this is a second producer of the put wire
+        // shape, so it carries the same obligation as `build_put_params` and
+        // is the one core-go's routing could not see from `sdk.rs` alone.
         let data_value: entity_ecf::Value = match ciborium::from_reader(entity.data.as_slice()) {
             Ok(v) => v,
             Err(e) => {
@@ -2361,10 +2365,14 @@ impl EntityPeer {
         };
         let entity_cbor = entity_ecf::Value::Map(vec![
             (
+                entity_ecf::text("content_hash"),
+                entity_ecf::Value::Bytes(entity.content_hash.to_bytes()),
+            ),
+            (entity_ecf::text("data"), data_value),
+            (
                 entity_ecf::text("type"),
                 entity_ecf::text(&entity.entity_type),
             ),
-            (entity_ecf::text("data"), data_value),
         ]);
         let params_map = entity_ecf::Value::Map(vec![(entity_ecf::text("entity"), entity_cbor)]);
         let mut params_bytes = Vec::new();
@@ -2375,7 +2383,7 @@ impl EntityPeer {
             );
             return None;
         }
-        let params = match entity_entity::Entity::new("system/tree/put_params", params_bytes) {
+        let params = match entity_entity::Entity::new("system/tree/put-request", params_bytes) {
             Ok(e) => e,
             Err(e) => {
                 godot_error!(

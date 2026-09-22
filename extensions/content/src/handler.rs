@@ -417,9 +417,16 @@ impl SystemContentHandler {
     }
 
     fn ingest_entity(&self, entity_v: Value, namespace_uri: &str) -> HandlerResult {
+        // `invalid_entity` has zero occurrences in the spec corpus and
+        // EXTENSION-CONTENT defines no error-code table for `ingest` (its one
+        // named 400 is §6.2/§6.3's `path_required`). Per ENTITY-CORE-PROTOCOL
+        // §3.3 (0.8.2.9) an undefined spelling falls back to the status default,
+        // and the absence of a table is not an unfilled slot. Same token, same
+        // ruling as the tree `put` decode row — this site is in that sweep even
+        // though it is a different handler in a different extension.
         let entity = match decode_core_entity(&entity_v) {
             Ok(e) => e,
-            Err(msg) => return bad_request("invalid_entity", &msg),
+            Err(msg) => return bad_request("invalid_request", &msg),
         };
         let entity_hash = entity.content_hash;
         if let Err(e) = self.content_store.put(entity) {

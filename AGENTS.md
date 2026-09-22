@@ -547,6 +547,46 @@ gates by making the TCP path compile on wasm32.
   shared status; "op X is not implemented" is the row. And when a ruling later un-retires a token,
   the seats that swept it are the seats that must move — we and go both did, and py, which never
   swept, was right the whole time.
+  **And the layer ABOVE all of them, which is where a SIBLING's census of your tree goes wrong: a
+  code-shaped token in a MESSAGE is not an emit site, and a returned `Err(HandlerError)` has no
+  code of its own — the dispatcher's slot map is the emit site.** *(Candidate: bit us once,
+  2026-09-05, and it was a sibling's report that carried the error.)* core-go routed EXTENSION-TREE
+  v4.4 to us as *"`invalid_entity` ×2 at `core/tree/src/lib.rs:708,713`"*, read out of our source.
+  Neither line emitted it. Both were
+  `.map_err(|e| HandlerError::InvalidParams(format!("invalid_entity: {e}")))` — the token sat in
+  the **message**, and `connection::handler_error_slot` supplied the code, so the wire carried
+  `400 invalid_params` at both sites. Driven before and after (`peer-manager start --type rust`,
+  image label `dirty=true` at HEAD, code read from the decoded `code` **key**): row 1
+  `invalid_params` → `invalid_request`, row 2 `invalid_params` → `hash_mismatch`, control `200`
+  unchanged. **The misreading is symmetric and that is what makes it worth an entry.** It
+  *over*-stated — we never shipped the undefined spelling the report is titled after, and go's
+  own worklist hedged (*"may surface as `invalid_params`; drive a put and read
+  `result.data.code`"*), which is the sentence that turned out to be the finding. And it
+  *under*-stated — the real defect was a **defined but wrong** specific standing where v4.4 pins
+  `hash_mismatch`, which is invisible to any census that greps for undefined tokens, because
+  `invalid_params` is one of §3.3's five legal 400 specifics. A wrong-but-legal code is the
+  expensive half: it reads as conformant at every seat and it silently costs the caller the one
+  branch the row exists to give them.
+  **Enforcement, and it is the cheap half of an already-cheap loop.** (a) When a report names a
+  code at a `file:line` in **your** tree, check whether that line *is* the emit site before
+  scoping: in this tree the emit sites are `error_result(...)` / `bad_request(...)` / an
+  `Entity::new(TYPE_ERROR, …)`, and an `Err(HandlerError::X)` is a *slot reference* whose real
+  spelling lives in `handler_error_slot` — one function, closed `match`, and it is the inventory.
+  (b) Then run the probe, because the token census cannot see the wrong-but-legal case: a
+  `peer-manager start` + a hand-driven EXECUTE reading the decoded `code` key is ~3 minutes, and it
+  is the only thing that distinguishes *"we emit the undefined token"* from *"we emit a defined
+  token that is not this row's."* (c) The same rule pointed outward is the reason to reply with the
+  before/after pair rather than *"landed"* — a seat that closes the item as written leaves the
+  ledger asserting a defect we never had and silent about the one we did.
+  **Corollary, and it is the sweep half: the sibling could only see the sites where the token was
+  NOT a code, and missed the one where it was.** `extensions/content/src/handler.rs:422` passed
+  `invalid_entity` to `bad_request` — a genuine wire emission of a spelling with zero occurrences
+  in either spec corpus, in a handler whose extension defines no error table at all (its one named
+  400 is `path_required`), which is precisely 0.8.2.9's *"the absence of a table is not an unfilled
+  slot"* case. Straight re-application of *"a MUST NOT on a token means `grep -rn '\"<code>\"'`,
+  and the region is the whole tree"* — with the twist that the routing's `file:line` pointed away
+  from the only real instance. Teeth:
+  `ingest_rejects_an_undecodable_entity_with_the_defined_400_default`, mutation-verified RED.
 - **A comment explaining why a surface is UNTESTED is a standing instruction not to try, and it
   never expires on its own — re-price it before you believe it.** *(Candidate: bit us once,
   2026-09-04, `e86f783`; found only because a sibling's packet hedged.)* `handle_pull`'s three
@@ -943,6 +983,76 @@ gates by making the TCP path compile on wasm32.
   first assertion it reaches, so mutate the narrowest thing the new row depends on and check the
   failure message names *your* row** — a green neighbour list is part of the result, not a
   formality.
+  **And the other way the same test lies: a mutation WRITTEN DOWN but not RUN. A doc comment that
+  says "mutation verified" is prose in exactly the way a cited control is.** *(2026-09-05, and it
+  is the third instance of the entry above, so it ratifies as the enforcement rather than as a new
+  rule.)* Landing the EXTENSION-TREE v4.4 `put` rows, the test's own doc comment claimed
+  *"collapsing the validate branch to a bare `hash_mismatch` reddens the non-decoding row."* Run,
+  it went **green** — the non-decoding row exits at `decode_entity_from_cbor` and never reaches
+  `validate`, so a mutation of one 400 arm says nothing about the other. The sentence was written
+  because both rows live in one `fn`, one screen apart, and *look* like one path. **Two error
+  arms in one function are two code paths, and a claim about a control's reach is a claim about
+  which arm the input takes — which the test name, the file, and the visual proximity all fail to
+  state.** Enforcement: every *"mutation verified"* in a comment names the mutation **and the row
+  it reddened**, and no such sentence is written before the failing run is in the transcript; the
+  three that bite here are recorded at
+  `put_error_codes_are_the_three_appendix_a_rows`, along with the fourth that deliberately does
+  **not** bite, so the next reader does not re-derive its greenness as a defect. Recording the
+  no-op mutation is the new half: an unreachable-by-construction arm looks identical to a
+  toothless test from the outside, and only the paired containment pin
+  (`validate_on_the_put_path_can_only_fail_with_hash_mismatch`) tells them apart.
+  **Fourth instance, 2026-09-06, and it failed in BOTH directions inside one commit — which is
+  what the two failure modes are.** (a) *Too weak.* *"Removing the non-bstr `else` reddens both
+  rows"* — run, it went **green**: a later `ok_or_else` refuses the same input with the same code,
+  so the two spellings are **behaviourally equivalent** and the mutation was a no-op wearing the
+  shape of a defect. The biting mutation was the *combination* with a second edit. **When a
+  function has two guards that can refuse the same input, mutating one proves nothing about
+  either** — and if nothing reddens, the honest finding is that the new guard is defence in depth,
+  not that the test is toothless. (b) *Scope-shifted.* *"Dropping the SDK's hash leaves every
+  put/get test green, which is the finding"* — **true at the parent commit, false by the end of
+  the same commit**, once the peer half landed and made ~12 tests red. **A mutation's result is
+  scoped to the tree state at the moment you ran it**, so in a two-half flag-day change (encoder +
+  decoder, writer + reader, SDK + peer) a claim measured after the first half describes a tree
+  that no longer exists. Enforcement: re-run the first half's mutation once the second half lands,
+  and if the answer moved, **write down both** — the change in the answer is the compensating pair
+  becoming visible, and it is the most useful sentence in the commit.
+- **A CROSS-SEAT drive that does not cross the seat boundary looks exactly like one that does —
+  assert on a value only the FAR seat can produce, never on the status alone.** *(Candidate: bit
+  us once, 2026-09-06, caught by reading an error message.)* The acceptance test for the
+  0.8.2.11 SDK half was *"drive our `put` against a strict go peer: 400 before the fix, 200
+  after."* Written with `PeerContext::put` against a path in the remote peer's namespace, it
+  produced **exactly that pair** — and measured our own peer twice. `put` dispatches at the bare
+  `system/tree` URI, which resolves to the **local** tree handler even when the resource target
+  names a foreign namespace (that is the site-cache / `follow` mirror shape, and it is a local
+  write); only the qualified `entity://{peer}/system/tree` form routes. Both halves of the
+  before/after were locally produced, so the mutation "worked," the status codes were right, and
+  the whole thing was a tautology of the kind already named above — with the twist that the
+  tautology was **which peer answered**, not which function computed the expectation.
+  **The tell was the 400's MESSAGE.** Ours reads *"submitted entity is not a core/entity: missing
+  'content_hash' field…"*; go's reads *"entity missing required content_hash field"*. A status
+  code is the one part of a refusal that every seat spells identically, which is precisely why it
+  cannot witness *whose* refusal it is. **Enforcement:** any test whose name or docstring says
+  *cross-impl*, *foreign*, *boundary*, or *strict peer* must assert on something the far seat
+  authored — its error wording, its `peer_id`, a hash only it holds — and the run must print it.
+  In this tree the discriminator is the URI helper: `execute` at a bare handler name is local,
+  `entity://{pid}/…` is remote, and `grep -n 'entity://' bindings/sdk/src/sdk.rs` finds the sites
+  that actually leave the process. Same family as the `is_connect_path` bite — a path helper that
+  reads plausibly and routes somewhere else — pointed at a test instead of a guard.
+- **A per-seat worklist reads as exhaustive PER SEAT, and the row that binds you may be filed
+  under someone else's name.** *(Candidate: bit us once, 2026-09-06.)* `ROUTING-2026-09-06-b`
+  splits into a `### rust` and a `### py` relay section, each two items, under a shared ruling.
+  Ours did not name `unsupported_content_hash_format` — `EXTENSION-TREE` Appendix A **v4.5**'s
+  fourth `put` row — because that row was item **3 of go's own worklist**, go being the seat that
+  noticed it. It binds every seat that ingests a `put`, and we were answering `invalid_request`
+  for it. **A named section addressed to you is a claim about what the author measured at your
+  seat, not an enumeration of what the version obliges you to do** — the same grammar as the
+  *"nothing you shipped moves"* and *"no action owed"* traps already recorded, one level down:
+  there the reassurance was a sentence, here it is the **document's structure**, which is more
+  convincing because nobody wrote it as a claim at all. **Enforcement:** when a routing carries
+  per-seat sections, read the **other seats' items** and ask of each whether the rule behind it is
+  seat-specific or version-wide — and read the spec diff, not the routing, for the answer
+  (`git show <fold> -- specs/`). A row in a shared Appendix A table is version-wide by
+  construction. Cheap tell: an item whose fix is a **code value** rather than a code path.
 - **A declared exclusion whose ground is "nothing installs it" is a gap wearing an exemption —
   register the surface and let the wire tell you what it was hiding.** *(Candidate: bit us once,
   2026-08-22.)* `CONFORMANCE-EXCLUSIONS.md`'s substitute entry rested on two grounds: Ruling 4

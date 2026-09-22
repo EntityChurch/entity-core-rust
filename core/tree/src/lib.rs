@@ -18,12 +18,12 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use entity_entity::{Entity, TYPE_DELETION_MARKER};
+use entity_entity::{Entity, EntityError, TYPE_DELETION_MARKER};
 use entity_handler::{
     Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST, STATUS_CONFLICT,
     STATUS_FORBIDDEN, STATUS_MULTI_STATUS, STATUS_NOT_FOUND, STATUS_NOT_SUPPORTED,
 };
-use entity_hash::Hash;
+use entity_hash::{Hash, HashError as EntityHashError};
 use entity_store::{
     CasError, CascadeResult, ContentStore, ExecutionContext, LocationEntry, LocationIndex,
 };
@@ -345,14 +345,58 @@ fn build_partial_result(cr: CascadeResult) -> HandlerResult {
     HandlerResult::error(STATUS_MULTI_STATUS, entity)
 }
 
-/// Decode an inline entity from CBOR `{type, data, content_hash?}`.
+/// Why a submitted `put` entity failed admission. Two *different* wire codes,
+/// which is the whole reason this is an enum and not a `String`.
 ///
-/// **The authored `content_hash` is preserved when present** (V7 §1.8 /
+/// `EXTENSION-TREE` Appendix A **v4.5** tabulates them as separate rows and
+/// says so in the row text: an unsupported format code is *"**Not** the
+/// `invalid_request` row — the value is a structurally valid hash and the peer
+/// simply cannot verify it."* Collapsing the two costs a caller the branch that
+/// distinguishes *"your submission is malformed, fix it"* from *"your hash is
+/// fine and this peer cannot speak your algorithm, try a peer that can"* — and
+/// answering `invalid_request` for the second is a **wrong-but-legal** code,
+/// the class `AGENTS.md` records as the expensive half: it reads as conformant
+/// at every seat and no token census can see it.
+enum PutAdmission {
+    /// 400 `invalid_request` — the value is not a `core/entity` at all.
+    NotAnEntity(String),
+    /// 400 `unsupported_content_hash_format` — a well-formed `system/hash`
+    /// naming a format code this build cannot verify. `ENTITY-CORE-PROTOCOL`
+    /// §4.7 row 5 is the authority; `EXTENSION-TREE` Appendix A restates it on
+    /// `put` because `put` is one of that code's ingest surfaces.
+    UnsupportedContentHashFormat(String),
+}
+
+/// Decode an inline entity from CBOR `{type, data, content_hash}` — the
+/// **structural** step of `ENTITY-CORE-PROTOCOL` §6.3's two-step `put`
+/// admission ladder (0.8.2.11).
+///
+/// **All three keys are required.** `put-request.entity` is typed `core/entity`
+/// (§3.9), and `ENTITY-NATIVE-TYPE-SYSTEM` §8.1 declares its three fields with
+/// no `optional` marker on any of them. The value is an entity only when it is
+/// a **map** carrying a **non-empty text-string `type`**, a **present `data`**
+/// (any CBOR value — `primitive/any` is unconstrained, so `null` is a legal
+/// payload and must not be confused with absence), and a **well-formed
+/// `system/hash` `content_hash`** whose total byte length matches its format
+/// code (§1.2). Failing any clause, it is not an entity and `put` refuses it
+/// `400 invalid_request`.
+///
+/// **`put` is a receipt path, and this function is where that is enforced.**
+/// Until 0.8.2.11 the `None` arm here called `Entity::new`, which *computes* a
+/// hash — so a two-key `{type, data}` submission was accepted `200` and the
+/// peer authored an address the submitter never chose. That is an authorship
+/// the protocol assigns to the submitter (§1.8 item 1), and the SDK is where it
+/// belongs: `SDK-OPERATIONS` §3.2's `put(path, type, data) → hash` cannot
+/// return a hash it did not compute. The defect was invisible in-tree because
+/// our own SDK stripped the field this decoder then restored — a compensating
+/// pair inside one tree, perfect on its own round-trip and wrong the moment a
+/// strict peer was on the other end, which is exactly how core-go measured it.
+///
+/// **The authored `content_hash` is preserved, never re-derived** (V7 §1.8 /
 /// v7.69 §4.5a). A reference belongs to whoever authored it and carries
 /// *their* `content_hash_format`; a peer holding it MUST use it verbatim and
 /// MUST NOT re-derive it under its own home format
 /// (SPECIFICATION-FORMAT §8.4.6 calls this disposition *hold-and-fetch*).
-///
 /// Rebuilding via `Entity::new` discarded the field and recomputed under the
 /// local default, so a SHA-384-authored entity `put` to a SHA-256-home peer
 /// came back at a different address than it was published to — and every
@@ -361,19 +405,19 @@ fn build_partial_result(cr: CascadeResult) -> HandlerResult {
 /// are the same bytes.
 ///
 /// Trusting the caller's hash is not a forgery vector: the put path calls
-/// `Entity::validate` immediately after, which recomputes under the claimed
-/// hash's OWN algorithm and rejects any mismatch. A caller can choose the
-/// format its entity is addressed under — which is exactly the authoring
-/// right §4.5a gives it — but cannot claim a hash its bytes do not produce.
-///
-/// `content_hash` absent stays supported and computes under the local format:
-/// that is an entity being authored here, not one being carried.
-fn decode_entity_from_cbor(raw: &[u8]) -> Result<Entity, String> {
+/// `Entity::validate` immediately after — §6.3 step **2** — which recomputes
+/// under the claimed hash's OWN algorithm and rejects any mismatch. A caller
+/// can choose the format its entity is addressed under, which is exactly the
+/// authoring right §4.5a gives it, but cannot claim a hash its bytes do not
+/// produce.
+fn decode_entity_from_cbor(raw: &[u8]) -> Result<Entity, PutAdmission> {
+    use PutAdmission::{NotAnEntity, UnsupportedContentHashFormat};
+
     let value: ciborium::Value =
-        ciborium::from_reader(raw).map_err(|e| format!("cbor decode: {}", e))?;
+        ciborium::from_reader(raw).map_err(|e| NotAnEntity(format!("cbor decode: {}", e)))?;
     let map = value
         .as_map()
-        .ok_or_else(|| "entity must be a CBOR map".to_string())?;
+        .ok_or_else(|| NotAnEntity("entity must be a CBOR map".to_string()))?;
 
     let mut entity_type = None;
     let mut entity_data = None;
@@ -381,34 +425,71 @@ fn decode_entity_from_cbor(raw: &[u8]) -> Result<Entity, String> {
 
     for (k, v) in map {
         match k.as_text() {
-            Some("type") => entity_type = v.as_text().map(|s| s.to_string()),
+            // Present-but-not-text and present-but-empty are both refusals,
+            // and neither may fall through to "absent": §8.1's `type` is
+            // `primitive/string` and Appendix A names *"absent / empty / not a
+            // text string"* as three spellings of one structural failure.
+            Some("type") => {
+                let s = v.as_text().ok_or_else(|| {
+                    NotAnEntity("'type' is present but is not a text string".to_string())
+                })?;
+                if s.is_empty() {
+                    return Err(NotAnEntity("'type' is present but empty".to_string()));
+                }
+                entity_type = Some(s.to_string());
+            }
             Some("data") => {
-                // data is raw CBOR — re-encode it
+                // data is raw CBOR — re-encode it. Any value is legal here,
+                // `null` included: `data` is `primitive/any`, so presence is
+                // the whole test and absence is the only failure.
                 let mut buf = Vec::new();
-                ciborium::into_writer(v, &mut buf).map_err(|e| format!("re-encode data: {}", e))?;
+                ciborium::into_writer(v, &mut buf)
+                    .map_err(|e| NotAnEntity(format!("re-encode data: {}", e)))?;
                 entity_data = Some(buf);
             }
             Some("content_hash") => {
-                if let Some(bytes) = v.as_bytes() {
-                    authored_hash =
-                        Some(Hash::from_bytes(bytes).map_err(|e| format!("content_hash: {e}"))?);
-                }
+                // A present-but-wrong-typed `content_hash` (null, a text
+                // string, a map) previously fell through this `if let` and
+                // left `authored_hash` at `None` — i.e. it took the authoring
+                // arm, indistinguishable from absence. It is a refusal.
+                let bytes = v.as_bytes().ok_or_else(|| {
+                    NotAnEntity("'content_hash' is present but is not a byte string".to_string())
+                })?;
+                authored_hash = Some(Hash::from_bytes(bytes).map_err(|e| match e {
+                    // A code this build does not implement — including the
+                    // §5.3 `0xFF` reservation — is the §4.7 row 5 case: the
+                    // hash is well-formed, we just cannot verify it.
+                    EntityHashError::UnsupportedAlgorithm(_)
+                    | EntityHashError::ReservedFormat(_) => {
+                        UnsupportedContentHashFormat(format!("content_hash: {e}"))
+                    }
+                    // A length that does not match the format code, or a
+                    // malformed leading varint, is a structural fault in the
+                    // submitted value — Appendix A's `invalid_request` row
+                    // names it verbatim.
+                    _ => NotAnEntity(format!("content_hash: {e}")),
+                })?);
             }
             _ => {}
         }
     }
 
-    let etype = entity_type.ok_or_else(|| "missing 'type' field".to_string())?;
-    let edata = entity_data.ok_or_else(|| "missing 'data' field".to_string())?;
+    let entity_type = entity_type.ok_or_else(|| NotAnEntity("missing 'type' field".to_string()))?;
+    let data = entity_data.ok_or_else(|| NotAnEntity("missing 'data' field".to_string()))?;
+    let content_hash = authored_hash.ok_or_else(|| {
+        NotAnEntity(
+            "missing 'content_hash' field — `put` is a receipt path and does not author \
+             a hash on the submitter's behalf (ENTITY-CORE-PROTOCOL §6.3; the SDK's \
+             construction step is SDK-OPERATIONS §3.2)"
+                .to_string(),
+        )
+    })?;
 
-    match authored_hash {
-        Some(content_hash) => Ok(Entity {
-            entity_type: etype,
-            data: edata,
-            content_hash,
-        }),
-        None => Entity::new(&etype, edata).map_err(|e| format!("entity new: {}", e)),
-    }
+    Ok(Entity {
+        entity_type,
+        data,
+        content_hash,
+    })
 }
 
 /// Decode bindings from a snapshot entity's data.
@@ -704,13 +785,73 @@ impl TreeHandler {
             ciborium::into_writer(entity_bytes, &mut raw)
                 .map_err(|e| HandlerError::Internal(format!("encode entity bytes: {}", e)))?;
 
-            let entity = decode_entity_from_cbor(&raw)
-                .map_err(|e| HandlerError::InvalidParams(format!("invalid_entity: {}", e)))?;
+            // EXTENSION-TREE Appendix A `put` rows (v4.4 tabulated; v4.5 stated
+            // the predicate and added the format row), over ENTITY-CORE-PROTOCOL
+            // §6.3's two-step admission ladder.
+            //
+            // STEP 1 — structure. `decode_entity_from_cbor` asks *is this a
+            // `core/entity`*: a map, non-empty text `type`, present `data`,
+            // well-formed `content_hash`. Two codes come back out of it, and
+            // they are different rows: `invalid_request` is §3.3's generic
+            // structurally-invalid case, while `unsupported_content_hash_format`
+            // (§4.7 row 5) says the hash is *fine* and this build cannot verify
+            // its algorithm. Appendix A v4.5 says explicitly that the second is
+            // "**Not** the `invalid_request` row".
+            //
+            // STEP 2 — hash, below. `hash_mismatch` says *this entity is not what
+            // it claims to be* (EXTENSION-CONTENT §923's code for the same
+            // failure). It is reached only if step 1 passed, and that ordering is
+            // a data dependency rather than a convention: step 2's inputs are
+            // exactly what step 1 establishes. A submission that is BOTH
+            // malformed and mis-hashed is step 1's, and it is the only input that
+            // discriminates the ladder — which is why §9.1's conformance row
+            // names it. Pinned by `put_admission_is_structure_then_hash`.
+            //
+            // None of these is the 409 `hash_mismatch` further down: that one is
+            // nobody's defect and is retryable.
+            //
+            // These are `error_result` (completed dispatch), not `Err(..)`: the
+            // dispatcher maps every `HandlerError::InvalidParams` to the single
+            // slot `400 invalid_params` (`connection::handler_error_slot`), which
+            // cannot express a per-operation code from a spec code set.
+            let entity = match decode_entity_from_cbor(&raw) {
+                Ok(e) => e,
+                Err(PutAdmission::NotAnEntity(msg)) => {
+                    return error_result(
+                        STATUS_BAD_REQUEST,
+                        "invalid_request",
+                        &format!("submitted entity is not a core/entity: {}", msg),
+                    );
+                }
+                Err(PutAdmission::UnsupportedContentHashFormat(msg)) => {
+                    return error_result(
+                        STATUS_BAD_REQUEST,
+                        "unsupported_content_hash_format",
+                        &format!("cannot verify the submitted content hash: {}", msg),
+                    );
+                }
+            };
 
-            // Validate hash
-            entity
-                .validate()
-                .map_err(|e| HandlerError::InvalidParams(format!("invalid_entity: {}", e)))?;
+            // Validate hash — §6.3 step 2. `Entity::validate` recomputes under the
+            // entity's own claimed format and can only report `HashMismatch` on
+            // this path: step 1 already refused an unsupported format code at
+            // `Hash::from_bytes`, and since 0.8.2.11 there is no arm that reaches
+            // here without a carried hash. The non-mismatch arm is therefore
+            // unreachable by construction today and is kept because it is a
+            // *different row*, not a fallback; it goes live the moment
+            // `digest_len_for_format` and `Hash::compute_format` stop agreeing on
+            // the supported set. That containment is pinned by
+            // `validate_on_the_put_path_can_only_fail_with_hash_mismatch`.
+            if let Err(e) = entity.validate() {
+                let (code, what) = match e {
+                    EntityError::HashMismatch { .. } => (
+                        "hash_mismatch",
+                        "content hash does not match the entity it addresses",
+                    ),
+                    _ => ("invalid_request", "entity is structurally invalid"),
+                };
+                return error_result(STATUS_BAD_REQUEST, code, &format!("{}: {}", what, e));
+            }
 
             // Store and bind
             let stored_hash = self
@@ -1816,6 +1957,10 @@ mod tests {
         let params = entity_ecf::Value::Map(vec![(
             entity_ecf::text("entity"),
             entity_ecf::Value::Map(vec![
+                (
+                    entity_ecf::text("content_hash"),
+                    entity_ecf::Value::Bytes(inner.content_hash.to_bytes()),
+                ),
                 (entity_ecf::text("data"), inner_data_val),
                 (
                     entity_ecf::text("type"),
@@ -1898,9 +2043,16 @@ mod tests {
         let mut fields: Vec<(entity_ecf::Value, entity_ecf::Value)> = Vec::new();
         if let Some(e) = entity {
             let inner_data_val: ciborium::Value = ciborium::from_reader(e.data.as_slice()).unwrap();
+            // All three keys — §6.3 step 1 admits the value as a `core/entity`
+            // before anything else looks at it, so a two-key fixture never
+            // reaches the CAS behaviour these callers exist to exercise.
             fields.push((
                 entity_ecf::text("entity"),
                 entity_ecf::Value::Map(vec![
+                    (
+                        entity_ecf::text("content_hash"),
+                        entity_ecf::Value::Bytes(e.content_hash.to_bytes()),
+                    ),
                     (entity_ecf::text("data"), inner_data_val),
                     (entity_ecf::text("type"), entity_ecf::text(&e.entity_type)),
                 ]),
@@ -1929,6 +2081,396 @@ mod tests {
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
         assert_eq!(tree.get("cas/path").unwrap().content_hash, e2.content_hash);
+    }
+
+    /// EXTENSION-TREE v4.4 Appendix A — all three `put` rows in one place, so
+    /// the two `hash_mismatch` rows sit beside the `invalid_request` row they
+    /// are most likely to be collapsed into.
+    ///
+    /// Mutation witnesses, each run and confirmed RED **at the row it is
+    /// scoped to** — the two 400 rows take different code paths, so a mutation
+    /// of one says nothing about the other:
+    ///
+    /// - decode site → `"hash_mismatch"` (the wholesale flip the routed
+    ///   worklist would have produced) reddens **row 1** at the
+    ///   `invalid_request` assertion.
+    /// - validate site → `"invalid_request"` (the collapse in the other
+    ///   direction) reddens **row 2**.
+    /// - restoring the pre-v4.4 `HandlerError::InvalidParams("invalid_entity:
+    ///   …")` at both sites reddens **row 1** at the `.unwrap()`, because the
+    ///   handler goes back to a propagated `Err`.
+    ///
+    /// One mutation deliberately does **not** bite and is recorded so nobody
+    /// re-derives it as a defect: collapsing only the *validate* branch's
+    /// `match` to a bare `"hash_mismatch"` leaves all three rows green. That is
+    /// correct — the non-mismatch arm is unreachable by construction, which is
+    /// what `validate_on_the_put_path_can_only_fail_with_hash_mismatch` exists
+    /// to keep true. It is not evidence that this test is toothless; the first
+    /// two mutations are.
+    #[tokio::test]
+    async fn put_error_codes_are_the_three_appendix_a_rows() {
+        // Row 1 — the submitted entity does not decode: 400 invalid_request.
+        // `entity` is present and is not a map, so `decode_entity_from_cbor`
+        // fails at `as_map` rather than at any hash check.
+        {
+            let tree = make_tree();
+            let params = entity_ecf::Value::Map(vec![(
+                entity_ecf::text("entity"),
+                entity_ecf::text("not a map"),
+            )]);
+            let ctx = make_handler_context("put", Some(params), Some(vec!["bad/decode".into()]));
+            let result = tree.handle(&ctx).await.unwrap();
+            assert_eq!(result.status, STATUS_BAD_REQUEST);
+            let val = decode_cbor(&result.result.data);
+            let map = val.as_map().unwrap();
+            assert_eq!(
+                cbor_map_get(map, "code").as_text(),
+                Some("invalid_request"),
+                "a non-decoding entity is the generic structurally-invalid case"
+            );
+            assert!(!tree.has("bad/decode"));
+        }
+
+        // Row 2 — the entity is well-formed and its content hash addresses
+        // something else: 400 hash_mismatch. This is the row that carries the
+        // information; it is what a caller branches on.
+        {
+            let tree = make_tree();
+            let e = make_entity("test", "the real payload");
+            let wrong = Hash::compute(
+                "test",
+                &entity_ecf::to_ecf(&entity_ecf::text("something else")),
+            );
+            assert_ne!(wrong, e.content_hash);
+            let inner: ciborium::Value = ciborium::from_reader(e.data.as_slice()).unwrap();
+            let params = entity_ecf::Value::Map(vec![(
+                entity_ecf::text("entity"),
+                entity_ecf::Value::Map(vec![
+                    (
+                        entity_ecf::text("content_hash"),
+                        entity_ecf::Value::Bytes(wrong.to_bytes().to_vec()),
+                    ),
+                    (entity_ecf::text("data"), inner),
+                    (entity_ecf::text("type"), entity_ecf::text(&e.entity_type)),
+                ]),
+            )]);
+            let ctx = make_handler_context("put", Some(params), Some(vec!["bad/hash".into()]));
+            let result = tree.handle(&ctx).await.unwrap();
+            assert_eq!(
+                result.status,
+                STATUS_BAD_REQUEST,
+                "a tampered content hash is a defect in the submission (400), not a lost race (409)"
+            );
+            let val = decode_cbor(&result.result.data);
+            let map = val.as_map().unwrap();
+            assert_eq!(cbor_map_get(map, "code").as_text(), Some("hash_mismatch"));
+            assert!(!tree.has("bad/hash"));
+        }
+
+        // Row 3 — the CAS race. Same token, different status, different
+        // failure: nobody's defect and retryable. Covered in full by
+        // `test_handler_put_cas_mismatch_returns_409`; asserted here only so
+        // the pair is visible as a pair.
+        {
+            let tree = make_tree();
+            tree.put("cas/pair", make_entity("test", "v1")).unwrap();
+            let wrong = Hash::compute("test", &entity_ecf::to_ecf(&entity_ecf::text("stale")));
+            let params = put_params_with_expected(Some(&make_entity("test", "v2")), Some(wrong));
+            let ctx = make_handler_context("put", Some(params), Some(vec!["cas/pair".into()]));
+            let result = tree.handle(&ctx).await.unwrap();
+            assert_eq!(result.status, STATUS_CONFLICT);
+            let val = decode_cbor(&result.result.data);
+            let map = val.as_map().unwrap();
+            assert_eq!(cbor_map_get(map, "code").as_text(), Some("hash_mismatch"));
+        }
+    }
+
+    /// `ENTITY-CORE-PROTOCOL` §6.3 step 1 in full — the **predicate**, not the
+    /// one clause that was routed. `EXTENSION-TREE` Appendix A v4.5 spells it
+    /// out: the value is not an entity when it is *"not a map, or `type` is
+    /// absent / empty / not a text string, or `data` is absent, or
+    /// `content_hash` is absent or its length does not match its format code"*.
+    /// core-go's routing named only absent `content_hash`, because that is the
+    /// clause their check drove; the sentence binds all of them, so the
+    /// boundary is the clause list and not the pointer (`AGENTS.md`: a routed
+    /// pointer is a starting point, not the boundary).
+    ///
+    /// Two clauses were already right here before this change and are asserted
+    /// rather than "fixed": a non-map, and a `data` that is absent. Two were
+    /// not: an **empty** `type` was accepted, and a **non-text** `type` reached
+    /// the right code by accident — it fell through `as_text()` into the
+    /// *"missing 'type'"* arm, so the wire answer was correct while the reason
+    /// was wrong and one refactor away from silently becoming an empty type.
+    ///
+    /// `data: null` is deliberately in the PASS column: `data` is
+    /// `primitive/any`, so §6.3 asks only that it be **present**. Reading
+    /// absent and null as one fact here would refuse a legal payload.
+    #[tokio::test]
+    async fn put_admission_predicate_is_every_clause_of_the_entity_shape() {
+        let good = make_entity("test/type", "payload");
+        let good_data: ciborium::Value = ciborium::from_reader(good.data.as_slice()).unwrap();
+        let ch = || {
+            (
+                entity_ecf::text("content_hash"),
+                entity_ecf::Value::Bytes(good.content_hash.to_bytes()),
+            )
+        };
+
+        // Each row: (label, the `entity` value, refused?)
+        let rows: Vec<(&str, entity_ecf::Value, bool)> = vec![
+            ("not a map", entity_ecf::text("not a map"), true),
+            (
+                "type absent",
+                entity_ecf::Value::Map(vec![ch(), (entity_ecf::text("data"), good_data.clone())]),
+                true,
+            ),
+            (
+                "type empty",
+                entity_ecf::Value::Map(vec![
+                    ch(),
+                    (entity_ecf::text("data"), good_data.clone()),
+                    (entity_ecf::text("type"), entity_ecf::text("")),
+                ]),
+                true,
+            ),
+            (
+                "type not a text string",
+                entity_ecf::Value::Map(vec![
+                    ch(),
+                    (entity_ecf::text("data"), good_data.clone()),
+                    (entity_ecf::text("type"), entity_ecf::integer(7)),
+                ]),
+                true,
+            ),
+            (
+                "data absent",
+                entity_ecf::Value::Map(vec![
+                    ch(),
+                    (entity_ecf::text("type"), entity_ecf::text("test/type")),
+                ]),
+                true,
+            ),
+            (
+                "content_hash absent",
+                entity_ecf::Value::Map(vec![
+                    (entity_ecf::text("data"), good_data.clone()),
+                    (entity_ecf::text("type"), entity_ecf::text("test/type")),
+                ]),
+                true,
+            ),
+            (
+                "content_hash mis-sized for its format code",
+                entity_ecf::Value::Map(vec![
+                    (
+                        entity_ecf::text("content_hash"),
+                        // format 0x00 (SHA-256) declares 32 digest bytes; 8 is
+                        // a length that does not match the code it names.
+                        entity_ecf::Value::Bytes(vec![0x00; 9]),
+                    ),
+                    (entity_ecf::text("data"), good_data.clone()),
+                    (entity_ecf::text("type"), entity_ecf::text("test/type")),
+                ]),
+                true,
+            ),
+            // --- the control: the same shape, complete, is admitted. Without
+            // it every row above is satisfied by a `put` that refuses
+            // everything, which is the one-edit-away wrong fix.
+            (
+                "all three fields present and well-formed",
+                entity_ecf::Value::Map(vec![
+                    ch(),
+                    (entity_ecf::text("data"), good_data.clone()),
+                    (entity_ecf::text("type"), entity_ecf::text("test/type")),
+                ]),
+                false,
+            ),
+        ];
+
+        for (label, entity_val, refused) in rows {
+            let tree = make_tree();
+            let params = entity_ecf::Value::Map(vec![(entity_ecf::text("entity"), entity_val)]);
+            let ctx = make_handler_context("put", Some(params), Some(vec!["p/x".into()]));
+            let result = tree.handle(&ctx).await.unwrap();
+            if refused {
+                assert_eq!(
+                    result.status, STATUS_BAD_REQUEST,
+                    "clause `{label}` must be refused"
+                );
+                let val = decode_cbor(&result.result.data);
+                assert_eq!(
+                    cbor_map_get(val.as_map().unwrap(), "code").as_text(),
+                    Some("invalid_request"),
+                    "clause `{label}` is the structural row"
+                );
+                assert!(!tree.has("p/x"), "clause `{label}` stored something");
+            } else {
+                assert_eq!(result.status, STATUS_OK, "row `{label}` must be admitted");
+                assert!(tree.has("p/x"), "row `{label}` must bind");
+            }
+        }
+
+        // `data: null` is PRESENT, and presence is the whole test.
+        let null_body =
+            Entity::new("test/type", entity_ecf::to_ecf(&entity_ecf::Value::Null)).unwrap();
+        let tree = make_tree();
+        let params = entity_ecf::Value::Map(vec![(
+            entity_ecf::text("entity"),
+            entity_ecf::Value::Map(vec![
+                (
+                    entity_ecf::text("content_hash"),
+                    entity_ecf::Value::Bytes(null_body.content_hash.to_bytes()),
+                ),
+                (entity_ecf::text("data"), entity_ecf::Value::Null),
+                (entity_ecf::text("type"), entity_ecf::text("test/type")),
+            ]),
+        )]);
+        let ctx = make_handler_context("put", Some(params), Some(vec!["p/null".into()]));
+        let result = tree.handle(&ctx).await.unwrap();
+        assert_eq!(
+            result.status, STATUS_OK,
+            "`data` is primitive/any — null is a legal payload, not an absence"
+        );
+    }
+
+    /// `EXTENSION-TREE` Appendix A **v4.5**'s fourth `put` row, and it is a
+    /// **wrong-but-legal code** we were shipping until now: a `content_hash`
+    /// that is a well-formed `system/hash` naming a format code this build
+    /// cannot verify is `400 unsupported_content_hash_format`
+    /// (`ENTITY-CORE-PROTOCOL` §4.7 row 5), **not** `invalid_request`. The row
+    /// says so in its own text — *"Not the `invalid_request` row — the value is
+    /// a structurally valid hash and the peer simply cannot verify it."*
+    ///
+    /// This clause was **not** in core-go's relay section for us; it was item 3
+    /// of go's own worklist, because go is where the row was noticed. The row
+    /// binds every seat that ingests a `put`, so it is ours too — the sweep
+    /// found it, not the routing.
+    ///
+    /// It is the expensive kind of defect precisely because the old answer was
+    /// *legal*: `invalid_request` is a real §3.3 400 code, so no token census
+    /// anywhere can see the mistake. Only a caller trying to decide *"re-encode
+    /// my submission"* versus *"find a peer that speaks SHA-512"* pays for it.
+    ///
+    /// Mutation verified: routing `UnsupportedAlgorithm` / `ReservedFormat`
+    /// back into `PutAdmission::NotAnEntity` reddens both rows below at the
+    /// `code` assertion, and leaves
+    /// `put_admission_predicate_is_every_clause_of_the_entity_shape` green —
+    /// which is why this needs its own rows rather than one more clause there.
+    #[tokio::test]
+    async fn put_unsupported_content_hash_format_is_its_own_row_not_invalid_request() {
+        // 0x02 is unallocated; 0xFF is the v7.67 §5.3 reservation, encoded as
+        // the two-byte varint [0xFF, 0x01]. Both are "well-formed hash, format
+        // this peer cannot verify" and both take the §4.7 row 5 exit.
+        let mut reserved = vec![0xFF, 0x01];
+        reserved.extend_from_slice(&[0u8; 32]);
+        let unallocated = {
+            let mut v = vec![0x02];
+            v.extend_from_slice(&[0u8; 32]);
+            v
+        };
+
+        for (label, wire) in [
+            ("unallocated 0x02", unallocated),
+            ("reserved 0xFF", reserved),
+        ] {
+            let tree = make_tree();
+            let good = make_entity("test/type", "payload");
+            let inner: ciborium::Value = ciborium::from_reader(good.data.as_slice()).unwrap();
+            let params = entity_ecf::Value::Map(vec![(
+                entity_ecf::text("entity"),
+                entity_ecf::Value::Map(vec![
+                    (
+                        entity_ecf::text("content_hash"),
+                        entity_ecf::Value::Bytes(wire),
+                    ),
+                    (entity_ecf::text("data"), inner),
+                    (entity_ecf::text("type"), entity_ecf::text("test/type")),
+                ]),
+            )]);
+            let ctx = make_handler_context("put", Some(params), Some(vec!["fmt/x".into()]));
+            let result = tree.handle(&ctx).await.unwrap();
+            assert_eq!(result.status, STATUS_BAD_REQUEST, "{label}");
+            let val = decode_cbor(&result.result.data);
+            assert_eq!(
+                cbor_map_get(val.as_map().unwrap(), "code").as_text(),
+                Some("unsupported_content_hash_format"),
+                "{label}: a well-formed hash we cannot verify is §4.7 row 5, \
+                 not the structural row"
+            );
+            assert!(!tree.has("fmt/x"));
+        }
+    }
+
+    /// §6.3's ordering, and the **only input that can measure it**: a
+    /// submission carrying *both* faults at once. Each single-fault row reaches
+    /// its own branch under either ordering, so no vector carrying one fault
+    /// discriminates — 0.8.2.11 says this in the spec text and §9.1's
+    /// conformance row names the both-faults input for exactly that reason.
+    ///
+    /// Structure strictly precedes hash, and the ordering is a data dependency
+    /// rather than a convention: step 2 compares against `content_hash({type,
+    /// data})`, which are precisely the fields step 1 establishes exist.
+    ///
+    /// Mutation verified: deleting the empty-`type` clause from
+    /// `decode_entity_from_cbor` lets this input pass step 1, so step 2 speaks
+    /// instead and the row reddens with **`Some("hash_mismatch")` vs
+    /// `Some("invalid_request")`** — the ladder running backwards, which is
+    /// exactly what the assertion message names. (It also reddens the
+    /// `type empty` row of `put_admission_predicate_is_every_clause_of_the_
+    /// entity_shape`; that neighbour going red is expected and is not what
+    /// this row is measuring.)
+    #[tokio::test]
+    async fn put_admission_is_structure_then_hash() {
+        let tree = make_tree();
+        // Both faults: `type` is empty (structural), AND the carried hash
+        // addresses something else entirely (hash fault).
+        let other = make_entity("test/type", "a different payload");
+        let good = make_entity("test/type", "payload");
+        let inner: ciborium::Value = ciborium::from_reader(good.data.as_slice()).unwrap();
+        let params = entity_ecf::Value::Map(vec![(
+            entity_ecf::text("entity"),
+            entity_ecf::Value::Map(vec![
+                (
+                    entity_ecf::text("content_hash"),
+                    entity_ecf::Value::Bytes(other.content_hash.to_bytes()),
+                ),
+                (entity_ecf::text("data"), inner),
+                (entity_ecf::text("type"), entity_ecf::text("")),
+            ]),
+        )]);
+        let ctx = make_handler_context("put", Some(params), Some(vec!["both/faults".into()]));
+        let result = tree.handle(&ctx).await.unwrap();
+        assert_eq!(result.status, STATUS_BAD_REQUEST);
+        let val = decode_cbor(&result.result.data);
+        assert_eq!(
+            cbor_map_get(val.as_map().unwrap(), "code").as_text(),
+            Some("invalid_request"),
+            "a submission that is both malformed and mis-hashed is the STRUCTURAL row; \
+             answering hash_mismatch means the ladder is running backwards"
+        );
+        assert!(!tree.has("both/faults"));
+    }
+
+    /// The containment that makes the `put` validate branch's non-mismatch arm
+    /// unreachable, asserted rather than assumed. `decode_entity_from_cbor`
+    /// admits a `content_hash` only through `Hash::from_bytes`, which refuses
+    /// any format `digest_len_for_format` does not know; `Entity::validate`
+    /// then recomputes through `Hash::compute_format`. While those two agree on
+    /// the supported set, the only reachable failure is `HashMismatch`. If a
+    /// format is ever added to one and not the other this goes red, and the
+    /// `invalid_request` arm in `handle_put` becomes live code rather than a
+    /// documented dead row.
+    #[test]
+    fn validate_on_the_put_path_can_only_fail_with_hash_mismatch() {
+        for format_code in 0u8..=u8::MAX {
+            let known_to_decoder = entity_hash::digest_len_for_format(format_code).is_some();
+            let known_to_hasher = Hash::compute_format("test", b"\x60", format_code).is_ok();
+            assert_eq!(
+                known_to_decoder, known_to_hasher,
+                "format {:#04x} is known to one of the two hash tables and not the other; \
+                 the put validate branch's non-mismatch arm is now reachable",
+                format_code
+            );
+        }
     }
 
     #[tokio::test]
@@ -2749,23 +3291,118 @@ mod tests {
         got.validate().expect("served entity must validate");
     }
 
-    /// The other half: an entity arriving WITHOUT a `content_hash` is being
-    /// authored here, so it is hashed under the local home format. Preserving
-    /// a supplied hash must not turn the field into a requirement.
+    /// The other half, **inverted at 0.8.2.11 — and this test previously
+    /// asserted the defect.** It read
+    /// `test_handler_put_without_content_hash_authors_under_home_format` and
+    /// said *"preserving a supplied hash must not turn the field into a
+    /// requirement"*, asserting `STATUS_OK` for a two-key submission. §8.1
+    /// declares `core/entity`'s three fields with no `optional` marker and
+    /// `ENTITY-CORE-PROTOCOL` §6.3 now states the ladder outright: `put` is a
+    /// **receipt** path and MUST NOT author a hash on the submitter's behalf.
+    /// The field always was a requirement; the old test was written from the
+    /// `content_hash?` spelling `ENTITY-NATIVE-TYPE-SYSTEM` §2.8 carried until
+    /// 0.8.2.11 corrected it.
+    ///
+    /// **Because this rewrites what a test asserts rather than whether it
+    /// passes, it witnesses nothing on its own** (`AGENTS.md`: a test edited in
+    /// the same commit as the behaviour is not an independent witness). The two
+    /// things that do witness it are both outside this file:
+    ///   - the **untouched** control one function up,
+    ///     `test_handler_put_preserves_foreign_content_hash_format`, which
+    ///     drives a three-key SHA-384 submission and must stay green — it fails
+    ///     if this change made `put` refuse carried hashes rather than absent
+    ///     ones, which is the one-edit-away way to "fix" this wrong;
+    ///   - the cross-impl drive, `validate-peer -category tree_operations`,
+    ///     row `put_absent_content_hash_400_invalid_request`, which scored us
+    ///     **FAIL — 200** at `06404cb` and is the measurement that found this.
     #[tokio::test]
-    async fn test_handler_put_without_content_hash_authors_under_home_format() {
+    async fn put_without_content_hash_is_refused_and_never_authored() {
         let tree = make_tree();
         let entity = make_entity("test/type", "authored here");
-        let params = put_params_with_expected(Some(&entity), None);
+        let inner: ciborium::Value = ciborium::from_reader(entity.data.as_slice()).unwrap();
+        let params = entity_ecf::Value::Map(vec![(
+            entity_ecf::text("entity"),
+            entity_ecf::Value::Map(vec![
+                (entity_ecf::text("data"), inner),
+                (entity_ecf::text("type"), entity_ecf::text("test/type")),
+            ]),
+        )]);
         let ctx = make_handler_context("put", Some(params), Some(vec!["local/fmt".into()]));
         let result = tree.handle(&ctx).await.unwrap();
-        assert_eq!(result.status, STATUS_OK);
-        let got = tree.get("local/fmt").expect("bound");
-        assert_eq!(got.content_hash, entity.content_hash);
         assert_eq!(
-            got.content_hash.algorithm,
-            entity_hash::HASH_ALGORITHM_SHA256
+            result.status, STATUS_BAD_REQUEST,
+            "a two-key submission is not a core/entity; put must refuse it"
         );
+        let val = decode_cbor(&result.result.data);
+        assert_eq!(
+            cbor_map_get(val.as_map().unwrap(), "code").as_text(),
+            Some("invalid_request"),
+            "absence of a required field is the structural row, not hash_mismatch"
+        );
+        // The half that makes it a *receipt* claim rather than a status claim:
+        // nothing was stored and nothing was bound, so no address the
+        // submitter did not choose came into existence.
+        assert!(
+            !tree.has("local/fmt"),
+            "the peer authored a hash the submitter did not provide"
+        );
+    }
+
+    /// A `content_hash` that is *present but not a byte string* — `null`, a
+    /// text string, a map — is the same structural refusal as absence, and it
+    /// is the input the routed worklist did not name. It matters because the
+    /// pre-0.8.2.11 decoder read it through `if let Some(bytes) = v.as_bytes()`
+    /// and simply **fell through**, leaving the authored-hash slot empty: a
+    /// mis-typed field took the authoring arm, indistinguishable from a field
+    /// that was never sent.
+    ///
+    /// **Mutation, stated as measured rather than as expected — the first
+    /// version of this comment was wrong and the run is what corrected it.**
+    /// Removing the `else` *alone* leaves both rows below **green**: the
+    /// `ok_or_else` at the end of `decode_entity_from_cbor` catches the empty
+    /// slot and answers the same `invalid_request`, so the two spellings are
+    /// behaviourally equivalent on the wire today. The mutation that reddens
+    /// these rows is the **combination** — remove the `else` *and* restore the
+    /// authoring arm — because it takes both for a mis-typed field to reach a
+    /// peer-authored hash. So the `else` is defence in depth, not the load-
+    /// bearing check, and the honest reading of these rows is that they pin the
+    /// *wire answer* for a shape core-go's routing did not name, while
+    /// `put_without_content_hash_is_refused_and_never_authored` is the row that
+    /// discriminates the authoring arm on its own (verified: authoring arm
+    /// alone reddens that row and
+    /// `put_admission_predicate_is_every_clause_of_the_entity_shape`, and
+    /// leaves these two green).
+    #[tokio::test]
+    async fn put_content_hash_present_but_not_a_bstr_is_refused_not_authored() {
+        for (label, bad) in [
+            ("null", entity_ecf::Value::Null),
+            ("text", entity_ecf::text("not a hash")),
+        ] {
+            let tree = make_tree();
+            let entity = make_entity("test/type", "payload");
+            let inner: ciborium::Value = ciborium::from_reader(entity.data.as_slice()).unwrap();
+            let params = entity_ecf::Value::Map(vec![(
+                entity_ecf::text("entity"),
+                entity_ecf::Value::Map(vec![
+                    (entity_ecf::text("content_hash"), bad),
+                    (entity_ecf::text("data"), inner),
+                    (entity_ecf::text("type"), entity_ecf::text("test/type")),
+                ]),
+            )]);
+            let ctx = make_handler_context("put", Some(params), Some(vec!["bad/ch".into()]));
+            let result = tree.handle(&ctx).await.unwrap();
+            assert_eq!(
+                result.status, STATUS_BAD_REQUEST,
+                "content_hash as {label} is not a system/hash"
+            );
+            let val = decode_cbor(&result.result.data);
+            assert_eq!(
+                cbor_map_get(val.as_map().unwrap(), "code").as_text(),
+                Some("invalid_request"),
+                "content_hash as {label} is the structural row"
+            );
+            assert!(!tree.has("bad/ch"), "nothing may be stored for {label}");
+        }
     }
 
     /// Preserving the authored hash is not a forgery vector: `validate` runs

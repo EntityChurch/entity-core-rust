@@ -3650,14 +3650,24 @@ impl PeerContext {
     /// Returns [`SdkError::Conflict`] (status 409) when the expectation
     /// doesn't match; the caller can re-read and retry.
     ///
-    /// **Atomicity caveat**: entity-core-rust's `system/tree` handler does
-    /// not yet support native CAS via `expected_hash` in the put params.
-    /// Today this is implemented as a best-effort get-then-compare-then-put
-    /// at the SDK layer. For a single local writer (the common case today),
-    /// dispatch serialization inside the handler makes this effectively
-    /// atomic — but a second concurrent writer on the same path can race.
-    /// When the core handler gains native CAS, this will become atomic
-    /// without a signature change.
+    /// **Atomicity caveat**, and note what it is a caveat *about* — this is
+    /// PA-6, and the answer is that the old comment was the stale artifact.
+    /// It read *"entity-core-rust's `system/tree` handler does not yet support
+    /// native CAS via `expected_hash` in the put params … when the core
+    /// handler gains native CAS, this will become atomic"*. **The handler
+    /// supports it.** `TreeHandler::handle_put` reads `expected_hash` and
+    /// routes to `compare_and_swap_with_context` (or, for the v7.50 all-zero
+    /// hash, `compare_and_create_with_context`), answering `409 hash_mismatch`
+    /// on a lost race; core-go reporting us **passing** the wire CAS-race check
+    /// is a measurement of that path, not a contradiction of it.
+    ///
+    /// What remains true is narrower and is about **this method**: `put_cas`
+    /// still does a get-then-compare-then-put at the SDK layer and does not
+    /// send `expected_hash`, so a second concurrent writer on the same path can
+    /// race it. That is a gap in this wrapper, not in the handler, and closing
+    /// it is a behaviour change on a `SHOULD` path rather than part of the
+    /// 0.8.2.11 admission work — deliberately left for its own diff so the two
+    /// are not measured together.
     pub async fn put_cas(
         &self,
         path: &str,
@@ -4278,7 +4288,22 @@ fn empty_params() -> Entity {
     Entity::new("system/empty", entity_ecf::to_ecf(&entity_ecf::Value::Null)).unwrap()
 }
 
-/// Build put params: `{"entity": {"type": ..., "data": ...}}`.
+/// Build put params: `{"entity": {"type": ..., "data": ..., "content_hash": ...}}`.
+///
+/// **All three keys, always.** `put-request.entity` is typed `core/entity`
+/// (`ENTITY-CORE-PROTOCOL` §3.9), whose three fields are all required
+/// (`ENTITY-NATIVE-TYPE-SYSTEM` §8.1; §2.8's table said `content_hash?` until
+/// 0.8.2.11 corrected it). Authoring the hash is **this layer's** job:
+/// `SDK-OPERATIONS` §3.2 is `put(path, type, data) → hash`, and an SDK cannot
+/// return a hash it did not compute. A peer is a *receipt* path — it validates
+/// the carried hash and MUST NOT author one (§6.3 admission, step 1).
+///
+/// Sending `{type, data}` and letting the peer author the hash back is a
+/// **compensating pair inside one tree**: our own round-trip was perfect and
+/// our own suite was blind to it, because the stripping encoder and the
+/// authoring decoder agreed with each other. It broke only across a seat
+/// boundary, which is where core-go measured it (a strict go peer answered our
+/// SDK `400`). Same shape as the same-side round-trip pitfall in `AGENTS.md`.
 pub(crate) fn build_put_params(entity: &Entity) -> Result<Entity, SdkError> {
     // The `data` field must be sent as a decoded ciborium Value, NOT
     // wrapped as Value::Bytes. entity-core-rust's `system/tree` put
@@ -4287,17 +4312,28 @@ pub(crate) fn build_put_params(entity: &Entity) -> Result<Entity, SdkError> {
     // which double-wraps the CBOR and corrupts subsequent reads.
     // Decoding `entity.data` back to Value and sending that round-trips
     // cleanly because the handler's re-encode produces equivalent bytes.
+    //
+    // That round-trip is now load-bearing rather than merely tidy: the
+    // `content_hash` below is computed over `entity.data`'s ORIGINAL bytes
+    // (`ecf_for_hash` embeds them raw, no re-encode), so if the peer's
+    // re-encode of this Value differed by one byte the put would answer
+    // `400 hash_mismatch` instead of storing. Pinned by
+    // `put_params_carry_a_hash_the_peer_recomputes_from_the_data_it_receives`.
     let data_value: entity_ecf::Value = ciborium::from_reader(entity.data.as_slice())
         .map_err(|e| SdkError::TreeError(format!("decode entity.data for put: {}", e)))?;
     let entity_cbor = entity_ecf::Value::Map(vec![
         (
+            entity_ecf::text("content_hash"),
+            entity_ecf::Value::Bytes(entity.content_hash.to_bytes()),
+        ),
+        (entity_ecf::text("data"), data_value),
+        (
             entity_ecf::text("type"),
             entity_ecf::text(&entity.entity_type),
         ),
-        (entity_ecf::text("data"), data_value),
     ]);
     let params_map = entity_ecf::Value::Map(vec![(entity_ecf::text("entity"), entity_cbor)]);
-    Entity::new("system/tree/put/params", entity_ecf::to_ecf(&params_map))
+    Entity::new("system/tree/put-request", entity_ecf::to_ecf(&params_map))
         .map_err(|e| SdkError::TreeError(format!("build put params: {}", e)))
 }
 
@@ -4305,7 +4341,7 @@ pub(crate) fn build_put_params(entity: &Entity) -> Result<Entity, SdkError> {
 pub(crate) fn build_remove_params() -> Result<Entity, SdkError> {
     let params_map =
         entity_ecf::Value::Map(vec![(entity_ecf::text("entity"), entity_ecf::Value::Null)]);
-    Entity::new("system/tree/put/params", entity_ecf::to_ecf(&params_map))
+    Entity::new("system/tree/put-request", entity_ecf::to_ecf(&params_map))
         .map_err(|e| SdkError::TreeError(format!("build remove params: {}", e)))
 }
 
@@ -6866,6 +6902,201 @@ mod tests {
 
         let event = stream.try_recv();
         assert!(event.is_some());
+    }
+
+    // -- put admission: the SDK's construction step (SDK-OPERATIONS §3.2) --
+
+    /// `build_put_params` emits all three `core/entity` keys. Asserted on the
+    /// **built params**, not on a round-trip: a round-trip through our own peer
+    /// is exactly what hid this for as long as it was broken — the stripping
+    /// encoder and the authoring decoder agreed with each other, so `put` then
+    /// `get` returned the right bytes at the right hash under a wire shape no
+    /// other seat accepts (`AGENTS.md`: same-side round-trip tests pass with
+    /// the wrong shape too).
+    ///
+    /// **Mutation verified, and the result changed meaning mid-change — worth
+    /// recording, because it is the flag day itself.** Dropping the
+    /// `content_hash` pair from `build_put_params` today reddens this row *and*
+    /// roughly a dozen `put`/`get`/`follow` tests, because the peer half is now
+    /// strict and refuses a two-key submission. Run against the peer as it
+    /// stood at `06404cb` — which authored the missing hash back — the same
+    /// mutation reddened **nothing at all**: that is the compensating pair, and
+    /// the reason our own suite was blind to a defect a strict go peer answered
+    /// `400`. The broad redness is the pair being gone, not collateral damage.
+    /// This row is still written as a direct assertion on the built params so
+    /// it keeps discriminating if a peer-side authoring arm ever comes back.
+    #[test]
+    fn build_put_params_emits_all_three_entity_keys() {
+        let entity = make_entity("test/t", "payload");
+        let params = build_put_params(&entity).unwrap();
+        let val: ciborium::Value = ciborium::from_reader(params.data.as_slice()).unwrap();
+        let inner = val
+            .as_map()
+            .unwrap()
+            .iter()
+            .find(|(k, _)| k.as_text() == Some("entity"))
+            .map(|(_, v)| v.clone())
+            .expect("params carry an `entity`");
+        let fields = inner.as_map().expect("entity is a map");
+        let key = |name: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| k.as_text() == Some(name))
+                .map(|(_, v)| v.clone())
+        };
+
+        assert_eq!(
+            key("type").and_then(|v| v.as_text().map(str::to_string)),
+            Some("test/t".to_string())
+        );
+        assert!(key("data").is_some(), "`data` is present");
+        assert_eq!(
+            key("content_hash").and_then(|v| v.as_bytes().cloned()),
+            Some(entity.content_hash.to_bytes()),
+            "the SDK authors the hash — SDK-OPERATIONS §3.2's `put(...) -> hash` \
+             cannot return a hash it did not compute, and a peer is a receipt \
+             path that MUST NOT author one on our behalf"
+        );
+    }
+
+    /// The property that makes the line above safe to ship, and it is not
+    /// obvious: `ecf_for_hash` embeds `data`'s bytes **raw**, while the tree
+    /// handler re-encodes the decoded CBOR `Value` it receives. So the hash we
+    /// author is over *our* bytes and the hash the peer recomputes is over
+    /// *its re-encoding* of them. While that round-trip is byte-stable the put
+    /// stores; if it ever stops being, every put in the system answers
+    /// `400 hash_mismatch` — a total outage, not a degradation.
+    ///
+    /// Before 0.8.2.11 this could not fail, because the peer authored the hash
+    /// over its own re-encoded bytes and the question never arose. Landing the
+    /// SDK's construction step is what makes it load-bearing, so it is pinned
+    /// here rather than left to the fact that the suite happens to be green.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn put_params_carry_a_hash_the_peer_recomputes_from_the_data_it_receives() {
+        let ctx = make_peer_context();
+        let pid = ctx.peer_id().to_string();
+
+        // Shapes chosen to stress the re-encode: nested map (key order),
+        // integers at width boundaries, a bstr, a null, an empty array.
+        let payload = to_ecf(&entity_ecf::Value::Map(vec![
+            (text("a"), entity_ecf::integer(0)),
+            (text("b"), entity_ecf::integer(23)),
+            (text("c"), entity_ecf::integer(24)),
+            (text("d"), entity_ecf::integer(256)),
+            (text("e"), entity_ecf::integer(-1)),
+            (text("f"), entity_ecf::Value::Bytes(vec![0xde, 0xad])),
+            (text("g"), entity_ecf::Value::Null),
+            (text("h"), entity_ecf::Value::Array(vec![])),
+            (
+                text("i"),
+                entity_ecf::Value::Map(vec![(text("nested"), text("value"))]),
+            ),
+        ]));
+        let entity = Entity::new("test/roundtrip", payload).unwrap();
+        let authored = entity.content_hash;
+
+        let path = format!("/{}/app/test/fidelity", pid);
+        let returned = ctx
+            .put(&path, entity)
+            .await
+            .expect("a put whose carried hash the peer cannot reproduce is a 400, not a store");
+        assert_eq!(
+            returned, authored,
+            "the peer stored at an address the submitter did not author"
+        );
+
+        let got = ctx.get(&path).await.unwrap().expect("bound");
+        assert_eq!(got.content_hash, authored);
+        got.validate()
+            .expect("what the peer serves must verify at the hash it serves it under");
+    }
+
+    /// **The cross-seat acceptance test, and the only one that can fail for the
+    /// right reason.** Everything else in this file drives our SDK against our
+    /// own peer, and for as long as the defect lived that pair agreed with
+    /// itself: the SDK stripped `content_hash` and the peer authored it back,
+    /// so a green suite here was compatible with a wire shape **no other
+    /// implementation accepts**. The property is only observable across a seat
+    /// boundary, which is why core-go had to measure it for us.
+    ///
+    /// Ignored by default because it needs a live strict peer. Drive it with:
+    ///
+    /// ```text
+    /// # in entity-core-go, at bed12bb or later (the strict-put commit)
+    /// peer-manager start --name strictgo --type go
+    /// ENTITY_STRICT_PEER_ADDR=127.0.0.1:<port> \
+    ///   cargo test -p entity-sdk sdk_put_is_accepted_by_a_strict_foreign_peer \
+    ///   -- --ignored --nocapture
+    /// ```
+    ///
+    /// Expected, and this is the whole acceptance criterion: **`400` before the
+    /// `build_put_params` fix, `200` after.** A `400 invalid_request` here
+    /// means we are still shipping a two-key `{type, data}` submission and
+    /// asking the far peer to author an address we did not choose.
+    ///
+    /// **Measured, 2026-09-06, against go `b353351` (peer at `bed12bb`):**
+    /// fixed → `200` with a `content_hash` result; SDK fix reverted → `400`
+    /// `invalid_request`, message *"entity missing required content_hash
+    /// field"*. **Read the message, not just the status** — that wording is
+    /// go's. Our own handler's refusal reads *"submitted entity is not a
+    /// core/entity: missing 'content_hash' field…"*, and seeing OUR text come
+    /// back is the tell that the dispatch never left the process, which is
+    /// exactly the bug the first version of this test had.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    #[ignore]
+    async fn sdk_put_is_accepted_by_a_strict_foreign_peer() {
+        let addr = match std::env::var("ENTITY_STRICT_PEER_ADDR") {
+            Ok(a) => a,
+            Err(_) => panic!("set ENTITY_STRICT_PEER_ADDR to a live strict peer"),
+        };
+        let ctx = make_peer_context();
+        let remote_pid = ctx
+            .connect_to(&addr)
+            .await
+            .expect("connect to the strict peer");
+        eprintln!("connected to {addr} as peer {remote_pid}");
+
+        let entity = make_entity("test/boundary", "authored by the rust SDK");
+        let path = format!("/{}/app/rust-sdk-boundary", remote_pid);
+
+        // NOTE the handler URI, because the obvious spelling does not cross the
+        // wire and the first version of this test did not notice. `ctx.put()`
+        // dispatches at the bare `system/tree` URI, which resolves to the
+        // LOCAL tree handler even when the resource target names a foreign
+        // namespace — that is the site-cache / mirror shape, and it is a local
+        // write. A put that never leaves the process cannot measure a foreign
+        // peer's admission: the reverted-SDK run of that version came back
+        // `400` carrying OUR OWN handler's message, which is what exposed it.
+        // The qualified `entity://{peer}/system/tree` form is what routes.
+        let params = build_put_params(&entity).expect("build put params");
+        let opts = entity_handler::ExecuteOptions {
+            resource: Some(entity_capability::ResourceTarget {
+                targets: vec![path.clone()],
+                exclude: vec![],
+            }),
+            ..Default::default()
+        };
+        let result = ctx
+            .execute(
+                format!("entity://{}/system/tree", remote_pid),
+                "put",
+                params,
+                opts,
+            )
+            .await
+            .expect("cross-peer dispatch to the strict peer");
+
+        eprintln!(
+            "strict peer answered status={} body={}",
+            result.status,
+            String::from_utf8_lossy(&result.result.data)
+        );
+        assert_eq!(
+            result.status, 200,
+            "a strict peer refuses a two-key put; 200 is the SDK's construction step working"
+        );
     }
 
     // -- put_cas tests --
