@@ -1,6 +1,6 @@
 # entity-core-rust — status
 
-_Updated: 2026-09-11 · public: v0.8.0 (master)_
+_Updated: 2026-09-15 · public: v0.8.0 (master)_
 
 > **A note on the citations below.** Entries name the handoff, routing note or
 > validation report that produced them — files under `docs/status/` and
@@ -41,6 +41,30 @@ and tree semantics are interop-validated against the Go and Python peers, not
 just self-tested.
 
 ## Where we left off
+
+_2026-09-15: **long-running browser peers. Three WebRTC signaling fixes landed, and the remaining
+items are written up in `docs/BACKLOG.md`.**_
+
+A browser consumer (two browsers that meet through a signaling node and then chat) reported that long
+sessions stop reconnecting. Checked against our source, both of the causes they named were ours, and
+fixing them surfaced a third:
+
+- **An answerer took the oldest offer at the node, not the newest.** Offers from an abandoned attempt
+  stay at the node for its TTL, so every retry answered a session nobody was waiting on. It now takes
+  the newest.
+- **The §6.5 carrier cached its node connection outside the connection pool** and never evicted it,
+  so the first transport failure was permanent. It now redials when the node closes the connection or
+  a request fails at the transport.
+- **An answerer re-answered an offer it had already answered.** After a successful negotiation that
+  offer is usually the only one at the node, so "newest" did not skip it, and each later attempt sent
+  an answer no offerer reads. The consumer measured this as extra deposits at the node. It now skips
+  offers whose session already carries an answer this peer signed.
+
+Each has a test that fails with the fix removed. Deferred, each with its reason and next step in the
+backlog: why the answerer re-negotiates at all (needs the consumer's peer-side logs), `merge`'s
+`source_envelope` byte fidelity (spans the SDK and the tree handler), `system/content:get`'s namespace
+binding (held until grants narrow), the SDK's hardcoded `debug_open_grants` (a migration), and a stale
+`connected` status surviving a restart (a spec gap, logged in `docs/SPEC-AMBIGUITIES.md`).
 
 _2026-09-11 (c) — **`0.8.2.21` absorbed. The exclude fail-open had four sites here, not the three
 the ruling counts, and the third one is not fail-closed by accident.**_

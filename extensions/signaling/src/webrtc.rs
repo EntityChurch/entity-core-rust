@@ -686,12 +686,57 @@ pub fn find_answer<'a>(
 /// available now — a spoofer would have to produce a container that verifies
 /// under the bucket key — but only against counterparts that deposit one, so
 /// the exposure closes with the migration rather than with this function.
-pub fn find_counterpart_offer<'a>(
-    messages: impl IntoIterator<Item = &'a Collected>,
+///
+/// **The NEWEST such offer, not the first.** The bucket outlives a negotiation:
+/// an offerer whose window closed re-offers under a fresh session, and its
+/// abandoned offers stay collectable for the rest of the node's TTL, oldest
+/// first (§5 pin 4). Taking the first match answers a session nobody is waiting
+/// on — and on every retry, since re-offers outpace the TTL — so two peers meet
+/// at the node and never connect, surviving any reload that does not also
+/// restart the node. §6.4 makes *which* offer to answer peer policy; the last
+/// in deposit order is the one an offerer can still be holding. Held by
+/// `an_answerer_answers_the_newest_offer_not_a_stale_one_still_in_the_bucket`.
+///
+/// **Never an offer this peer has already answered.** The same residue has a
+/// second shape that "newest" cannot see: a negotiation that completed leaves
+/// the counterpart's offer in the bucket beside *our own* answer to it, and
+/// when that offer is the only one there — the ordinary case, once the
+/// counterpart's channel is up and it has stopped offering — newest and first
+/// are the same offer. A later negotiation from this peer (a re-establish after
+/// the channel drops, or at teardown) would answer it again, and that answer
+/// can never pair: an offerer takes the **first** answer for its session
+/// ([`find_answer`]; `entity-core-go`'s `FindWebRTCAnswer` likewise) and stops
+/// reading after it. Measured in `entity-browser-rust`'s `e2e-webrtc-meet`
+/// (`ROUTING-2026-09-15-b`, K-6): the answerer deposited 8/12/16 against the
+/// offerer's single offer, one collect per extra answer-plus-candidates burst.
+///
+/// Keyed on the answer's **verified signer**, never on session alone: a third
+/// party that could deposit an answer under the counterpart's session would
+/// otherwise suppress a live offer. In `pair` the only legitimate answerer of
+/// the counterpart's offer is this peer, so "an answer I signed" is the whole
+/// rule — and our own deposits are always sealed ([`post`]), so the signer is
+/// always there to read. §6.4 leaves which offer to answer to peer policy. Held
+/// by `an_answerer_never_re_answers_an_offer_it_already_answered`.
+pub fn find_counterpart_offer(
+    messages: &[Collected],
     my_session: &SessionId,
+    my_peer_id: &str,
 ) -> Option<(Offer, Option<VerifiedSigner>)> {
-    messages.into_iter().find_map(|c| match &c.msg {
-        CollectedWebRtc::Offer(o) if &o.session_id != my_session => {
+    let already_answered = |session: &SessionId| {
+        messages.iter().any(|c| match &c.msg {
+            CollectedWebRtc::Answer(a) => {
+                &a.session_id == session
+                    && c.signer.as_ref().is_some_and(|s| s.peer_id() == my_peer_id)
+            }
+            _ => false,
+        })
+    };
+    // Newest first: the bucket is in deposit order, so the first match from the
+    // end is the last offer deposited.
+    messages.iter().rev().find_map(|c| match &c.msg {
+        CollectedWebRtc::Offer(o)
+            if &o.session_id != my_session && !already_answered(&o.session_id) =>
+        {
             Some((o.clone(), c.signer.clone()))
         }
         _ => None,
@@ -1121,7 +1166,7 @@ pub async fn negotiate<C: Carrier, I: WebRtcIo>(
         }
 
         if !offered && !answered {
-            if let Some((offer, signer)) = find_counterpart_offer(&mine, &session) {
+            if let Some((offer, signer)) = find_counterpart_offer(&mine, &session, &party.self_id) {
                 // The offerer's session governs the pairing from here.
                 session = offer.session_id.clone();
                 let remote =
@@ -1972,6 +2017,140 @@ mod tests {
             }
             other => panic!("expected a §6.5 timeout, got {other:?}"),
         }
+    }
+
+    /// An answerer MUST answer the counterpart's **current** offer, not the
+    /// oldest one still inside the node's TTL.
+    ///
+    /// `collect` is non-destructive and oldest-first (§5 pin 4), and the bucket
+    /// outlives any one negotiation: an offerer whose window closed and who
+    /// re-offers under a fresh `session_id` leaves its abandoned offers live for
+    /// the rest of the TTL. An answerer scanning for the *first* offer then
+    /// answers a session nobody is waiting on, and because the offerer keeps
+    /// re-offering faster than the TTL ages the old ones out, it does so on
+    /// every attempt — the two peers meet at the node and never connect, and a
+    /// browser reload changes nothing because the bucket lives in the node
+    /// (`entity-browser-rust` `HANDOFF-2026-09-15-a` §4 H1). §6.4 leaves
+    /// *which* request to answer to peer policy, so the newest is ours to pick.
+    ///
+    /// Discriminated on what `lo` observes: `lo` accepts only an answer
+    /// carrying its own session, so an answer to the stale offer never reaches
+    /// its `accept_answer`. The stale SDP is labelled so the `hi` side names
+    /// which offer it took. **Mutation:** `find_counterpart_offer` back to
+    /// `find_map` (first match) reddens this row.
+    #[tokio::test]
+    async fn an_answerer_answers_the_newest_offer_not_a_stale_one_still_in_the_bucket() {
+        let bucket = SharedBucket::default();
+        let (lo_io, hi_io) = (StubBrowser::new("lo", true), StubBrowser::new("hi", true));
+        let (lo_p, hi_p) = two_parties(VerificationPolicy::Require, VerificationPolicy::Require);
+
+        // `lo`'s previous, abandoned negotiation: same identity, same bucket,
+        // a session its current negotiation will never accept an answer for.
+        let stale = Offer::new(
+            SessionId::generate(),
+            "v=0\r\na=fingerprint:sha-256 STALE\r\n",
+        );
+        let stale_blob =
+            crate::envelope::seal(&stale.to_entity().unwrap(), &lo_p.key, &lo_p.signer).unwrap();
+        bucket.blobs.lock().unwrap().push(stale_blob);
+
+        let (lo_c, hi_c) = (BucketView(&bucket), BucketView(&bucket));
+        let (lo_res, _hi_res) = tokio::join!(negotiate(&lo_p, &lo_c, &lo_io), async {
+            // `lo` posts its current offer in its first poll; let it.
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            negotiate(&hi_p, &hi_c, &hi_io).await
+        });
+
+        let hi_took = hi_io.remote_offer_seen.lock().unwrap().clone();
+        assert!(
+            hi_took.as_deref().is_some_and(|sdp| !sdp.contains("STALE")),
+            "hi must answer lo's current offer, took {hi_took:?}"
+        );
+        assert!(
+            lo_io.remote_answer_seen.lock().unwrap().is_some(),
+            "lo must receive an answer to the session it is actually waiting on"
+        );
+        assert!(
+            lo_res.is_ok(),
+            "lo negotiates to an open channel: {lo_res:?}"
+        );
+    }
+
+    /// An answerer MUST NOT answer an offer it has already answered — the
+    /// residue a **completed** negotiation leaves, which "newest" cannot see
+    /// because it is usually the only offer in the bucket
+    /// (`entity-browser-rust` `ROUTING-2026-09-15-b`, K-6).
+    ///
+    /// Two rows, collected before asserting so each reports on its own.
+    /// **Row 1** re-runs `hi` after a completed negotiation while `lo` is not
+    /// offering: there is nothing live to answer, so it deposits nothing and
+    /// times out unanswered. **Row 2** is the control — `lo` offers again and a
+    /// fresh `hi` answers *that* offer, so the skip cannot be a blanket refusal
+    /// to answer at a key that holds an old answer.
+    ///
+    /// **Mutation:** drop `!already_answered(..)` from `find_counterpart_offer`
+    /// — row 1 reddens (hi answers the consumed offer, deposits its answer and
+    /// candidate, and the stub reports the channel open); row 2 stays green,
+    /// because `lo`'s new offer is newer than the consumed one and "newest"
+    /// already picks it.
+    #[tokio::test]
+    async fn an_answerer_never_re_answers_an_offer_it_already_answered() {
+        let req = VerificationPolicy::Require;
+        let bucket = SharedBucket::default();
+        let (lo_p, hi_p) = two_parties(req, req);
+        let again = |p: &WebRtcParty| party(p.signer.clone(), &p.peer_id, req);
+
+        let (lo_c, hi_c) = (BucketView(&bucket), BucketView(&bucket));
+        let (lo_io, hi_io) = (StubBrowser::new("lo", true), StubBrowser::new("hi", true));
+        let (lo_res, hi_res) = tokio::join!(
+            negotiate(&lo_p, &lo_c, &lo_io),
+            negotiate(&hi_p, &hi_c, &hi_io),
+        );
+        assert!(
+            lo_res.is_ok() && hi_res.is_ok(),
+            "setup: the first negotiation completes"
+        );
+        let settled = bucket.blobs.lock().unwrap().len();
+
+        // Row 1 — `hi` re-establishes; `lo`'s only offer is the one it answered.
+        let hi2_io = StubBrowser::new("hi2", true);
+        let hi2_p = again(&hi_p);
+        let row1 = negotiate(&hi2_p, &hi_c, &hi2_io).await;
+        let row1_took = hi2_io.remote_offer_seen.lock().unwrap().clone();
+        let row1_deposits = bucket.blobs.lock().unwrap().len() - settled;
+
+        // Row 2 — `lo` offers again; a fresh `hi` answers the new offer.
+        let (lo3_io, hi3_io) = (StubBrowser::new("lo3", true), StubBrowser::new("hi3", true));
+        let (lo3_p, hi3_p) = (again(&lo_p), again(&hi_p));
+        let (lo3_res, hi3_res) = tokio::join!(negotiate(&lo3_p, &lo_c, &lo3_io), async {
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            negotiate(&hi3_p, &hi_c, &hi3_io).await
+        });
+        let row2_took = hi3_io.remote_offer_seen.lock().unwrap().clone();
+
+        assert!(
+            matches!(
+                row1,
+                Err(WebRtcError::Timeout {
+                    answered: false,
+                    ..
+                })
+            ) && row1_took.is_none()
+                && row1_deposits == 0,
+            "row 1: hi must not re-answer the offer it already answered — \
+             result {row1:?}, took {row1_took:?}, deposited {row1_deposits}"
+        );
+        assert!(
+            row2_took.as_deref().is_some_and(|sdp| sdp.contains("lo3"))
+                && lo3_res.is_ok()
+                && hi3_res.is_ok(),
+            "row 2: hi must still answer lo's NEW offer — took {row2_took:?}, \
+             lo {lo3_res:?}, hi {hi3_res:?}"
+        );
     }
 
     #[test]

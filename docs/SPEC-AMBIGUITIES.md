@@ -6583,3 +6583,40 @@ pattern; it does not require one to.
 **Not asserted.** We have not measured what core-go or core-py do with a malformed grant exclude,
 and this is not filed as a divergence. It is a question about what the rule should mean, found by
 implementing it.
+
+## §3.13 `system/peer/status` is durable, and nothing says what a RESTARTED peer does with a `connected` it wrote before the restart
+
+*Filed 2026-09-15, from `entity-browser-rust` `HANDOFF-2026-09-15-a` §4 H4 (their hypothesis,
+re-read here). Kernel at `033a7c7`.*
+
+**The passage.** `ENTITY-CORE-PROTOCOL` §3.13: *"State transitions: `(unknown) → connected →
+suspect → disconnected`"*, and *"A durable `failing_since` is also what lets a restarting peer
+resume at the correct backoff escalation instead of dropping back to its minimum."*
+`EXTENSION-NETWORK` §2.11's `reason` table has no row for a restart.
+
+**The gap.** Restart is named once, and only for the failing direction. A peer that stops while a
+remote is `connected` restarts holding a durable `connected` with **no connection behind it**, and
+every writer of the entity in this tree is transition-driven from a live connection
+(`liveness::{demote_peer_on_transport_error, demote_peer_on_keepalive_miss,
+write_connected_status}`, `keepalive::{keepalive_loop, escalate_unbound_suspect,
+recover_connected}`, `network_link::{write_released, write_retry_exhausted}` — the closed list of
+`write_peer_status(` callers). The keepalive loop that would demote it is per-connection and died
+with the process. So the row stays `connected` until something happens to dial that peer and fail
+on a live endpoint — and a consumer that reads the status to decide *whether* to go and reach the
+peer (the browser's rendezvous keeper does) never does. In a browser a reload is a restart, and the
+tree is on IndexedDB.
+
+**What we shipped.** Nothing; the stale row is the current behaviour. We did not add a start-time
+reset because every shape of it is a choice the spec has not made: which status (`disconnected`
+opens a failure episode and sets `failing_since` for a failure that was not observed; `suspect`
+asserts a transport error), which `reason` (none of the eight fits, and minting one is protocol
+design), and whether it fires the lifecycle subscribers every write to this entity fans out to.
+
+**Ask.** Rule what a restarting peer MUST (or MAY) do with a pre-restart `connected`/`suspect` row.
+Candidates: (a) a start-time write to `disconnected` with a new `reason` (e.g. `local-restart`,
+recovery = backoff-reconnect); (b) a bare `{peer_id, status: disconnected}` write, which §3.13
+already says is conformant, with `failing_since` left unset; (c) state that the entity is advisory
+across restarts and a consumer MUST NOT read `connected` as reachability without a live
+connection. (c) needs no write and moves the obligation to readers.
+
+**Not asserted.** Not reproduced on a device, and go/py not read.

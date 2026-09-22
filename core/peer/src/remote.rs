@@ -324,6 +324,14 @@ impl RemoteConnection {
     pub fn reciprocal_grant_sent(&self) -> bool {
         self.reciprocal_grant_sent
     }
+
+    /// Has this connection's reader exited? A `true` connection can never
+    /// answer another request — see the `reader_ended` field. For a caller that
+    /// *caches* a connection outside the pool (the §6.5 carrier), this is the
+    /// check that stops it handing out a dead one.
+    pub fn reader_ended(&self) -> bool {
+        self.reader_ended.load(Ordering::Acquire)
+    }
 }
 
 impl RemoteEndpoint for RemoteConnection {

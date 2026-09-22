@@ -53,6 +53,23 @@ Tree get with `mode: "hash"` should return just the hash without fetching the en
 ### Pagination
 Tree listing should support offset/limit for large subtrees.
 
+### `merge` with `source_envelope` re-encodes instead of storing the received bytes
+EXTENSION-TREE §5.4 has `merge` put each `source_envelope` entity into the content store. `handle_merge`
+(`core/tree`) rebuilds each entity's `data` from a decoded CBOR value, recomputes its hash, ignores the
+`included` map's keys and each entity's stated `content_hash`, and drops per-entity failures silently.
+**Effect:** none for ECF-canonical entities, which is everything a conformant peer emits: the rebuilt
+bytes and hash are identical. A non-canonical entity is stored under a different hash than the one
+the source trie names, so the merge silently misses it. The content store cannot be poisoned through
+this path, because the recompute is what keeps it content-addressed (`ContentStore::put` keys by the
+entity's stamped hash).
+**Why it is not a one-site fix:** both SDK producers of `source_envelope`
+(`bindings/sdk` `follow.rs::bootstrap_merge_params` and `reconcile.rs::build_tree_merge_params`) decode
+the envelope and re-encode it canonically before the handler sees it. The fix spans producer and
+handler: carry the envelope's raw bytes through, decode them with `entity_wire::decode_envelope`
+(raw `data` slices plus the key-binds-value check), and `validate()` each entity before `put`.
+That turns today's silent re-address into a `400 hash_mismatch` for a non-canonical entity, so measure
+it against the go and py peers on `follow` and reconcile before landing.
+
 ---
 
 ## Protocol Gaps
@@ -94,6 +111,36 @@ EXTENSION-IDENTITY v2.2 §6.8 sync-hook contract. Local writes through `create_a
 
 ### Identity AttestationStore enforcement at verify_request
 The `AttestationStore` trait is wired into `PeerBuilder` and exposed via `Peer::lookup_attestation()`, but `core/protocol/src/verify.rs` does NOT yet consult it. Wiring the consultation requires picking a default cache-miss policy (§10.1: `fetch-on-demand`, `reject-and-escalate`, or `embedded-only`) and a `cache_miss_policy` config option on `PeerConfig` so deployments can opt in.
+
+### `system/content:get` does not check the namespace binding
+EXTENSION-CONTENT §6.4.1 makes the namespace-scoped topology the production default for multi-party
+deployments and single-trust-domain (serve any stored hash) a restricted opt-in. Under the default,
+§6.4.2 has a receiver of `system/content:get` under `{namespace}` resolve through
+`tree:get({namespace}/{hex(H)})`. `handle_get` (`extensions/content/src/handler.rs`) goes straight to
+the content store and never checks that binding, so this peer behaves as single-trust-domain: a grant
+on any content namespace reads any stored content by hash. **Held deliberately:** content saved through the tree rather than through content
+ingest may lack that binding, so enforcing it now could break consumers that only read by hash (a
+browser file-transfer app does). Land it together with (or before) any consumer narrowing its grants.
+The fix needs the binding written on every path that stores user content, plus a test that reads a
+tree-saved file by hash under a narrowed grant.
+
+### A restarted peer keeps a stale `connected` status
+ENTITY-CORE-PROTOCOL §3.13's `system/peer/status` is durable and every writer is driven by a live
+connection, so a peer that stops while a remote is `connected` restarts still reading `connected`
+with no connection behind it. In a browser, a page reload is a restart. The reset is a spec choice
+(which status, which `reason`, and whether it fires lifecycle subscribers), logged in
+`docs/SPEC-AMBIGUITIES.md` under §3.13. Implement once ruled; until then consumers should not
+treat `connected` as reachable without a live connection.
+
+### WebRTC answerer re-negotiates after its channel is already open (cause not established)
+A browser consumer's two-peer meet-and-chat run showed the §6.5 answerer running further negotiations
+after the first one succeeded. Each one answered the offer it had already answered, an answer no
+offerer reads. That half is fixed: `find_counterpart_offer` now skips offers whose session carries an
+answer this peer signed. **Open:** why the answerer started a new negotiation at all, and why this
+appeared only after the carrier began redialing a lost node connection. The node cannot see who
+triggered an attempt. After the fix those attempts should cost collects only, with no deposits.
+Next step: re-measure with the consumer's rig and, if deposits still exceed one negotiation per side,
+read the peer-side `§6.5 (direct): negotiation to …` console lines with timestamps through teardown.
 
 ---
 
@@ -152,6 +199,19 @@ future regressions on this hot path.
 
 Parked from the upstream-asks + peer-arm-architecture arc. Each has an
 explicit fire trigger — none are active now.
+
+### SDK and worker-host constructors hardcode the deprecated `debug_open_grants`
+Every `PeerManager` constructor (`bindings/sdk/src/peer_manager.rs`) and three `wasm-worker-host`
+build sites set `debug_open_grants: true`, and none lets an embedder pass its own policy. The kernel
+already provides the replacement (`with_seed_policy` / `with_owner_identity`). **Not a drop-in swap,
+so schedule it as a migration:**
+- bare `*` resources drop foreign-namespace subtrees (`/*/*` is the open form);
+- a seed-policy `default` entry also becomes the ceiling for `system/capability:request`;
+- seeding is write-if-absent, so a profile that already stores a `default` entry keeps it, and
+  narrowing later needs a decision about stored entries.
+
+Add an embedder-supplied policy seam first, keep the SDK's default behaviour open, and only then
+move the default. (Godot's `peer_node.rs` already takes it from a setting.)
 
 ### `PeerSurface` trait — formal arm-unification
 `EntitySDK` and `WorkerProxy` ship two un-unified per-peer surfaces over

@@ -42,6 +42,22 @@ use crate::transport::Connector;
 /// The connection is cached and reused across the several `offer` / `collect`
 /// calls one exchange makes — reconnecting per verb would triple the carrier's
 /// load for no benefit.
+///
+/// # The cache is not the pool, so it owes its own eviction
+///
+/// This connection lives outside `RemoteState`, so nothing that demotes and
+/// re-dials a pooled connection ever touches it. It used to be returned
+/// unconditionally, which made the carrier's first transport failure permanent:
+/// a phone that backgrounded, a network change, or a node restart left every
+/// later §6.5 negotiation failing with `carrier refused or failed` until the
+/// establisher was rebuilt — while meets, riding the pool, kept working
+/// (`entity-browser-rust` `HANDOFF-2026-09-15-a` §4 H2). Two evictions, because
+/// a dead connection shows up in two ways: a reader that has exited is dropped
+/// **before** use (the next verb re-dials instead of failing), and any
+/// transport error from a verb drops the connection it ran on — which catches
+/// the socket that went silent without closing, where the reader never learns.
+/// A non-200 status is an answer, not a transport failure, and keeps the
+/// connection. Held by `a_carrier_redials_after_losing_the_node`.
 pub struct PeerCarrier {
     node_peer_id: String,
     node_addr: String,
@@ -93,7 +109,14 @@ impl PeerCarrier {
     async fn connection(&self) -> Result<Arc<remote::RemoteConnection>, PunchError> {
         let mut slot = self.conn.lock().await;
         if let Some(existing) = slot.as_ref() {
-            return Ok(existing.clone());
+            if !existing.reader_ended() {
+                return Ok(existing.clone());
+            }
+            tracing::debug!(
+                node = %self.node_addr,
+                "§6.5 carrier: the cached node connection's reader has ended; re-dialing"
+            );
+            *slot = None;
         }
         let transport = self
             .connector
@@ -125,8 +148,19 @@ impl PeerCarrier {
             &std::collections::HashMap::new(),
             None,
         )
-        .await
-        .map_err(|e| PunchError::Carrier(format!("{}: {}", operation, e)))?;
+        .await;
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => {
+                // Evict the connection this verb ran on — and only that one: a
+                // concurrent verb may already have replaced it with a live dial.
+                let mut slot = self.conn.lock().await;
+                if slot.as_ref().is_some_and(|c| Arc::ptr_eq(c, &conn)) {
+                    *slot = None;
+                }
+                return Err(PunchError::Carrier(format!("{}: {}", operation, e)));
+            }
+        };
         Ok((resp.status, resp.result))
     }
 }
@@ -395,5 +429,167 @@ mod rendezvous_over_a_real_node {
         );
 
         node_handle.abort();
+    }
+
+    /// A write half that can be cut while the read half stays open — the
+    /// socket that went silent without closing, where the reader never learns.
+    struct CutWriter {
+        inner: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+        cut: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl tokio::io::AsyncWrite for CutWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.cut.load(std::sync::atomic::Ordering::Acquire) {
+                return std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()));
+            }
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    /// A connector to an in-process node whose every link the test can break,
+    /// in either of the two ways a real one breaks.
+    struct BreakableNodeLink {
+        shared: Arc<crate::PeerShared>,
+        dials: std::sync::atomic::AtomicUsize,
+        servers: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+        cut: Mutex<Option<Arc<std::sync::atomic::AtomicBool>>>,
+    }
+
+    impl BreakableNodeLink {
+        fn dials(&self) -> usize {
+            self.dials.load(std::sync::atomic::Ordering::Acquire)
+        }
+        /// The node closes the connection: the reader sees EOF.
+        fn close_from_the_node(&self) {
+            for h in self.servers.lock().unwrap().drain(..) {
+                h.abort();
+            }
+        }
+        /// The connection goes silent: writes fail, the reader never ends.
+        fn cut_silently(&self) {
+            if let Some(c) = self.cut.lock().unwrap().as_ref() {
+                c.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Connector for BreakableNodeLink {
+        async fn connect(
+            &self,
+            _addr: &str,
+        ) -> Result<transport::Connection, transport::TransportError> {
+            let (client, server) = transport::memory_transport_pair();
+            let shared = self.shared.clone();
+            self.servers.lock().unwrap().push(tokio::spawn(async move {
+                let _ = crate::connection::handle_connection(server, shared).await;
+            }));
+            self.dials.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            let cut = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            *self.cut.lock().unwrap() = Some(cut.clone());
+            Ok(transport::Connection {
+                reader: client.reader,
+                writer: Box::new(CutWriter {
+                    inner: client.writer,
+                    cut,
+                }),
+                remote_addr: client.remote_addr,
+                transport_type: client.transport_type,
+            })
+        }
+        fn transport_type(&self) -> &'static str {
+            "memory"
+        }
+    }
+
+    /// The carrier re-dials a node it has lost, instead of failing every §6.5
+    /// negotiation for the rest of the session (`HANDOFF-2026-09-15-a` §4 H2).
+    ///
+    /// Two rows, one per eviction, and each is RED under the other eviction
+    /// alone. **Closed by the node** asks that the *very next* verb succeed,
+    /// which only the before-use `reader_ended` check can deliver — evict-on-error
+    /// alone spends that verb failing. **Gone silent** keeps the reader alive, so
+    /// only evict-on-error can recover, on the verb after the one that failed.
+    /// Under the original unconditional cache both rows fail forever.
+    #[tokio::test]
+    async fn a_carrier_redials_after_losing_the_node() {
+        let node_kp = entity_crypto::IdentityKeypair::Ed25519(Keypair::from_seed([0x71; 32]));
+        let node_id = node_kp.peer_id().to_string();
+        let core = Arc::new(entity_signaling::SignalingCore::new("node:71".to_string()));
+        let node = PeerBuilder::new()
+            .identity_keypair(node_kp)
+            .with_seed_policy(signaling_seed())
+            .handler(Arc::new(entity_signaling::SignalingHandler::new(
+                core, &node_id,
+            )))
+            .build()
+            .expect("node builds");
+        let shared = node.shared();
+        node.start_engines(&shared);
+
+        let link = Arc::new(BreakableNodeLink {
+            shared,
+            dials: Default::default(),
+            servers: Mutex::new(Vec::new()),
+            cut: Mutex::new(None),
+        });
+        let me = entity_crypto::IdentityKeypair::Ed25519(Keypair::from_seed([0x72; 32]));
+        let carrier = PeerCarrier::new(
+            node_id.clone(),
+            "memory:node",
+            me,
+            link.clone(),
+            entity_hash::HASH_ALGORITHM_SHA256,
+        );
+        let key = pair_key("a", "b");
+
+        carrier
+            .collect(&key)
+            .await
+            .expect("first collect dials the node");
+        assert_eq!(link.dials(), 1);
+
+        // Row 1 — closed by the node. Wait until the reader has seen it.
+        link.close_from_the_node();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !carrier.conn.lock().await.as_ref().unwrap().reader_ended() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the reader observes the node closing");
+        let row1 = carrier.collect(&key).await;
+
+        // Row 2 — the connection goes silent. One verb may fail; the next must not.
+        link.cut_silently();
+        let _first_after_cut = carrier.collect(&key).await;
+        let row2 = carrier.collect(&key).await;
+
+        assert!(
+            row1.is_ok(),
+            "closed by the node: the next verb must re-dial, got {row1:?}"
+        );
+        assert!(
+            row2.is_ok(),
+            "gone silent: the verb after a transport failure must re-dial, got {row2:?}"
+        );
+        assert_eq!(link.dials(), 3, "one dial per lost connection");
     }
 }
