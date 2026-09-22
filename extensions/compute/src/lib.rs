@@ -110,6 +110,25 @@ impl ComputeHandler {
         // URI-only resource shape — anything else is 400 ambiguous_resource.
         let expression_uri = match ctx.resource_target.as_ref() {
             Some(rt) if rt.targets.len() == 1 && rt.exclude.is_empty() => rt.targets[0].clone(),
+            // §3.3 (0.8.2.18): ABSENT is `path_required`, MORE THAN ONE is
+            // `ambiguous_resource` — two inputs, two remedies, and collapsing
+            // them is non-conformant on the absent case. A non-empty `exclude`
+            // stays on the ambiguous arm: §3.3 names two inputs and an
+            // exclusion set is neither.
+            None => {
+                let err = make_error_entity(
+                    "path_required",
+                    "eval requires a resource target (the expression path)",
+                );
+                return Ok(HandlerResult::error(STATUS_BAD_REQUEST, err));
+            }
+            Some(rt) if rt.targets.is_empty() => {
+                let err = make_error_entity(
+                    "path_required",
+                    "eval requires a resource target (the expression path)",
+                );
+                return Ok(HandlerResult::error(STATUS_BAD_REQUEST, err));
+            }
             _ => {
                 let err = make_error_entity(
                     "ambiguous_resource",
@@ -246,6 +265,25 @@ impl ComputeHandler {
         // an authorization target the caller needs separate cover for.
         let qualified_resource = match ctx.resource_target.as_ref() {
             Some(rt) if rt.targets.len() == 1 && rt.exclude.is_empty() => rt.targets[0].clone(),
+            // §3.3 (0.8.2.18): ABSENT is `path_required`, MORE THAN ONE is
+            // `ambiguous_resource` — two inputs, two remedies, and collapsing
+            // them is non-conformant on the absent case. A non-empty `exclude`
+            // stays on the ambiguous arm: §3.3 names two inputs and an
+            // exclusion set is neither.
+            None => {
+                let err = make_error_entity(
+                    "path_required",
+                    "install requires a resource target (the root expression path)",
+                );
+                return Ok(HandlerResult::error(STATUS_BAD_REQUEST, err));
+            }
+            Some(rt) if rt.targets.is_empty() => {
+                let err = make_error_entity(
+                    "path_required",
+                    "install requires a resource target (the root expression path)",
+                );
+                return Ok(HandlerResult::error(STATUS_BAD_REQUEST, err));
+            }
             _ => {
                 let err = make_error_entity(
                     "ambiguous_resource",
@@ -634,6 +672,25 @@ impl ComputeHandler {
         // but unused.
         let qualified_resource = match ctx.resource_target.as_ref() {
             Some(rt) if rt.targets.len() == 1 && rt.exclude.is_empty() => rt.targets[0].clone(),
+            // §3.3 (0.8.2.18): ABSENT is `path_required`, MORE THAN ONE is
+            // `ambiguous_resource` — two inputs, two remedies, and collapsing
+            // them is non-conformant on the absent case. A non-empty `exclude`
+            // stays on the ambiguous arm: §3.3 names two inputs and an
+            // exclusion set is neither.
+            None => {
+                let err = make_error_entity(
+                    "path_required",
+                    "uninstall requires a resource target (the subgraph path)",
+                );
+                return Ok(HandlerResult::error(STATUS_BAD_REQUEST, err));
+            }
+            Some(rt) if rt.targets.is_empty() => {
+                let err = make_error_entity(
+                    "path_required",
+                    "uninstall requires a resource target (the subgraph path)",
+                );
+                return Ok(HandlerResult::error(STATUS_BAD_REQUEST, err));
+            }
             _ => {
                 let err = make_error_entity(
                     "ambiguous_resource",
@@ -1398,6 +1455,68 @@ mod entity_native_tests {
             data_str(&data, "code").as_deref(),
             Some("index_out_of_range")
         );
+    }
+
+    /// **ENTITY-CORE-PROTOCOL §3.3 (0.8.2.18), swept into `EXTENSION-COMPUTE`
+    /// v3.30 for all three path-taking ops.** `eval` / `install` / `uninstall`
+    /// each derive their path from `EXECUTE.resource.targets[0]`, so each
+    /// requires a resource: ABSENT answers `path_required`, MORE THAN ONE
+    /// answers `ambiguous_resource`. All three collapsed both into
+    /// `ambiguous_resource`, which §3.3 calls *"non-conformant on the absent
+    /// case"* — the remedy for absent is *supply a resource*, and telling the
+    /// caller to pick one of the zero targets they sent is not that.
+    ///
+    /// The two shapes are asserted side by side because the fix and its
+    /// degenerate form — deleting one of the two codes — are one line apart.
+    ///
+    /// **Mutation RUN, not predicted**: deleting the three new `path_required`
+    /// arms reddens this test on its first absent row (`eval / absent`,
+    /// `left: "ambiguous_resource"`); relabelling the three catch-alls
+    /// `path_required` reddens it on `eval / two targets` instead. Both were run;
+    /// the `{op} / {label}` message is what tells the two reds apart, since a
+    /// table test short-circuits at its first failing assertion.
+    #[test]
+    fn absent_resource_is_path_required_and_two_targets_is_ambiguous() {
+        let cs: Arc<dyn ContentStore> = Arc::new(MemoryContentStore::new());
+        let li: Arc<dyn LocationIndex> = Arc::new(MemoryLocationIndex::new());
+        let handler = ComputeHandler::new(cs, li, TEST_PID.to_string());
+
+        for op in ["eval", "install", "uninstall"] {
+            let cases: Vec<(&str, Option<entity_capability::ResourceTarget>, &str)> = vec![
+                ("absent", None, "path_required"),
+                (
+                    "empty targets",
+                    Some(entity_capability::ResourceTarget {
+                        targets: vec![],
+                        exclude: vec![],
+                    }),
+                    "path_required",
+                ),
+                (
+                    "two targets",
+                    Some(entity_capability::ResourceTarget {
+                        targets: vec!["app/a/expr".to_string(), "app/b/expr".to_string()],
+                        exclude: vec![],
+                    }),
+                    "ambiguous_resource",
+                ),
+            ];
+            for (label, rt, want) in cases {
+                let mut ctx = make_handler_context(op);
+                ctx.resource_target = rt;
+                let r = match op {
+                    "eval" => handler.handle_eval(&ctx),
+                    "install" => handler.handle_install(&ctx),
+                    _ => handler.handle_uninstall(&ctx),
+                }
+                .expect("handler returns a response");
+                assert_eq!(r.status, 400, "{op} / {label}");
+                let got = entity_handler::decode_error_entity(&r.result)
+                    .and_then(|(c, _)| c)
+                    .unwrap_or_default();
+                assert_eq!(got, want, "{op} / {label}");
+            }
+        }
     }
 
     /// PROPOSAL-COMPUTE-NAVIGATION-AND-ERROR-SURFACE §3 (F10): an evaluated

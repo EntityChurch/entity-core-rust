@@ -769,6 +769,7 @@ impl PeerContext {
                     "entity-sdk peers are Ed25519-only (Ed448 backends use core PeerBuilder)",
                 ),
                 &deliver_uri,
+                delivering_engine_identity(&shared, remote_pid.as_deref()),
                 peer.content_store(),
             )
         };
@@ -982,6 +983,7 @@ impl PeerContext {
                 .as_ed25519()
                 .expect("entity-sdk peers are Ed25519-only"),
             &deliver_uri,
+            delivering_engine_identity(&shared, remote_pid.as_deref()),
             peer.content_store(),
         );
 
@@ -1430,9 +1432,81 @@ fn decode_notification(entity: &Entity) -> Option<L1SubscriptionEvent> {
 /// Build + sign a self-grant capability token authorizing `deliver_uri`
 /// for `receive`, store the token and its signature in the content
 /// store, and return `(token_entity, token_hash)`.
+/// Mint the `deliver_token` a subscriber hands the engine that will deliver to
+/// it (EXTENSION-SUBSCRIPTION §1.2 / §3.1).
+///
+/// `delivering_engine` is the identity hash of the peer that will **originate**
+/// the delivery — the remote subscription host for a cross-peer subscription,
+/// and this peer itself for a local one. It becomes the token's `grantee`, and
+/// that is the `0.8.2.19` Phase-1 change.
+///
+/// **Why the grantee is not the subscriber.** `ENTITY-CORE-PROTOCOL` §1.4 makes
+/// autonomous delivery an in-scope outbound sub-dispatch, relaxed on Dimension 4
+/// by *the credential the RECIPIENT armed it with* — this token. The presented
+/// arm requires the leaf `grantee` to resolve to the **local** peer at the seat
+/// making the dispatch, which is the delivering engine, not us. Minted as a
+/// self-grant (`grantee` = the subscriber) the token is well-formed, A-rooted,
+/// and **relaxes nothing**, so a host that correctly gates its delivery engine
+/// would refuse every cross-peer delivery we asked for. The token was the gap,
+/// not the gate.
+///
+/// **Phase 1 of a sequenced three-seat change, and only phase 1.** Arch's
+/// ordering (`ROUTING-2026-09-10-e`): every seat MINTS the conformant shape
+/// first, no seat GATES until all three do. Receivers accept either shape
+/// throughout, and this seat's own admission check is unaffected — subscribe
+/// runs `check_creator_authority`, which matches on the **granter** (still the
+/// subscriber) and never reads `grantee`. Do not pair this with flipping
+/// `DispatchCeiling::PeerRoot` in `core/peer/src/lib.rs`; that is phase 2 and it
+/// is not ours to start.
+///
+/// `peers` stays **absent**, not `["*"]`: absent defaults to the granter's own
+/// peer, which is precisely where the delivery goes, and a wildcard would make
+/// the dimension this token exists to satisfy vacuous.
+/// Identity hash of the peer whose engine will originate deliveries for this
+/// subscription — the `grantee` of the `deliver_token` (§1.4 / `0.8.2.19`
+/// phase 1; see [`mint_delivery_grant`]).
+///
+/// `None` for a local subscription: this peer subscribes and this peer's engine
+/// delivers, so the delivering engine IS the local identity and the token is
+/// legitimately a self-grant. `Some(pid)` resolves the remote's identity hash —
+/// derived from the PeerID itself for identity-form pids, and from the session
+/// entity learned at handshake for SHA-256-form ones, which is why this runs
+/// after `connect_to` rather than at handle construction.
+///
+/// **Falls back to the local identity when the remote cannot be resolved**, and
+/// that is deliberate: the pre-`0.8.2.19` shape. A subscribe that cannot name
+/// its host's identity is not a subscribe we should refuse in phase 1, where no
+/// seat gates — refusing here would turn a mint change into an availability
+/// change, which is the one thing the phased ordering exists to prevent. The
+/// `debug` line is the tell if a host later gates and this seat's deliveries
+/// start being refused.
+fn delivering_engine_identity(shared: &Arc<PeerShared>, remote_pid: Option<&str>) -> Hash {
+    let Some(pid) = remote_pid else {
+        return shared.identity_hash;
+    };
+    match entity_peer::remote::resolve_peer_identity_hash(
+        pid,
+        shared.content_store.as_ref(),
+        shared.location_index.as_ref(),
+        shared.peer_id.as_str(),
+    ) {
+        Some(h) => h,
+        None => {
+            tracing::debug!(
+                remote_peer = %pid,
+                "deliver_token: could not resolve the delivering engine's identity \
+                 — minting the pre-0.8.2.19 self-grant shape, which relaxes nothing \
+                 at a host that gates its delivery engine (§1.4)"
+            );
+            shared.identity_hash
+        }
+    }
+}
+
 fn mint_delivery_grant(
     keypair: &Keypair,
     deliver_uri: &str,
+    delivering_engine: Hash,
     content_store: &Arc<dyn ContentStore>,
 ) -> Result<(Entity, Hash), SdkError> {
     // Identity hash: the content hash of the peer's identity entity.
@@ -1455,8 +1529,11 @@ fn mint_delivery_grant(
             constraints: None,
             allowances: None,
         }],
+        // A-rooted: the subscriber grants, so §1.4's root-granter-is-the-target
+        // check passes at the delivering seat (the target of its dispatch is us).
         granter: entity_capability::Granter::Single(identity_hash),
-        grantee: identity_hash,
+        // The delivering ENGINE, not the subscriber — see the fn doc.
+        grantee: delivering_engine,
         parent: None,
         created_at: now_ms,
         expires_at: None,
@@ -1837,6 +1914,7 @@ mod tests {
         let listener =
             MemoryListener::bind(b_pid.clone(), reg.clone()).expect("bind MemoryListener");
         let b_shared = ctx_b.peer_shared();
+        let b_shared_for_assert = ctx_b.peer_shared();
         let server_task = tokio::spawn(async move {
             let _ = entity_peer::server::run(listener, b_shared).await;
         });
@@ -1870,6 +1948,84 @@ mod tests {
             "B's engine should hold the subscription created by A"
         );
         assert_eq!(subs_on_b[0].subscription_id, handle.subscription_id());
+
+        // --- §1.4 / 0.8.2.19 phase 1: the deliver_token B's engine will
+        // --- deliver under must name B as its grantee.
+        //
+        // B holds the subscription, so B's copy of the token is the one that
+        // matters — read it out of B's own store, not A's, so this asserts what
+        // travelled rather than what we built.
+        let token = {
+            let sub_path = format!(
+                "/{}/system/subscription/{}",
+                b_pid, subs_on_b[0].subscription_id
+            );
+            let sub_entity = b_shared_for_assert
+                .location_index
+                .get(&sub_path)
+                .and_then(|h| b_shared_for_assert.content_store.get(&h))
+                .expect("B persisted the subscription it accepted");
+            // Field-decoded rather than via `entity-subscription`'s decoder:
+            // the SDK does not depend on that crate directly and the crate DAG
+            // is not worth bending for one test read.
+            let v: ciborium::Value =
+                ciborium::from_reader(sub_entity.data.as_slice()).expect("subscription decodes");
+            let token_hash = v
+                .as_map()
+                .and_then(|m| {
+                    m.iter()
+                        .find(|(k, _)| k.as_text() == Some("deliver_token"))
+                        .and_then(|(_, val)| val.as_bytes())
+                        .and_then(|b| Hash::from_bytes(b).ok())
+                })
+                .expect("subscription carries its deliver_token hash");
+            b_shared_for_assert
+                .content_store
+                .get(&token_hash)
+                .expect("B holds the deliver_token it accepted")
+        };
+        let cap =
+            entity_capability::CapabilityToken::from_entity(&token).expect("deliver_token decodes");
+        assert_eq!(
+            cap.grantee, b_shared_for_assert.identity_hash,
+            "EXTENSION-SUBSCRIPTION §1.2 / ENTITY-CORE-PROTOCOL §1.4: the \
+             deliver_token's grantee is the DELIVERING ENGINE (B), not the \
+             subscriber. Minted as a self-grant it is well-formed and A-rooted \
+             and relaxes NOTHING at B, so a host that correctly gates its \
+             delivery engine refuses every delivery we asked for."
+        );
+        assert_eq!(
+            cap.granter,
+            entity_capability::Granter::Single(ctx_a.peer_shared().identity_hash),
+            "and it stays A-rooted — §1.4's root-granter check at B asks whether \
+             the root granter is the TARGET of B's dispatch, which is A. Both \
+             halves or neither: A-rooted with the wrong grantee is the shape \
+             that was already here, and B-rooted with the right grantee is go's \
+             non-conformant one."
+        );
+        for g in &cap.grants {
+            assert!(
+                g.peers.is_none(),
+                "peers absent, not [*] — this credential exists to satisfy \
+                 Dimension 4, and a wildcard makes that dimension vacuous"
+            );
+        }
+        // **Mutations RUN, not predicted** (0.8.2.19 phase 1, 2026-09-10):
+        //   `grantee: delivering_engine` → `grantee: identity_hash` (restore the
+        //     self-grant) — this row reddens on the grantee assertion, and it is
+        //     the only test in the crate that moves.
+        //   `peers: None` → `Some(["*"])` — this row reddens on the peers
+        //     assertion, and again nothing else does.
+        // The two are disjoint, and the second is the one that matters most for
+        // the class: a wildcard `peers` LOOKS more permissive and is actually
+        // the shape that deletes the check, so a suite that only pinned the
+        // grantee would have called the token conformant.
+        //
+        // The **control is one test down**: `subscribe_at_self_id_delegates_to_
+        // local`, where the delivering engine IS the local peer, so the grantee
+        // is legitimately the subscriber. Without it, "grantee = the remote"
+        // reads as a rule about remoteness rather than about who delivers, and
+        // the local path would be the next thing someone "fixed."
 
         // Drop fires unsubscribe at B (remote_pid path).
         drop(handle);
@@ -1911,6 +2067,50 @@ mod tests {
         let events = received.lock().unwrap().clone();
         assert_eq!(events.len(), 1, "local delivery should fire exactly once");
         assert_eq!(events[0].path, target);
+
+        // **The control for the phase-1 grantee rule** (§1.4 / 0.8.2.19). On the
+        // local path the delivering engine IS this peer, so the deliver_token is
+        // legitimately a self-grant: granter == grantee == us. That is not an
+        // exception to the rule, it is the rule — the grantee is *whoever will
+        // originate the delivery*, and remoteness is incidental.
+        //
+        // It earns its place by what it forbids: without it, the cross-peer row
+        // above is satisfied by "always name the remote", which has no answer
+        // for a local subscription and would mint a token granted to nobody.
+        let shared = ctx.peer_shared();
+        let sub_id = ctx
+            .list_subscriptions()
+            .first()
+            .map(|s| s.subscription_id.clone())
+            .expect("the local subscription is registered");
+        let sub_entity = shared
+            .location_index
+            .get(&format!("/{}/system/subscription/{}", pid, sub_id))
+            .and_then(|h| shared.content_store.get(&h))
+            .expect("subscription entity persisted locally");
+        let v: ciborium::Value =
+            ciborium::from_reader(sub_entity.data.as_slice()).expect("subscription decodes");
+        let token_hash = v
+            .as_map()
+            .and_then(|m| {
+                m.iter()
+                    .find(|(k, _)| k.as_text() == Some("deliver_token"))
+                    .and_then(|(_, val)| val.as_bytes())
+                    .and_then(|b| Hash::from_bytes(b).ok())
+            })
+            .expect("subscription carries its deliver_token hash");
+        let cap = entity_capability::CapabilityToken::from_entity(
+            &shared.content_store.get(&token_hash).expect("token stored"),
+        )
+        .expect("deliver_token decodes");
+        assert_eq!(
+            cap.grantee, shared.identity_hash,
+            "local subscription: the delivering engine is this peer, so the              self-grant is the CONFORMANT shape here"
+        );
+        assert_eq!(
+            cap.granter,
+            entity_capability::Granter::Single(shared.identity_hash)
+        );
     }
 
     #[tokio::test]

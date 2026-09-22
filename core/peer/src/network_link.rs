@@ -174,7 +174,40 @@ impl PeerLink for PeerNetworkLink {
             HashMap::new(),
             None,
             None,
-            // The peer is dispatching as itself, not as a deputy (D1).
+            // **KNOWN NON-CONFORMANCE against §1.4 F65/E2 (0.8.2.19) on ONE of
+            // this seam's call sites, held for a ruling — routed as
+            // `ROUTING-2026-09-10-a` (docs/status/).**
+            //
+            // Three of the four `self_execute` callers in `extensions/network`
+            // target a LOCAL uri (`system/subscription` subscribe/unsubscribe,
+            // `system/continuation` advance), where the §1.4 outbound gate does
+            // not run and the classification is inert. The fourth is §9.2's
+            // best-effort close notification, `entity://{peer}/system/protocol/
+            // connect:close` — a genuine outbound sub-dispatch at a foreign
+            // peer, originated by the `system/network` handler while it serves
+            // a caller-supplied `peer_id`. By 0.8.2.19's authority-provenance
+            // test that spends the network handler's grant and is IN scope;
+            // `PeerRoot` exempts it.
+            //
+            // **This is not the F67 credential bypass** (fixed at
+            // `outbound_sub_dispatch_authorized`) — it is the same escape by
+            // the other door: a ceiling classified out of the gate rather than
+            // a credential jumping it. And it is why the rule cannot be read as
+            // permitting a handler to re-root to peer authority at will: if a
+            // seam may declare itself `PeerRoot`, F65 is evadable by every
+            // handler and the rule is empty.
+            //
+            // **What blocks the flip.** `internal_scope()` below grants
+            // `system/protocol/connect` only `hello` + `authenticate`, with
+            // `peers` absent — so `Handler(..)` refuses the close notification
+            // on Dimensions 2 AND 4, and nothing supplies a Dimension-4
+            // relaxation: the `held_capability` we hold from that peer is
+            // `default_connection_grants`, which does not cover
+            // `connect:close`. Adding `close` to the scope is ours to do;
+            // **what authorizes a peer's own §9.2 courtesy close toward the
+            // peer it is disconnecting from is a cohort question**, and
+            // widening a bootstrap grant to `peers: ["*"]` is the one direction
+            // §6.2 names as specifically wrong. Routed rather than guessed.
             connection::DispatchCeiling::PeerRoot,
         );
         execute_fn(uri.to_string(), operation.to_string(), params, opts).await
@@ -187,6 +220,15 @@ impl PeerLink for PeerNetworkLink {
         // release-peer is the deliberate teardown. `generate_deliver_token`
         // grants inbox `receive` at `deliver_uri` under the peer's identity;
         // passing the local identity hash as the grantee makes it self-owned.
+        //
+        // **The self-grant is CONFORMANT here and this is not the §1.4 phase-1
+        // gap** (`0.8.2.19`). That rule says the `grantee` is *the peer whose
+        // engine will originate the delivery*; for a lifecycle subscription this
+        // peer both subscribes and delivers, so the delivering engine IS the
+        // local identity. Checked against the criterion rather than pattern-
+        // matched on the shape — the gap is at `mint_delivery_grant` in
+        // bindings/sdk, where the subscription is cross-peer and the engine is
+        // somebody else's.
         let params = remote::generate_deliver_token(
             &self.shared.keypair,
             self.shared.identity_hash,

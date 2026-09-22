@@ -885,7 +885,15 @@ impl PeerData {
             ),
         ]);
         let data = entity_ecf::to_ecf(&value);
-        Entity::new(TYPE_PEER, data).map_err(|e| TypesError::EntityError(e.to_string()))
+        // **The FLOOR, not the home format** (V7 §4.5a item 1a). `Entity::new`
+        // here was a latent defect on a non-floor-home peer: it minted the one
+        // entity item 1a exists to make a single value under a second hash, on
+        // the surface where §5.2's identity equalities are evaluated. Nothing
+        // failed, because both sides of every comparison were wrong the same
+        // way. The constructor now refuses the non-floor form outright, so this
+        // is the explicit form of what it enforces rather than a second policy.
+        Entity::new_with_format(TYPE_PEER, data, entity_hash::HASH_ALGORITHM_SHA256)
+            .map_err(|e| TypesError::EntityError(e.to_string()))
     }
 
     /// Derive the canonical wire `peer_id` (Base58) for this peer per V7

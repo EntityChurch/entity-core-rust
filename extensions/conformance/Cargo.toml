@@ -8,6 +8,7 @@ description = "GUIDE-CONFORMANCE §7a wire-gate scaffolding handlers (system/val
 entity-ecf.workspace = true
 entity-hash.workspace = true
 entity-entity.workspace = true
+entity-capability.workspace = true
 entity-wire.workspace = true
 entity-handler.workspace = true
 entity-types.workspace = true

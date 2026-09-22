@@ -709,6 +709,67 @@ pub fn check_permission(
     capability: &CapabilityToken,
     local_peer_id: &str,
 ) -> bool {
+    check_permission_inner(
+        operation,
+        handler_pattern,
+        target_peer,
+        resource_target,
+        capability,
+        local_peer_id,
+        false,
+    )
+}
+
+/// [`check_permission`] with **Dimension 4 (`peers`) relaxed** — §1.4's one
+/// exemption (0.8.2.19).
+///
+/// The outbound sub-dispatch gate calls this, and only this, when a valid
+/// credential minted by the TARGET peer has already answered *where*. The
+/// target answers where; this grant still answers *what*, so Dimensions 1–3
+/// are checked exactly as [`check_permission`] checks them.
+///
+/// **It is not dimension-mixing, and the loop shape is what enforces that.**
+/// §5.2 requires all applicable dimensions to be satisfied *by a single grant
+/// entry*; this skips the peers **test**, it does not let entry A supply
+/// `handlers` while entry B supplies `peers`. Written as a flag threaded into
+/// one body rather than a second copy of the loop for exactly that reason — a
+/// second copy is where the two would drift apart.
+///
+/// **A credential is not a grant.** There is deliberately no entry point here
+/// that authorizes from the credential alone: with no handler grant there is
+/// nothing to supply Dimensions 1–3 and the caller must refuse. Reintroducing
+/// the pre-0.8.2.19 bypass requires adding a new early return at the gate, not
+/// passing a different argument here.
+pub fn check_permission_relax_peers(
+    operation: &str,
+    handler_pattern: &str,
+    resource_target: Option<&ResourceTarget>,
+    capability: &CapabilityToken,
+    local_peer_id: &str,
+) -> bool {
+    check_permission_inner(
+        operation,
+        handler_pattern,
+        // Unread when `relax_peers` is set; passing the local peer id keeps the
+        // argument honest rather than inventing a sentinel.
+        local_peer_id,
+        resource_target,
+        capability,
+        local_peer_id,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_permission_inner(
+    operation: &str,
+    handler_pattern: &str,
+    target_peer: &str,
+    resource_target: Option<&ResourceTarget>,
+    capability: &CapabilityToken,
+    local_peer_id: &str,
+    relax_peers: bool,
+) -> bool {
     for grant in &capability.grants {
         // Operations (id-scope, §5.2 — literal match, no canonicalization)
         if !matches_id_scope(
@@ -729,11 +790,15 @@ pub fn check_permission(
             continue;
         }
 
-        // Peers (id-scope, §5.2 — literal match, no canonicalization)
-        let default_peers = IdScope::new(vec![local_peer_id.into()]);
-        let peers = grant.peers.as_ref().unwrap_or(&default_peers);
-        if !matches_id_scope(target_peer, &peers.include, &peers.exclude) {
-            continue;
+        // Peers (id-scope, §5.2 — literal match, no canonicalization).
+        // Skipped, and ONLY skipped, under §1.4's one exemption — see
+        // `check_permission_relax_peers`.
+        if !relax_peers {
+            let default_peers = IdScope::new(vec![local_peer_id.into()]);
+            let peers = grant.peers.as_ref().unwrap_or(&default_peers);
+            if !matches_id_scope(target_peer, &peers.include, &peers.exclude) {
+                continue;
+            }
         }
 
         // Resources — only checked when resource is present.

@@ -669,7 +669,56 @@ impl Peer {
                         included,
                         None, // engine-initiated, no parent bounds
                         None, // engine-initiated, no external caller
-                        // The peer is dispatching as itself, not as a deputy.
+                        // **KNOWN NON-CONFORMANCE against §1.4 F65/E2
+                        // (0.8.2.19), held for cohort coordination — routed as
+                        // `ROUTING-2026-09-10-a` (docs/status/).**
+                        //
+                        // 0.8.2.19 decides scope by AUTHORITY PROVENANCE, not
+                        // timing, and says outright that *"an autonomous
+                        // origination is IN scope and what relaxes its
+                        // Dimension 4 is the credential the RECIPIENT armed it
+                        // with"* — naming EXTENSION-SUBSCRIPTION §1.2's
+                        // `deliver_token` as exactly that credential, and that
+                        // *"a peer MUST NOT exempt the class on the ground that
+                        // no caller was on the stack."* A delivery engine
+                        // spends the `system/subscription` handler's grant; it
+                        // is not the peer originating as itself. So this
+                        // `PeerRoot` is wrong and the correct value is
+                        // `Handler(<the subscription handler's grant>)` with
+                        // the deliver_token presented as `opts.capability`.
+                        //
+                        // **What blocks the flip, stated so nobody re-derives
+                        // it. Part one of three is now DONE; the other two are
+                        // not ours to start.**
+                        //
+                        // The fix is three parts — (1) mint the token with
+                        // `grantee` = the delivering engine, (2) present it here
+                        // as `opts.capability`, (3) gate on the handler grant
+                        // instead of `PeerRoot`. Arch's sequencing
+                        // (`ROUTING-2026-09-10-e`) splits it: **phase 1 is (1)
+                        // at every seat, phase 2 is (2)+(3) once all three
+                        // mint.** Parts 2 and 3 change what a peer *accepts* on
+                        // the wire; part 1 only changes what it *offers*, and
+                        // receivers ignore the field throughout, which is what
+                        // makes the split safe.
+                        //
+                        // **Phase 1 landed here 2026-09-10.** `mint_delivery_
+                        // grant` (bindings/sdk/src/subscription.rs) now sets
+                        // `grantee` = the delivering engine and leaves `peers`
+                        // absent; the token was already A-rooted (granter = the
+                        // subscriber, `parent: None`), unlike go's, which roots
+                        // at the DELIVERING peer. So this peer now ARMS a remote
+                        // engine correctly.
+                        //
+                        // What still blocks (2)+(3) is the other direction: the
+                        // tokens *we* receive are minted by go and py, which
+                        // have not landed phase 1. Flipping this ceiling today
+                        // refuses every delivery a not-yet-updated subscriber
+                        // asked for — a availability regression bought with no
+                        // security gain, since the gate only bites peers that
+                        // already mint conformantly. **Do not flip it because
+                        // our own mint is fixed; that is precisely the reading
+                        // the phasing exists to prevent.**
                         connection::DispatchCeiling::PeerRoot,
                     );
                     let opts = entity_handler::ExecuteOptions {

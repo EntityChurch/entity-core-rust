@@ -3450,53 +3450,80 @@ pub enum DispatchCeiling {
 }
 
 /// §1.4 *"The enforcement point, and the authority it runs against"*
-/// (0.8.2.17 — PD-2): may this locally-originated sub-dispatch **leave the
-/// peer**?
+/// (PD-2, **as corrected at 0.8.2.19**): may this locally-originated
+/// sub-dispatch **leave the peer**?
 ///
-/// `check_permission` runs before the sub-dispatch leaves, all four dimensions
-/// applied, `target_peer = extract_peer(uri, local_peer_id)`. *Which* authority
-/// it runs against depends on what the sub-dispatch spends, and the two cases
-/// are different questions:
+/// **ONE GATE AND ONE EXEMPTION.** The executing handler's grant decides, on
+/// all four dimensions (§6.8). A valid credential minted **by the target peer**
+/// relaxes **Dimension 4 (`peers`) and only Dimension 4**, to the peers that
+/// credential covers. *The target answers **where**; the handler's grant still
+/// answers **what**.*
 ///
-/// - **Presented authority** — a capability that is *not* the propagated
-///   `caller_capability` (§6.2) but a distinct credential minted **by the target
-///   peer** naming **this peer** as `grantee`. That capability's own four
-///   dimensions authorize, and the dispatching handler's `peers` scope is not
-///   consulted: the party that decides what may be done at a peer is that peer,
-///   and it already has.
-/// - **Ambient authority** — no such capability. The sub-dispatch rides the
-///   executing handler's grant and **Dimension 4 binds it**: a handler whose
-///   grant carries no matching `peers` scope cannot reach a foreign peer. This
-///   is the confused-deputy ceiling the dimension exists for, and it is the arm
-///   this tree did not have — `default_handler_self_grant`'s `peers: None` was
-///   documented as "inert in this tree today" precisely because the remote
-///   branch returned before any ceiling check ran.
+/// **This function used to be two arms, and that was a confused-deputy hole
+/// (F67).** The presented arm verified a target-minted credential on its own
+/// four dimensions and `return true`d **before the handler grant was ever
+/// consulted**. Because the credential arrives as a caller-supplied param — the
+/// §7a.1 scaffold reads it straight out of `params` — a caller holding a copy of
+/// any `target → this peer` capability could steer **any** handler on this peer
+/// past its own grant. The caller cannot wield the credential itself (the leaf
+/// `grantee` is us), which is precisely what makes it a confused deputy, with
+/// the ceiling that was supposed to bound it removed by name. `entity-core-
+/// keystone` found it; go, py and this tree had all implemented the identical
+/// bypass, and two of the three (this one included) had written design prose
+/// defending it. The prose is gone with the branch.
+///
+/// **The structure is the fix, not the condition.** The credential check is a
+/// **predicate that produces a bit** ([`presented_credential_relaxes_peers`]),
+/// never an authorizer, and the bit feeds one call to
+/// [`entity_capability::check_permission_relax_peers`]. There is no code path
+/// by which a credential authorizes alone: reinstating F67 requires adding a
+/// new early return, which is exactly what
+/// `a_target_minted_credential_does_not_lift_a_handler_grant_that_does_not_cover_the_op`
+/// exists to redden.
+///
+/// **`PeerRoot` is out of scope by the provenance test, not by exemption**
+/// (§1.4, restated 0.8.2.19). The test is *does this dispatch spend a handler's
+/// grant, or the peer's own root authority?* A peer originating as itself has no
+/// delegated authority to confine and could mint any grant the check would test
+/// against, so a sender-side check constrains nothing there. **This is not the
+/// "no caller was on the stack" exemption the spec forbids** — an autonomous
+/// origination that spends a handler's grant (a timer, a continuation advance, a
+/// subscription delivery) is IN scope and must arrive here as
+/// `Handler(..)`. See `docs/status/` for the one class in this tree still
+/// classified `PeerRoot` against that rule (subscription delivery) and why it is
+/// routed rather than flipped unilaterally.
 ///
 /// **Disjoint from §6.2's confused-deputy prohibition, not an exception to it.**
 /// That rule forbids re-spending the *propagated caller capability* at a target
-/// the caller chose; presented authority is the opposite shape — minted for this
-/// purpose, by the party being accessed. `parent_caller_capability` is
-/// deliberately **not** a candidate here.
+/// the caller chose. A target-minted credential is a different object with a
+/// different granter — but that only answers the second half of §6.8, and the
+/// first half (*the decision is made on the executing handler's grant*) is the
+/// operative one, which is why the relaxation is scoped to Dimension 4.
+/// `parent_caller_capability` is deliberately **not** a candidate here.
 ///
 /// **Both candidate sources are target-minted.** `opts.capability` is the
 /// explicit one (a continuation's scoped `dispatch_capability`). The session's
 /// `held_capability` is the standing one — *"the cap remote granted me at
 /// handshake"* (`session_entity`, R6-a), granter = target, grantee = local by
-/// construction. Both are verified here on their own terms rather than trusted
-/// for their provenance; a capability failing any check **is not presented
-/// authority** and falls through to the ambient arm.
+/// construction. Both are verified on their own terms rather than trusted for
+/// their provenance; a capability failing any check **relaxes nothing** and the
+/// handler grant gates unrelaxed.
 ///
-/// Framing note, and it is the half that is easy to get backwards: a presented
-/// capability is evaluated **end to end in the target's frame**, not ours. It
-/// was minted by the target, so its `resources` canonicalize against the
-/// target's peer id (§5.5a / PR-8's per-link granter frame) and an absent
-/// `peers` defaults to `{include: [target]}` — which is what makes an ordinary
-/// handshake cap, naming no peers at all, authorize a dispatch *at the peer that
-/// issued it*. The same argument is passed to the chain walk, where it decides
-/// §5.5's root-trust rule rather than a canonicalization; using our own peer id
-/// there rejects every target-issued credential outright. Both were measured,
-/// not reasoned: our own pid yields `NotLocalPeer` at the chain and a
-/// no-matching-grant at coverage.
+/// Framing note, and it is the half that is easy to get backwards — §1.4 now
+/// pins it **per arm** (0.8.2.19 / E3). A presented credential is evaluated
+/// **end to end in the target's frame**: it was minted by the target, so its
+/// `resources` canonicalize against the target's peer id (§5.5a / PR-8's
+/// per-link granter frame) and an absent `peers` defaults to
+/// `{include: [target]}` — which is what makes an ordinary handshake cap, naming
+/// no peers at all, cover a dispatch *at the peer that issued it*. The same
+/// argument is passed to the chain walk, where it decides §5.5's root-trust rule
+/// rather than a canonicalization; using our own peer id there rejects every
+/// target-issued credential outright. **The handler grant is the opposite and
+/// generalizing the credential's frame to it is E3's named failure:** the grant
+/// is local, so both sides canonicalize in the LOCAL frame — canonicalize its
+/// `handlers` pattern against the target and Dimension 1 never matches for any
+/// foreign target, refusing even a handler legitimately scoped
+/// `peers: {include: [target]}`. Both directions were measured, not reasoned.
 #[allow(clippy::too_many_arguments)]
 fn outbound_sub_dispatch_authorized(
     shared: &PeerShared,
@@ -3509,7 +3536,7 @@ fn outbound_sub_dispatch_authorized(
     resource: Option<&entity_capability::ResourceTarget>,
     local_pid: &str,
 ) -> bool {
-    // --- Arm 1: presented authority ---------------------------------------
+    // --- The exemption bit: does a target-minted credential relax Dim 4? ----
     //
     // The target's identity hash is derived, never read off the connection:
     // §1.4 rejects keying this on "the connection the request arrived on"
@@ -3542,8 +3569,9 @@ fn outbound_sub_dispatch_authorized(
         }
     }
 
-    for cand in &candidates {
-        if presented_authority_authorizes(
+    // A bit, not a verdict. Nothing below consults `candidates` again.
+    let relax_peers = candidates.iter().any(|cand| {
+        presented_credential_relaxes_peers(
             shared,
             cand,
             included,
@@ -3551,41 +3579,61 @@ fn outbound_sub_dispatch_authorized(
             operation,
             target_peer,
             resource,
-        ) {
-            return true;
-        }
-    }
+        )
+    });
 
-    // --- Arm 2: ambient authority ------------------------------------------
+    // --- The gate: the executing handler's grant ---------------------------
     match ceiling {
-        // The peer itself is dispatching — `Peer::execute_with_options`, the
-        // engine, the network link. There is no deputy and no grant: Dimension 4
-        // bounds a *grant*, and the operator acting through its own peer has
-        // none to attenuate against. Same reading as the local branch's
-        // `PeerRoot` arm, and the same reason.
+        // Out of scope by the §1.4 provenance test — this dispatch spends the
+        // peer's own root authority, not a handler's grant. See the doc comment;
+        // this is NOT the "nobody was on the stack" exemption the spec forbids.
         DispatchCeiling::PeerRoot => true,
-        DispatchCeiling::Handler(Some(grant)) => entity_capability::check_permission(
-            operation,
-            handler_pattern,
-            target_peer,
-            resource,
-            grant,
-            local_pid,
-        ),
-        // A handler that can prove no authority at all cannot reach a foreign
-        // peer on ambient authority. Fail-closed, as on the local branch.
+        DispatchCeiling::Handler(Some(grant)) => {
+            if relax_peers {
+                // Dimensions 1-3 unconditional, Dimension 4 relaxed to the peers
+                // the credential covers — which the credential has already been
+                // checked to do, in its own frame, above.
+                entity_capability::check_permission_relax_peers(
+                    operation,
+                    handler_pattern,
+                    resource,
+                    grant,
+                    local_pid,
+                )
+            } else {
+                entity_capability::check_permission(
+                    operation,
+                    handler_pattern,
+                    target_peer,
+                    resource,
+                    grant,
+                    local_pid,
+                )
+            }
+        }
+        // **A credential is not a grant** (§9.1, 0.8.2.19). With no handler grant
+        // there is nothing to supply Dimensions 1-3, so a valid target-minted
+        // credential does not rescue this: `relax_peers` is deliberately not read
+        // on this arm. Fail-closed, as on the local branch.
         DispatchCeiling::Handler(None) => false,
     }
 }
 
-/// The presented-authority arm's four verifications (§1.4, 0.8.2.17). Every one
-/// already existed in this tree; this is a composition, not new machinery.
+/// §1.4's presented-credential verifications (0.8.2.19). Every one already
+/// existed in this tree; this is a composition, not new machinery.
+///
+/// **This is a predicate, not an authorizer.** Its `true` means exactly *"§1.4's
+/// one exemption applies: Dimension 4 of the executing handler's grant is
+/// relaxed to the peers this credential covers."* It never means *authorized* —
+/// see [`outbound_sub_dispatch_authorized`] for what F67 was and why the return
+/// type is the fix.
 ///
 /// Returns `false` — *"not presented authority"*, never an error — for any
-/// failure, because §1.4's disposition for a capability failing any of these is
-/// to **fall back to the ambient arm**, not to refuse outright.
+/// failure, because §1.4's disposition for a credential failing any of these is
+/// that it **relaxes nothing and the handler grant gates unrelaxed**, not that
+/// the dispatch is refused outright.
 #[allow(clippy::too_many_arguments)]
-fn presented_authority_authorizes(
+fn presented_credential_relaxes_peers(
     shared: &PeerShared,
     cap_entity: &entity_entity::Entity,
     included: &HashMap<entity_hash::Hash, entity_entity::Entity>,
@@ -3679,6 +3727,40 @@ fn presented_authority_authorizes(
     {
         return false;
     }
+
+    // (c2) §1.4 *"Root granter under multi-signature"* `[MUST]` (0.8.2.19 / E3).
+    //
+    // The root-granter rule — *"the chain's ROOT `granter` resolves to the
+    // target peer's identity"* — is undefined for a §3.6 `multi-granter`, and
+    // M3 makes multi-signature root-ONLY, so a K-of-N-rooted credential is
+    // exactly where it lands. Passing `target_peer` as the frame above does not
+    // answer it: on a multi-sig root §5.5's root-trust becomes M6, which asks
+    // whether the frame peer is *among* the signers and signed — i.e. *"the
+    // target is one constituent of the group"*. 0.8.2.19 rules that
+    // insufficient. **A K-of-N root is a GROUP's authority, and treating a
+    // constituent as the granter would let any one signer's target confer the
+    // group's grant.** The credential satisfies the check only when the target's
+    // identity IS the multi-granter, which no `system/peer` identity can be — so
+    // this is deliberate under-acceptance, stated at the code because a reader
+    // who finds M6 already passing will otherwise conclude the case is handled.
+    //
+    // Fails closed on an unwalkable chain for the same reason `is_revoked` does:
+    // "relaxes nothing" is the safe answer, and `verify_capability_chain` has
+    // already walked this chain successfully one statement up.
+    match entity_protocol::collect_authority_chain(&cap_entity.content_hash, |h| {
+        bundle.get(h).cloned()
+    }) {
+        Ok(chain) => match chain.last() {
+            Some((_, root_fields)) => {
+                if matches!(root_fields.granter, entity_capability::Granter::Multi(_)) {
+                    return false;
+                }
+            }
+            None => return false,
+        },
+        Err(_) => return false,
+    }
+
     if entity_protocol::is_revoked(
         &cap_entity.content_hash,
         target_peer,
@@ -3709,9 +3791,11 @@ fn presented_authority_authorizes(
         return false;
     }
 
-    // (d) Coverage: the capability's OWN four dimensions authorize the request,
-    //     evaluated in the granter's frame — see the framing note on
-    //     `outbound_sub_dispatch_authorized`.
+    // (d) Coverage: the credential MUST *additionally* cover the request on its
+    //     OWN four dimensions, evaluated in the granter's frame — see the
+    //     framing note on `outbound_sub_dispatch_authorized`. "Additionally" is
+    //     the whole of it: this is a second bound on top of the handler grant,
+    //     never a substitute for it.
     entity_capability::check_permission(
         operation,
         handler_pattern,
@@ -3906,9 +3990,10 @@ pub fn make_execute_fn(
                             handler_path = %handler_path,
                             operation = %operation,
                             target_peer = %remote_peer_id,
-                            "outbound sub-dispatch denied: §5.2 Dimension 4 (peers) \
-                             on ambient authority, and no target-minted capability \
-                             authorizes it (§1.4, 0.8.2.17 PD-2)"
+                            "outbound sub-dispatch denied: the executing handler's \
+                             grant does not authorize it, and a target-minted \
+                             credential relaxes Dimension 4 only (§1.4 PD-2, \
+                             0.8.2.19)"
                         );
                         return Ok(entity_handler::HandlerResult::error(
                             STATUS_FORBIDDEN,
@@ -4040,6 +4125,56 @@ pub fn make_execute_fn(
                             )));
                         }
                     };
+
+                    // §6.5 envelope-signature ingestion over **any received
+                    // envelope carrying an `included` map** (0.8.2.19 / E4).
+                    //
+                    // D7 (0.8.2.18) extended ingestion from the inbound EXECUTE
+                    // to the connect/authenticate response — the *initial-grant*
+                    // carrier — and left the **runtime** one unbound. §6.2 says
+                    // which carrier is the deliberate one: the capability
+                    // handler is *"the runtime entry point for in-band
+                    // capability management, while §4.4 covers initial-grant
+                    // delivery"*, and its `request`/`delegate` result envelope
+                    // carries the same three entities — the issued token, its
+                    // signature at the §3.5 invariant-pointer path, and the
+                    // granter identity. An `EXECUTE_RESPONSE` is neither an
+                    // inbound EXECUTE nor a connect response, so nothing here
+                    // reached it.
+                    //
+                    // So a peer that goes and ACQUIRES a target-minted credential
+                    // in order to make a presented-authority sub-dispatch
+                    // acquired it with its signature bound at no path — the
+                    // identical defect the connect-response ingest closed one
+                    // surface earlier, and invisible for the same reason: the
+                    // far side verifies against its own store, where its own
+                    // signature is bound.
+                    //
+                    // Best-effort, matching the connect-response site: a
+                    // conflict is logged, not propagated. A `signature_path_
+                    // conflict` on a *response* has no envelope to reject — the
+                    // request already succeeded at the far peer — and turning it
+                    // into a dispatch error would fail a call whose result is
+                    // valid.
+                    if !resp.included.is_empty() {
+                        let ingest_set: std::collections::BTreeMap<
+                            entity_hash::Hash,
+                            entity_entity::Entity,
+                        > = resp.included.iter().map(|(h, e)| (*h, e.clone())).collect();
+                        if let Err(e) = crate::ingest::ingest_envelope_signatures(
+                            &ingest_set,
+                            shared.content_store.as_ref(),
+                            shared.location_index.as_ref(),
+                        ) {
+                            tracing::warn!(
+                                remote_peer = %remote_peer_id,
+                                error = %e,
+                                "EXECUTE_RESPONSE signature ingestion failed; a \
+                                 capability issued in this response may not verify \
+                                 locally (§6.5, 0.8.2.19)"
+                            );
+                        }
+                    }
 
                     tracing::debug!(
                         handler_path = %handler_path,

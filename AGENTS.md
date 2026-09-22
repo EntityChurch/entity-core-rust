@@ -672,6 +672,173 @@ gates by making the TCP path compile on wasm32.
   `ingest_envelope_signatures` (producer) and `collect_chain_bundle` (consumer), and the question
   that closes it is *"which envelopes does ingestion run on?"* — the answer was one, and the code
   said so nowhere.
+  **Ratified 2026-09-10, and the second bite was the SAME producer at a THIRD surface.** 0.8.2.19
+  E4 generalizes §6.5 ingestion to *any received envelope carrying an `included` map*, and the one
+  we still did not run it on was the **`EXECUTE_RESPONSE`** — which §6.2 names as the *deliberate*
+  runtime carrier of a target-minted credential (*"the capability handler is the runtime entry
+  point for in-band capability management, while §4.4 covers initial-grant delivery"*). So a peer
+  that goes and **acquires** a credential in order to make a presented-authority sub-dispatch
+  acquired it with its signature bound at no path: the identical `MissingSignature`, one surface
+  later, and mutation-measured as `left: None` — the binding did not exist at all
+  (`a_capability_minted_in_an_execute_response_lands_with_its_signature_bound`). **Two surfaces
+  were each enumerated one at a time, each after a failure; the rule is the fix, not a third
+  enumeration** — the enforcement question is now *"does this code path receive an envelope?"*,
+  and every `yes` owes an `ingest_envelope_signatures` call. Grep `parse_execute_response(` and
+  `\.included` on any receive path.
+
+- **A ruling that says "X is IN scope" is answered by an INVENTORY, not by the one site the
+  routing named — and a seam that re-roots its own dispatch to peer authority is how the scope
+  rule gets emptied.** *(Candidate: bit us once, 2026-09-10; both instances found by our own
+  sweep, neither named by the sibling's routing.)* 0.8.2.19's E2 decides §1.4 scope by **authority
+  provenance** — *does this dispatch spend a handler's grant, or the peer's own root authority?* —
+  and adds *"a peer MUST NOT exempt the class on the ground that no caller was on the stack."*
+  The sibling's routing flagged one class (subscription delivery). Enumerating **every**
+  `DispatchCeiling::PeerRoot` construction in the tree instead found **two** that fail the test:
+  the delivery engine (`core/peer/src/lib.rs`) and `PeerLink::self_execute`
+  (`core/peer/src/network_link.rs`), whose §9.2 close notification is a real outbound dispatch to
+  a **caller-supplied** peer id, originated inside the `system/network` handler.
+  **The transferable half is the argument, not the count.** `self_execute`'s doc comment said
+  *"dispatch as the local peer identity — the same path `Peer::execute_with_options` takes"*, and
+  that reads as a fact about the mechanism rather than as a claim about authority. It is a claim
+  about authority: **if a handler may declare its own dispatch `PeerRoot`, the provenance rule is
+  evadable by every handler and means nothing.** Prose describing a seam is not a scope argument,
+  which is the same failure as a comment asserting a concurrency invariant without naming the
+  construct that enforces it.
+  **Enforcement:** when a ruling defines a scope, the region that closes is the **constructor of
+  the thing being classified** — here `grep -rn 'DispatchCeiling::PeerRoot' --include=*.rs`, a
+  closed list — and each site owes one line saying which side of the test it falls on and why.
+  Sites legitimately out of scope (the SDK entry points, `Peer::execute_with_options`) say so;
+  sites in scope and not yet flipped say **what blocks the flip**, because *"we know"* with no
+  stated blocker is indistinguishable from an exemption. Both are pinned at the code citing
+  `ROUTING-2026-09-10-a`. And note which way the cost runs: the subscription instance cannot be
+  flipped from one seat — our `deliver_token` is A-rooted (conformant, §1.2) but minted as a
+  **self-grant**, so its leaf `grantee` is not this engine and it relaxes nothing; flipping the
+  ceiling alone refuses every cross-peer delivery. **A restrictive fix whose correctness depends
+  on a credential shape three seats must mint identically is a coordination item, not a fix.**
+
+- **Two ALTERNATIVE authorities is a bypass wearing a design; the shape that is not is one gate
+  with a named exemption — and the two vectors everyone writes are the two that cannot tell them
+  apart.** *(Candidate: bit us once, 2026-09-10, **F67**; found by `entity-core-keystone`, not by
+  us, not by go, not by py, not by arch. We wrote design prose defending it.)* 0.8.2.17 said a
+  target-minted credential's *"own four dimensions authorize the sub-dispatch"* while exempting
+  the handler's `peers` scope **by name**. Three independent ground-up implementations read the
+  first clause as sufficient and returned *authorized* before the executing handler's grant was
+  ever consulted. Because that credential arrives as a **caller-supplied parameter**, a caller
+  holding a copy of any `T → P` capability could steer **any** handler on P past its own grant —
+  the confused deputy, with the ceiling removed by name. 0.8.2.19 corrects it to **one gate and
+  one exemption**: the handler's grant decides all four dimensions, a valid target-minted
+  credential relaxes **Dimension 4 only**. *The target answers where; the handler's grant answers
+  what.*
+  **Three things to carry, and none of them is "read §1.4 harder."**
+  1. **The reading was available and cheap.** §6.8 states the gate *positively and
+     unconditionally* — *"the authorization decision for an internal sub-request is made on the
+     executing handler's grant, never on the propagated caller capability"* — and that sentence
+     has **two halves**. Everyone answered the second (a target-minted credential is not the
+     propagated caller capability — true, and it survives) and nobody answered the first.
+     `EXTENSION-CONTINUATION` §3.6b had already resolved the identical shape as *Level 1 = the
+     dispatch gate, Level 2 = the caller capability*; we made a credential Level 1 for the first
+     time in the corpus, on the surface where it costs most. **When a fold hands you a new
+     authority, open the section that already states the gate and reconcile the two — an
+     over-broad clause is a spec-issue to ROUTE, not a licence to implement from.**
+  2. **The test set could not see it, and the reason generalizes past this bug.** Our two PD-2
+     rows were *credential + covering grant → allow* and *no credential → refuse*. Under a bypass
+     and under a compose those give the **same** answers, because in both rows the two authority
+     sources **agree**. The discriminating vector is the one where they **disagree**: a valid
+     credential presented to a handler whose grant does NOT cover the request → MUST refuse.
+     **Whenever an outcome can be reached by more than one source of authority, the check set
+     needs a row where the sources disagree — otherwise it measures their union, and a bypass and
+     a composition have the same union.**
+  3. **The structure is the fix; the condition is not.** Do not patch it as an `&&`. The
+     credential check is now a **predicate that produces a bit**
+     (`presented_credential_relaxes_peers`), never an authorizer, feeding one call to
+     `check_permission_relax_peers`; the relaxation is a flag threaded into the *same* loop body
+     so §5.2's all-dimensions-from-one-grant-entry rule cannot drift, and there is **no code path
+     by which a credential authorizes alone**. Reinstating F67 requires adding a new early return.
+     **`-> bool` meaning "authorized" and `-> bool` meaning "one dimension is relaxed" are the
+     same type and opposite facts** — the function name and the doc comment are the only thing
+     stopping the next reader from re-fusing them, so both say so.
+  **Enforcement:** the pair is mandatory and **both mutations must be RUN, not predicted**, and
+  their reddened rows must be **disjoint** — restore-the-bypass reddens the discriminator and
+  leaves the relaxation control green; neuter-the-relaxation reddens the control and leaves the
+  discriminator green (measured: `5P/2F` each way, `core/peer/tests/conformance_reentry_7a2a.rs`).
+  A negative security test can PASS for the wrong reason — refused upstream of the gate — so
+  "refused" is worth nothing until the restore mutation shows the probe *reaches* the gate. And
+  note what a green cross-impl run was worth here: three seats passed both arms and the report
+  read *"PD-2 both arms converged."* **Convergence on a shared reading of one spec sentence is
+  cohort-consistency, not independent verification** (ADR-0012, verbatim) — and here it actively
+  masked a security hole for as long as it stood.
+
+- **When a carrier goes from singular to PLURAL, the empty array is a new state the old code
+  could not express — and if the field selects an authorization ARM, reading presence off the
+  MAP KEY instead of the array's length silently deletes the arm.** *(Candidate: bit us once,
+  2026-09-10, caught by writing the row before the code.)* `GUIDE-CONFORMANCE` §7a.1's reentry
+  carriers went plural at `0.8.2.19` (`reentry_granters` / `reentry_cap_signatures`) so a K-of-2
+  multi-sig root could be expressed on the wire at all. The all-or-none rule then selects §1.4's
+  **presented** arm from *credential + ≥1 granter + ≥1 signature*, the **ambient** arm from all
+  three absent, and `400 invalid_params` from anything between. `reentry_granters: []` is the row
+  that separates the two readings: key present, array empty. Our own already-ratified rule says
+  absent and empty are the same fact for an optional array — so it is the **ambient** arm, and a
+  peer whose presence test is `cbor_map_field_raw(...).is_some()` calls it partial and 400s it.
+  That is the *exact* unmeasurability `0.8.2.17` fixed (an early refusal makes a peer look strict
+  and the arm under test unreachable), reintroduced by a params change made for an unrelated
+  reason. **The pluralization is where an optional-array rule stops being an encoding nicety and
+  becomes an authorization branch.**
+  **Enforcement:** when a scalar field becomes an array, enumerate the three states the change
+  creates — absent key, present-and-empty, present-and-non-empty — and write the row for the
+  middle one first; if the answer to *"is this the same as absent?"* is yes, the presence test
+  must read the decoded **length**, never the key. Grep `cbor_map_field_raw` on any path whose
+  result feeds a `match`/`if` that picks a code path rather than a value. Teeth:
+  `all_keys_present_but_both_arrays_empty_is_the_ambient_arm` (`extensions/conformance`),
+  mutation-verified as the **only** row the key-presence reading reddens — the five partial rows
+  beside it stay green under it, because under that reading they are still partial.
+
+- **An authorization check evaluates the target it was GIVEN; a handler acts on the set that target
+  DERIVES — and where those differ, the dimension does not bind however correct the check is.**
+  *(Candidate: bit us once, 2026-09-10, found by recomputing arch's `CP-12a` against our tree rather
+  than by the routing.)* `CP-12a` names one instance — a target the caller also excludes is *skipped*
+  by `check_resource_scope` and then acted on anyway — and its fix (count the **effective** set) is
+  about arity. The class is wider and the fix does not reach it: **a prefix, a wildcard, a snapshot
+  root, a merge source is one string to the authorizer and a subtree to the handler.** Driven at our
+  line: a grant `{include:[app/*], exclude:[app/secret]}` **authorizes** `system/tree:get` on
+  `/{p}/app/` — the exclude does not match the prefix *string* — and `handle_listing` then returns
+  `secret` and its hash, while the child's own path is correctly refused. The direct read is denied,
+  the enumeration is not, so nothing looks wrong from either side. §5.2's own pseudocode comment
+  states the property (*"Otherwise the effective target includes paths the grant forbids"*) and its
+  pattern arm makes the caller's `exclude` **load-bearing for the authorization decision** — a promise
+  no consumer in any tree applies.
+  **The second half is ours and is the same *sibling arms* miss one layer down.** `handle_snapshot`
+  carries a documented confused-deputy check for its `params.prefix` fallback; `handle_merge`
+  (287 lines) and `handle_extract` (173 lines) carry **zero authorization symbols** — brace-bounded
+  extraction, counting `check_permission` / `check_resource_scope` / `check_path_permission` /
+  `caller_capability` / `STATUS_FORBIDDEN` / `capability_denied` / `access_denied` / `matches_scope`.
+  `merge` reads no resource target at all and writes wherever `params.target_prefix` says, which is
+  `EXTENSION-TREE` §11's *"MUST verify authorization before applying any writes"* and §12.1's atomic-403
+  MUST, unimplemented. **core-go implements all three** (`core/tree/operations.go` — snapshot,
+  per-path inside the merge loop, extract); we implement one, and one arm getting the fix is how the
+  other two stayed invisible.
+  **Enforcement, and the tell is a primitive rather than a rule:** when a change touches an
+  authorization input that is a path, grep the handlers for the **expansion** primitives —
+  `location_index.list(`, any prefix walk, any pattern match against stored paths — and for each,
+  state whether the authorizer evaluated the *string* or the *set*. Where it evaluated the string, the
+  handler owes either a per-entry filter against the grant (`extensions/query`'s post-filter is the
+  in-tree model, and it is the one enumerating consumer that gets it right) or a refusal. A negative
+  control is mandatory and it is the non-obvious half: the **child's own path must still be refused**,
+  because that row passing is exactly what makes the leak read as a working guard.
+
+- **An identifier in a relayed packet is a citation — resolve it in the ISSUING repo's register before
+  you propagate it, and never mint one for a finding that arrived unnamed.** *(Candidate: bit us
+  once — as readers — 2026-09-10.)* Arch's ruling used *"`F68`'s exact shape"* as an **analogy** for a
+  fix landing in one home that the next revision moves; `F68` itself is keystone's floor finding,
+  closed at `entity-core-protocol` `dd5f785`, and the bypass the packet actually found is registered
+  as `CP-12a` / `COHORT-OPEN-ITEMS` §0af.2. The relay read the analogy as the bypass's **name** and
+  carried it into two routings and a charter entry, so one identifier now denotes two findings in
+  three trees — and both usages are locally coherent, which is why nobody catches it inside one repo.
+  Same family as *one representation carrying two meanings*, applied to a ledger key, where the cost
+  is that every later citation is ambiguous and the ratchet entries cannot be joined.
+  **Enforcement:** before repeating an `F`/`CP`/`R` number from a packet, grep the issuing repo
+  (`grep -rn '<id>' ../entity-system-architecture/docs/{DESIGN-REGISTER,COHORT-OPEN-ITEMS}.md`) and
+  check the finding under it is the one in front of you. A finding that arrives with a section
+  reference and no number **has** no number — cite the section.
 
 - **An operation added to a `Handler` has two registration sites, and the second one is in
   another crate.** `impl Handler::operations()` makes it answerable; `bootstrap_handler(...)` in
@@ -895,6 +1062,32 @@ gates by making the TCP path compile on wasm32.
   `v1_retention_clamp_beyond_ceiling_live` and `v2_retention_clamp_null_takes_ceiling_live`.
   The entry stays because the check that caught it — read the ROWS, not the exit code — is
   the transferable part.)**
+  **Fifth level, and it is the one a green run actively conceals: a sibling's check may be a
+  `[self]` check, measuring the harness's own implementation inside a run nominally scoring
+  YOURS.** *(Candidate: bit us once, 2026-09-10 — caught by reading the row's marker while
+  looking for something else.)* §4.5a **item 1a** pins the `system/peer` identity entity to the
+  ECFv1-SHA-256 floor unconditionally. go's `hash_format_sha_384_1` covers it, including the
+  negative half (*"authoring `system/peer` under 0x01 is refused"*), and it PASSed in our
+  `validate-complete.sh rust` run — while our `Entity::new_with_format` accepted it and
+  `core/types::PeerData::to_entity` authored the identity under the **home** format, which on a
+  `--hash-type sha384` peer is exactly the defect the rule exists to prevent. go's harness is
+  honest about it (41 rows print `[self]`, and `result.go` says outright that a PASS there in a
+  run against rust proves nothing about rust) — the failure was ours, for reading a green row as
+  being about us.
+  **And the class is structurally invisible on the wire, which is why it can only ever be a
+  `[self]` check.** A non-floor identity entity is well-formed; it carries a *second*
+  `content_hash` for the one value item 1a exists to collapse, and both sides of every downstream
+  `grantee` / `granter` / `signer` comparison are then wrong the same way. Nothing fails. That is
+  the same-side round-trip pitfall raised to the level of an entire seat, and no cross-impl probe
+  at any seat can catch it.
+  **Enforcement:** `grep -n '\[self\]'` the run before citing any row as evidence about your
+  peer, and for each self-check ask what the equivalent code in **your** tree does — the row's own
+  declaration names the rule, which is enough to go read it. And when the rule is *"this value may
+  only ever be built one way"*, put the refusal in the **constructor**, not at the call sites: a
+  per-call-site obligation is one no gate enforces and every new caller re-opens. Teeth:
+  `system_peer_is_refused_at_any_format_but_the_floor` (`core/entity`), whose control — an
+  ordinary CONTENT entity at SHA-384, which §4.5a item 2 permits — reddens if the guard is
+  written type-blind.
   **And one level BELOW the row: read the row's DETAIL LINE, because a harness failure wears the
   vector's name.** *(Candidate: bit us once, 2026-09-09, cost one wrong bisect plan.)* A
   `validate-complete.sh rust` run came back with six `peer_issued` FAILs reading
@@ -1131,6 +1324,26 @@ gates by making the TCP path compile on wasm32.
   seat-specific or version-wide — and read the spec diff, not the routing, for the answer
   (`git show <fold> -- specs/`). A row in a shared Appendix A table is version-wide by
   construction. Cheap tell: an item whose fix is a **code value** rather than a code path.
+  **Ratified 2026-09-10, and the second shape is a DEFECT filed under another seat's name that
+  is also in your tree — at a site the author could not have known you had.**
+  `ROUTING-2026-09-10-e`'s §4 table gives rust *"`grantee` = the delivering engine"* and gives py
+  *"stop minting `peers:["*"]` — it makes Dimension 4 vacuous."* Recomputed against our tree,
+  **both** were here, split across two mint sites: `bindings/sdk::mint_delivery_grant` had the
+  wrong grantee with `peers` correctly absent, and `core/peer::generate_deliver_token` had the
+  right grantee with `peers: ["*"]`. Neither seat could have seen the other's half — arch read
+  each tree's *one* deliver-token minter and each tree has a different number of them. The first
+  shape was *"your section is not an enumeration of what binds you"*; this one is sharper,
+  because the row addressed to someone else names a **rule**, and a rule is checked against your
+  whole tree rather than against the site the author happened to read. Note which way the error
+  runs: taking the table at face value would have left a vacuous Dimension 4 shipping behind a
+  green gate and a routing reply claiming the item closed.
+  **Enforcement:** for every row in a per-seat table — *including the other seats'* — extract the
+  rule, then enumerate **your** constructors of the artifact it governs and answer per site
+  (`grep -rn 'CapabilityToken {' --include=*.rs` for a credential; the type's constructor list is
+  the region that closes). A site that is legitimately fine says so at the code with the criterion
+  it was checked against, not with the shape it happens to have — `network_link::mint_deliver_token`
+  is a self-grant and conformant, because for a lifecycle subscription the delivering engine IS
+  the local peer, and that sentence is the difference between checked and pattern-matched.
 - **A declared exclusion whose ground is "nothing installs it" is a gap wearing an exemption —
   register the surface and let the wire tell you what it was hiding.** *(Candidate: bit us once,
   2026-08-22.)* `CONFORMANCE-EXCLUSIONS.md`'s substitute entry rested on two grounds: Ruling 4

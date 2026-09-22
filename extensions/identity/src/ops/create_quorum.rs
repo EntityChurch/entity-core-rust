@@ -18,25 +18,30 @@ impl IdentityHandler {
         // canonical quorum path, e.g. `system/quorum/{quorum_id_hex}` after
         // computing the quorum_id locally.
         //
-        // **`0.8.2.17` names this operation as an example of the opposite, and
-        // we are deliberately not following it.** Retracting `path_required`
-        // from dispatch, §3.3's 400 row says *"which operations require one is
-        // stated by each operation's own specification"* and then offers
-        // *"operations for which no resource is legitimate (`configure`,
-        // `create_quorum`) simply do not carry the requirement."* Both named ops
-        // are EXTENSION-IDENTITY's, and EXTENSION-IDENTITY §6's resource-target
-        // table gives `create_quorum` → `system/quorum/{q_hex}` and `configure`
-        // → `system/identity/peer-config`, under *"All ops follow path-as-
-        // resource per ENTITY-CORE-PROTOCOL.md §3.2 (architectural-side MUST)."*
+        // **This was a routed ambiguity and it is now CLOSED, for this reading**
+        // (`0.8.2.19`, `entity-core-protocol dd5f785`, 2026-09-10).
         //
-        // The normative sentence and the parenthetical disagree, so we follow
-        // the normative sentence: it points at the operation's own
-        // specification, and the operation's own specification requires a
-        // resource. The parenthetical is an illustration that names two
-        // operations it does not own. Routed rather than silently resolved —
-        // if arch rules for the parenthetical, this arm and `configure`'s in
-        // `handler.rs` come out together, and `EXTENSION-IDENTITY` §6's table
-        // and §1380's MUST have to move with them.
+        // `0.8.2.17`'s §3.3 400 row used to name this very operation as an
+        // example of the opposite — *"operations for which no resource is
+        // legitimate (`configure`, `create_quorum`) simply do not carry the
+        // requirement"* — while its own normative sentence pointed at *"each
+        // operation's own specification"*, and `EXTENSION-IDENTITY` §6's
+        // resource-target table gives `create_quorum` → `system/quorum/{q_hex}`
+        // under an architectural-side MUST. We followed the normative sentence
+        // and routed the contradiction rather than resolving it silently.
+        //
+        // §3.3 now settles it with a **test** instead of a list: *"an operation
+        // that writes or reads at a path derived from `EXECUTE.resource.
+        // targets[0]` requires a resource however administrative it looks"*, and
+        // the illustration is `system/quorum:verify`, which takes both operands
+        // in `params` and binds nothing. This operation writes at the
+        // caller-supplied path, so it carries the requirement and the
+        // `path_required` below stands.
+        //
+        // Left as a note rather than deleted, because the shape is the point: a
+        // code comment citing a spec passage is a claim with an expiry date, and
+        // the passage this one cited no longer exists. Recorded closed in
+        // `docs/SPEC-AMBIGUITIES.md`.
         let resource_path = match self.resource_path(ctx) {
             Some(p) => p,
             None => {

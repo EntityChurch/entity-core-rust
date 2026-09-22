@@ -90,10 +90,67 @@ impl RoleHandler {
         format!("/{}/{}", self.local_peer_id, bare)
     }
 
-    fn resource_path(&self, ctx: &HandlerContext) -> Option<String> {
-        ctx.resource_target
-            .as_ref()
-            .and_then(|rt| rt.targets.first().cloned())
+    /// The single `EXECUTE.resource` target every role op reads its path from
+    /// (§3.2 path-as-resource), or the refusal that names **which** wrong shape
+    /// arrived.
+    ///
+    /// `ENTITY-CORE-PROTOCOL` §3.3 (`0.8.2.18`): *"An operation that requires a
+    /// resource answers ABSENT with `path_required` and MORE THAN ONE with
+    /// `ambiguous_resource`"* — two different inputs with two different
+    /// remedies, and *"a handler specification that collapses them into one code
+    /// is non-conformant on the absent case."* `EXTENSION-ROLE` §4.3 v2.2 swept
+    /// `assign`'s pseudocode to match; the rule is general, so it binds every op
+    /// here that derives its path from `resource.targets[0]`, which is all six.
+    ///
+    /// **This replaces a guard that was wrong in BOTH directions**, not one that
+    /// merely used a coarse code. `resource_path` returned
+    /// `targets.first().cloned()`, so `None` — and therefore the
+    /// `ambiguous_resource` every call site raised — meant *absent*, exactly
+    /// inverting the row; and **more than one target was silently accepted**,
+    /// the first one used, so the code named `ambiguous_resource` was the one
+    /// input this handler could never answer with it.
+    ///
+    /// A non-empty `exclude` is deliberately left on the `ambiguous_resource`
+    /// arm: §3.3 names two inputs and an exclusion set is neither, so picking a
+    /// third code would be inventing vocabulary. Noted rather than overlooked.
+    /// The `Err` is boxed because `HandlerResult` is 176 bytes and
+    /// `clippy::result_large_err` is `-D warnings` here — the call sites
+    /// unbox with `*e`.
+    fn resource_path(
+        &self,
+        ctx: &HandlerContext,
+        what: &str,
+    ) -> Result<String, Box<HandlerResult>> {
+        match ctx.resource_target.as_ref() {
+            None => Err(Box::new(error(
+                STATUS_BAD_REQUEST,
+                "path_required",
+                &format!(
+                    "{} requires a resource target ({})",
+                    ctx.operation.as_str(),
+                    what
+                ),
+            ))),
+            Some(rt) if rt.targets.is_empty() => Err(Box::new(error(
+                STATUS_BAD_REQUEST,
+                "path_required",
+                &format!(
+                    "{} requires a resource target ({})",
+                    ctx.operation.as_str(),
+                    what
+                ),
+            ))),
+            Some(rt) if rt.targets.len() == 1 && rt.exclude.is_empty() => Ok(rt.targets[0].clone()),
+            Some(_) => Err(Box::new(error(
+                STATUS_BAD_REQUEST,
+                "ambiguous_resource",
+                &format!(
+                    "{} requires exactly one resource target ({})",
+                    ctx.operation.as_str(),
+                    what
+                ),
+            ))),
+        }
     }
 }
 
@@ -147,15 +204,9 @@ impl RoleHandler {
 
     async fn handle_assign(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         // Step 1: resource decomposition (§4.3 step 1)
-        let path = match self.resource_path(ctx) {
-            Some(p) => p,
-            None => {
-                return Ok(error(
-                    STATUS_BAD_REQUEST,
-                    "ambiguous_resource",
-                    "assign requires exactly one resource target (the assignment path)",
-                ))
-            }
+        let path = match self.resource_path(ctx, "the assignment path") {
+            Ok(p) => p,
+            Err(e) => return Ok(*e),
         };
         let parsed = match parse_assignment_path(&path) {
             Some(p) if p.role_name.is_some() => p,
@@ -393,15 +444,9 @@ impl RoleHandler {
     // -------------------------------------------------------------------
 
     async fn handle_unassign(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
-        let path = match self.resource_path(ctx) {
-            Some(p) => p,
-            None => {
-                return Ok(error(
-                    STATUS_BAD_REQUEST,
-                    "ambiguous_resource",
-                    "unassign requires the assignment path as resource",
-                ))
-            }
+        let path = match self.resource_path(ctx, "the assignment path") {
+            Ok(p) => p,
+            Err(e) => return Ok(*e),
         };
         let parsed = match parse_assignment_path(&path) {
             Some(p) => p,
@@ -501,15 +546,9 @@ impl RoleHandler {
     // -------------------------------------------------------------------
 
     async fn handle_exclude(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
-        let path = match self.resource_path(ctx) {
-            Some(p) => p,
-            None => {
-                return Ok(error(
-                    STATUS_BAD_REQUEST,
-                    "ambiguous_resource",
-                    "exclude requires the exclusion path as resource",
-                ))
-            }
+        let path = match self.resource_path(ctx, "the exclusion path") {
+            Ok(p) => p,
+            Err(e) => return Ok(*e),
         };
         let parsed = match parse_exclusion_path(&path) {
             Some(p) => p,
@@ -572,15 +611,9 @@ impl RoleHandler {
     // -------------------------------------------------------------------
 
     async fn handle_unexclude(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
-        let path = match self.resource_path(ctx) {
-            Some(p) => p,
-            None => {
-                return Ok(error(
-                    STATUS_BAD_REQUEST,
-                    "ambiguous_resource",
-                    "unexclude requires the exclusion path as resource",
-                ))
-            }
+        let path = match self.resource_path(ctx, "the exclusion path") {
+            Ok(p) => p,
+            Err(e) => return Ok(*e),
         };
         if parse_exclusion_path(&path).is_none() {
             return Ok(error(
@@ -740,15 +773,9 @@ impl RoleHandler {
     // -------------------------------------------------------------------
 
     async fn handle_define(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
-        let path = match self.resource_path(ctx) {
-            Some(p) => p,
-            None => {
-                return Ok(error(
-                    STATUS_BAD_REQUEST,
-                    "ambiguous_resource",
-                    "define requires the role-definition path as resource",
-                ))
-            }
+        let path = match self.resource_path(ctx, "the role-definition path") {
+            Ok(p) => p,
+            Err(e) => return Ok(*e),
         };
         let parsed =
             match parse_role_definition_path(&path) {
@@ -869,15 +896,9 @@ impl RoleHandler {
     // -------------------------------------------------------------------
 
     async fn handle_re_derive(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
-        let path = match self.resource_path(ctx) {
-            Some(p) => p,
-            None => {
-                return Ok(error(
-                    STATUS_BAD_REQUEST,
-                    "ambiguous_resource",
-                    "re-derive requires the role-definition path as resource",
-                ))
-            }
+        let path = match self.resource_path(ctx, "the role-definition path") {
+            Ok(p) => p,
+            Err(e) => return Ok(*e),
         };
         let parsed = match parse_role_definition_path(&path) {
             Some(p) => p,

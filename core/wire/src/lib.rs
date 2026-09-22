@@ -317,6 +317,33 @@ pub fn cbor_map_field_raw<'a>(data: &'a [u8], key: &str) -> Option<&'a [u8]> {
     None
 }
 
+/// Split a definite-length CBOR **array** into the raw on-wire byte slice of
+/// each element, without decoding any of them.
+///
+/// The array counterpart of [`cbor_map_field_raw`], and it exists for the same
+/// reason: GUIDE-CONFORMANCE §7a.1's reentry carriers went **plural** at
+/// `0.8.2.19` (`reentry_granters` / `reentry_cap_signatures` are arrays, the
+/// single-granter case being an array of one), and each element is a nested
+/// entity whose `data` must survive without a decode+re-encode cycle.
+///
+/// Returns `None` if `data` is not a definite-length CBOR array, or if any
+/// element is malformed. An **empty** array yields `Some(vec![])` — absent and
+/// empty are the same fact for an optional array, and the caller decides.
+pub fn cbor_array_elements_raw(data: &[u8]) -> Option<Vec<&[u8]>> {
+    let (major, count, head_size) = parse_cbor_head(data, 0).ok()?;
+    if major != 4 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(count as usize);
+    let mut cursor = head_size;
+    for _ in 0..count {
+        let end = cbor_item_end(data, cursor).ok()?;
+        out.push(&data[cursor..end]);
+        cursor = end;
+    }
+    Some(out)
+}
+
 // ---------------------------------------------------------------------------
 // CBOR byte-range walker (ENTITY-CBOR-ENCODING §4.2 — definite-length only)
 // ---------------------------------------------------------------------------

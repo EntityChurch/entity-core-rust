@@ -1924,6 +1924,25 @@ impl ContinuationHandler {
         // discriminated by `params.type`.
         let qualified_path = match ctx.resource_target.as_ref() {
             Some(rt) if rt.targets.len() == 1 && rt.exclude.is_empty() => rt.targets[0].clone(),
+            // §3.3 (0.8.2.18): ABSENT is `path_required`, MORE THAN ONE is
+            // `ambiguous_resource` — two inputs, two remedies, and collapsing
+            // them is non-conformant on the absent case. A non-empty `exclude`
+            // stays on the ambiguous arm: §3.3 names two inputs and an
+            // exclusion set is neither.
+            None => {
+                return Ok(error_result(
+                    STATUS_BAD_REQUEST,
+                    "path_required",
+                    "install requires a resource target (the suspended continuation path)",
+                ));
+            }
+            Some(rt) if rt.targets.is_empty() => {
+                return Ok(error_result(
+                    STATUS_BAD_REQUEST,
+                    "path_required",
+                    "install requires a resource target (the suspended continuation path)",
+                ));
+            }
             _ => {
                 return Ok(error_result(
                     STATUS_BAD_REQUEST,
@@ -5289,6 +5308,60 @@ mod tests {
             entity_ecf::to_ecf(&entity_ecf::Value::Map(fields)),
         )
         .unwrap()
+    }
+
+    /// **ENTITY-CORE-PROTOCOL §3.3 (0.8.2.18), swept into
+    /// `EXTENSION-CONTINUATION` v1.24.** `install` derives the suspended path
+    /// from `EXECUTE.resource.targets[0]`, so it requires a resource: ABSENT
+    /// answers `path_required`, MORE THAN ONE answers `ambiguous_resource`. It
+    /// collapsed both into `ambiguous_resource`, which §3.3 calls
+    /// *"non-conformant on the absent case."*
+    ///
+    /// The ambiguous row is the control: without it, splitting the codes and
+    /// deleting one of them look identical from the test suite.
+    ///
+    /// **Mutation RUN, not predicted**: deleting the two new `path_required`
+    /// arms reddens the `absent` row; relabelling the catch-all `path_required`
+    /// reddens the `two targets` row. Neither reddens the other, and neither
+    /// touches any other test in this file.
+    #[tokio::test]
+    async fn absent_resource_is_path_required_and_two_targets_is_ambiguous() {
+        let h = make_handler();
+        let author = Hash::compute("test", b"author");
+        let cases: Vec<(&str, Option<entity_capability::ResourceTarget>, &str)> = vec![
+            ("absent", None, "path_required"),
+            (
+                "empty targets",
+                Some(entity_capability::ResourceTarget {
+                    targets: vec![],
+                    exclude: vec![],
+                }),
+                "path_required",
+            ),
+            (
+                "two targets",
+                Some(entity_capability::ResourceTarget {
+                    targets: vec!["app/a".to_string(), "app/b".to_string()],
+                    exclude: vec![],
+                }),
+                "ambiguous_resource",
+            ),
+        ];
+        for (label, rt, want) in cases {
+            let mut ctx = make_install_ctx(
+                author,
+                "app/suspended",
+                make_params(entity_ecf::Value::Null),
+                HashMap::new(),
+            );
+            ctx.resource_target = rt;
+            let r = h.handle(&ctx).await.unwrap();
+            assert_eq!(r.status, 400, "install / {label}");
+            let got = entity_handler::decode_error_entity(&r.result)
+                .and_then(|(c, _)| c)
+                .unwrap_or_default();
+            assert_eq!(got, want, "install / {label}");
+        }
     }
 
     fn make_install_ctx(

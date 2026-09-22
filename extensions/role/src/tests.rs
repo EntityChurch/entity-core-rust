@@ -2243,3 +2243,130 @@ mod policy_tests {
         assert!(resolve_grants(&deps, &connecting).is_none());
     }
 }
+
+// ===========================================================================
+// ENTITY-CORE-PROTOCOL §3.3 (0.8.2.18) — absent is `path_required`, more than
+// one is `ambiguous_resource`. EXTENSION-ROLE §4.3 v2.2 swept `assign`'s
+// pseudocode; the §3.3 rule is general, so it binds all six ops that derive a
+// path from `resource.targets[0]`.
+// ===========================================================================
+
+/// The six role operations that read `EXECUTE.resource.targets[0]`. `delegate`
+/// is deliberately absent — it takes its target from params and binds no path,
+/// which is §3.3's own *"an operation that targets no entity binding carries no
+/// requirement."*
+const PATH_OPS: [&str; 6] = [
+    "assign",
+    "unassign",
+    "exclude",
+    "unexclude",
+    "define",
+    "re-derive",
+];
+
+fn ctx_with_resource(
+    operation: &str,
+    resource_target: Option<ResourceTarget>,
+    pid: &str,
+    identity_hash: Hash,
+) -> HandlerContext {
+    let mut ctx = build_ctx(
+        operation,
+        "system/role/admin/assignment/00aa/operator",
+        empty_params(),
+        Some(wildcard_cap(identity_hash)),
+        pid,
+        identity_hash,
+    );
+    ctx.resource_target = resource_target;
+    ctx
+}
+
+fn code_of(result: &entity_handler::HandlerResult) -> String {
+    entity_handler::decode_error_entity(&result.result)
+        .and_then(|(code, _)| code)
+        .unwrap_or_default()
+}
+
+/// **The absent arm.** Every path-taking op answers `400 path_required` — the
+/// remedy is *supply a resource*, which is a different instruction from *fix
+/// your request*, and the code is what selects it.
+///
+/// **This is not a code-widening, it is an inversion being corrected.**
+/// `RoleHandler::resource_path` used to be `targets.first().cloned()`, so `None`
+/// meant *absent* and every call site answered `ambiguous_resource` for it — the
+/// one code §3.3 assigns to the other input.
+///
+/// **Mutation RUN, not predicted** — restoring the pre-sweep body
+/// (`targets.first().cloned()` with one collapsed `ambiguous_resource`) scored
+/// `72 passed; 2 failed`: **this row and the discriminator below**. Both, and
+/// that is the finding — the old guard was wrong in *both* directions at once,
+/// so a single reddened row would have understated it.
+#[tokio::test]
+async fn an_absent_resource_is_path_required_on_every_path_taking_op() {
+    let (handler, _cs, _li, pid, identity_hash) = fixture();
+    for op in PATH_OPS {
+        for (label, rt) in [
+            ("absent", None),
+            (
+                "empty targets",
+                Some(ResourceTarget {
+                    targets: vec![],
+                    exclude: vec![],
+                }),
+            ),
+        ] {
+            let ctx = ctx_with_resource(op, rt, &pid, identity_hash);
+            let r = handler.handle(&ctx).await.unwrap();
+            assert_eq!(r.status, 400, "{op} / {label}");
+            assert_eq!(
+                code_of(&r),
+                "path_required",
+                "{op} / {label}: §3.3 — an operation whose spec requires a \
+                 resource answers ABSENT with path_required"
+            );
+        }
+    }
+}
+
+/// **The discriminating control, and it is the half the old code could never
+/// answer.** More than one target is `ambiguous_resource` — and before this
+/// sweep `resource_path` took `targets.first()`, so a two-target request was
+/// **silently accepted** and acted on the first one. So this row is not merely
+/// the other half of a relabel: it is a refusal that did not exist.
+///
+/// Without it, "absent is now `path_required`" is indistinguishable from
+/// "`ambiguous_resource` was deleted from this handler" — the two edits are one
+/// line apart, and only a row that still demands the *other* code tells them
+/// apart.
+///
+/// **Mutation RUN, not predicted** — relabelling the ambiguous arm
+/// `path_required` (the relabel-instead-of-discriminate edit) scored `73 passed;
+/// 1 failed`: **this row only**, with the absent row above green. Disjoint from
+/// the mutation above, which is what makes the pair orthogonal rather than two
+/// spellings of one assertion.
+#[tokio::test]
+async fn more_than_one_resource_target_is_ambiguous_resource_and_is_refused() {
+    let (handler, _cs, _li, pid, identity_hash) = fixture();
+    for op in PATH_OPS {
+        let ctx = ctx_with_resource(
+            op,
+            Some(ResourceTarget {
+                targets: vec![
+                    "system/role/admin/assignment/00aa/operator".to_string(),
+                    "system/role/admin/assignment/00bb/operator".to_string(),
+                ],
+                exclude: vec![],
+            }),
+            &pid,
+            identity_hash,
+        );
+        let r = handler.handle(&ctx).await.unwrap();
+        assert_eq!(
+            r.status, 400,
+            "{op}: two targets is not a request this handler may act on — it \
+             used to take the first one and proceed"
+        );
+        assert_eq!(code_of(&r), "ambiguous_resource", "{op}");
+    }
+}

@@ -6382,9 +6382,33 @@ scope default to `{include: [local]}` where the minting peer meant *"at me."*
 
 ---
 
-## §3.3's `path_required` parenthetical names two operations it does not own
+## §3.3's `path_required` parenthetical names two operations it does not own — **CLOSED**
 
 **Spec:** `ENTITY-CORE-PROTOCOL` 0.8.2.17, §3.3 status table, 400 row. Logged 2026-09-09.
+**Closed 2026-09-10 against `0.8.2.19` (`entity-core-protocol dd5f785`), for the interim reading.**
+
+**Resolution.** Both halves of the ask were taken. §3.3's 400 row no longer names `configure` or
+`create_quorum` at all — the illustration is now `system/quorum:verify`, *"which takes both
+operands in `params` and binds nothing, so a `resource` would have nothing to name"* — and the
+disagreement is settled by a **stated test** rather than by a list: *"The test is whether the
+operation targets a binding, not whether it is configuration-shaped: an operation that writes or
+reads at a path derived from `EXECUTE.resource.targets[0]` requires a resource however
+administrative it looks."*
+
+That is exactly the criterion the interim choice applied, so nothing here moves:
+`system/identity:create_quorum` and `:configure` both write at a path derived from
+`resource.targets[0]` and keep their `400 path_required`; `system/quorum:verify` reads no resource
+and correctly has no such guard (`extensions/quorum/src/handler.rs::handle_verify` — checked, not
+assumed). **No seat has handler code to change**, which is the part the ask predicted would be
+expensive and turned out not to be.
+
+Verified while landing the §3.3 sweep of 0.8.2.18's absent-vs-ambiguous split. The stale citation
+was carried in a code comment that read as current — see the note now at
+`extensions/identity/src/ops/create_quorum.rs`.
+
+---
+
+## ~~§3.3's `path_required` parenthetical~~ — original entry, kept for the record
 
 **The passages, and they disagree.**
 
@@ -6438,3 +6462,42 @@ bound. Fixed by running the same §6.5 ingestion over the connect response.
 invariant paths — i.e. that §6.5 ingestion applies to the connect response and not only to inbound
 EXECUTEs. If so it is worth one sentence in §6.5, because nothing currently says it and the
 consequence only becomes observable at 0.8.2.17.
+
+---
+
+## §3.3's absent/ambiguous split names two inputs; a non-empty `exclude` is a third
+
+**Spec:** `ENTITY-CORE-PROTOCOL` `0.8.2.19`, §3.3 status table, 400 row (the `0.8.2.18` split).
+Logged 2026-09-10 while sweeping the twelve path-as-resource sites in this tree.
+
+**The passage.** *"An operation that requires a resource answers ABSENT with `path_required` and
+MORE THAN ONE with `ambiguous_resource` — the two are different inputs with different remedies …
+A handler specification that collapses them into one code is non-conformant on the absent case."*
+`EXTENSION-ROLE` 2.2, `EXTENSION-COMPUTE` 3.30 and `EXTENSION-CONTINUATION` 1.24 sweep the same
+two arms into pseudocode.
+
+**The gap.** `EXECUTE.resource` is a `{targets, exclude}` pair (§3.2). A path-as-resource
+operation invoked with **exactly one target and a non-empty `exclude`** matches neither named
+input: it is not absent, and it is not more-than-one. Every implementation must answer
+*something*, and the paragraph does not say what — so three seats will pick three codes for an
+input that is trivially constructible from any conformance client.
+
+The remedy test §3.3 itself uses is the tell: *supply a resource* and *pick one* are both wrong
+instructions here. The right one is *drop the exclusion*, which is a third remedy.
+
+**Interim choice.** Left on the `ambiguous_resource` arm at all twelve sites — the conservative
+option, since it preserves the pre-`0.8.2.18` behaviour for an input neither version rules on and
+does not invent vocabulary. Written at each site as a deliberate choice rather than an oversight.
+
+**Our reading, offered as a preference and not a derivation.** `invalid_request` is the better
+answer: §3.3 gives it as *"the generic 400 code an extension handler uses for a structurally
+invalid request"*, and an exclusion set attached to an operation that names exactly one binding is
+structurally invalid rather than ambiguous — there is nothing to disambiguate. The case against
+our own reading: `ambiguous_resource` already means *"this resource does not resolve to the single
+binding the operation needs"*, and an exclusion is one way not to resolve, so a seat could
+reasonably fold it in and keep the vocabulary at two codes.
+
+**Ask.** Rule it either way, or state that the `exclude` field is not meaningful on a
+path-as-resource operation and MUST be ignored — which is a third coherent answer and the only
+one that needs no code at all. Whichever it is, the swept extension pseudocode is where it has to
+land, because that is what the next seat will implement from.

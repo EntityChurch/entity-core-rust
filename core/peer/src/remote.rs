@@ -1702,7 +1702,32 @@ pub const PROFILE_ID_PRIMARY_HTTP: &str = "primary-http";
 /// This is the outbound-dial analogue of the inbound `canonical_peer_id`
 /// root-check fix (commit 1e1c817): both make the Ed448 SHA-256-form PID
 /// resolvable against state the peer already holds.
-pub(crate) fn resolve_peer_id_hex(
+/// [`resolve_peer_id_hex`] as a [`Hash`] — the remote's `system/peer` identity
+/// hash, which is what `grantee` / `granter` / `signer` comparisons take.
+///
+/// Exists because the hex form is a *path segment* (v7.64 §1.4) while every
+/// authorization comparison is over the hash itself, and round-tripping through
+/// a string at each call site is how the two drift. Public for the SDK, which
+/// needs the delivering engine's identity to mint a conformant `deliver_token`
+/// (`EXTENSION-SUBSCRIPTION` §1.2 / `ENTITY-CORE-PROTOCOL` §1.4).
+pub fn resolve_peer_identity_hash(
+    peer_id: &str,
+    content_store: &dyn ContentStore,
+    location_index: &dyn LocationIndex,
+    local_peer_id: &str,
+) -> Option<Hash> {
+    let hex = resolve_peer_id_hex(peer_id, content_store, location_index, local_peer_id)?;
+    if hex.len() % 2 != 0 || hex.is_empty() {
+        return None;
+    }
+    let mut bytes = vec![0u8; hex.len() / 2];
+    for (i, b) in bytes.iter_mut().enumerate() {
+        *b = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Hash::from_bytes(&bytes).ok()
+}
+
+pub fn resolve_peer_id_hex(
     peer_id: &str,
     content_store: &dyn ContentStore,
     location_index: &dyn LocationIndex,
@@ -2940,7 +2965,21 @@ pub fn generate_deliver_token(
             ]),
             operations: entity_capability::IdScope::new(vec!["receive".to_string()]),
             resources: entity_capability::PathScope::new(vec![deliver_to_uri.to_string()]),
-            peers: Some(entity_capability::IdScope::new(vec!["*".to_string()])),
+            // **ABSENT, not `["*"]`** (§1.4 / `0.8.2.19` phase 1). This token is
+            // the credential a recipient arms a delivering engine with, and its
+            // whole job is to relax **Dimension 4** of that engine's handler
+            // grant. A wildcard `peers` makes the dimension it exists to satisfy
+            // vacuous — the credential stops saying *"deliver to me"* and starts
+            // saying *"deliver anywhere"*, which is exactly the shape arch told
+            // py to stop minting. Absent defaults to the granter's own peer,
+            // which is where the delivery is going, so this is both narrower and
+            // correct rather than narrower and lossy.
+            //
+            // Recomputed against our own tree rather than taken from the
+            // per-seat worklist: the item was filed under py's name and this
+            // mint site had the identical defect. Phase 1 only — nothing in this
+            // tree gates on Dimension 4 for a deliver_token yet.
+            peers: None,
             constraints: None,
             allowances: None,
         }],

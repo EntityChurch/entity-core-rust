@@ -80,18 +80,40 @@ impl HandlersHandler {
         // Path-as-resource (PROPOSAL-PATH-AS-RESOURCE-HYGIENE §3.4, P-V7-1):
         // resource = `system/handler/{pattern}`. Pattern is derived from the
         // resource path; manifest.pattern (if present) MUST agree.
-        let qualified_resource = match ctx.resource_target.as_ref() {
-            Some(rt) if rt.targets.len() == 1 && rt.exclude.is_empty() => rt.targets[0].clone(),
-            _ => {
-                return Ok(HandlerResult::error(
+        let qualified_resource =
+            match ctx.resource_target.as_ref() {
+                Some(rt) if rt.targets.len() == 1 && rt.exclude.is_empty() => rt.targets[0].clone(),
+                // §3.3 (0.8.2.18): ABSENT is `path_required`, MORE THAN ONE is
+                // `ambiguous_resource` — two inputs, two remedies, and collapsing
+                // them is non-conformant on the absent case. A non-empty `exclude`
+                // stays on the ambiguous arm: §3.3 names two inputs and an
+                // exclusion set is neither.
+                None => {
+                    return Ok(HandlerResult::error(
+                        STATUS_BAD_REQUEST,
+                        error_entity(
+                            "path_required",
+                            "register requires a resource target (system/handler/{pattern})",
+                        ),
+                    ))
+                }
+                Some(rt) if rt.targets.is_empty() => {
+                    return Ok(HandlerResult::error(
+                        STATUS_BAD_REQUEST,
+                        error_entity(
+                            "path_required",
+                            "register requires a resource target (system/handler/{pattern})",
+                        ),
+                    ))
+                }
+                _ => return Ok(HandlerResult::error(
                     STATUS_BAD_REQUEST,
                     error_entity(
                         "ambiguous_resource",
-                        "register requires resource = system/handler/{pattern}",
+                        "register requires exactly one resource target (system/handler/{pattern})",
                     ),
-                ))
-            }
-        };
+                )),
+            };
         let pattern = match parse_handler_resource_pattern(&qualified_resource) {
             Some(p) => p,
             None => {
@@ -418,15 +440,36 @@ impl HandlersHandler {
         // ignored here.
         let qualified_resource = match ctx.resource_target.as_ref() {
             Some(rt) if rt.targets.len() == 1 && rt.exclude.is_empty() => rt.targets[0].clone(),
-            _ => {
+            // §3.3 (0.8.2.18): ABSENT is `path_required`, MORE THAN ONE is
+            // `ambiguous_resource` — two inputs, two remedies, and collapsing
+            // them is non-conformant on the absent case. A non-empty `exclude`
+            // stays on the ambiguous arm: §3.3 names two inputs and an
+            // exclusion set is neither.
+            None => {
                 return Ok(HandlerResult::error(
                     STATUS_BAD_REQUEST,
                     error_entity(
-                        "ambiguous_resource",
-                        "unregister requires resource = system/handler/{pattern}",
+                        "path_required",
+                        "unregister requires a resource target (system/handler/{pattern})",
                     ),
                 ))
             }
+            Some(rt) if rt.targets.is_empty() => {
+                return Ok(HandlerResult::error(
+                    STATUS_BAD_REQUEST,
+                    error_entity(
+                        "path_required",
+                        "unregister requires a resource target (system/handler/{pattern})",
+                    ),
+                ))
+            }
+            _ => return Ok(HandlerResult::error(
+                STATUS_BAD_REQUEST,
+                error_entity(
+                    "ambiguous_resource",
+                    "unregister requires exactly one resource target (system/handler/{pattern})",
+                ),
+            )),
         };
         let pattern = match parse_handler_resource_pattern(&qualified_resource) {
             Some(p) => p,
@@ -805,6 +848,75 @@ mod tests {
             session_peer_id: None,
         }
     }
+
+    /// **ENTITY-CORE-PROTOCOL §3.3 (0.8.2.18), and this one is core's own row.**
+    /// §6.13's `register`/`unregister` derive the pattern from
+    /// `EXECUTE.resource.targets[0]`, so both require a resource: ABSENT answers
+    /// `path_required`, MORE THAN ONE answers `ambiguous_resource`. The two
+    /// inputs have different remedies — *supply a resource* is not *pick one* —
+    /// and the code is what selects between them. Both were `ambiguous_resource`
+    /// here.
+    ///
+    /// Driven as one table over both operations and both wrong shapes, with the
+    /// **discriminating pair kept adjacent**: the absent rows and the
+    /// more-than-one rows must answer DIFFERENT codes, which is the only thing
+    /// that separates this fix from deleting one of the two codes.
+    ///
+    /// **Mutation RUN, not predicted** — see the two entries recorded below the
+    /// test body.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn absent_resource_is_path_required_and_two_targets_is_ambiguous() {
+        let handler = test_handler();
+        let one = format!("/{}/system/handler/app/echo", TEST_PID);
+        let two = format!("/{}/system/handler/app/other", TEST_PID);
+
+        for op in ["register", "unregister"] {
+            let cases: Vec<(&str, Option<entity_capability::ResourceTarget>, &str)> = vec![
+                ("absent", None, "path_required"),
+                (
+                    "empty targets",
+                    Some(entity_capability::ResourceTarget {
+                        targets: vec![],
+                        exclude: vec![],
+                    }),
+                    "path_required",
+                ),
+                (
+                    "two targets",
+                    Some(entity_capability::ResourceTarget {
+                        targets: vec![one.clone(), two.clone()],
+                        exclude: vec![],
+                    }),
+                    "ambiguous_resource",
+                ),
+            ];
+            for (label, rt, want) in cases {
+                let params = build_register_request("app/echo", true, None);
+                let mut ctx = ctx_with_params(params, op, "app/echo");
+                ctx.resource_target = rt;
+                let r = handler.handle(&ctx).await.unwrap();
+                assert_eq!(r.status, 400, "{op} / {label}");
+                let got = entity_handler::decode_error_entity(&r.result)
+                    .and_then(|(c, _)| c)
+                    .unwrap_or_default();
+                assert_eq!(got, want, "{op} / {label}");
+            }
+        }
+    }
+
+    // **Mutation 1** — collapse the two new `path_required` arms back into the
+    // catch-all (delete the `None` and `targets.is_empty()` arms from both
+    // `handle_register` and `handle_unregister`): `absent_resource_is_path_
+    // required_and_two_targets_is_ambiguous` reddens on its first absent row and
+    // every other test in this file stays green.
+    //
+    // **Mutation 2** — relabel the catch-all `path_required` (the
+    // relabel-instead-of-discriminate edit): the same row reddens, on the
+    // **two targets** case rather than the absent one. Both mutations are named
+    // because a single "it went red" would not say which half bit, and this test
+    // short-circuits at its first failing assertion — the failure MESSAGE
+    // (`{op} / {label}`) is what makes the two distinguishable, which is why it
+    // carries the label rather than just the codes.
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_register_succeeds_for_app_pattern() {

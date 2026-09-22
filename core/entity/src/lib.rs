@@ -18,6 +18,12 @@ use thiserror::Error;
 /// System type for signature entities.
 pub const TYPE_SIGNATURE: &str = "system/signature";
 
+/// `system/peer` — the identity entity. Declared here (rather than only in
+/// `entity-crypto` / `entity-types`, which sit above this crate) because
+/// [`Entity::new_with_format`] enforces V7 §4.5a item 1a's floor pin on it and
+/// needs the name at this layer.
+pub const TYPE_PEER: &str = "system/peer";
+
 /// `system/deletion-marker` — ENTITY-NATIVE-TYPE-SYSTEM v4.2.0 §4.9.
 /// Zero-field canonical entity. Its `data` is the CBOR empty map (`0xa0`).
 pub const TYPE_DELETION_MARKER: &str = "system/deletion-marker";
@@ -81,6 +87,9 @@ impl Entity {
     /// Create a new entity, computing its content hash under an explicit
     /// `content_hash_format` code (V7 §4.5a — author under the connection's
     /// negotiated active format). An unsupported format code is rejected.
+    ///
+    /// **`system/peer` at a non-floor format is refused outright** — see the
+    /// guard below.
     pub fn new_with_format(
         entity_type: &str,
         data: Vec<u8>,
@@ -93,6 +102,34 @@ impl Entity {
         }
         if data.is_empty() {
             return Err(EntityError::MissingField("data".into()));
+        }
+        // V7 §4.5a **item 1a** (v7.77): the `system/peer` identity entity is
+        // authored at the ECFv1-SHA-256 floor **unconditionally** — on every
+        // connection, whatever the active format, and whatever the peer's home
+        // format. It is the single exception to §1.2's "persistent state is
+        // uniformly the home format", and item 4 names the failure it prevents
+        // by name: an implementation that *derives* an identity hash for a path
+        // segment and *authors* one for an equality check is using **one**
+        // function, and two functions is the defect.
+        //
+        // **Refused at the constructor rather than fixed at each call site,
+        // because the failure is silent by construction.** A non-floor identity
+        // entity is well-formed; it just carries a second content_hash for the
+        // one identity item 1a exists to collapse — on the exact surface where
+        // §5.2's `grantee`/`granter`/`signer` equalities are evaluated. Both
+        // sides of every downstream comparison are then wrong the same way, so
+        // nothing fails and no cross-impl check can see it: go's own item-1a
+        // vector is a `[self]` check by construction, and it can only ever
+        // measure the seat that runs it.
+        //
+        // Authors go through `entity_crypto::peer_entity_from_components*`,
+        // which takes no format parameter for this reason.
+        if entity_type == TYPE_PEER && format_code != entity_hash::HASH_ALGORITHM_SHA256 {
+            return Err(EntityError::InvalidType(format!(
+                "{} is pinned to the ECFv1-SHA-256 floor (V7 §4.5a item 1a); \
+                 refusing to author it under content_hash_format {:#04x}",
+                TYPE_PEER, format_code
+            )));
         }
         let content_hash = Hash::compute_format(entity_type, &data, format_code)
             .map_err(|e| EntityError::InvalidType(e.to_string()))?;
@@ -1320,5 +1357,60 @@ mod tests {
         ] {
             assert!(is_safe_path_segment(s), "sentinel {s:?} is not path-safe");
         }
+    }
+
+    /// **V7 §4.5a item 1a — `system/peer` is pinned to the ECFv1-SHA-256 floor,
+    /// and the constructor refuses anything else.**
+    ///
+    /// The rule exists because a non-floor identity entity is *well-formed*: it
+    /// simply carries a second `content_hash` for the one identity item 1a
+    /// exists to collapse. §5.2's `grantee` / `granter` / `signer` equalities
+    /// then compare two values that are wrong the same way, so nothing fails.
+    /// That is why this is enforced at construction rather than checked at the
+    /// comparison sites — there is no observable downstream to assert on.
+    ///
+    /// **Note what this test can and cannot stand in for.** It is a self-check
+    /// by nature; so is go's cross-impl vector for the same rule, which its own
+    /// harness labels `[self]` and which therefore only ever measures the seat
+    /// running it. No wire probe can catch this class, at any seat. That is the
+    /// argument for the constructor guard, not an argument that the guard is
+    /// untested — the guard IS the enforcement point.
+    #[test]
+    fn system_peer_is_refused_at_any_format_but_the_floor() {
+        let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+            (entity_ecf::text("key_type"), entity_ecf::text("ed25519")),
+            (
+                entity_ecf::text("public_key"),
+                entity_ecf::Value::Bytes(vec![7u8; 32]),
+            ),
+        ]));
+
+        // The floor authors, unconditionally.
+        let floor =
+            Entity::new_with_format(TYPE_PEER, data.clone(), entity_hash::HASH_ALGORITHM_SHA256)
+                .expect("the floor is the one legal format for an identity entity");
+        assert_eq!(
+            floor.content_hash.algorithm,
+            entity_hash::HASH_ALGORITHM_SHA256
+        );
+
+        // Every other allocated format is refused — enumerated rather than
+        // spot-checked at 0x01, so allocating a third format does not silently
+        // open a hole this row would have caught at the second.
+        for fmt in 0x01u8..=0x03 {
+            let err = Entity::new_with_format(TYPE_PEER, data.clone(), fmt).unwrap_err();
+            assert!(
+                format!("{err}").contains("floor"),
+                "format {fmt:#04x} must be refused by the item-1a guard, got: {err}"
+            );
+        }
+
+        // **The control, and it is what says this is a type-scoped pin and not
+        // a ban on non-floor authoring.** An ordinary content entity at
+        // SHA-384 is legal (§1.2 home format, §4.5a item 2), so a guard written
+        // as "refuse 0x01" rather than "refuse 0x01 FOR system/peer" reddens
+        // here and nowhere else.
+        Entity::new_with_format("app/thing", data, entity_hash::HASH_ALGORITHM_SHA384)
+            .expect("a CONTENT entity may be authored at any supported format");
     }
 }
