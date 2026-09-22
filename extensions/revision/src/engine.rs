@@ -202,24 +202,64 @@ impl RevisionEngine {
         let canonical = canonicalize_prefix(&config.prefix);
         let tracked_root_path = self.tracked_root_path(&canonical);
 
-        // §6.1 precondition: tracked root must be populated. If absent, the
-        // tracking-config coordination invariant is violated (§6D.5 MUST).
-        let tracked_root = self.location_index.get(&tracked_root_path).ok_or_else(|| {
-            format!(
-                "auto-version: tracking-config missing or disabled for prefix {:?} \
-                 (no binding at {})",
-                config.prefix, tracked_root_path
-            )
-        })?;
-
         // Resolve prefix to absolute form, then compute the hash-addressed
         // subtree key (EXTENSION-REVISION v3.0 §3.1).
         let abs_prefix = crate::resolve_prefix(&config.prefix, &self.local_peer_id_str);
         let ph = crate::prefix_hash(&abs_prefix);
 
         let head_path = crate::rev_head_path(&self.local_peer_id_str, &ph);
-        let current_head = self.location_index.get(&head_path);
 
+        for _ in 0..MAX_HEAD_CAS_RETRIES {
+            // READ THE HEAD BEFORE THE TRACKED ROOT. The order is the invariant,
+            // not a style choice. Within one writer's cascade the root tracker
+            // (position 6) stores the tracked root strictly before this hook
+            // (position 7) advances the head, so observing another thread's head
+            // write implies its tracked-root store is already visible — reading
+            // the head first therefore guarantees the root we read below is at
+            // least as new as the head we will chain from. Reversed, a thread can
+            // read a stale root, then read a head that another writer has since
+            // advanced, and CAS a version that drops that writer's path with the
+            // dedup check passing.
+            let current_head = self.location_index.get(&head_path);
+
+            // §6.1 precondition: tracked root must be populated. If absent, the
+            // tracking-config coordination invariant is violated (§6D.5 MUST).
+            let tracked_root = self.location_index.get(&tracked_root_path).ok_or_else(|| {
+                format!(
+                    "auto-version: tracking-config missing or disabled for prefix {:?} \
+                     (no binding at {})",
+                    config.prefix, tracked_root_path
+                )
+            })?;
+
+            match self.try_emit_once(config, ctx, &head_path, &ph, current_head, tracked_root)? {
+                EmitOutcome::Settled => return Ok(()),
+                EmitOutcome::Contended => continue,
+            }
+        }
+
+        Err(format!(
+            "auto-version: head at {} lost {} CAS races — this write is in no version",
+            head_path, MAX_HEAD_CAS_RETRIES
+        ))
+    }
+
+    /// One attempt of the §6.1 emit: dedup, build, and CAS the head forward.
+    ///
+    /// Split out so the retry loop above has exactly one exit per outcome.
+    /// `current_head` and `tracked_root` are the values the caller observed, in
+    /// that order; a CAS miss means another cascade advanced the head underneath
+    /// us and the caller must re-observe both.
+    #[allow(clippy::too_many_arguments)]
+    fn try_emit_once(
+        &self,
+        config: &RevisionConfig,
+        ctx: &ExecutionContext,
+        head_path: &str,
+        ph: &str,
+        current_head: Option<Hash>,
+        tracked_root: Hash,
+    ) -> Result<EmitOutcome, String> {
         // D1 (§6.1) — the version root is the EXCLUDE-FILTERED trie, the same
         // computation `handle_commit` performs; it is NOT the raw tracked root.
         // The tracked root comes from EXTENSION-TREE §3.4.1a's structural
@@ -241,7 +281,7 @@ impl RevisionEngine {
                 .and_then(|e| decode_revision_entry(&e))
             {
                 if entry.root == version_root {
-                    return Ok(());
+                    return Ok(EmitOutcome::Settled);
                 }
             }
         }
@@ -255,22 +295,53 @@ impl RevisionEngine {
         })?;
         let entry_hash = self.content_store.put(entry).map_err(|e| e.to_string())?;
 
-        // Advance head. Per spec §6.1 "Contention handling", conformant
-        // mechanisms are CAS+retry or single-writer-per-prefix serialization.
-        // SyncTreeHooks fire synchronously within a single cascade thread;
-        // cross-thread contention on this path is handled by the
-        // NotifyingLocationIndex cascade discipline. A plain set() is
-        // conformant under that serialization property.
-        let _cascade = self
-            .location_index
-            .set_with_context(&head_path, entry_hash, ctx.clone());
+        // Advance head. §6.1 "Contention handling" names two conformant
+        // mechanisms — CAS+retry, or single-writer-per-prefix serialization —
+        // and this is the CAS one.
+        //
+        // It used to be a plain `set()`, justified by a comment claiming
+        // SyncTreeHooks "fire synchronously within a single cascade thread" so
+        // the serialization arm applied. **That claim was false.**
+        // `NotifyingLocationIndex::set_impl` mutates the inner index and then
+        // calls `dispatch_event` holding no lock at all, so N threads writing N
+        // paths run N cascades — and N copies of this function — concurrently.
+        // Two of them would read the same `current_head`, build two entries both
+        // chained from it, and both `set()`: last writer wins and the loser's
+        // version is orphaned, so the head commits to a root missing that
+        // writer's path. Terminal, because the last write of a burst has no next
+        // event to re-fire. Measured against a live peer as 4 of 8 concurrent
+        // writes left in `status.pending` permanently.
+        //
+        // Single-writer-per-prefix was the other option and is NOT available
+        // here: this write re-enters the cascade, and for a universal-prefix
+        // config the path back through the root tracker re-enters this very
+        // function for the same prefix — a per-prefix mutex would deadlock.
+        let cas = match current_head {
+            Some(expected) => self.location_index.compare_and_swap_with_context(
+                head_path,
+                expected,
+                entry_hash,
+                ctx.clone(),
+            ),
+            None => self.location_index.compare_and_create_with_context(
+                head_path,
+                entry_hash,
+                ctx.clone(),
+            ),
+        };
+        if cas.is_err() {
+            // Another cascade advanced the head between our read and our write.
+            // The entry we just put is unreferenced (content-store puts are
+            // idempotent); the caller re-observes and rebuilds from the new head.
+            return Ok(EmitOutcome::Contended);
+        }
 
         // Advance active-branch pointer when set (§6.1 algorithm step 4).
-        let ab_path = crate::rev_active_branch_path(&self.local_peer_id_str, &ph);
+        let ab_path = crate::rev_active_branch_path(&self.local_peer_id_str, ph);
         if let Some(ab_hash) = self.location_index.get(&ab_path) {
             if let Some(ab_entity) = self.content_store.get(&ab_hash) {
                 if let Some(name) = decode_active_branch_name(&ab_entity) {
-                    let branch_path = crate::rev_branch_path(&self.local_peer_id_str, &ph, &name);
+                    let branch_path = crate::rev_branch_path(&self.local_peer_id_str, ph, &name);
                     let _cascade =
                         self.location_index
                             .set_with_context(&branch_path, entry_hash, ctx.clone());
@@ -278,9 +349,31 @@ impl RevisionEngine {
             }
         }
 
-        Ok(())
+        Ok(EmitOutcome::Settled)
     }
 }
+
+/// Result of one [`RevisionEngine::try_emit_once`] attempt.
+///
+/// `Contended` is not a failure: it means the head moved under us and the emit
+/// must be rebuilt from the newer head. It is deliberately NOT an `Ok(())` the
+/// caller can drop on the floor — the last write of a burst has no next event,
+/// so an emit abandoned here is a write that ends up in no version at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EmitOutcome {
+    Settled,
+    Contended,
+}
+
+/// Bound on [`RevisionEngine::auto_version_once`]'s CAS-retry loop.
+///
+/// A losing attempt means another writer's cascade advanced this prefix's head
+/// in between our read and our CAS, so the bound is a bound on simultaneous
+/// writers to one tracked prefix. Exhaustion halts the cascade rather than
+/// abandoning the emit quietly: `entity-core-go`'s equivalent give-up
+/// ("next event will retry") is precisely what made the same class of loss
+/// terminal there, and the last write of a burst has no next event.
+const MAX_HEAD_CAS_RETRIES: usize = 64;
 
 impl SyncTreeHook for RevisionEngine {
     fn on_tree_change(
@@ -1996,5 +2089,221 @@ mod tests {
 
         cfg.exclude = vec!["system/*".to_string()];
         validate_revision_config(&cfg).expect("the subtree form covers");
+    }
+
+    // -----------------------------------------------------------------------
+    // The last-burst-write loss, revision half (§6.1 "Contention handling")
+    // -----------------------------------------------------------------------
+
+    /// A `LocationIndex` that fires a one-shot injected write the first time a
+    /// watched path is read, AFTER sampling the value the caller gets back.
+    ///
+    /// Sync hooks run under no cross-thread lock — `NotifyingLocationIndex::
+    /// set_impl` mutates then dispatches holding nothing — so two writers to one
+    /// tracked prefix run two copies of `auto_version_once` concurrently. This
+    /// decorator reproduces the losing interleave deterministically in one
+    /// thread, which a load test can only do when the scheduler cooperates.
+    struct InterleaveOnRead {
+        inner: Arc<MemoryLocationIndex>,
+        watch_path: String,
+        injection: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl InterleaveOnRead {
+        fn new(inner: Arc<MemoryLocationIndex>, watch_path: String) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                watch_path,
+                injection: std::sync::Mutex::new(None),
+            })
+        }
+        fn arm(&self, f: Box<dyn FnOnce() + Send>) {
+            *self.injection.lock().unwrap() = Some(f);
+        }
+    }
+
+    impl entity_store::LocationIndex for InterleaveOnRead {
+        fn get(&self, path: &str) -> Option<Hash> {
+            let sampled = self.inner.get(path);
+            if path == self.watch_path {
+                let taken = self.injection.lock().unwrap().take();
+                if let Some(f) = taken {
+                    f();
+                }
+            }
+            sampled
+        }
+        fn set(&self, path: &str, hash: Hash) {
+            self.inner.set(path, hash)
+        }
+        fn has(&self, path: &str) -> bool {
+            self.inner.has(path)
+        }
+        fn remove(&self, path: &str) -> Option<Hash> {
+            self.inner.remove(path)
+        }
+        fn list(&self, prefix: &str) -> Vec<entity_store::LocationEntry> {
+            self.inner.list(prefix)
+        }
+        fn len_prefix(&self, prefix: &str) -> usize {
+            self.inner.len_prefix(prefix)
+        }
+        // Forward the CAS trio — the default trait impls are a non-atomic
+        // get+set, which would defeat the thing under test.
+        fn compare_and_swap(
+            &self,
+            path: &str,
+            expected: Hash,
+            new_hash: Hash,
+        ) -> Result<(), entity_store::CasError> {
+            self.inner.compare_and_swap(path, expected, new_hash)
+        }
+        fn compare_and_remove(
+            &self,
+            path: &str,
+            expected: Hash,
+        ) -> Result<Hash, entity_store::CasError> {
+            self.inner.compare_and_remove(path, expected)
+        }
+        fn compare_and_create(
+            &self,
+            path: &str,
+            new_hash: Hash,
+        ) -> Result<(), entity_store::CasError> {
+            self.inner.compare_and_create(path, new_hash)
+        }
+    }
+
+    /// Build a revision entry, store it, and return its hash.
+    fn put_version(store: &Arc<MemoryContentStore>, root: Hash, parents: Vec<Hash>) -> Hash {
+        let entry = build_revision_entry(&RevisionEntryData { root, parents }).unwrap();
+        store.put(entry).unwrap()
+    }
+
+    /// §6.1 — a concurrent emit MUST NOT orphan the version another writer just
+    /// advanced the head to.
+    ///
+    /// Pre-fix the head advance was a plain `set()`, justified by a comment
+    /// claiming SyncTreeHooks are serialized. They are not. Two cascades read the
+    /// same head, build two entries both chained from it, and both `set`: the
+    /// loser's version is orphaned and the head commits to a root missing that
+    /// writer's path — terminally, since a burst's last write has no next event.
+    ///
+    /// **Mutation:** restore the plain
+    /// `self.location_index.set_with_context(head_path, entry_hash, ctx.clone())`
+    /// and this goes RED — the racer's version is unreachable from the head.
+    #[test]
+    fn concurrent_emit_does_not_orphan_the_racing_version() {
+        let peer_id = test_peer_id();
+        let store = Arc::new(MemoryContentStore::new());
+        let raw = Arc::new(MemoryLocationIndex::new());
+        let ph = test_ph(&peer_id, "project/");
+        let head_path = crate::rev_head_path(&peer_id, &ph);
+        let li = InterleaveOnRead::new(raw.clone(), head_path.clone());
+
+        let cfg = base_config("project/", true);
+        let cfg_hash = store.put(make_config_entity(&cfg)).unwrap();
+        raw.set(&crate::rev_config_path(&peer_id, &ph), cfg_hash);
+        let tracked_root = sample_hash(0xaa);
+        raw.set(
+            &format!("/{}/system/tree/root/project", peer_id),
+            tracked_root,
+        );
+
+        let engine = RevisionEngine::new(store.clone(), li.clone(), peer_id.clone());
+
+        // The racing writer lands its own version at the head while we are
+        // mid-emit, chained from nothing (it got there first).
+        let racer_root = sample_hash(0xbb);
+        let racer_version = put_version(&store, racer_root, Vec::new());
+        {
+            let raw2 = raw.clone();
+            let head2 = head_path.clone();
+            li.arm(Box::new(move || {
+                raw2.set(&head2, racer_version);
+            }));
+        }
+
+        let evt = event_for(&peer_id, "project/file.rs", sample_hash(0x11));
+        engine
+            .on_tree_change(&evt, &mut ExecutionContext::default())
+            .expect("emit must not halt the cascade");
+
+        // The head must reach the racer's version through the parent chain —
+        // i.e. our emit chained onto it instead of overwriting it.
+        let head = raw.get(&head_path).expect("head");
+        let entry = decode_revision_entry(&store.get(&head).unwrap()).unwrap();
+        assert_eq!(
+            entry.root, tracked_root,
+            "our emit must carry the live root"
+        );
+        assert!(
+            entry.parents.contains(&racer_version),
+            "the concurrently-advanced version was orphaned — the head no longer reaches it, \
+             so the write it captured is in no version a follower can reach"
+        );
+    }
+
+    /// §6.1 — the head MUST be read BEFORE the tracked root, and this is the
+    /// test that says so.
+    ///
+    /// Within one writer's cascade the root tracker (position 6) stores the
+    /// tracked root strictly before this hook (position 7) advances the head, so
+    /// observing another thread's head implies its root store is already
+    /// visible. Read the root first and that implication is lost: a thread can
+    /// sample a stale root, then read a head another writer has since advanced,
+    /// and CAS a version that silently drops the other writer's path — the CAS
+    /// succeeds, because the head is exactly what the thread read.
+    ///
+    /// **Mutation:** move the `let current_head = ...get(&head_path)` line below
+    /// the `tracked_root` read in `auto_version_once` and this goes RED with the
+    /// head committing to the stale root. CAS alone does not save it.
+    #[test]
+    fn head_is_read_before_the_tracked_root() {
+        let peer_id = test_peer_id();
+        let store = Arc::new(MemoryContentStore::new());
+        let raw = Arc::new(MemoryLocationIndex::new());
+        let ph = test_ph(&peer_id, "project/");
+        let head_path = crate::rev_head_path(&peer_id, &ph);
+        let root_path = format!("/{}/system/tree/root/project", peer_id);
+        let li = InterleaveOnRead::new(raw.clone(), root_path.clone());
+
+        let cfg = base_config("project/", true);
+        let cfg_hash = store.put(make_config_entity(&cfg)).unwrap();
+        raw.set(&crate::rev_config_path(&peer_id, &ph), cfg_hash);
+
+        // The root as it stands when we sample it — already stale by then.
+        let stale_root = sample_hash(0xaa);
+        raw.set(&root_path, stale_root);
+
+        // The racer's cascade completes entirely inside our read window: it
+        // stores the fuller root FIRST (position 6) and advances the head to a
+        // version over it SECOND (position 7) — the real hook order.
+        let full_root = sample_hash(0xbb);
+        let racer_version = put_version(&store, full_root, Vec::new());
+        {
+            let raw2 = raw.clone();
+            let root2 = root_path.clone();
+            let head2 = head_path.clone();
+            li.arm(Box::new(move || {
+                raw2.set(&root2, full_root);
+                raw2.set(&head2, racer_version);
+            }));
+        }
+
+        let engine = RevisionEngine::new(store.clone(), li.clone(), peer_id.clone());
+        let evt = event_for(&peer_id, "project/file.rs", sample_hash(0x11));
+        engine
+            .on_tree_change(&evt, &mut ExecutionContext::default())
+            .expect("emit must not halt the cascade");
+
+        let head = raw.get(&head_path).expect("head");
+        let entry = decode_revision_entry(&store.get(&head).unwrap()).unwrap();
+        assert_eq!(
+            entry.root, full_root,
+            "the head committed to a root that predates a write already in the live tree — \
+             reading the tracked root before the head loses the happens-before that makes \
+             the observed head imply the observed root"
+        );
     }
 }

@@ -44,6 +44,16 @@ struct TrackingConfig {
 /// with no external traffic.
 pub const PUBLISHED_ROOT_HANDLER_PATTERN: &str = "system/peer/published-root";
 
+/// Bound on [`RootTrackerEngine::apply_event`]'s CAS-retry loop.
+///
+/// Each losing attempt means another thread's cascade advanced this prefix's
+/// root in between our read and our write, so the bound is really a bound on
+/// simultaneous writers to one prefix; realistic contention resolves in one or
+/// two attempts. Exhaustion is NOT a silent give-up — it halts the cascade, so
+/// the writer learns its write is not in the root instead of the peer serving a
+/// root that quietly lost it.
+const MAX_ROOT_CAS_RETRIES: usize = 64;
+
 /// Does `pattern` name a sync-hook consumer whose writes inside a tracked
 /// prefix would loop the trie-root → consumer → trie-root cycle?
 ///
@@ -289,38 +299,93 @@ impl RootTrackerEngine {
     /// Incrementally apply a single tree-change event to the trie for
     /// `bare_prefix`. Returns silently when the event's path is not under
     /// the prefix.
+    ///
+    /// **The read-modify-write is CAS-guarded, and it has to be.** Sync hooks do
+    /// NOT run under any cross-thread lock: `NotifyingLocationIndex::set_impl`
+    /// mutates the inner index and then calls `dispatch_event` with nothing held,
+    /// so two threads writing two different paths under one tracked prefix run
+    /// two cascades — and therefore two copies of this function — in parallel.
+    /// Read-`trie_put`-store with a plain `set` is then a textbook lost update:
+    /// both threads read root `R0`, both compute `R0 + their own path`, and the
+    /// later store silently drops the earlier one's binding. It is **terminal**,
+    /// because the live index keeps both paths while the tracked root keeps one
+    /// and nothing re-derives the root from the index afterwards — which makes it
+    /// data loss in every downstream consumer of the root (the version a write
+    /// gets captured in, the published root a follower syncs from).
+    ///
+    /// `trie_put`/`trie_remove` are pure functions of `(root, rel, hash)`, so a
+    /// CAS miss is repaired by re-reading and recomputing; the retry converges
+    /// because each attempt observes a strictly newer root. EXTENSION-REVISION
+    /// §6.1 "Contention handling" names CAS+retry as a conformant mechanism.
+    /// Exhaustion is reported to the caller rather than swallowed — see
+    /// [`Self::on_tree_change`].
     fn apply_event(
         &self,
         bare_prefix: &str,
         event: &TreeChangeEvent,
         ctx: Option<&ExecutionContext>,
-    ) {
+    ) -> Result<(), String> {
         let qualified = self.qualified_bare_prefix(bare_prefix);
         if !event.path.starts_with(&qualified) {
-            return;
+            return Ok(());
         }
         let rel = &event.path[qualified.len()..];
-        let current_root = self.load_tracked_root(bare_prefix);
+        let path = self.qualified_root_path(bare_prefix);
 
-        let result = match event.new_hash {
-            Some(new) => trie::trie_put(self.content_store.as_ref(), current_root, rel, new),
-            None => trie::trie_remove(self.content_store.as_ref(), current_root, rel),
-        };
+        for _ in 0..MAX_ROOT_CAS_RETRIES {
+            let current_root = self.load_tracked_root(bare_prefix);
 
-        match result {
-            Ok(new_root) => {
-                tracing::info!(
-                    prefix = %bare_prefix,
-                    path = %event.path,
-                    root = %new_root,
-                    "[root-tracker] update"
-                );
-                self.store_tracked_root(bare_prefix, new_root, ctx);
+            let new_root = match event.new_hash {
+                Some(new) => trie::trie_put(self.content_store.as_ref(), current_root, rel, new),
+                None => trie::trie_remove(self.content_store.as_ref(), current_root, rel),
             }
-            Err(e) => {
-                tracing::warn!(prefix = %bare_prefix, path = %event.path, error = %e, "[root-tracker] incremental update failed");
+            .map_err(|e| e.to_string())?;
+
+            // Nothing to do — this event is already reflected in the root.
+            if current_root == Some(new_root) {
+                return Ok(());
+            }
+
+            let outcome = match current_root {
+                Some(expected) => match ctx {
+                    Some(c) => self
+                        .location_index
+                        .compare_and_swap_with_context(&path, expected, new_root, c.clone())
+                        .map(|_| ()),
+                    None => self
+                        .location_index
+                        .compare_and_swap(&path, expected, new_root),
+                },
+                None => match ctx {
+                    Some(c) => self
+                        .location_index
+                        .compare_and_create_with_context(&path, new_root, c.clone())
+                        .map(|_| ()),
+                    None => self.location_index.compare_and_create(&path, new_root),
+                },
+            };
+
+            match outcome {
+                Ok(()) => {
+                    tracing::info!(
+                        prefix = %bare_prefix,
+                        path = %event.path,
+                        root = %new_root,
+                        "[root-tracker] update"
+                    );
+                    return Ok(());
+                }
+                // Another thread's cascade advanced the root between our read and
+                // our write. Re-read and re-apply this event onto the newer root.
+                Err(entity_store::CasError::Mismatch(_))
+                | Err(entity_store::CasError::NotFound) => continue,
             }
         }
+
+        Err(format!(
+            "tracked root at {} lost {} CAS races — this event is not reflected in the root",
+            path, MAX_ROOT_CAS_RETRIES
+        ))
     }
 
     fn handle_config_change(&self, event: &TreeChangeEvent, ctx: Option<&ExecutionContext>) {
@@ -408,7 +473,24 @@ impl SyncTreeHook for RootTrackerEngine {
             if !cfg.enabled {
                 continue;
             }
-            self.apply_event(&cfg.prefix, event, Some(ctx));
+            // A tracked root that silently lost this write is data loss with no
+            // later event to repair it (the last write of a burst has no next
+            // event), so the failure is surfaced to the writer rather than
+            // logged and dropped.
+            if let Err(e) = self.apply_event(&cfg.prefix, event, Some(ctx)) {
+                tracing::error!(
+                    prefix = %cfg.prefix,
+                    path = %event.path,
+                    error = %e,
+                    "tree: tracked-root update failed — halting cascade"
+                );
+                return Err(entity_store::CascadeHalt {
+                    consumer_name: self.name().to_string(),
+                    error_code: 500,
+                    error_message: format!("tracked-root update failed: {}", e),
+                    is_error: false,
+                });
+            }
         }
         Ok(())
     }
@@ -818,5 +900,198 @@ mod tests {
         let tracked = engine.load_tracked_root("project/").unwrap();
         let from_build = trie::build_trie(cs.as_ref(), &expected).unwrap();
         assert_eq!(tracked, from_build);
+    }
+
+    // -----------------------------------------------------------------------
+    // Concurrent-burst capture loss (the lost-update half)
+    // -----------------------------------------------------------------------
+
+    /// A `LocationIndex` that fires a one-shot injected write the first time the
+    /// tracked-root path is read, AFTER sampling the value the caller will get
+    /// back. That reproduces the exact interleave two concurrent cascades hit —
+    /// thread A reads root `R0`, thread B lands `R0 + pathB`, thread A then
+    /// writes `R0 + pathA` over it — deterministically, in one thread.
+    ///
+    /// This is the forced-interleave net the mechanism needs. A load test can
+    /// only show the bug when the scheduler cooperates; this one cannot pass
+    /// against a read-modify-write that does not re-check what it read.
+    struct InterleaveOnRead {
+        inner: Arc<MemoryLocationIndex>,
+        watch_path: String,
+        injection: std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl InterleaveOnRead {
+        fn new(inner: Arc<MemoryLocationIndex>, watch_path: &str) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                watch_path: watch_path.to_string(),
+                injection: std::sync::Mutex::new(None),
+            })
+        }
+        fn arm(&self, f: Box<dyn FnOnce() + Send>) {
+            *self.injection.lock().unwrap() = Some(f);
+        }
+    }
+
+    impl LocationIndex for InterleaveOnRead {
+        fn get(&self, path: &str) -> Option<Hash> {
+            // Sample first: this is the stale value the racing writer's store
+            // will invalidate a moment later.
+            let sampled = self.inner.get(path);
+            if path == self.watch_path {
+                let taken = self.injection.lock().unwrap().take();
+                if let Some(f) = taken {
+                    f();
+                }
+            }
+            sampled
+        }
+        fn set(&self, path: &str, hash: Hash) {
+            self.inner.set(path, hash)
+        }
+        fn has(&self, path: &str) -> bool {
+            self.inner.has(path)
+        }
+        fn remove(&self, path: &str) -> Option<Hash> {
+            self.inner.remove(path)
+        }
+        fn list(&self, prefix: &str) -> Vec<entity_store::LocationEntry> {
+            self.inner.list(prefix)
+        }
+        fn len_prefix(&self, prefix: &str) -> usize {
+            self.inner.len_prefix(prefix)
+        }
+        // Forward the CAS trio to the inner index — the default trait impls are
+        // a non-atomic get+set, which would defeat the very thing under test.
+        fn compare_and_swap(
+            &self,
+            path: &str,
+            expected: Hash,
+            new_hash: Hash,
+        ) -> Result<(), entity_store::CasError> {
+            self.inner.compare_and_swap(path, expected, new_hash)
+        }
+        fn compare_and_remove(
+            &self,
+            path: &str,
+            expected: Hash,
+        ) -> Result<Hash, entity_store::CasError> {
+            self.inner.compare_and_remove(path, expected)
+        }
+        fn compare_and_create(
+            &self,
+            path: &str,
+            new_hash: Hash,
+        ) -> Result<(), entity_store::CasError> {
+            self.inner.compare_and_create(path, new_hash)
+        }
+    }
+
+    /// EXTENSION-TREE §3.4 — the tracked root MUST reflect every write under the
+    /// prefix, including two that land concurrently.
+    ///
+    /// `apply_event` is a read-`trie_put`-store cycle and sync hooks run under no
+    /// cross-thread lock (`NotifyingLocationIndex::set_impl` dispatches with
+    /// nothing held), so with a plain `set` the second store clobbers the first
+    /// and the live index keeps a path the tracked root has lost — permanently,
+    /// since nothing re-derives the root from the index afterwards.
+    ///
+    /// **Mutation:** replace the CAS in `apply_event` with
+    /// `self.store_tracked_root(bare_prefix, new_root, ctx)` and this goes RED
+    /// with `racer.md` missing from the tracked root.
+    #[test]
+    fn concurrent_root_update_does_not_clobber_the_racing_write() {
+        let cs: Arc<MemoryContentStore> = Arc::new(MemoryContentStore::new());
+        let raw: Arc<MemoryLocationIndex> = Arc::new(MemoryLocationIndex::new());
+        let root_path = format!("/{}/system/tree/root/project", peer_id());
+        let li = InterleaveOnRead::new(raw.clone(), &root_path);
+        let engine = Arc::new(RootTrackerEngine::new(
+            cs.clone(),
+            li.clone() as Arc<dyn LocationIndex>,
+            peer_id(),
+        ));
+
+        let cfg = make_tracking_config_entity("project/", true);
+        put_at(
+            cs.as_ref(),
+            li.as_ref(),
+            &format!("/{}/system/tree/tracking-config/project", peer_id()),
+            cfg,
+        );
+        engine.bootstrap();
+
+        // The racing writer: lands `racer.md` in the live index and advances the
+        // tracked root to include it, in the window between our read and write.
+        let racer_hash = cs.put(make_entity("test/doc", "racer")).unwrap();
+        let racer_path = format!("/{}/project/racer.md", peer_id());
+        {
+            let cs2 = cs.clone();
+            let li2 = li.clone();
+            let engine2 = engine.clone();
+            let racer_path2 = racer_path.clone();
+            let root_path2 = root_path.clone();
+            li.arm(Box::new(move || {
+                li2.inner.set(&racer_path2, racer_hash);
+                let base = li2.inner.get(&root_path2);
+                let advanced = trie::trie_put(cs2.as_ref(), base, "racer.md", racer_hash).unwrap();
+                li2.inner.set(&root_path2, advanced);
+                drop(engine2);
+            }));
+        }
+
+        // Our write: `ours.md`. Its apply_event reads the root (firing the
+        // injection), then must not overwrite what the racer stored.
+        let ours_hash = cs.put(make_entity("test/doc", "ours")).unwrap();
+        let ours_path = format!("/{}/project/ours.md", peer_id());
+        li.inner.set(&ours_path, ours_hash);
+        let mut ctx = ExecutionContext::default();
+        let event = synthetic_event(&ours_path, Some(ours_hash), None);
+        engine.on_tree_change(&event, &mut ctx).unwrap();
+
+        // Both paths are in the live index; both MUST be in the tracked root.
+        let tracked = engine.load_tracked_root("project/").expect("tracked root");
+        let bindings = trie::collect_all_bindings(cs.as_ref(), tracked, "");
+        assert_eq!(
+            bindings.get("ours.md"),
+            Some(&ours_hash),
+            "our own write is missing from the tracked root"
+        );
+        assert_eq!(
+            bindings.get("racer.md"),
+            Some(&racer_hash),
+            "the concurrent write was clobbered — tracked root lost a path the live index still has \
+             (this is the last-burst-write loss: live tree has it, no version does)"
+        );
+    }
+
+    /// The control for the test above: with no racing writer, the ordinary
+    /// single-write path still lands. Fails if the CAS loop is wired so that a
+    /// first-ever root (the `compare_and_create` arm) never stores.
+    #[test]
+    fn uncontended_root_update_still_lands() {
+        let (cs, li, engine) = setup();
+        let cfg = make_tracking_config_entity("project/", true);
+        put_at(
+            cs.as_ref(),
+            li.as_ref(),
+            &format!("/{}/system/tree/tracking-config/project", peer_id()),
+            cfg,
+        );
+        engine.bootstrap();
+
+        let h = cs.put(make_entity("test/doc", "solo")).unwrap();
+        let p = format!("/{}/project/solo.md", peer_id());
+        li.set(&p, h);
+        let mut ctx = ExecutionContext::default();
+        engine
+            .on_tree_change(&synthetic_event(&p, Some(h), None), &mut ctx)
+            .unwrap();
+
+        let tracked = engine.load_tracked_root("project/").expect("tracked root");
+        assert_eq!(
+            trie::collect_all_bindings(cs.as_ref(), tracked, "").get("solo.md"),
+            Some(&h)
+        );
     }
 }

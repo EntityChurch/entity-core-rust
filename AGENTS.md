@@ -165,6 +165,42 @@ gates by making the TCP path compile on wasm32.
   `RwLock<...>` and refresh only on events under their own config subtree — never
   `location_index.list()` + `content_store.get()` + decode per put (that was a 100×+
   regression). Canary: `core/peer/src/lib.rs::perf_treeput_1100` (`--release`).
+- **A comment asserting a concurrency invariant MUST name the construct that enforces it —
+  and a read-modify-write on shared state is a defect until it does.** *(Candidate: bit us
+  once, `7776675`, and it cost a sibling ten days of wrong analysis.)* `auto_version_once`
+  advanced the revision head with a plain `set()` under a comment reading *"SyncTreeHooks fire
+  synchronously within a single cascade thread; cross-thread contention is handled by the
+  NotifyingLocationIndex cascade discipline. A plain set() is conformant under that
+  serialization property."* **There is no such property.** `set_impl` mutates the inner index
+  and then calls `dispatch_event` holding no lock, so N writers run N cascades — and N copies
+  of every hook — in parallel. The comment named a mechanism (*"the cascade discipline"*) that
+  does not exist as code, and nobody checked, because prose that sounds like an invariant reads
+  like one. `RootTrackerEngine::apply_event` had the same shape with no comment at all. The
+  cost was not only ours: meta's cross-impl read declared rust *"structurally exempt"* from
+  go's last-burst-write loss **on the strength of this comment**, so the analysis that should
+  have found our bug cited it as the reason we could not have one.
+  **Enforcement.** Grep the pattern, not the prose: a `get(...)` / `list(...)` followed by a
+  `set(...)`/`put(...)` to the **same path** in one function is a read-modify-write, and on any
+  path a `SyncTreeHook` can reach it needs CAS+retry or a lock, named at the `fn`. When you
+  write a comment claiming serialization, cite the **type and the field** that provides it
+  (`Mutex<_>` at `X::y`) — if you cannot, you have found the bug. And prefer CAS to a lock on
+  any path whose write re-enters the cascade: a per-prefix mutex in `auto_version_once` would
+  deadlock, because a universal-prefix config routes that write back through the root tracker
+  into the same function for the same prefix.
+  **The other half, and it is why the in-tree suite could never have caught this: an
+  in-process load test is not a net for an in-process race.** An 8-writer × 40-round burst
+  through the real `NotifyingLocationIndex` + tracker + revision chain **passed with the head
+  advance mutated back to the broken `set()`** — the window between the read and the write is
+  nanoseconds when there is no socket in the path, so the scheduler never interleaves. It was
+  written, measured against the mutation, found toothless, and **deleted rather than kept as
+  reassurance**. What works is a forced interleave: a `LocationIndex` decorator that fires a
+  one-shot injected write on the first read of the watched path, *after* sampling the value the
+  caller gets back (`InterleaveOnRead`, in both `core/tree` and `extensions/revision`). That is
+  deterministic, single-threaded, and mutation-RED every time — the same conclusion core-go
+  reached from the other side (*"net it with a deterministic forced-interleave test, not
+  `-race` or test-starved"*). Corollary for reporting: **a concurrency fix's wire number is the
+  evidence; the in-tree green is not.** Ours went 4-of-8-lost → PASS 5/5 at ~30ms, and the
+  image label must read `dirty` at your HEAD or you measured a stale binary.
 - **A MUST-write owes a named collector, swept BEFORE the write.** A spec'd write with no
   reaper is a leak by construction (CONTINUATION v1.23 §3.4 A.1 — ~1,440 marker nodes/day
   against one dead peer). When adding the reaper: sweep at the top of the bind path, never
@@ -746,6 +782,39 @@ Cross-impl wire fidelity. Same-side round-trip tests pass with the **wrong** sha
     rename to `log`'s field would have left `fetch` emitting a type that no longer declares
     it. When a rule's sentence names two fields, grep for the second one — it is the one with
     no example — `59e6f55`.
+  - **Sibling *methods of one trait* — a DECORATOR inherits every default it does not name,
+    and a defaulted method that is documented as unsafe-for-real-use is a trapdoor under
+    every wrapper in the stack.** `LocationIndex` gives `compare_and_swap` /
+    `compare_and_remove` / `compare_and_create` default bodies that are a non-atomic
+    `get`+`set`, and says so at the definition: *"Real backends MUST override this with an
+    atomic implementation."* Every **backend** did (`Memory`, `Sqlite`, `Opfs`, `Idb`). Both
+    **decorators** — `IndexingLocationIndex` (query) and `JournaledLocationIndex` (persist) —
+    forwarded `get`/`set`/`remove`/`list`, named none of the CAS trio, and so silently
+    supplied the broken default *in front of* a correct backend. `IndexingLocationIndex` sits
+    unconditionally between the base index and `NotifyingLocationIndex` whenever `query` is
+    on (the default), so `MemoryLocationIndex`'s atomic CAS was reachable **in unit tests and
+    unreachable in the peer**: every CAS the shipping peer performed was a read followed by
+    an unconditional write, §3.9's `expected_hash` on `system/tree:put` included. The
+    observable was two root-tracker updates logging a successful CAS from the *same* expected
+    root and a write leaving the tracked trie for good (`7776675`). Note the direction: the
+    wrapper did not *break* a method, it **declined to mention one**, so there is no diff to
+    review and no compiler error — `impl Trait for Wrapper` is the one construct where doing
+    nothing is an active choice.
+    **Enforcement, and the test shape is the load-bearing half.** (a) For any trait with
+    defaulted methods where a default is documented as degraded, enumerate `impl <Trait> for`
+    across the tree and check each **wrapper** forwards the whole contract, not just the
+    methods it had a reason to touch — the region that closes is the `impl` list, not a grep
+    for the method name (which finds the backends and misses exactly the wrappers that are
+    the bug). (b) **Assert which method the inner layer SAW, never the value it returned.** A
+    decorator on the non-atomic default returns the *correct answer* single-threaded — it
+    reads, compares, writes — so no value-based assertion can separate the two
+    implementations, and a suite full of them stays green through the whole defect. The
+    discriminator is a counting spy on the backend
+    (`cas_is_forwarded_to_the_backend_not_synthesized_from_get_and_set`, `extensions/query`):
+    forwarded → the backend's `compare_and_swap` is entered; inherited → the backend sees
+    `get`+`set` and zero CAS calls. Its neighbour `a_losing_cas_does_not_disturb_the_indexes`
+    is deliberately kept **green under the same mutation** as the standing proof that the
+    value assertion cannot see this class.
   Also check every **form** the value arrives in: a kind-based predicate (`is_error`) makes
   the enum variant and the entity variant one fact, so a site fixed for one is not fixed.
   And when a swept site turns out to be **fine**, prove it and say so at the code rather than

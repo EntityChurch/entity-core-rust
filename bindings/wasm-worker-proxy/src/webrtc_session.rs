@@ -33,8 +33,8 @@
 //! `[security — MUST]`. What remains here is glue whose first real exercise is
 //! S5, and per §11.5.1 nothing before S5 is evidence that any of it works.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 
 use entity_peer::transport::{
@@ -45,7 +45,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    MessageChannel, MessageEvent, MessagePort, RtcConfiguration, RtcDataChannel,
+    Event, MessageChannel, MessageEvent, MessagePort, RtcConfiguration, RtcDataChannel,
     RtcDataChannelEvent, RtcDataChannelInit, RtcDataChannelState, RtcDataChannelType,
     RtcIceCandidate, RtcIceCandidateInit, RtcPeerConnection, RtcPeerConnectionIceEvent, RtcSdpType,
     RtcSessionDescriptionInit,
@@ -75,6 +75,199 @@ type MessageClosures = Rc<RefCell<Vec<Closure<dyn FnMut(MessageEvent)>>>>;
 /// `MessagePort` pump. See [`attach_inbox`] for why this must exist.
 type Inbox = Rc<RefCell<Vec<Vec<u8>>>>;
 
+/// Plain `Event` listeners on the data channel, retained for the session's
+/// life for the same reason as [`MessageClosures`].
+type ChannelHooks = RefCell<Vec<Closure<dyn FnMut(Event)>>>;
+
+/// The largest single `RTCDataChannel.send()` [`PortPump`] will ever make.
+///
+/// A cap *below* whatever the connection negotiated, on purpose. The layer
+/// above this transport is a byte stream — `PortReader` feeds `read_frame`'s
+/// 4-byte-length-prefixed framing (`entity-wire`) and already carries a
+/// `leftover` for a delivery that does not land on a frame boundary — so the
+/// size of an individual `send()` carries **no semantics at all**. It is a pure
+/// performance knob, and the cheapest thing to buy with it is that every engine
+/// pair executes the same code path: Firefox↔Firefox negotiates ~1 GiB and
+/// would otherwise take a splitting path no other pair takes, which is exactly
+/// how a size defect stays invisible to a Firefox-only harness.
+const PIECE_CEILING: usize = 64 * 1024;
+
+/// Used when the engine will not say what it negotiated. Deliberately small:
+/// 16 KiB is carried by every SCTP implementation, browser or not.
+const PIECE_FALLBACK: usize = 16 * 1024;
+
+/// Stop feeding `send()` once this much is sitting unsent, and resume at
+/// [`BUFFER_LOW_WATER`].
+///
+/// Not a nicety. Chromium **closes the data channel** when its send buffer
+/// passes 16 MiB, so an unpaced writer converts a large transfer into a
+/// mid-stream teardown; 1 MiB leaves two orders of magnitude of headroom while
+/// still keeping enough in flight to saturate a LAN.
+const BUFFER_HIGH_WATER: u32 = 1024 * 1024;
+const BUFFER_LOW_WATER: u32 = 256 * 1024;
+
+/// The outbound half of the pump: `MessagePort` → `RTCDataChannel`.
+///
+/// # Why this is not one `send()` per port message
+///
+/// A data channel has a negotiated per-message ceiling
+/// (`RTCPeerConnection.sctp.maxMessageSize`) and **the engines disagree about
+/// it by four orders of magnitude**: Firefox advertises ~1 GiB and fragments
+/// internally, Chromium advertises 262 144 bytes and does not, and the pair
+/// takes the smaller of the two. `entity-browser-rust`'s file pull hands this
+/// pump a `GET_BATCH_SIZE` response of ~4 MiB — fine to Firefox, over the
+/// ceiling to Chromium — and the previous implementation neither checked the
+/// size nor read the error, so the oversized `send()` threw into a discarded
+/// `Result` and the byte stream simply stopped. A progress line, then silence.
+///
+/// Splitting needs no header and no reassembler on the far side, because the
+/// far side is not reassembling messages: see [`PIECE_CEILING`].
+///
+/// # Why a failed send closes the channel
+///
+/// A dropped piece is not a lost message, it is a **hole in a byte stream** —
+/// the peer's `read_exact` either blocks on a length prefix that never
+/// completes or resynchronizes onto garbage. Neither is recoverable, and the
+/// first is precisely the silent hang this type exists to end. Closing turns it
+/// into a transport error the layers above already know how to report.
+struct PortPump {
+    dc: RtcDataChannel,
+    /// Largest `send()` this connection will take, already clamped.
+    piece: usize,
+    /// Pieces awaiting a send, in strict order. Ordered delivery is the data
+    /// channel's job (`init.set_ordered(true)`); keeping the *queue* ordered is
+    /// ours, so nothing may ever send directly past a non-empty queue.
+    queue: RefCell<VecDeque<Vec<u8>>>,
+    /// Latched on the first unrecoverable send. Everything after it is dropped
+    /// rather than sent into a stream that already has a hole in it.
+    failed: Cell<bool>,
+}
+
+impl PortPump {
+    fn new(dc: RtcDataChannel, piece: usize) -> Self {
+        Self {
+            dc,
+            piece,
+            queue: RefCell::new(VecDeque::new()),
+            failed: Cell::new(false),
+        }
+    }
+
+    /// Split one port message into sendable pieces and push the pump along.
+    fn enqueue(&self, bytes: Vec<u8>) {
+        if self.failed.get() {
+            return;
+        }
+        {
+            let mut q = self.queue.borrow_mut();
+            if bytes.len() <= self.piece {
+                q.push_back(bytes);
+            } else {
+                for piece in bytes.chunks(self.piece) {
+                    q.push_back(piece.to_vec());
+                }
+            }
+        }
+        self.drain();
+    }
+
+    /// Send until the queue empties or the channel's buffer fills. Re-entered
+    /// from `bufferedamountlow` when it fills.
+    fn drain(&self) {
+        while !self.failed.get() {
+            let state = self.dc.ready_state();
+            if state != RtcDataChannelState::Open {
+                // Not "wait and retry": `wait_open` only wires this pump after
+                // the channel is open, so anything other than Open here is a
+                // channel that has since died with bytes still owed to it.
+                self.fail(&format!("channel is {state:?}, not open"));
+                return;
+            }
+            if self.dc.buffered_amount() >= BUFFER_HIGH_WATER {
+                // Resumed by the `bufferedamountlow` listener in `wait_open`.
+                return;
+            }
+            let next = self.queue.borrow_mut().pop_front();
+            let Some(piece) = next else { return };
+            let len = piece.len();
+            if let Err(e) = self.dc.send_with_u8_array(&piece) {
+                self.fail(&format!(
+                    "send({len} bytes) threw {e:?} (piece limit {}, buffered {})",
+                    self.piece,
+                    self.dc.buffered_amount()
+                ));
+                return;
+            }
+        }
+    }
+
+    fn fail(&self, why: &str) {
+        if self.failed.replace(true) {
+            return;
+        }
+        let owed: usize = self.queue.borrow().iter().map(Vec::len).sum();
+        web_sys::console::error_1(&JsValue::from_str(&format!(
+            "webrtc: outbound pump failed — {why}; {owed} byte(s) undelivered, closing the channel"
+        )));
+        self.queue.borrow_mut().clear();
+        self.dc.close();
+    }
+}
+
+/// Forward one inbound frame into the port, or say why the stream just
+/// developed a hole.
+///
+/// The inbound twin of [`PortPump::fail`], and it exists for the same reason:
+/// what crosses this port is a **byte stream**, so a dropped delivery is not a
+/// lost message but a gap the worker's `read_exact` waits on forever. Posting
+/// into a live `MessagePort` does not realistically throw — which is precisely
+/// why discarding the `Result` here would produce a hang nobody could ever
+/// attribute to it. Closing the channel converts that into a transport error
+/// the layers above already report.
+fn post_inbound(port: &MessagePort, frame: &JsValue, dc: &RtcDataChannel) {
+    if let Err(e) = port.post_message(frame) {
+        web_sys::console::error_1(&JsValue::from_str(&format!(
+            "webrtc: inbound post_message failed — {e:?}; closing the channel"
+        )));
+        dc.close();
+    }
+}
+
+/// `RTCPeerConnection.sctp.maxMessageSize` — the largest message this
+/// connection agreed to carry, i.e. the minimum of what we can send and what
+/// the remote advertised in its SDP `a=max-message-size`.
+///
+/// Read reflectively rather than through `RtcSctpTransport`: one getter does
+/// not earn a `web-sys` feature, and this file already reaches for
+/// `usernameFragment` the same way. `None` covers absent, `null` and
+/// `undefined` alike — all of which mean the engine will not tell us, which is
+/// a fallback, not a failure.
+fn negotiated_max_message_size(pc: &RtcPeerConnection) -> Option<f64> {
+    let sctp = js_sys::Reflect::get(pc, &JsValue::from_str("sctp")).ok()?;
+    if sctp.is_null() || sctp.is_undefined() {
+        return None;
+    }
+    js_sys::Reflect::get(&sctp, &JsValue::from_str("maxMessageSize"))
+        .ok()?
+        .as_f64()
+}
+
+/// The negotiated ceiling as reported, and the piece size derived from it.
+///
+/// The reported value is returned alongside so the caller can log it: it is the
+/// number every decision here is derived from, it differs by four orders of
+/// magnitude between engines, and until now it was read nowhere in this
+/// codebase. `Infinity` is a legal value (the spec's reading of a remote that
+/// advertised no limit) and is exactly why this is not used raw.
+fn outbound_piece_size(pc: &RtcPeerConnection) -> (Option<f64>, usize) {
+    let reported = negotiated_max_message_size(pc);
+    let negotiated = match reported {
+        Some(v) if v.is_finite() && v >= 1.0 => v as usize,
+        _ => PIECE_FALLBACK,
+    };
+    (reported, negotiated.clamp(1, PIECE_CEILING))
+}
+
 pub(crate) struct WebRtcSession {
     pc: RtcPeerConnection,
     /// Candidates gathered since the last drain. Trickle is the sole candidate
@@ -97,6 +290,13 @@ pub(crate) struct WebRtcSession {
     /// life: dropping it closes the port and tears down the pump the instant
     /// `wait_open` returns.
     kept_ports: RefCell<Vec<MessagePort>>,
+    /// Data-channel event listeners installed by `wait_open` —
+    /// `bufferedamountlow`, `error`, `close`.
+    ///
+    /// Parked on the session rather than on the [`PortPump`] they drive: each
+    /// holds an `Rc<PortPump>`, so a closure stored inside the pump would be a
+    /// reference cycle that survives the session.
+    channel_hooks: ChannelHooks,
 }
 
 impl WebRtcSession {
@@ -179,6 +379,7 @@ impl WebRtcSession {
             pumps,
             inbox,
             kept_ports: RefCell::new(Vec::new()),
+            channel_hooks: RefCell::new(Vec::new()),
         }))
     }
 
@@ -373,11 +574,12 @@ impl WebRtcSession {
 
         // RTCDataChannel -> port: inbound frames toward the worker.
         let ours_for_dc = ours.clone();
+        let dc_for_inbound = dc.clone();
         let dc_to_port = Closure::<dyn FnMut(MessageEvent)>::new(move |ev: MessageEvent| {
             let Some(bytes) = frame_bytes(ev.data()) else {
                 return;
             };
-            let _ = ours_for_dc.post_message(&bytes);
+            post_inbound(&ours_for_dc, &bytes, &dc_for_inbound);
         });
         dc.set_onmessage(Some(dc_to_port.as_ref().unchecked_ref()));
 
@@ -397,30 +599,76 @@ impl WebRtcSession {
         for frame in std::mem::take(&mut *self.inbox.borrow_mut()) {
             let arr = Uint8Array::new_with_length(frame.len() as u32);
             arr.copy_from(&frame);
-            let _ = ours.post_message(&arr);
+            post_inbound(&ours, &arr, &dc);
         }
 
-        // port -> RTCDataChannel: outbound frames from the worker.
-        let dc_for_port = dc.clone();
+        // port -> RTCDataChannel: outbound frames from the worker, split to the
+        // size this connection actually negotiated. See `PortPump`.
+        let (reported_max, piece) = outbound_piece_size(&self.pc);
+        web_sys::console::log_1(&JsValue::from_str(&format!(
+            "webrtc: data channel open — sctp.maxMessageSize={}, outbound piece={piece} bytes",
+            match reported_max {
+                Some(v) => format!("{v}"),
+                None => "unreported".to_string(),
+            }
+        )));
+
+        let pump = Rc::new(PortPump::new(dc.clone(), piece));
+        let pump_for_port = pump.clone();
         let port_to_dc = Closure::<dyn FnMut(MessageEvent)>::new(move |ev: MessageEvent| {
-            let data = ev.data();
-            let bytes = match data.dyn_into::<Uint8Array>() {
+            let bytes = match ev.data().dyn_into::<Uint8Array>() {
                 Ok(a) => a.to_vec(),
                 Err(_) => return,
             };
-            if dc_for_port.ready_state() == RtcDataChannelState::Open {
-                let _ = dc_for_port.send_with_u8_array(&bytes);
-            }
+            pump_for_port.enqueue(bytes);
         });
         ours.set_onmessage(Some(port_to_dc.as_ref().unchecked_ref()));
         ours.start();
 
-        // Retain both closures AND our end of the channel for the session's
+        // Backpressure. Without a resume hook the pump parks at
+        // `BUFFER_HIGH_WATER` and never restarts, which would trade the old
+        // silent hang for a new one.
+        dc.set_buffered_amount_low_threshold(BUFFER_LOW_WATER);
+        let pump_for_low = pump.clone();
+        let on_low = Closure::<dyn FnMut(Event)>::new(move |_: Event| pump_for_low.drain());
+        dc.add_event_listener_with_callback("bufferedamountlow", on_low.as_ref().unchecked_ref())
+            .map_err(|e| format!("bufferedamountlow listener: {e:?}"))?;
+
+        // Diagnostics only — nothing branches on these. They exist because the
+        // two ways this transport dies (`error`, and a `close` nobody asked
+        // for) previously produced no output whatsoever on either side.
+        let dc_for_err = dc.clone();
+        let on_error = Closure::<dyn FnMut(Event)>::new(move |ev: Event| {
+            web_sys::console::error_1(&JsValue::from_str(&format!(
+                "webrtc: data channel error — {:?} (buffered {})",
+                js_sys::Reflect::get(&ev, &JsValue::from_str("error")).unwrap_or(ev.clone().into()),
+                dc_for_err.buffered_amount()
+            )));
+        });
+        dc.add_event_listener_with_callback("error", on_error.as_ref().unchecked_ref())
+            .map_err(|e| format!("error listener: {e:?}"))?;
+
+        let dc_for_close = dc.clone();
+        let on_close = Closure::<dyn FnMut(Event)>::new(move |_: Event| {
+            web_sys::console::log_1(&JsValue::from_str(&format!(
+                "webrtc: data channel closed (buffered {} still unsent)",
+                dc_for_close.buffered_amount()
+            )));
+        });
+        dc.add_event_listener_with_callback("close", on_close.as_ref().unchecked_ref())
+            .map_err(|e| format!("close listener: {e:?}"))?;
+
+        // Retain the closures AND our end of the channel for the session's
         // life. Dropping `ours` here would close the port and tear down the
         // pump the moment this function returned.
         self.pumps.borrow_mut().push(dc_to_port);
         self.pumps.borrow_mut().push(port_to_dc);
         self.kept_ports.borrow_mut().push(ours);
+        let mut hooks = self.channel_hooks.borrow_mut();
+        hooks.push(on_low);
+        hooks.push(on_error);
+        hooks.push(on_close);
+        drop(hooks);
 
         Ok(for_worker)
     }

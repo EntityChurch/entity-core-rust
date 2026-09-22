@@ -241,6 +241,40 @@ impl LocationIndex for JournaledLocationIndex {
     fn len_prefix(&self, prefix: &str) -> usize {
         self.memory.len_prefix(prefix)
     }
+
+    // --- The CAS trio: forwarded to the atomic in-memory index. -----------
+    //
+    // Same rule as `IndexingLocationIndex` in the query extension, and the same
+    // trap: a decorator that forwards `get`/`set`/`remove` reads as complete
+    // while every method it does not name inherits `LocationIndex`'s default —
+    // a non-atomic `get` + `set` that the trait explicitly marks as "acceptable
+    // only for single-threaded or deprecated backends". Forwarding to
+    // `self.memory` keeps the compare and the swap under ONE lock acquisition;
+    // journaling the committed result after the fact matches `set`/`remove`,
+    // which also journal post-commit.
+    fn compare_and_swap(&self, path: &str, expected: Hash, new_hash: Hash) -> Result<(), CasError> {
+        self.memory.compare_and_swap(path, expected, new_hash)?;
+        let mut journal = self.journal.lock().unwrap();
+        let _ = write_set_location(&mut *journal, path, &new_hash);
+        let _ = journal.flush();
+        Ok(())
+    }
+
+    fn compare_and_remove(&self, path: &str, expected: Hash) -> Result<Hash, CasError> {
+        let removed = self.memory.compare_and_remove(path, expected)?;
+        let mut journal = self.journal.lock().unwrap();
+        let _ = write_remove_location(&mut *journal, path);
+        let _ = journal.flush();
+        Ok(removed)
+    }
+
+    fn compare_and_create(&self, path: &str, new_hash: Hash) -> Result<(), CasError> {
+        self.memory.compare_and_create(path, new_hash)?;
+        let mut journal = self.journal.lock().unwrap();
+        let _ = write_set_location(&mut *journal, path, &new_hash);
+        let _ = journal.flush();
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
