@@ -42,6 +42,44 @@ just self-tested.
 
 ## Where we left off
 
+_2026-09-15 (b): **a live §5.4 byte-fidelity violation at eight sites. The `tree:merge` lead we had
+answered as "narrow" was the visible corner of a rule our own type system could not express.**_
+
+`entity-browser-rust` read `handle_merge` at the line and found it rebuilds each `source_envelope`
+entity's `data` from a decoded CBOR value. We had answered that as real but narrow, and deferred it.
+Sweeping the boundary the spec sentence names — *every site that carries an entity's `data` across a
+decode* — found **eight**, and the cause is a type: `entity_ecf::Value` is `ciborium::Value` and
+cannot hold raw bytes, so every place we inline an entity inside another entity's data had to reach
+for decode + re-encode. Two helpers existed for exactly that, which is how it spread.
+
+Four of the eight are nowhere near `tree:merge`: the outbound EXECUTE builder, the receive-side
+dispatch boundary that produces **every handler's `ctx.params`**, the in-process sub-dispatch
+builder, and the EXECUTE_RESPONSE reader — that last one asymmetric, since the *writer* had always
+spliced raw, which is the one shape a round-trip test structurally cannot see.
+
+**Observable cost:** a merge of any entity this peer did not author bound `path → hash` from the
+source trie while storing the entity at a different hash — `200 applied:N` over bindings that resolve
+to nothing. A re-addressed trie *node* drops an entire subtree the same way.
+
+**Why nothing caught it, and it is the transferable part:** the re-encode is the **identity** on
+every value an ECF encoder authors, so no fixture in any tree can tell the broken implementation from
+the fixed one. Our 133-suite `make test` and a clean `validate-complete.sh rust` both sat on top of
+it. The fixture that works is `{"v": 1}` with the `1` written non-minimally — valid CBOR,
+self-consistent, unauthorable by ECF.
+
+Fixed with the missing primitive rather than eight edits (`entity_wire::cbor_map_set_raw`), both
+lossy helpers deleted. The handler-side rows were green with the defect fully live on the wire — N6
+again — so the evidence is a two-peer wire vector, and **both of its axes were measured as
+load-bearing**: with the target sharing the source's store, the pre-fix code passed. Six mutations
+run; all six redden that row and none reddens any pre-existing row.
+
+Routed to `entity-core-go`: their `tree_operations.roundtrip_verify_entity` is the check that would
+have caught this and misses on the same two axes at once, and their cross-peer `extractAndMerge`
+helper re-encodes the envelope in the harness. go itself reads as immune — `Entity.Data` is
+`cbor.RawMessage` — but that is a code read of their tree, not a drive, and the packet says so.
+`validate-complete.sh rust` exits 0 on all six passes after the change (PASS 1: 1658 · 0F);
+`tree_operations` 64 · 0F before and after, which is what says the wire *shape* did not move.
+
 _2026-09-15: **long-running browser peers. Three WebRTC signaling fixes landed, and the remaining
 items are written up in `docs/BACKLOG.md`.**_
 
@@ -62,7 +100,8 @@ fixing them surfaced a third:
 
 Each has a test that fails with the fix removed. Deferred, each with its reason and next step in the
 backlog: why the answerer re-negotiates at all (needs the consumer's peer-side logs), `merge`'s
-`source_envelope` byte fidelity (spans the SDK and the tree handler), `system/content:get`'s namespace
+`source_envelope` byte fidelity (**closed 2026-09-15 (b) — it was eight sites, not two**),
+`system/content:get`'s namespace
 binding (held until grants narrow), the SDK's hardcoded `debug_open_grants` (a migration), and a stale
 `connected` status surviving a restart (a spec gap, logged in `docs/SPEC-AMBIGUITIES.md`).
 

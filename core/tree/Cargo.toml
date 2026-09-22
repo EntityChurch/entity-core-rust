@@ -12,6 +12,10 @@ entity-handler.workspace = true
 entity-store.workspace = true
 entity-types.workspace = true
 entity-capability.workspace = true
+# §5.4 byte fidelity: `encode_envelope` / `decode_envelope` / `cbor_map_field_raw`
+# are the only codec in this tree that carries an entity's `data` as RAW bytes.
+# `extract` and `merge` both inline entities, so both must go through them.
+entity-wire.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 ciborium.workspace = true

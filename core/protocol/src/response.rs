@@ -6,7 +6,6 @@ use entity_entity::{Entity, Envelope};
 use entity_hash::Hash;
 use entity_types::{TYPE_ERROR, TYPE_EXECUTE_RESPONSE};
 
-use crate::connect::decode_entity_from_value;
 use crate::ProtocolError;
 
 /// Build an EXECUTE_RESPONSE envelope (§3.3).
@@ -179,31 +178,15 @@ pub fn parse_execute_response(envelope: &Envelope) -> Result<ParsedResponse, Pro
 
     let mut request_id = None;
     let mut status = None;
-    let mut result_entity = None;
     let mut durability = None;
 
     for (k, v) in map {
         match k.as_text() {
             Some("request_id") => request_id = v.as_text().map(|s| s.to_string()),
             Some("status") => status = v.as_integer().and_then(|i| u32::try_from(i).ok()),
-            Some("result") => {
-                // A bare CBOR null `result` is the 202-accepted async ack
-                // shape Go emits (`make202Response` → `Result: []byte{0xf6}`),
-                // with no `{type,data,content_hash}` wrapper. Rust emits its
-                // own 202 as a `primitive/null` *entity*
-                // (`peer::connection::build_202_response`), so a same-side
-                // round-trip never exercised the bare-null form — a cross-impl
-                // gap that stranded Go's 202 ack in the reader. Tolerate it
-                // (Postel / MUST-ignore spirit): map a null result to the same
-                // `primitive/null` entity we emit, keeping `result: Entity`.
-                // Root-caused in the 2026-07-19 go↔rust null-result validation
-                // run (internal dev history; the tolerance above is the whole
-                // of what it concluded).
-                result_entity = Some(match v {
-                    ciborium::Value::Null => null_result_entity(),
-                    _ => decode_entity_from_value(v)?,
-                });
-            }
+            // `result` is handled OUTSIDE this loop, from the raw slice —
+            // see below. An entity's `data` cannot come through a decoded
+            // `Value` (§5.4).
             // EXTENSION-DURABILITY §5 — optional durability verdict. Bare
             // CBOR map of {requested, applied, committed?, max_available?,
             // reason?} (NOT an entity wrapper, same convention as
@@ -214,6 +197,34 @@ pub fn parse_execute_response(envelope: &Envelope) -> Result<ParsedResponse, Pro
             _ => {}
         }
     }
+
+    // ⛔ **`result` comes from the RAW SLICE, never from the decoded `Value`.**
+    // The scalars above (`request_id`, `status`) survive a decode; an entity's
+    // `data` does not. This used to route through `decode_entity_from_value`,
+    // which rebuilt `data` with `ciborium::into_writer` while keeping the
+    // wire's `content_hash` — so a result entity whose bytes our own codec
+    // would not have authored came back **self-inconsistent**, and the defect
+    // surfaced downstream as `hash_mismatch` *about the entity* rather than as
+    // the byte rewrite it was. This is the read half of
+    // `build_execute_response_full`, which has always spliced with
+    // `encode_entity`; the two were asymmetric and only the write half was
+    // right. Measured by `core/peer`'s
+    // `a_non_canonical_entity_survives_extract_then_merge_to_a_second_peer`.
+    let result_entity = match entity_wire::cbor_map_field_raw(&envelope.root.data, "result") {
+        // A bare CBOR null `result` is the 202-accepted async ack shape Go
+        // emits (`make202Response` → `Result: []byte{0xf6}`), with no
+        // `{type,data,content_hash}` wrapper. Rust emits its own 202 as a
+        // `primitive/null` *entity* (`peer::connection::build_202_response`),
+        // so a same-side round-trip never exercised the bare-null form — a
+        // cross-impl gap that stranded Go's 202 ack in the reader. Tolerate it
+        // (Postel / MUST-ignore spirit). Root-caused in the 2026-07-19 go↔rust
+        // null-result validation run.
+        Some([0xf6]) => Some(null_result_entity()),
+        Some(raw) => Some(
+            entity_wire::decode_entity(raw).map_err(|e| ProtocolError::Invalid(e.to_string()))?,
+        ),
+        None => None,
+    };
 
     // PROPOSAL-CROSS-IMPL-STANDARDIZATION-CATCHUP §2 dispatch-surface
     // result-equivalence: a handler returning a `system/envelope` (or any

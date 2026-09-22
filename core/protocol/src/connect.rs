@@ -700,8 +700,17 @@ fn parse_connect_execute(execute: &Entity) -> Result<ConnectExecute, ProtocolErr
     let request_id = request_id.ok_or(ProtocolError::MissingField("request_id"))?;
     let uri = uri.ok_or(ProtocolError::MissingField("uri"))?;
     let operation = operation.ok_or(ProtocolError::MissingField("operation"))?;
-    let params_v = params_value.ok_or(ProtocolError::MissingField("params"))?;
-    let params = decode_entity_from_value(params_v)?;
+    let _ = params_value;
+    // ⛔ **RAW SLICE for `params`.** The `Value` walk above is fine for
+    // `request_id` / `uri` / `operation` — text scalars survive a decode — but
+    // an entity's `data` does not: §5.4 byte fidelity forbids the
+    // decode+re-encode `decode_entity_from_value` performs, which additionally
+    // keeps the wire's `content_hash` and so hands back a **self-inconsistent**
+    // entity whenever the sender's bytes were not what ciborium would emit.
+    let params_raw = entity_wire::cbor_map_field_raw(&execute.data, "params")
+        .ok_or(ProtocolError::MissingField("params"))?;
+    let params = entity_wire::decode_entity(params_raw)
+        .map_err(|e| ProtocolError::Invalid(e.to_string()))?;
 
     Ok(ConnectExecute {
         request_id,
@@ -711,47 +720,14 @@ fn parse_connect_execute(execute: &Entity) -> Result<ConnectExecute, ProtocolErr
     })
 }
 
-/// Decode an Entity from a ciborium::Value (a CBOR map with type, data, content_hash).
-pub(crate) fn decode_entity_from_value(value: &ciborium::Value) -> Result<Entity, ProtocolError> {
-    let map = value
-        .as_map()
-        .ok_or_else(|| ProtocolError::Invalid("params must be a CBOR map (entity)".into()))?;
-
-    let mut entity_type = None;
-    let mut entity_data = None;
-    let mut content_hash = None;
-
-    for (k, v) in map {
-        match k.as_text() {
-            Some("type") => entity_type = v.as_text().map(|s| s.to_string()),
-            Some("data") => {
-                let mut buf = Vec::new();
-                ciborium::into_writer(v, &mut buf)
-                    .map_err(|e| ProtocolError::Invalid(e.to_string()))?;
-                entity_data = Some(buf);
-            }
-            Some("content_hash") => {
-                if let Some(bytes) = v.as_bytes() {
-                    content_hash = Some(
-                        Hash::from_bytes(bytes)
-                            .map_err(|e| ProtocolError::Invalid(e.to_string()))?,
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
-
-    let entity_type = entity_type.ok_or(ProtocolError::MissingField("type"))?;
-    let data = entity_data.ok_or(ProtocolError::MissingField("data"))?;
-    let content_hash = content_hash.ok_or(ProtocolError::MissingField("content_hash"))?;
-
-    Ok(Entity {
-        entity_type,
-        data,
-        content_hash,
-    })
-}
+// `decode_entity_from_value` is deliberately gone rather than left unused. It
+// rebuilt an entity's `data` with `ciborium::into_writer` while keeping the
+// wire's `content_hash` verbatim — a §5.4 violation that also produced a
+// self-inconsistent entity, so the defect surfaced downstream as
+// `hash_mismatch` about the entity rather than as "your peer rewrote my
+// bytes". Both callers (`parse_connect_execute`, `parse_execute_response`)
+// take the raw slice now. A helper that exists is a helper the next
+// decode-an-inline-entity site will reach for.
 
 /// Build an EXECUTE entity for a connect operation (§4.1).
 ///

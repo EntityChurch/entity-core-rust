@@ -417,6 +417,63 @@ pub fn cbor_array_elements_raw(data: &[u8]) -> Option<Vec<&[u8]>> {
     Some(out)
 }
 
+/// Rebuild a definite-length CBOR **map** with one text-keyed field set to
+/// `value` **verbatim**, copying every other entry's key and value as their
+/// on-wire byte slices. Output is in ECF key order (encoded-key length, then
+/// lexicographic), so a map assembled this way is byte-identical to `to_ecf`
+/// over the same logical value — except that no value is ever re-encoded.
+///
+/// ⛔ **This is the write half of `cbor_map_field_raw`, and it exists because
+/// `entity_ecf::Value` cannot hold raw bytes.** An entity's `data` is a CBOR
+/// *item*, so inlining an entity inside another entity's data (`{content_hash,
+/// data, type}`) through a `Value` tree means a decode+re-encode cycle on
+/// `data` — which §5.4 forbids and which silently re-addresses any entity
+/// whose bytes our own encoder would not have produced. go gets this for free
+/// because its `Entity.Data` is `cbor.RawMessage`; in this tree the splice has
+/// to be explicit, and this is the function that makes it one line.
+///
+/// Errors if `map_bytes` is not a definite-length CBOR map with text keys.
+/// Setting a key that is absent inserts it; setting one that is present
+/// replaces its value.
+pub fn cbor_map_set_raw(map_bytes: &[u8], key: &str, value: &[u8]) -> Result<Vec<u8>, WireError> {
+    let (major, count, head_size) = parse_cbor_head(map_bytes, 0)?;
+    if major != 5 {
+        return Err(WireError::CborDecode(format!(
+            "cbor_map_set_raw: expected CBOR map, got major={major}"
+        )));
+    }
+
+    // (encoded key bytes, value bytes) — keys stay encoded so the ECF sort
+    // below is over exactly the bytes that will be emitted.
+    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(count as usize + 1);
+    let mut cursor = head_size;
+    for _ in 0..count {
+        let (k, after_key) = decode_cbor_text(map_bytes, cursor)?;
+        let value_end = cbor_item_end(map_bytes, after_key)?;
+        if k != key {
+            entries.push((
+                map_bytes[cursor..after_key].to_vec(),
+                map_bytes[after_key..value_end].to_vec(),
+            ));
+        }
+        cursor = value_end;
+    }
+
+    let mut encoded_key = Vec::new();
+    entity_ecf::encode_cbor_text(&mut encoded_key, key);
+    entries.push((encoded_key, value.to_vec()));
+
+    entries.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.cmp(&b.0)));
+
+    let mut out = Vec::new();
+    entity_ecf::encode_head(&mut out, 5 << 5, entries.len() as u64);
+    for (k, v) in entries {
+        out.extend_from_slice(&k);
+        out.extend_from_slice(&v);
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // CBOR byte-range walker (ENTITY-CBOR-ENCODING §4.2 — definite-length only)
 // ---------------------------------------------------------------------------
@@ -607,6 +664,102 @@ mod tests {
     fn make_entity(type_str: &str, data_str: &str) -> Entity {
         let data = entity_ecf::to_ecf(&entity_ecf::text(data_str));
         Entity::new(type_str, data).unwrap()
+    }
+
+    // --- cbor_map_set_raw (§5.4 byte fidelity) ---
+
+    /// The value goes in **verbatim**, including byte sequences no ECF encoder
+    /// emits. This is the property the whole function exists for: an entity's
+    /// `data` is a CBOR item, and carrying it through `ciborium::Value`
+    /// normalizes non-minimal integer and length encodings, folds
+    /// indefinite-length items to definite, sorts map keys and drops tags.
+    ///
+    /// The fixture is a non-minimal uint (`0x18 0x01` for `1`) because the
+    /// alternative — a value our own codec authors — makes the broken and the
+    /// fixed implementation byte-identical and the assertion a tautology.
+    #[test]
+    fn map_set_raw_splices_bytes_our_own_encoder_cannot_emit() {
+        let noncanonical = [0xa1u8, 0x61, 0x76, 0x18, 0x01]; // {"v": 1}, 1 written long
+        let base = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+            entity_ecf::text("type"),
+            entity_ecf::text("test/x"),
+        )]));
+
+        let out = cbor_map_set_raw(&base, "data", &noncanonical).unwrap();
+        assert_eq!(
+            cbor_map_field_raw(&out, "data"),
+            Some(&noncanonical[..]),
+            "the spliced value is the caller's bytes, not a re-encoding of them"
+        );
+        assert_eq!(
+            cbor_map_field_raw(&out, "type"),
+            cbor_map_field_raw(&base, "type"),
+            "untouched fields keep their own byte slices too"
+        );
+
+        // Control: a round trip through `Value` would have changed it, which is
+        // what makes the assertion above worth making.
+        let v: ciborium::Value = ciborium::from_reader(&noncanonical[..]).unwrap();
+        let mut reencoded = Vec::new();
+        ciborium::into_writer(&v, &mut reencoded).unwrap();
+        assert_ne!(
+            reencoded,
+            noncanonical.to_vec(),
+            "fixture must be a value the codec cannot author, or this test is a tautology"
+        );
+    }
+
+    /// Output is in ECF key order regardless of where the set key sorts, so a
+    /// map assembled this way is byte-identical to `to_ecf` over the same
+    /// logical value. Checked against `to_ecf` itself on an all-canonical map.
+    #[test]
+    fn map_set_raw_emits_ecf_key_order() {
+        let base = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+            (entity_ecf::text("source_prefix"), entity_ecf::text("a/")),
+            (
+                entity_ecf::text("strategy"),
+                entity_ecf::text("source-wins"),
+            ),
+            (entity_ecf::text("target_prefix"), entity_ecf::text("b/")),
+        ]));
+        let env = entity_ecf::to_ecf(&entity_ecf::text("envelope-stand-in"));
+        let out = cbor_map_set_raw(&base, "source_envelope", &env).unwrap();
+
+        let expected = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+            (
+                entity_ecf::text("source_envelope"),
+                entity_ecf::text("envelope-stand-in"),
+            ),
+            (entity_ecf::text("source_prefix"), entity_ecf::text("a/")),
+            (
+                entity_ecf::text("strategy"),
+                entity_ecf::text("source-wins"),
+            ),
+            (entity_ecf::text("target_prefix"), entity_ecf::text("b/")),
+        ]));
+        assert_eq!(out, expected);
+    }
+
+    /// Setting a key that is already present replaces it rather than emitting
+    /// a duplicate — a duplicate key is not a CBOR map.
+    #[test]
+    fn map_set_raw_replaces_an_existing_key() {
+        let base = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+            (entity_ecf::text("a"), entity_ecf::text("old")),
+            (entity_ecf::text("b"), entity_ecf::text("keep")),
+        ]));
+        let new_val = entity_ecf::to_ecf(&entity_ecf::text("new"));
+        let out = cbor_map_set_raw(&base, "a", &new_val).unwrap();
+        let decoded: ciborium::Value = ciborium::from_reader(out.as_slice()).unwrap();
+        let map = decoded.as_map().unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(cbor_map_field_raw(&out, "a"), Some(&new_val[..]));
+    }
+
+    #[test]
+    fn map_set_raw_refuses_a_non_map() {
+        let arr = entity_ecf::to_ecf(&entity_ecf::Value::Array(vec![entity_ecf::text("x")]));
+        assert!(cbor_map_set_raw(&arr, "k", b"\x01").is_err());
     }
 
     // --- Framing tests ---

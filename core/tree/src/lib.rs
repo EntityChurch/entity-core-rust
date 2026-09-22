@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use entity_entity::{Entity, EntityError, TYPE_DELETION_MARKER};
+use entity_entity::{Entity, EntityError, Envelope, TYPE_DELETION_MARKER};
 use entity_handler::{
     Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST, STATUS_CONFLICT,
     STATUS_FORBIDDEN, STATUS_MULTI_STATUS, STATUS_NOT_FOUND, STATUS_NOT_SUPPORTED,
@@ -1591,6 +1591,122 @@ impl TreeHandler {
         Ok(HandlerResult::ok(diff_entity))
     }
 
+    /// Ingest `params.source_envelope` (EXTENSION-TREE §5.2) into the content
+    /// store and return the root snapshot's hash.
+    ///
+    /// ⛔ **Read from `ctx.params.data` as a RAW BYTE SLICE, never from the
+    /// decoded params `Value`.** `params.data` is the entity's on-wire CBOR
+    /// (`decode_entity` captures it as a slice for exactly this reason), and an
+    /// envelope's entities are entities: §5.4 forbids a decode+re-encode of
+    /// `data`, so the only conformant way to reach them is to keep the bytes.
+    /// The previous implementation walked the decoded `ciborium::Value` and
+    /// rebuilt each entity with `ciborium::into_writer` — which normalizes
+    /// non-minimal integer and length encodings and folds indefinite-length
+    /// items to definite. For an ECF-canonical entity that is the identity, so
+    /// every fixture in this tree and every cross-impl vector passed; for an
+    /// entity authored anywhere else the rebuilt bytes hash to a **different**
+    /// address, the entity landed at a hash the source trie does not name, and
+    /// the merge reported `200 applied:N` over bindings that resolve to
+    /// nothing. Silent partial data loss with a success report.
+    ///
+    /// ⚠ The far more damaging case is a re-addressed **trie node**:
+    /// `trie::collect_bindings_into` skips a `Link` it cannot load, so one lost
+    /// node drops an entire subtree from the merge — still `200`, still a
+    /// plausible `applied` count.
+    ///
+    /// Routing this through [`entity_wire::decode_envelope`] also closes a
+    /// second gap, and it is the one our own charter predicts: `source_envelope`
+    /// is **an envelope built from received bytes at a site that is not
+    /// `decode_envelope`**, so §3.1's key-binds-value check — the guard against
+    /// filing an entity under a hash it does not hash to — never ran on it.
+    /// It runs now, and a mis-keyed entry is `400 hash_mismatch` rather than a
+    /// silent re-address.
+    ///
+    /// Returns `Ok(Ok(hash))` on success and `Ok(Err(response))` for a coded
+    /// refusal the caller should return verbatim.
+    fn ingest_source_envelope(
+        &self,
+        ctx: &HandlerContext,
+    ) -> Result<Result<Hash, HandlerResult>, HandlerError> {
+        let raw = entity_wire::cbor_map_field_raw(&ctx.params.data, "source_envelope").ok_or_else(
+            || {
+                HandlerError::InvalidParams(
+                    "source_envelope is not addressable in the params CBOR".into(),
+                )
+            },
+        )?;
+
+        // Unwrap the `{type, data}` entity wrapper the continuation inject mode
+        // and both SDK producers use — by raw slice, so the envelope inside it
+        // is still its own on-wire bytes. A bare envelope (no `type`) is
+        // accepted as-is, which is the other shape §5.2 admits.
+        let envelope_bytes = match (
+            entity_wire::cbor_map_field_raw(raw, "type"),
+            entity_wire::cbor_map_field_raw(raw, "data"),
+        ) {
+            (Some(_), Some(data)) => data,
+            _ => raw,
+        };
+
+        let envelope = match entity_wire::decode_envelope(envelope_bytes) {
+            Ok(e) => e,
+            Err(entity_wire::WireError::IncludedKeyMismatch { key, actual }) => {
+                // §3.1 / §5.2a — the same disposition `decode_envelope` earns at
+                // the connection boundary, answered here because this envelope
+                // arrived inside a params field and never crossed that boundary.
+                return Ok(Err(error_result(
+                    STATUS_BAD_REQUEST,
+                    "hash_mismatch",
+                    &format!(
+                        "source_envelope.included entry keyed {key} holds an entity that \
+                         hashes to {actual}"
+                    ),
+                )?));
+            }
+            Err(e) => {
+                return Ok(Err(error_result(
+                    STATUS_BAD_REQUEST,
+                    "invalid_params",
+                    &format!("source_envelope is not a decodable envelope: {e}"),
+                )?));
+            }
+        };
+
+        // §1.8 item 1 on every entity before it enters the store: `content_hash`
+        // rides the wire and is caller-controlled, so a self-inconsistent entity
+        // is refused rather than silently re-stamped. `decode_envelope` has
+        // already bound each included KEY to its entity; this is the other half.
+        for entity in envelope.included.values() {
+            if let Err(e) = entity.validate() {
+                return Ok(Err(error_result(
+                    STATUS_BAD_REQUEST,
+                    "hash_mismatch",
+                    &format!("source_envelope carries a self-inconsistent entity: {e}"),
+                )?));
+            }
+            self.content_store
+                .put(entity.clone())
+                .map_err(|e| HandlerError::Internal(format!("store included entity: {e}")))?;
+        }
+
+        // The root is validated the same way. `decode_envelope` admits a
+        // mis-stamped root by design (it has no key to bind it against), so the
+        // check belongs here — and it must happen before the `put`, because
+        // `ContentStore::put` keys by the stamped field.
+        if let Err(e) = envelope.root.validate() {
+            return Ok(Err(error_result(
+                STATUS_BAD_REQUEST,
+                "hash_mismatch",
+                &format!("source_envelope root is self-inconsistent: {e}"),
+            )?));
+        }
+        let root_hash = self
+            .content_store
+            .put(envelope.root)
+            .map_err(|e| HandlerError::Internal(format!("store root entity: {e}")))?;
+        Ok(Ok(root_hash))
+    }
+
     fn handle_merge(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         let params = decode_params(ctx)
             .ok_or_else(|| HandlerError::InvalidParams("params required for merge".into()))?;
@@ -1616,80 +1732,11 @@ impl TreeHandler {
         };
         let source_hash = if let Some(h) = source_hash {
             h
-        } else if let Some(env_val) = cbor_map_get(params_map, "source_envelope") {
-            // source_envelope: inline entity wrapping an envelope, or raw envelope.
-            // Per TREE §5.2: handler ingests included entities and uses root as source.
-            // Entity data is re-encoded via ciborium round-trip (same approach as
-            // wire::decode_entity — ciborium preserves CBOR byte fidelity).
-            let env_map = env_val.as_map().ok_or_else(|| {
-                HandlerError::InvalidParams("source_envelope must be a map".into())
-            })?;
-
-            // Unwrap entity wrapper if present (from continuation inject mode)
-            let has_type = env_map.iter().any(|(k, _)| k.as_text() == Some("type"));
-            let has_data = env_map.iter().any(|(k, _)| k.as_text() == Some("data"));
-            let envelope_map = if has_type && has_data {
-                let data_val = cbor_map_get(env_map, "data").ok_or_else(|| {
-                    HandlerError::InvalidParams("source_envelope entity missing data".into())
-                })?;
-                data_val.as_map().ok_or_else(|| {
-                    HandlerError::InvalidParams("source_envelope data must be a map".into())
-                })?
-            } else {
-                env_map
-            };
-
-            // Ingest included entities into content store
-            if let Some(included_val) = cbor_map_get(envelope_map, "included") {
-                if let Some(included_map) = included_val.as_map() {
-                    for (_key, val) in included_map {
-                        if let Some(ent_map) = val.as_map() {
-                            let ent_type = cbor_map_get(ent_map, "type")
-                                .and_then(|v| v.as_text().map(String::from))
-                                .unwrap_or_default();
-                            // Use ciborium round-trip for data (preserves CBOR fidelity,
-                            // same approach as wire::decode_entity)
-                            let ent_data = if let Some(d) = cbor_map_get(ent_map, "data") {
-                                let mut buf = Vec::new();
-                                ciborium::into_writer(d, &mut buf).ok();
-                                buf
-                            } else {
-                                Vec::new()
-                            };
-                            if !ent_type.is_empty() && !ent_data.is_empty() {
-                                if let Ok(entity) = Entity::new(&ent_type, ent_data) {
-                                    let _ = self.content_store.put(entity);
-                                }
-                            }
-                        }
-                    }
-                }
+        } else if cbor_map_get(params_map, "source_envelope").is_some() {
+            match self.ingest_source_envelope(ctx)? {
+                Ok(h) => h,
+                Err(refusal) => return Ok(refusal),
             }
-
-            // Extract and store the root (snapshot) entity
-            let root_val = cbor_map_get(envelope_map, "root").ok_or_else(|| {
-                HandlerError::InvalidParams("source_envelope missing root".into())
-            })?;
-            let root_map = root_val.as_map().ok_or_else(|| {
-                HandlerError::InvalidParams("source_envelope root must be a map".into())
-            })?;
-            let root_type = cbor_map_get(root_map, "type")
-                .and_then(|v| v.as_text().map(String::from))
-                .unwrap_or_default();
-            let root_data = if let Some(d) = cbor_map_get(root_map, "data") {
-                let mut buf = Vec::new();
-                ciborium::into_writer(d, &mut buf).ok();
-                buf
-            } else {
-                Vec::new()
-            };
-            let root_entity = Entity::new(&root_type, root_data)
-                .map_err(|e| HandlerError::Internal(format!("build root entity: {}", e)))?;
-            let root_hash = self
-                .content_store
-                .put(root_entity)
-                .map_err(|e| HandlerError::Internal(format!("store root entity: {}", e)))?;
-            root_hash
         } else {
             return Err(HandlerError::InvalidParams(
                 "source snapshot hash or source_envelope required".into(),
@@ -2100,26 +2147,41 @@ impl TreeHandler {
         let snapshot = Entity::new(entity_types::TYPE_TREE_SNAPSHOT, snap_data)
             .map_err(|e| HandlerError::Internal(e.to_string()))?;
 
-        // Build included map: all referenced entities
-        let mut included_pairs: Vec<(entity_ecf::Value, entity_ecf::Value)> = Vec::new();
+        // ⛔ **Every entity here is spliced by its RAW `data` bytes** — built
+        // through `entity_entity::Envelope` + `entity_wire::encode_envelope`,
+        // never by decoding `data` into a `Value` and letting `to_ecf` write
+        // it back (ENTITY-CORE-PROTOCOL §5.4 byte fidelity; §3.1's *"keyed by
+        // its own content hash"*, normative in the SENDER direction since
+        // 0.8.2.23).
+        //
+        // What this used to be — `raw_cbor_value(&entity.data)` into an
+        // `entity_ecf::Value::Map` — is a decode+re-encode, and `to_ecf`
+        // normalizes non-minimal integer and length encodings, folds
+        // indefinite-length items to definite, sorts map keys, and **drops
+        // tags** (`encode_value`'s `Value::Tag(_, inner)` arm). For every
+        // entity our own codec authored those are all no-ops, which is
+        // precisely why no in-tree test and no cross-impl vector could see it:
+        // the transform is the identity on every value the fixture set can
+        // produce. For an entity authored anywhere else, the re-encoded bytes
+        // hash to something else — so this map's KEY (the true hash, taken
+        // from the store) stopped addressing its own VALUE, and the receiver
+        // stored the entity at a hash the trie does not name. Measured end to
+        // end at `merge_from_an_envelope_preserves_entity_bytes`.
+        //
+        // go is immune by construction here: `entity.Entity.Data` is
+        // `cbor.RawMessage`, so its encoder splices. This is the rust-shaped
+        // half of the same rule.
+        // `include`, not `included.insert` — it keys by the RECOMPUTED content
+        // hash (§3.1, 0.8.2.23), which is what makes the map content-addressed
+        // rather than stamp-addressed. With raw `data` now surviving the trip,
+        // the two agree for every honestly-built entity and disagree exactly
+        // where the receiver should refuse.
+        let mut envelope = Envelope::new(snapshot.clone());
+        // The snapshot rides in `included` as well as in `root` — the
+        // receiver's `ContentStore::put` round-trip wants it addressable.
+        envelope.include(snapshot.clone());
 
-        // Include the snapshot itself (with content_hash for Store.Put roundtrip)
-        included_pairs.push((
-            entity_ecf::Value::Bytes(snapshot.content_hash.to_bytes().to_vec()),
-            entity_ecf::Value::Map(vec![
-                (
-                    entity_ecf::text("content_hash"),
-                    entity_ecf::Value::Bytes(snapshot.content_hash.to_bytes().to_vec()),
-                ),
-                (entity_ecf::text("data"), raw_cbor_value(&snapshot.data)),
-                (
-                    entity_ecf::text("type"),
-                    entity_ecf::text(&snapshot.entity_type),
-                ),
-            ]),
-        ));
-
-        // Include all trie node entities (per TREE §6.2 — MUST include all reachable nodes)
+        // All trie node entities (per TREE §6.2 — MUST include all reachable nodes)
         let trie_hashes = trie::collect_all_hashes(self.content_store.as_ref(), root_hash);
         for h in &trie_hashes {
             // Skip binding hashes (data entities are added below) and the snapshot itself
@@ -2127,64 +2189,18 @@ impl TreeHandler {
                 continue;
             }
             if let Some(entity) = self.content_store.get(h) {
-                included_pairs.push((
-                    entity_ecf::Value::Bytes(h.to_bytes().to_vec()),
-                    entity_ecf::Value::Map(vec![
-                        (
-                            entity_ecf::text("content_hash"),
-                            entity_ecf::Value::Bytes(h.to_bytes().to_vec()),
-                        ),
-                        (entity_ecf::text("data"), raw_cbor_value(&entity.data)),
-                        (
-                            entity_ecf::text("type"),
-                            entity_ecf::text(&entity.entity_type),
-                        ),
-                    ]),
-                ));
+                envelope.include(entity);
             }
         }
 
-        // Include data entities referenced by bindings
+        // Data entities referenced by bindings
         for hash in bindings.values() {
             if let Some(entity) = self.content_store.get(hash) {
-                included_pairs.push((
-                    entity_ecf::Value::Bytes(hash.to_bytes().to_vec()),
-                    entity_ecf::Value::Map(vec![
-                        (
-                            entity_ecf::text("content_hash"),
-                            entity_ecf::Value::Bytes(hash.to_bytes().to_vec()),
-                        ),
-                        (entity_ecf::text("data"), raw_cbor_value(&entity.data)),
-                        (
-                            entity_ecf::text("type"),
-                            entity_ecf::text(&entity.entity_type),
-                        ),
-                    ]),
-                ));
+                envelope.include(entity);
             }
         }
 
-        // Build envelope entity: {included: {...}, root: {content_hash, data, type}}
-        let envelope_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-            (
-                entity_ecf::text("included"),
-                entity_ecf::Value::Map(included_pairs),
-            ),
-            (
-                entity_ecf::text("root"),
-                entity_ecf::Value::Map(vec![
-                    (
-                        entity_ecf::text("content_hash"),
-                        entity_ecf::Value::Bytes(snapshot.content_hash.to_bytes().to_vec()),
-                    ),
-                    (entity_ecf::text("data"), raw_cbor_value(&snapshot.data)),
-                    (
-                        entity_ecf::text("type"),
-                        entity_ecf::text(&snapshot.entity_type),
-                    ),
-                ]),
-            ),
-        ]));
+        let envelope_data = entity_wire::encode_envelope(&envelope);
 
         // EXTENSION-TREE §6 + PROPOSAL-CONTINUATION-TRANSFORM-AND-ENVELOPE-AMENDMENTS S3:
         // extract returns `system/envelope` (data bundle), NOT
@@ -2195,10 +2211,12 @@ impl TreeHandler {
     }
 }
 
-/// Parse raw CBOR bytes back into a ciborium::Value for embedding in ECF output.
-fn raw_cbor_value(data: &[u8]) -> entity_ecf::Value {
-    ciborium::from_reader::<ciborium::Value, _>(data).unwrap_or(entity_ecf::Value::Null)
-}
+// `raw_cbor_value` — *"parse raw CBOR bytes back into a ciborium::Value for
+// embedding in ECF output"* — is deliberately gone rather than left unused.
+// It was the one helper in this file whose whole purpose was to carry an
+// entity's `data` across a decode+re-encode, which §5.4 forbids; `extract`
+// and `merge` were its only callers and both splice raw bytes now. A helper
+// that exists is a helper the next inline-an-entity site will reach for.
 
 #[derive(Debug, Error)]
 pub enum TreeError {
@@ -4638,6 +4656,222 @@ mod tests {
 
         // But no actual write
         assert!(!tree.has(&qp("dest/a")));
+    }
+
+    // -----------------------------------------------------------------------
+    // §5.4 byte fidelity across extract → merge
+    // -----------------------------------------------------------------------
+
+    /// An entity whose `data` is valid CBOR that **no ECF encoder emits**:
+    /// `{"v": 1}` with the `1` written non-minimally (`0x18 0x01`). It is
+    /// self-consistent — `content_hash` is computed over these exact bytes —
+    /// so §1.8 item-1 validation passes and `ContentStore::put` keys it at the
+    /// recomputed hash, which for this entity is the same one.
+    ///
+    /// ⛔ **This fixture is the whole test.** The transform under scrutiny —
+    /// decode `data` into a `Value`, write it back with `to_ecf` /
+    /// `ciborium::into_writer` — is the **identity** on every value our own
+    /// codec authors, so a fixture built the usual way (`make_entity`, which
+    /// goes through `to_ecf`) passes under both the broken and the fixed
+    /// implementation and measures nothing. Same rule as
+    /// `set_resolver_config_stores_the_submitted_bytes…`, one level down: there
+    /// the fixture needed a **field** the codec cannot emit, here it needs
+    /// **bytes** it cannot emit. Measured against ciborium 0.2.2: non-minimal
+    /// uint, non-minimal bstr/tstr length, and indefinite-length text / array /
+    /// map all change under the round trip; `to_ecf` additionally sorts map
+    /// keys and drops tags.
+    fn noncanonical_entity() -> Entity {
+        Entity::new("test/noncanon", vec![0xa1, 0x61, 0x76, 0x18, 0x01]).unwrap()
+    }
+
+    /// Wrap an extract result as `source_envelope` and build merge params —
+    /// **splicing the envelope's raw bytes**, the way both SDK producers
+    /// (`follow::bootstrap_merge_params`, `reconcile::build_tree_merge_params`)
+    /// and the continuation's `result_field` injection now do.
+    fn merge_params_raw(envelope: &Entity, source_prefix: &str, target_prefix: &str) -> Vec<u8> {
+        let wrapper = entity_wire::cbor_map_set_raw(
+            &entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+                entity_ecf::text("type"),
+                entity_ecf::text(&envelope.entity_type),
+            )])),
+            "data",
+            &envelope.data,
+        )
+        .unwrap();
+        entity_wire::cbor_map_set_raw(
+            &entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+                (
+                    entity_ecf::text("source_prefix"),
+                    entity_ecf::text(source_prefix),
+                ),
+                (
+                    entity_ecf::text("target_prefix"),
+                    entity_ecf::text(target_prefix),
+                ),
+            ])),
+            "source_envelope",
+            &wrapper,
+        )
+        .unwrap()
+    }
+
+    /// A `HandlerContext` whose `params.data` is exactly the bytes given — no
+    /// `to_ecf` pass, so a deliberately non-canonical byte sequence reaches the
+    /// handler the way the wire delivers it. `make_handler_context` cannot be
+    /// used for these rows: it re-encodes the params `Value`, which is itself
+    /// one of the transforms under test.
+    fn make_handler_context_raw_params(operation: &str, params_data: Vec<u8>) -> HandlerContext {
+        let mut ctx = make_handler_context(operation, None, None);
+        ctx.params =
+            Entity::new(&format!("system/tree/{}-params", operation), params_data).unwrap();
+        ctx
+    }
+
+    /// Put an entity, `extract` it, `merge` the envelope into a peer that has
+    /// **never seen it**, and check the merged path resolves to content.
+    ///
+    /// Both halves of that sentence are load-bearing and each is, on its own,
+    /// enough to make the row blind — which is why core-go's
+    /// `roundtrip_verify_entity` scored us PASS through the whole defect:
+    ///
+    /// 1. **Its fixture is ECF-canonical** (`ecf.Encode` in `put_entity`), so
+    ///    the re-encode is the identity.
+    /// 2. **Its round trip is same-peer** — `system/validate/tree-ops/` to
+    ///    `…/tree-ops-mirror/` on one peer — so the target already holds every
+    ///    entity from the original `put`, and the binding resolves whether or
+    ///    not the envelope ingest did anything at all.
+    ///
+    /// Measured here: driving the same fixture into a target that **shares**
+    /// the source's store passed against the pre-fix code, i.e. fixing only (1)
+    /// would not have reddened it. Both axes have to move.
+    ///
+    /// **Mutations RUN** (not predicted — the first prediction about which row
+    /// each would redden was wrong once already):
+    /// - *M1, re-encode on the receive side* (`ingest_source_envelope` rebuilds
+    ///   `data` through `ciborium::into_writer`): **this row reddens**,
+    ///   `a_miskeyed_source_envelope_is_refused…` stays **green** — M1 is
+    ///   downstream of the key check and cannot reach it.
+    /// - *M2, re-encode on the emit side* (`handle_extract` re-encodes each
+    ///   entity and keys it by the store hash, the literal pre-fix code):
+    ///   **this row reddens**. Note what stays green — all three pre-existing
+    ///   `test_handler_extract_*` rows — which is the finding, not a detail:
+    ///   the extract suite asserts the envelope's *shape*, and the shape is
+    ///   identical under both implementations.
+    /// - *M5, drop §3.1's key-binds-value refusal in `decode_envelope`*: this
+    ///   row stays **green** (M2 is not active, so the keys are honest) and
+    ///   only `a_miskeyed_source_envelope_is_refused…` reddens. The two rows
+    ///   are **disjoint discriminators**: one measures the bytes, the other
+    ///   measures the addressing, and neither can stand in for the other.
+    ///
+    /// The canonical row in the loop is the control. It passes under every
+    /// mutation above, which is the point: it is what a reader would have
+    /// written, and it is why this shipped.
+    #[tokio::test]
+    async fn merge_from_an_envelope_preserves_entity_bytes() {
+        for (label, ent) in [
+            ("non-canonical", noncanonical_entity()),
+            ("canonical control", make_entity("test/canon", "a")),
+        ] {
+            let source = make_tree();
+            let true_hash = source.put(&qp("src/a"), ent.clone()).unwrap();
+            assert_eq!(
+                true_hash, ent.content_hash,
+                "{label}: fixture is self-consistent"
+            );
+
+            let ex = source
+                .handle(&make_handler_context(
+                    "extract",
+                    None,
+                    Some(vec![qp("src/")]),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(ex.status, STATUS_OK, "{label}: extract");
+
+            // A peer that has never seen this entity.
+            let target = make_tree();
+            let res = target
+                .handle(&make_handler_context_raw_params(
+                    "merge",
+                    merge_params_raw(&ex.result, "src/", "dest/"),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(res.status, STATUS_OK, "{label}: merge status");
+
+            assert_eq!(
+                target.location_index.get(&qp("dest/a")),
+                Some(true_hash),
+                "{label}: the binding names the source hash"
+            );
+            let got = target
+                .get(&qp("dest/a"))
+                .unwrap_or_else(|| panic!("{label}: merged path resolves to content"));
+            assert_eq!(got.content_hash, true_hash, "{label}: same entity");
+            assert_eq!(
+                got.data, ent.data,
+                "{label}: §5.4 — the bytes crossed the merge unchanged"
+            );
+        }
+    }
+
+    /// The other half of routing `source_envelope` through
+    /// [`entity_wire::decode_envelope`]: §3.1's key-binds-value check now runs
+    /// on it. It never did before, because `source_envelope` is **an envelope
+    /// built from received bytes at a site that is not `decode_envelope`** —
+    /// the exact gap our charter's *"enforce it at the constructor"* entry
+    /// predicts, one params field away from the constructor that enforces it.
+    #[tokio::test]
+    async fn a_miskeyed_source_envelope_is_refused_not_silently_re_addressed() {
+        let source = make_tree();
+        let ent = make_entity("test/canon", "a");
+        source.put(&qp("src/a"), ent.clone()).unwrap();
+        let ex = source
+            .handle(&make_handler_context(
+                "extract",
+                None,
+                Some(vec![qp("src/")]),
+            ))
+            .await
+            .unwrap();
+
+        // Re-key one included entry under a hash it does not hash to, leaving
+        // the entity itself untouched and self-consistent — `validate()` alone
+        // cannot see this, which is why the KEY check has to be its own.
+        let env_val = decode_cbor(&ex.result.data);
+        let mut env_map = env_val.as_map().unwrap().clone();
+        let wrong = Hash::compute("test/canon", b"\x61z");
+        for (k, v) in env_map.iter_mut() {
+            if k.as_text() == Some("included") {
+                let mut inc = v.as_map().unwrap().clone();
+                let bad = entity_ecf::Value::Bytes(wrong.to_bytes().to_vec());
+                let last = inc.len() - 1;
+                inc[last].0 = bad;
+                *v = entity_ecf::Value::Map(inc);
+            }
+        }
+        let forged = Entity::new(
+            &ex.result.entity_type,
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(env_map)),
+        )
+        .unwrap();
+
+        let target = make_tree();
+        let res = target
+            .handle(&make_handler_context_raw_params(
+                "merge",
+                merge_params_raw(&forged, "src/", "dest/"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status, STATUS_BAD_REQUEST);
+        let (code, _) = entity_handler::decode_error_entity(&res.result).unwrap();
+        assert_eq!(code.as_deref(), Some("hash_mismatch"));
+        assert!(
+            !target.has(&qp("dest/a")),
+            "a refused envelope writes nothing"
+        );
     }
 
     // -----------------------------------------------------------------------

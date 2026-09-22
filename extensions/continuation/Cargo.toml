@@ -12,6 +12,9 @@ entity-store.workspace = true
 entity-handler.workspace = true
 entity-capability.workspace = true
 entity-protocol.workspace = true
+# §5.4 byte fidelity — `cbor_map_set_raw` splices an entity's `data` without a
+# decode+re-encode; see the doc comment there for why a `Value` cannot.
+entity-wire.workspace = true
 entity-types.workspace = true
 async-trait.workspace = true
 ciborium.workspace = true

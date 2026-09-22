@@ -15,6 +15,9 @@ entity-types.workspace = true
 entity-crypto.workspace = true
 entity-handler.workspace = true
 entity-capability.workspace = true
+# §5.4 byte fidelity — `cbor_map_set_raw` splices an entity's `data` without a
+# decode+re-encode; see the doc comment there for why a `Value` cannot.
+entity-wire.workspace = true
 # Direct dep on entity-protocol so the SDK can surface
 # `is_operator_class_for` (GUIDE-CAPABILITIES §10) at the consumer
 # boundary — app code consults via SDK, not by reaching into

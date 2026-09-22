@@ -2029,6 +2029,65 @@ gates by making the TCP path compile on wasm32.
   item is a claim with an expiry date, and the comment will never tell you it expired** — when a
   ruling lands on a surface, grep the tree for the superseded item's identifier, not just for the
   behaviour.
+- **A byte-fidelity rule the TYPE cannot express is a rule every site re-decides, and every site
+  will get it wrong the same way — find the missing primitive, not the missing call.** *(Candidate:
+  bit us once, 2026-09-15, at **eight** sites simultaneously; found by a sibling's read of one of
+  them.)* §5.4 says an entity's `data` is preserved as-is, never decoded and re-encoded. `core/wire`
+  holds that line perfectly — `decode_entity` captures `data` as a raw slice, `encode_entity`
+  splices it. Everywhere else in the tree it was violated, because **`entity_ecf::Value` IS
+  `ciborium::Value` and cannot hold raw bytes**: the moment a site needs to inline an entity inside
+  another entity's data — `{content_hash, data, type}`, which is §3.4's params shape, §3.1's
+  `included` entries, and every result wrapper — the only tool available was
+  `ciborium::from_reader` + `to_ecf`. Two helpers existed for exactly that purpose
+  (`core/tree::raw_cbor_value`, `core/protocol::decode_entity_from_value`), which is how the pattern
+  propagated: the second site copied the first. **go has no such rule to remember — its
+  `Entity.Data` is `cbor.RawMessage`, so its encoder splices by construction.** A rule one
+  implementation gets for free from a type is a rule the other implementation will break at every
+  site, and the fix is a primitive (`entity_wire::cbor_map_set_raw`), not N call-site edits. Delete
+  the lossy helpers in the same commit — a helper that exists is a helper the next site reaches for,
+  and `raw_cbor_value` going dead was the signal that `core/tree` was actually clean.
+  **What it cost, measured:** `to_ecf` sorts map keys, normalizes non-minimal integer and length
+  encodings, folds indefinite-length items to definite and **drops tags**; ciborium's own round trip
+  does all but the first and last. So a `tree:merge` of any entity this peer did not author stored it
+  at a hash the source trie does not name — `200 applied:N` over bindings resolving to nothing — and
+  a re-addressed *trie node* silently drops an entire subtree, because
+  `trie::collect_bindings_into` skips a `Link` it cannot load.
+  **Enforcement, and it is the grep plus the fixture rule.** (a) `grep -rn 'text("content_hash")'
+  --include=*.rs` enumerates the inline-an-entity sites; for each, read what the `data` key is given.
+  A decoded `Value` is the defect. (b) **Any test of this class needs a fixture whose BYTES our own
+  codec cannot author** — the entry above already says a byte-exactness fixture needs a *field* the
+  codec cannot emit; this is the same rule one level down. `{"v": 1}` with the `1` written
+  non-minimally (`0xa1 0x61 0x76 0x18 0x01`) is self-consistent, valid CBOR, and unauthorable by ECF.
+  Built with `to_ecf` instead, the broken and the fixed implementation are byte-identical and the
+  assertion is a tautology — which is why this shipped behind a green suite and a green cross-impl
+  gate.
+  **And the half that is about WHERE the row lives, because a handler-side fix was dead code for the
+  second time this month.** `core/tree`'s rows were green with the defect fully live on the wire:
+  four more layers between the socket and the handler re-encoded independently — the outbound EXECUTE
+  builder, `extract_params_entity` (every handler's `ctx.params`), the in-process sub-dispatch
+  builder, and `parse_execute_response`. That last one is the sharpest: `build_execute_response_full`
+  has **always** spliced raw, so the write half was right and only the read half was wrong, and **a
+  round-trip test is structurally unable to see an encoder/decoder disagreement** — it is the one
+  shape where two functions can disagree and still round-trip. Same conclusion as `0.8.2.24` N6:
+  *an in-process row is a floor under a vector, not one.* Teeth:
+  `core/peer/tests/merge_byte_fidelity_vector.rs`, two peers over a real handshake, whose **two axes
+  are both load-bearing** — a non-canonical fixture AND a target peer that has never seen the entity.
+  Measured: with the target sharing the source's store the pre-fix code **passed**, because merge
+  binds `path → hash` from the source trie and a target that already holds that hash resolves it
+  whether or not the ingest did anything. Six mutations RUN, all six reddening that row and **no**
+  pre-existing row in the 133-suite set.
+  **Cohort note, stated at the right evidence level:** core-go's `tree_operations.roundtrip_verify_
+  entity` is the check that would catch this and misses on **both** axes (an `ecf.Encode` fixture,
+  and a `tree-ops/` → `tree-ops-mirror/` round trip on one peer); its cross-peer
+  `convergence.extractAndMerge` helper re-encodes the envelope in the **harness**
+  (`cbor.Unmarshal` → `ecf.Encode`), so it would flatten the fixture before any peer saw it. That is
+  a code read of their tree, not a drive — routed for them to confirm and to own the vector.
+- **⚠ A restore that preserves the backup's mtime makes `cargo` skip the rebuild, and the test you
+  then run is about the PREVIOUS binary.** Cost ~10 minutes here chasing a "failure" that was a
+  reverted mutation still linked in. `shutil.move`/`cp -p` back over a source file is the trap.
+  `touch` every file you restored before re-running, and treat a `Finished … in 0.0Ns` with no
+  `Compiling` line as the tell — it is the in-tree twin of the charter's *"check the build line or
+  you have mutated a binary nobody re-made."*
 - **SDK '`static` futures:** any `pub async fn(&self, ...)` on borrowed accessors
   (`IdentityOps`/`ComputeOps`/…) plumbed through a `BoxFuture<'static>` consumer trait must
   instead return `impl Future + Send + 'static` (drop `Send` on wasm32): capture Arcs/owned

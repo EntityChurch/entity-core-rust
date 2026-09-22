@@ -276,24 +276,36 @@ fn build_tree_merge_params(envelope: &Entity, prefix: &str, strategy: &str) -> E
     // the same prefix (the diff was computed for `prefix` on the
     // remote, and we want the same prefix locally).
     //
-    // ECF order: source_envelope, source_prefix, strategy, target_prefix.
-    let env_value: ciborium::Value =
-        ciborium::de::from_reader(envelope.data.as_slice()).unwrap_or(ciborium::Value::Null);
-    let source_envelope = ciborium::Value::Map(vec![
-        (entity_ecf::text("data"), env_value),
-        (
+    //
+    // ⛔ **`source_envelope` is spliced RAW** — `cbor_map_set_raw`, never a
+    // `ciborium::from_reader` + `to_ecf` round trip. §5.4 byte fidelity binds
+    // the entities *inside* the envelope, and re-encoding them here silently
+    // re-addresses any entity whose bytes our own codec would not have
+    // produced, while leaving the `included` map keyed by the original hash.
+    // See `follow::wrap_envelope_raw` for the full argument and
+    // `core/tree`'s `merge_from_an_envelope_preserves_entity_bytes` for the
+    // measurement.
+    let source_envelope = entity_wire::cbor_map_set_raw(
+        &entity_ecf::to_ecf(&ciborium::Value::Map(vec![(
             entity_ecf::text("type"),
             entity_ecf::text(&envelope.entity_type),
-        ),
-    ]);
+        )])),
+        "data",
+        &envelope.data,
+    )
+    .expect("to_ecf emits a definite-length text-keyed map");
 
     let fields: Vec<(ciborium::Value, ciborium::Value)> = vec![
-        (entity_ecf::text("source_envelope"), source_envelope),
         (entity_ecf::text("source_prefix"), entity_ecf::text(prefix)),
         (entity_ecf::text("strategy"), entity_ecf::text(strategy)),
         (entity_ecf::text("target_prefix"), entity_ecf::text(prefix)),
     ];
-    let data = entity_ecf::to_ecf(&ciborium::Value::Map(fields));
+    let data = entity_wire::cbor_map_set_raw(
+        &entity_ecf::to_ecf(&ciborium::Value::Map(fields)),
+        "source_envelope",
+        &source_envelope,
+    )
+    .expect("to_ecf emits a definite-length text-keyed map");
     Entity::new("system/tree/merge-params", data)
         .expect("tree merge-params entity construction is infallible")
 }
@@ -346,6 +358,43 @@ mod tests {
             .generate_keypair()
             .build()
             .expect("PeerContext build should succeed")
+    }
+
+    /// The reconcile producer's half of `follow`'s
+    /// `merge_params_carry_the_envelopes_own_bytes`: the extract envelope's
+    /// `data` reaches `tree:merge` as the bytes the remote sent (§5.4). Two
+    /// producers of `source_envelope`, two rows — a shared argument is not a
+    /// measurement of either site.
+    ///
+    /// The fixture is a non-minimal uint, a byte sequence our own encoder
+    /// cannot author; built with `to_ecf` this assertion is a tautology.
+    ///
+    /// **Mutation RUN** — restore the `from_reader` + `into_writer` wrap: this
+    /// row reddens, and `follow`'s row is unaffected (different function).
+    #[test]
+    fn merge_params_carry_the_envelopes_own_bytes() {
+        let noncanonical = vec![0xa1u8, 0x61, 0x76, 0x18, 0x01];
+        let v: ciborium::Value = ciborium::de::from_reader(noncanonical.as_slice()).unwrap();
+        let mut reencoded = Vec::new();
+        ciborium::into_writer(&v, &mut reencoded).unwrap();
+        assert_ne!(
+            reencoded, noncanonical,
+            "fixture must be a value the codec cannot author, or this test is a tautology"
+        );
+
+        let envelope = Entity::new("system/envelope", noncanonical.clone()).unwrap();
+        let params = build_tree_merge_params(&envelope, "/p/app/", "source-wins");
+
+        let wrapper = entity_wire::cbor_map_field_raw(&params.data, "source_envelope")
+            .expect("source_envelope is addressable");
+        assert_eq!(
+            entity_wire::cbor_map_field_raw(wrapper, "data"),
+            Some(&noncanonical[..]),
+        );
+        assert_eq!(
+            entity_wire::cbor_map_field_raw(&params.data, "strategy"),
+            Some(&entity_ecf::to_ecf(&entity_ecf::text("source-wins"))[..]),
+        );
     }
 
     /// Empty `remote_peer_id` is rejected pre-dispatch with a wrapper-

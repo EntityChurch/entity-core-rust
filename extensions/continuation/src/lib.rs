@@ -3859,27 +3859,24 @@ fn assemble_params(
         // Neither params nor result_field: pass-through
         (None, None) => Ok(result_bytes.to_vec()),
 
-        // Params + result_field: inject
+        // Params + result_field: inject.
+        //
+        // ⛔ **The previous step's result is spliced as RAW BYTES.** It used to
+        // be decoded into a `ciborium::Value` and written back with
+        // `into_writer`, which normalizes non-minimal integer and length
+        // encodings and folds indefinite-length items to definite. A result
+        // entity's `data` is a CBOR item and §5.4 byte fidelity binds it, so
+        // that round trip re-addressed anything our own codec would not have
+        // authored — and this function is the **third** hop on `follow`'s
+        // `extract → merge` leg (after the extract envelope and the SDK's
+        // params builder), so a fix at either of those alone would not have
+        // survived here. `cbor_map_set_raw` copies every other field's value
+        // slice verbatim too, so the params this closure did not touch are
+        // equally untouched.
         (Some(params_bytes), Some(field)) => {
-            let mut params_val: ciborium::Value = ciborium::from_reader(params_bytes.as_slice())
-                .map_err(|e| HandlerError::InvalidParams(format!("decode params: {}", e)))?;
-            let result_val: ciborium::Value = ciborium::from_reader(result_bytes)
-                .map_err(|e| HandlerError::InvalidParams(format!("decode result: {}", e)))?;
-
-            if let ciborium::Value::Map(ref mut map) = params_val {
-                // Remove existing field if present, then add
-                map.retain(|(k, _)| k.as_text() != Some(field));
-                map.push((ciborium::Value::Text(field.clone()), result_val));
-            } else {
-                return Err(HandlerError::InvalidParams(
-                    "params not a map for injection".into(),
-                ));
-            }
-
-            let mut buf = Vec::new();
-            ciborium::into_writer(&params_val, &mut buf)
-                .map_err(|e| HandlerError::Internal(format!("encode assembled: {}", e)))?;
-            Ok(buf)
+            entity_wire::cbor_map_set_raw(params_bytes, field, result_bytes).map_err(|e| {
+                HandlerError::InvalidParams(format!("params not a map for injection: {e}"))
+            })
         }
 
         // Params but no result_field: trigger mode
@@ -4033,6 +4030,57 @@ mod tests {
 
     fn make_params(data: entity_ecf::Value) -> Entity {
         Entity::new("primitive/null", entity_ecf::to_ecf(&data)).unwrap()
+    }
+
+    /// `result_field` injection is hop **three** of `follow`'s
+    /// `extract → merge` leg, and every hop that decodes an entity's `data`
+    /// into a `Value` and writes it back silently re-addresses it (§5.4).
+    ///
+    /// The fixture carries a non-minimal uint (`0x18 0x01` for `1`) because
+    /// that is a byte sequence our own encoder cannot author — a result built
+    /// with `to_ecf` is byte-identical under both the broken and the fixed
+    /// implementation, so it would measure nothing. Untouched static params are
+    /// asserted too: `cbor_map_set_raw` copies their value slices verbatim, and
+    /// the old implementation re-encoded those as well.
+    ///
+    /// **Mutation RUN** — restore the `from_reader` + `into_writer` injection
+    /// (M3): this row reddens; the three `test_v116_assemble_params_merge_*`
+    /// rows beside it stay **green**, because `assemble_params_merge` is a
+    /// different function and was not part of this change. It carries the same
+    /// defect for `result_merge` mode and is **not** fixed here — noted rather
+    /// than left silent: that mode does a shallow key union, which cannot be
+    /// done on raw slices without a key-level walk, and no shipping path in
+    /// this tree threads an entity through it.
+    #[test]
+    fn assemble_params_splices_the_previous_results_bytes_verbatim() {
+        let noncanonical = vec![0xa1u8, 0x61, 0x76, 0x18, 0x01]; // {"v": 1}, 1 written long
+        let mut reencoded = Vec::new();
+        let v: ciborium::Value = ciborium::from_reader(noncanonical.as_slice()).unwrap();
+        ciborium::into_writer(&v, &mut reencoded).unwrap();
+        assert_ne!(
+            reencoded, noncanonical,
+            "fixture must be a value the codec cannot author, or this test is a tautology"
+        );
+
+        let static_params = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+            (entity_ecf::text("source_prefix"), entity_ecf::text("a/")),
+            (entity_ecf::text("target_prefix"), entity_ecf::text("b/")),
+        ]));
+        let out = assemble_params(
+            &Some(static_params.clone()),
+            &Some("source_envelope".to_string()),
+            &noncanonical,
+        )
+        .unwrap();
+
+        assert_eq!(
+            entity_wire::cbor_map_field_raw(&out, "source_envelope"),
+            Some(&noncanonical[..]),
+        );
+        assert_eq!(
+            entity_wire::cbor_map_field_raw(&out, "source_prefix"),
+            entity_wire::cbor_map_field_raw(&static_params, "source_prefix"),
+        );
     }
 
     fn make_execute() -> Entity {

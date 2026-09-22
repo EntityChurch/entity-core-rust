@@ -511,26 +511,48 @@ fn merge_params_cbor(prefix: &str) -> Vec<u8> {
 /// `reconcile.rs::build_tree_merge_params`.
 #[cfg(feature = "continuation")]
 fn bootstrap_merge_params(envelope: &Entity, prefix: &str) -> Entity {
-    let env_value: ciborium::Value =
-        ciborium::de::from_reader(envelope.data.as_slice()).unwrap_or(ciborium::Value::Null);
-    let source_envelope = entity_ecf::Value::Map(vec![
-        (entity_ecf::text("data"), env_value),
-        (
-            entity_ecf::text("type"),
-            entity_ecf::text(&envelope.entity_type),
-        ),
-    ]);
-    let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-        (entity_ecf::text("source_envelope"), source_envelope),
-        (entity_ecf::text("source_prefix"), entity_ecf::text(prefix)),
-        (
-            entity_ecf::text("strategy"),
-            entity_ecf::text("source-wins"),
-        ),
-        (entity_ecf::text("target_prefix"), entity_ecf::text(prefix)),
-    ]));
+    let data = entity_wire::cbor_map_set_raw(
+        &entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+            (entity_ecf::text("source_prefix"), entity_ecf::text(prefix)),
+            (
+                entity_ecf::text("strategy"),
+                entity_ecf::text("source-wins"),
+            ),
+            (entity_ecf::text("target_prefix"), entity_ecf::text(prefix)),
+        ])),
+        "source_envelope",
+        &wrap_envelope_raw(envelope),
+    )
+    .expect("to_ecf emits a definite-length text-keyed map");
     Entity::new("system/tree/merge-params", data)
         .expect("tree merge-params entity construction is infallible")
+}
+
+/// Wrap an extract result as `tree:merge`'s `source_envelope` — `{data, type}`
+/// with `data` **spliced as the envelope entity's raw bytes**.
+///
+/// ⛔ **Never `ciborium::from_reader` + `to_ecf` here.** An envelope's entities
+/// carry their own `data`, and §5.4 byte fidelity forbids a decode+re-encode of
+/// it. The round trip normalizes non-minimal integer and length encodings,
+/// folds indefinite-length items to definite, sorts map keys and drops tags —
+/// all of which are the identity for anything our own codec authored, and none
+/// of which is for an entity that came from anywhere else. Re-encoding here
+/// re-addressed every such entity while leaving the `included` map keyed by the
+/// original hash, so the receiver's merge stored it at an address its own trie
+/// does not name: `200 applied:N` over bindings that resolve to nothing.
+/// `core/tree`'s `merge_from_an_envelope_preserves_entity_bytes` drives the
+/// pair end to end.
+#[cfg(feature = "continuation")]
+fn wrap_envelope_raw(envelope: &Entity) -> Vec<u8> {
+    entity_wire::cbor_map_set_raw(
+        &entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+            entity_ecf::text("type"),
+            entity_ecf::text(&envelope.entity_type),
+        )])),
+        "data",
+        &envelope.data,
+    )
+    .expect("to_ecf emits a definite-length text-keyed map")
 }
 
 /// Applies delivered subscription events to the local store as mirror
@@ -691,6 +713,51 @@ mod tests {
     #[test]
     fn slugify_flattens_prefix() {
         assert_eq!(slugify("/p/app/chat/c/messages/"), "p-app-chat-c-messages");
+    }
+
+    /// Hop **two** of the `extract → merge` leg. The envelope entity's `data`
+    /// must reach `tree:merge` as the bytes the remote sent, because §5.4 byte
+    /// fidelity binds the entities *inside* it and a re-encode re-addresses
+    /// them while the `included` map keeps the original keys.
+    ///
+    /// The fixture is a non-minimal uint (`0x18 0x01` for `1`) — a byte
+    /// sequence our own encoder cannot author. Built with `to_ecf` instead, the
+    /// broken and the fixed producer emit identical bytes and the assertion
+    /// measures nothing, which is exactly why this shipped.
+    ///
+    /// **Mutation RUN** — restore the `from_reader` + `into_writer` wrap (M4):
+    /// this row reddens and nothing else in the 219-row sdk suite does.
+    /// `reconcile::build_tree_merge_params` is the same edit at the other
+    /// producer and has its own row —
+    /// `reconcile::tests::merge_params_carry_the_envelopes_own_bytes`. Two
+    /// producers, two observers: a shared argument is not a measurement of
+    /// either site.
+    #[cfg(feature = "continuation")]
+    #[test]
+    fn merge_params_carry_the_envelopes_own_bytes() {
+        let noncanonical = vec![0xa1u8, 0x61, 0x76, 0x18, 0x01];
+        let v: ciborium::Value = ciborium::de::from_reader(noncanonical.as_slice()).unwrap();
+        let mut reencoded = Vec::new();
+        ciborium::into_writer(&v, &mut reencoded).unwrap();
+        assert_ne!(
+            reencoded, noncanonical,
+            "fixture must be a value the codec cannot author, or this test is a tautology"
+        );
+
+        let envelope = Entity::new("system/envelope", noncanonical.clone()).unwrap();
+        let params = bootstrap_merge_params(&envelope, "/p/app/");
+
+        let wrapper = entity_wire::cbor_map_field_raw(&params.data, "source_envelope")
+            .expect("source_envelope is addressable");
+        assert_eq!(
+            entity_wire::cbor_map_field_raw(wrapper, "data"),
+            Some(&noncanonical[..]),
+        );
+        // The rest of the params are still an ordinary ECF map.
+        assert_eq!(
+            entity_wire::cbor_map_field_raw(&params.data, "strategy"),
+            Some(&entity_ecf::to_ecf(&entity_ecf::text("source-wins"))[..]),
+        );
     }
 
     /// A `FollowMode::Continuation` follow with no connection to the remote

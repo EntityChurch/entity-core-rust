@@ -2658,22 +2658,6 @@ pub fn build_authenticated_execute(
         ));
     }
 
-    // Build params as inline entity map (matching wire format §3.4)
-    let params_data_val: entity_ecf::Value =
-        ciborium::from_reader(params.data.as_slice()).unwrap_or(entity_ecf::Value::Null);
-    let params_entity_val = entity_ecf::Value::Map(vec![
-        (
-            entity_ecf::text("content_hash"),
-            entity_ecf::Value::Bytes(params.content_hash.to_bytes().to_vec()),
-        ),
-        (entity_ecf::text("data"), params_data_val),
-        (
-            entity_ecf::text("type"),
-            entity_ecf::text(&params.entity_type),
-        ),
-    ]);
-    fields.push((entity_ecf::text("params"), params_entity_val));
-
     // Include deliver_to + deliver_token per CONTINUATION §3.5 step 4
     if let Some(dt) = deliver_to_params {
         fields.push((
@@ -2749,7 +2733,22 @@ pub fn build_authenticated_execute(
         }
     }
 
-    let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(fields));
+    // §3.4's inline params entity `{content_hash, data, type}`, spliced by
+    // `encode_entity` so `data` rides as the caller's RAW bytes (§5.4). The
+    // `ciborium::from_reader` + `to_ecf` form this replaces re-encoded every
+    // outbound EXECUTE's params — which is the identity for anything our own
+    // codec authored, and a silent rewrite for anything else: a `tree:merge`
+    // `source_envelope` forwarded to a peer, or GUIDE-CONFORMANCE §7a.2a's
+    // in-band reentry capability / granter / signature, whose whole contract
+    // is that they round-trip without a decode+re-encode cycle. Added LAST and
+    // through `cbor_map_set_raw`, which re-sorts into ECF key order, so the
+    // field order this used to depend on is no longer load-bearing.
+    let data = entity_wire::cbor_map_set_raw(
+        &entity_ecf::to_ecf(&entity_ecf::Value::Map(fields)),
+        "params",
+        &entity_wire::encode_entity(params),
+    )
+    .map_err(|e| PeerError::ConnectionError(format!("build execute params: {}", e)))?;
     let execute = Entity::new(entity_types::TYPE_EXECUTE, data)
         .map_err(|e| PeerError::ConnectionError(format!("build execute: {}", e)))?;
 

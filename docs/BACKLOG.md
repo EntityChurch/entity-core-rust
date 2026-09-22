@@ -53,22 +53,32 @@ Tree get with `mode: "hash"` should return just the hash without fetching the en
 ### Pagination
 Tree listing should support offset/limit for large subtrees.
 
-### `merge` with `source_envelope` re-encodes instead of storing the received bytes
-EXTENSION-TREE §5.4 has `merge` put each `source_envelope` entity into the content store. `handle_merge`
-(`core/tree`) rebuilds each entity's `data` from a decoded CBOR value, recomputes its hash, ignores the
-`included` map's keys and each entity's stated `content_hash`, and drops per-entity failures silently.
-**Effect:** none for ECF-canonical entities, which is everything a conformant peer emits: the rebuilt
-bytes and hash are identical. A non-canonical entity is stored under a different hash than the one
-the source trie names, so the merge silently misses it. The content store cannot be poisoned through
-this path, because the recompute is what keeps it content-addressed (`ContentStore::put` keys by the
-entity's stamped hash).
-**Why it is not a one-site fix:** both SDK producers of `source_envelope`
-(`bindings/sdk` `follow.rs::bootstrap_merge_params` and `reconcile.rs::build_tree_merge_params`) decode
-the envelope and re-encode it canonically before the handler sees it. The fix spans producer and
-handler: carry the envelope's raw bytes through, decode them with `entity_wire::decode_envelope`
-(raw `data` slices plus the key-binds-value check), and `validate()` each entity before `put`.
-That turns today's silent re-address into a `400 hash_mismatch` for a non-canonical entity, so measure
-it against the go and py peers on `follow` and reconcile before landing.
+### ~~`merge` with `source_envelope` re-encodes instead of storing the received bytes~~ DONE
+Closed 2026-09-15. The lead (`entity-browser-rust` K-4) was accurate and the boundary was **six
+sites wide**, not one: `handle_extract`, `handle_merge`, both SDK `source_envelope` producers, the
+continuation's `result_field` injection, the outbound EXECUTE builder, the receive-side dispatch
+boundary (`extract_params_entity` — every handler's `ctx.params`), and `parse_execute_response`.
+Every one carried an entity's `data` across a `ciborium::Value` / `entity_ecf::Value` round trip,
+which §5.4 forbids and which `to_ecf` makes lossy (it sorts map keys, normalizes non-minimal integer
+and length encodings, folds indefinite-length items to definite, and drops tags).
+**Root cause worth keeping:** `entity_ecf::Value` is `ciborium::Value` and cannot hold raw bytes, so
+every *inline an entity inside another entity's data* site reached for decode+re-encode. go is immune
+by construction — its `Entity.Data` is `cbor.RawMessage`. `entity_wire::cbor_map_set_raw` is the
+missing primitive; the two lossy helpers (`core/tree::raw_cbor_value`,
+`core/protocol::decode_entity_from_value`) were deleted rather than left unused.
+Measured by `core/peer/tests/merge_byte_fidelity_vector.rs` (two peers, a non-canonical fixture);
+`validate-complete.sh rust` 1658 · 0F after.
+
+### The remaining entity-inlining sites have not been swept
+`cbor_map_set_raw` fixed the `extract`/`merge`/EXECUTE path. `grep -rn 'text("content_hash")'
+--include=*.rs core/ extensions/ bindings/` still returns ~20 production sites that inline an entity
+as `{content_hash, data, type}`, and the ones that pair it with a decoded `data` value carry the same
+defect. Known: `connection.rs`'s inbox-delivery `result_inline`, `extensions/inbox`'s params inline,
+`extensions/query` / `extensions/history` / `extensions/content` result inlines, and
+`continuation::assemble_params_merge` (`result_merge` mode — a shallow key union, which needs a
+key-level raw walk rather than a single splice). Each is only observable with a fixture whose bytes
+our own codec cannot author, so the in-tree suite and every cross-impl vector are blind to all of
+them. Sweep with the same primitive; the region that closes is that grep.
 
 ---
 

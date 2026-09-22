@@ -4378,27 +4378,24 @@ pub fn make_execute_fn(
                 );
 
                 // Build a synthetic EXECUTE entity for the child context.
-                // Per spec §3.4, params is an inline entity {content_hash, data, type}.
-                let params_data_val: entity_ecf::Value =
-                    ciborium::from_reader(params.data.as_slice())
-                        .unwrap_or(entity_ecf::Value::Null);
-                let params_entity_val = entity_ecf::Value::Map(vec![
-                    (
-                        entity_ecf::text("content_hash"),
-                        entity_ecf::Value::Bytes(params.content_hash.to_bytes().to_vec()),
-                    ),
-                    (entity_ecf::text("data"), params_data_val),
-                    (
-                        entity_ecf::text("type"),
-                        entity_ecf::text(&params.entity_type),
-                    ),
-                ]);
-                let execute_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
-                    (entity_ecf::text("operation"), entity_ecf::text(&operation)),
-                    (entity_ecf::text("params"), params_entity_val),
-                    (entity_ecf::text("request_id"), entity_ecf::text("internal")),
-                    (entity_ecf::text("uri"), entity_ecf::text(&handler_path)),
-                ]));
+                // Per spec §3.4, params is an inline entity {content_hash, data, type}
+                // — **spliced by `encode_entity`, which embeds `data` raw**
+                // (§5.4). The `ciborium::from_reader` + `to_ecf` form this
+                // replaces re-encoded the caller's params on every in-process
+                // sub-dispatch, so an entity riding in params (a `tree:merge`
+                // `source_envelope`, a §7a.2a reentry capability) was rewritten
+                // once per hop. `extract_params_entity` is the matching read
+                // half; the two are a pair and neither alone is enough.
+                let execute_data = entity_wire::cbor_map_set_raw(
+                    &entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+                        (entity_ecf::text("operation"), entity_ecf::text(&operation)),
+                        (entity_ecf::text("request_id"), entity_ecf::text("internal")),
+                        (entity_ecf::text("uri"), entity_ecf::text(&handler_path)),
+                    ])),
+                    "params",
+                    &entity_wire::encode_entity(&params),
+                )
+                .map_err(|e| HandlerError::Internal(e.to_string()))?;
                 let execute = entity_entity::Entity::new(entity_types::TYPE_EXECUTE, execute_data)
                     .map_err(|e| HandlerError::Internal(e.to_string()))?;
 
@@ -4892,36 +4889,38 @@ fn extract_params_entity(execute: &entity_entity::Entity) -> entity_entity::Enti
         })
     };
 
-    let value: ciborium::Value = match ciborium::from_reader(execute.data.as_slice()) {
-        Ok(v) => v,
-        Err(_) => return default(),
+    // ⛔ **RAW SLICE, not a decoded `Value`.** This is the dispatch boundary
+    // every handler's `ctx.params` comes through, and it used to rebuild
+    // `data` with `entity_ecf::to_ecf(ev)` — a full decode + ECF re-encode of
+    // the caller's params payload. §5.4 byte fidelity forbids that for an
+    // entity's `data`, and params routinely *carries* entities: `tree:merge`'s
+    // `source_envelope`, and GUIDE-CONFORMANCE §7a.2a's in-band reentry
+    // capability / granter / signature, which `cbor_map_field_raw`'s own doc
+    // comment says "MUST round-trip without a decode+re-encode cycle".
+    //
+    // ⚠ **This is why a handler-side fix alone is dead code**, and it is the
+    // same shape as `0.8.2.24` N6: `to_ecf` sorts map keys, normalizes
+    // non-minimal integer and length encodings, folds indefinite-length items
+    // to definite and **drops tags**, so by the time a handler read
+    // `ctx.params.data` the bytes had already been rewritten. An in-process row
+    // that builds `HandlerContext` by hand cannot see it — the boundary is not
+    // in the picture. `core/tree`'s merge rows are the floor;
+    // `params_data_survives_the_dispatch_boundary_byte_for_byte` is the row
+    // that crosses the socket.
+    //
+    // `decode_entity_parts` rather than `decode_entity`: §3.4's inline params
+    // entity is written `{content_hash, data, type}` by every producer here,
+    // but a `content_hash` is not load-bearing for dispatch and a peer that
+    // omits it should still be served.
+    let Some(params_raw) = entity_wire::cbor_map_field_raw(&execute.data, "params") else {
+        return default();
     };
-    let map = match value.as_map() {
-        Some(m) => m,
-        None => return default(),
-    };
-
-    for (k, v) in map {
-        if k.as_text() == Some("params") {
-            if let Some(entity_map) = v.as_map() {
-                let mut entity_type = String::new();
-                let mut entity_data = Vec::new();
-
-                for (ek, ev) in entity_map {
-                    match ek.as_text() {
-                        Some("type") => entity_type = ev.as_text().unwrap_or("").to_string(),
-                        Some("data") => entity_data = entity_ecf::to_ecf(ev),
-                        _ => {}
-                    }
-                }
-
-                if let Ok(e) = entity_entity::Entity::new(&entity_type, entity_data) {
-                    return e;
-                }
-            }
+    match entity_wire::decode_entity_parts(params_raw) {
+        Ok((entity_type, entity_data)) => {
+            entity_entity::Entity::new(&entity_type, entity_data).unwrap_or_else(|_| default())
         }
+        Err(_) => default(),
     }
-    default()
 }
 
 /// Extract resource target from an EXECUTE entity's data (best-effort).
