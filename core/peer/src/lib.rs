@@ -131,6 +131,20 @@ pub struct PeerConfig {
     /// (EXTENSION-NETWORK §2.3 / §5.4, Amendment 12 rung 2). Defaults to
     /// the spec values (30s / 10s / 3, enabled).
     pub keepalive: keepalive::KeepaliveConfig,
+    /// **EXTENSION-RELAY §8.1 (v1.3)** — the Mode-S retention CEILING in ms
+    /// (`relay_store_retention`). `0` = enforce no ceiling.
+    ///
+    /// Default `0`, and that is a deliberate default-OFF: §8.1 is "MUST when
+    /// present", so a relay that declares no ceiling holds entries to their own
+    /// `expires_at`. Note §8.1's own warning about what that means — *"unlimited"
+    /// is not a policy; it is unbounded accumulation* — which is why the knob
+    /// exists in one place and is published (§4.1) wherever it is set.
+    pub relay_store_retention_ms: u64,
+    /// **EXTENSION-RELAY §8.2 (v1.3)** — the relay-wide Mode-S store bound in
+    /// bytes. `0` = unbounded. Default-off for the same reason as above; when
+    /// set, a `:put` over the bound is refused `storage_full`/507 and the relay
+    /// MUST NOT evict to make room.
+    pub relay_max_storage_bytes: u64,
 }
 
 impl Default for PeerConfig {
@@ -144,6 +158,8 @@ impl Default for PeerConfig {
             content_get_frame_budget: None,
             home_hash_format: entity_hash::HASH_ALGORITHM_SHA256,
             keepalive: keepalive::KeepaliveConfig::default(),
+            relay_store_retention_ms: 0,
+            relay_max_storage_bytes: 0,
         }
     }
 }
@@ -2288,8 +2304,29 @@ impl PeerBuilder {
                     pid.clone(),
                 )
                 .with_forwarder(forwarder)
-                .with_inbox_relay_resolver(inbox_relay_resolver),
+                .with_inbox_relay_resolver(inbox_relay_resolver)
+                // §8.1 / §8.2 (v1.3) operator bounds. Both default-off; when
+                // set they are enforced AND published (the self-advertise
+                // below reads them back off the handler, so there is one
+                // source of truth for "what this relay actually enforces").
+                .with_store_retention_ms(self.config.relay_store_retention_ms)
+                .with_max_storage_bytes(self.config.relay_max_storage_bytes),
             );
+            // §4.1 self-advertise. Published BEFORE the handler is registered
+            // is unnecessary, but it must be published at all: §8.1 makes
+            // publishing `max_retention_ms` a MUST for any relay that enforces
+            // a ceiling, and §4.1 states the reason — "a ceiling that is
+            // enforced but unpublished configures behaviour no counterparty can
+            // observe before depending on it." A sender choosing a relay, and a
+            // peer choosing which relays to name in its own §3.5 inbox-relay
+            // declaration, both depend on how long an entry will be held.
+            publish_relay_self_advertise(
+                &content_store,
+                &notifying_li,
+                &keypair,
+                &pid,
+                relay_handler.configured_limits(),
+            )?;
             handler_registry.register(relay_handler);
             bootstrap_handler(
                 &content_store,
@@ -2982,6 +3019,99 @@ fn write_peer_self_status(
 /// `bare_pattern` is the interop-visible pattern (e.g., "system/tree").
 /// Tree paths are qualified with `peer_id`.
 /// Manifest entity DATA keeps the bare pattern for interop.
+/// EXTENSION-RELAY §4.1 — publish this peer's own signed `system/relay/advertise`
+/// entity, carrying the §8 bounds it actually enforces.
+///
+/// **Why this exists at all, and why it is not optional.** §8.1 makes publishing
+/// `limits.max_retention_ms` a **MUST** for a relay that enforces a retention
+/// ceiling, and §4.1 gives the reason in one sentence: *"a ceiling that is
+/// enforced but unpublished configures behaviour no counterparty can observe
+/// before depending on it."* Duration is the number that decides whether
+/// store-and-forward is usable — a sender picking a relay, and a peer deciding
+/// which relays to name in its own §3.5 `inbox-relay` declaration, both need it,
+/// and neither can learn it any other way.
+///
+/// The limits come from the handler (`configured_limits`) rather than from the
+/// config, so what is advertised is what the enforcing code holds. Reading them
+/// off the config instead would make the advertise a second, independently
+/// drifting statement of the same fact.
+///
+/// The entity is signed by `relay_peer_id` per V7 §5.2, with **no `refs:`
+/// block** — the signature is reachable at the invariant pointer
+/// `system/signature/{hex(advertise.content_hash)}` (§3.0/§4.1). The signature
+/// is bound BEFORE the advertise (referenced-before-reference), so a reader that
+/// sees the advertise can always resolve its signature.
+///
+/// **An advertised limit is a promise a relay can break** (§4.1), which is why
+/// publishing it discloses nothing new: §5.1's threat model already bounds an
+/// intermediary to drop-or-delay.
+#[cfg(feature = "relay")]
+fn publish_relay_self_advertise(
+    store: &Arc<dyn ContentStore>,
+    index: &Arc<dyn LocationIndex>,
+    keypair: &entity_crypto::IdentityKeypair,
+    peer_id: &str,
+    limits: entity_relay::data::AdvertiseLimits,
+) -> Result<(), PeerError> {
+    let advertise = entity_relay::AdvertiseData {
+        // v1 ships both named modes (§1, §10.1): a *deployment* may enable a
+        // subset, but the implementation supports Mode F and Mode S.
+        modes: vec![
+            entity_relay::MODE_FORWARD.to_string(),
+            entity_relay::MODE_STORE.to_string(),
+        ],
+        // NETWORK §6.5 dial-able endpoints. Empty: this peer's reachability is
+        // published as `system/peer/transport/...` profiles, which is where a
+        // dialer already looks. Endpoint duplication here is deferred rather
+        // than guessed — an empty array and an absent key are the same fact.
+        endpoints: Vec::new(),
+        limits,
+        // §5.2: polling a namespace is the cap a consumer of a Mode-S relay
+        // needs to be told about; forward/put are per-deployment grants.
+        caps_required: vec![entity_relay::CAP_RELAY_POLL.to_string()],
+        // §4.1 `expires_at` is the advertise's own lifetime, not a store bound.
+        // Absent = valid until superseded; the entity is republished on every
+        // peer start (§8: "renewed on relay restart").
+        expires_at: None,
+    };
+
+    let advertise_entity = advertise
+        .to_entity()
+        .map_err(|e| PeerError::BuildError(format!("encode relay advertise: {e}")))?;
+    let advertise_hash = advertise_entity.content_hash;
+
+    let identity = keypair
+        .peer_entity()
+        .map_err(|e| PeerError::BuildError(format!("relay advertise signer identity: {e}")))?;
+    let signature = entity_types::SignatureData {
+        target: advertise_hash,
+        signer: identity.content_hash,
+        algorithm: keypair.key_type().label().to_string(),
+        signature: keypair.sign(&advertise_hash.to_bytes()).to_vec(),
+    };
+    let signature_entity = signature
+        .to_entity()
+        .map_err(|e| PeerError::BuildError(format!("encode relay advertise signature: {e}")))?;
+
+    let signature_hash = store
+        .put(signature_entity)
+        .map_err(|e| PeerError::BuildError(e.to_string()))?;
+    store
+        .put(advertise_entity)
+        .map_err(|e| PeerError::BuildError(e.to_string()))?;
+
+    // Signature first — referenced-before-reference.
+    index.set(
+        &entity_hash::invariant_signature_path(peer_id, &advertise_hash),
+        signature_hash,
+    );
+    index.set(
+        &entity_relay::advertise_path(peer_id, peer_id),
+        advertise_hash,
+    );
+    Ok(())
+}
+
 fn bootstrap_handler(
     store: &Arc<dyn ContentStore>,
     index: &Arc<dyn LocationIndex>,
@@ -7130,6 +7260,7 @@ mod tests {
             route: None,
             next_hop: Some(c_pid.clone()),
             ttl_hops: 3,
+            expires_at: None,
             envelope_inner: inner_entity.content_hash,
         };
         let fr_entity = fr.to_entity().unwrap();
@@ -7363,6 +7494,7 @@ mod tests {
             route: Some(vec![c_pid.clone(), d_pid.clone()]),
             next_hop: None,
             ttl_hops: 8,
+            expires_at: None,
             envelope_inner: inner_entity.content_hash,
         };
         let fr_entity = fr.to_entity().unwrap();
@@ -8816,6 +8948,593 @@ mod tests {
              delivery recipient's — recipient peer-id is still the sole key, and \
              a delegated wield fails closed on valid authority"
         );
+    }
+
+    /// §1.4 / §6.5 step 3 (PD-1h) — an inbound EXECUTE whose HANDLER URI names
+    /// a peer that is not us is refused `400 invalid_request` at
+    /// canonicalization, before handler resolution.
+    ///
+    /// **The control is the whole test.** A bare "foreign uri → 400" assertion
+    /// is satisfied by a peer that 400s the frame for any reason at all, so each
+    /// foreign form is paired with a LOCAL form that is identical in every other
+    /// respect — same cap, same handler, same operation, same resource — and the
+    /// local form must NOT be gated. That is what makes the 400 attributable to
+    /// the peer segment rather than to a malformed request.
+    ///
+    /// **Both foreign spellings, because they reach the defect by different
+    /// routes.** `entity://{them}/…` is the escalating one:
+    /// `extract_handler_path` drops the authority and `qualify_path` re-attaches
+    /// OURS, so pre-fix it resolved OUR handler under THEIR address.
+    /// `/{them}/…` survives that round-trip unchanged. One gate covers both
+    /// because it reads `extract_peer`, which is authority-aware.
+    ///
+    /// The cap deliberately carries `peers: ["*"]` — the §5.2 open-access
+    /// dev-cap shape the conformance driver presents. That is the condition
+    /// under which the pre-fix behaviour is not merely a wrong status but a
+    /// privilege escalation: Dimension 4 compares the cap's peer scope against
+    /// the foreign target and ALLOWS, so the frame ran to completion. Mutation
+    /// (delete the gate): all four rows collapse to the same answer, and the two
+    /// foreign rows go red.
+    #[tokio::test]
+    async fn inbound_execute_naming_a_foreign_peer_is_refused_before_handler_resolution() {
+        fn status_of(env: &entity_entity::Envelope) -> u32 {
+            entity_protocol::parse_execute_response(env)
+                .map(|r| r.status)
+                .unwrap_or(0)
+        }
+        fn carries(env: &entity_entity::Envelope, needle: &str) -> bool {
+            env.root
+                .data
+                .windows(needle.len())
+                .any(|w| w == needle.as_bytes())
+        }
+
+        let peer = PeerBuilder::new()
+            .keypair(Keypair::from_seed([91u8; 32]))
+            .build()
+            .unwrap();
+        let shared = peer.shared();
+        let local_pid = shared.peer_id.as_str().to_string();
+        let fmt = shared.config.home_hash_format;
+
+        let caller = IdentityKeypair::from(Keypair::from_seed([92u8; 32]));
+        let caller_identity = caller.peer_entity().expect("caller identity");
+
+        // A THIRD peer id — the namespace the foreign rows address. Not us, and
+        // not the caller, so nothing about the frame's authorship can be
+        // mistaken for the reason it is refused.
+        let foreign_pid = IdentityKeypair::from(Keypair::from_seed([93u8; 32]))
+            .peer_id()
+            .as_str()
+            .to_string();
+
+        // §5.2's open-access shape: `/*/*` resources plus `peers: ["*"]`. With
+        // anything narrower on `peers`, Dimension 4 would deny the foreign row
+        // on its own and the gate would be untestable through this path.
+        let open = vec![entity_capability::GrantEntry {
+            handlers: entity_capability::PathScope::new(vec!["system/tree".into()]),
+            resources: entity_capability::PathScope::new(vec!["/*/*".into()]),
+            operations: entity_capability::IdScope::new(vec!["get".into()]),
+            peers: Some(entity_capability::IdScope::all()),
+            constraints: None,
+            allowances: None,
+        }];
+        let grant_env = remote::build_reentry_grant_envelope(
+            &shared.keypair,
+            caller_identity.content_hash,
+            fmt,
+            open,
+        )
+        .expect("the open cap mints");
+        let bundle: std::collections::HashMap<entity_hash::Hash, entity_entity::Entity> = grant_env
+            .included
+            .values()
+            .map(|e| (e.content_hash, e.clone()))
+            .collect();
+        let cap_entity = bundle
+            .values()
+            .find(|e| e.entity_type == entity_types::TYPE_CAP_TOKEN)
+            .expect("the minted bundle carries the capability")
+            .clone();
+
+        // One resource for every row: a path in OUR namespace. The gate is about
+        // the handler address, never the resource target, so holding this fixed
+        // keeps the only variable the uri's peer segment.
+        let get_path = format!("/{}/system/type/system/peer", local_pid);
+        let params = entity_entity::Entity::new(
+            entity_types::TYPE_TREE_GET_REQ,
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+                entity_ecf::text("uri"),
+                entity_ecf::text(&get_path),
+            )])),
+        )
+        .expect("tree get params");
+        let resource = entity_capability::ResourceTarget {
+            targets: vec![get_path.clone()],
+            exclude: vec![],
+        };
+
+        let dispatch = |uri: String, rid: &'static str| {
+            let wield = remote::build_authenticated_execute(
+                &caller,
+                &cap_entity,
+                &bundle,
+                &std::collections::HashMap::new(),
+                rid,
+                &uri,
+                "get",
+                &params,
+                Some(&resource),
+                None,
+                None,
+            )
+            .expect("the caller can author the frame");
+            let shared = shared.clone();
+            async move { connection::dispatch_request(&wield, shared, None).await }
+        };
+
+        // --- The two foreign spellings: both MUST be refused, same pair. ---
+        for (uri, rid, shape) in [
+            (
+                format!("entity://{}/system/tree", foreign_pid),
+                "pd1h-foreign-authority",
+                "entity:// authority form — the one whose authority is stripped \
+                 and re-qualified to us, so pre-fix it ran OUR handler under \
+                 THEIR address",
+            ),
+            (
+                format!("/{}/system/tree", foreign_pid),
+                "pd1h-foreign-absolute",
+                "absolute-path form — survives strip+qualify unchanged, so it \
+                 reaches the defect by a different route than the authority form",
+            ),
+        ] {
+            let refused = dispatch(uri.clone(), rid).await;
+            assert_eq!(
+                (status_of(&refused), carries(&refused, "invalid_request")),
+                (400, true),
+                "{uri}: §1.4 requires `400 invalid_request` for an inbound \
+                 EXECUTE naming a non-local namespace ({shape}). §5.2a's \
+                 pre-dispatch row and §6.2 both forbid the alternatives: it MUST \
+                 NOT surface as `404 handler_not_found` (false — we HAVE the \
+                 handler, we are refusing the address) and MUST NOT surface as \
+                 `403 capability_denied` (there is no authorization verdict; the \
+                 refusal precedes authorization entirely)"
+            );
+            assert!(
+                !carries(&refused, "handler_not_found") && !carries(&refused, "capability_denied"),
+                "{uri}: refused with the right status but a code that reports it \
+                 as a resolution or an authorization failure"
+            );
+        }
+
+        // --- The controls: identical frames, local address. NOT gated. ---
+        for (uri, rid, shape) in [
+            (
+                format!("entity://{}/system/tree", local_pid),
+                "pd1h-local-authority",
+                "our own peer id, spelled as an authority",
+            ),
+            (
+                "system/tree".to_string(),
+                "pd1h-peer-relative",
+                "peer-relative — §1.4 qualifies it to us, so `extract_peer` \
+                 returns local and there is nothing to refuse",
+            ),
+        ] {
+            let allowed = dispatch(uri.clone(), rid).await;
+            assert!(
+                !(status_of(&allowed) == 400 && carries(&allowed, "invalid_request")),
+                "{uri}: the routing gate fired on a LOCAL address ({shape}). The \
+                 gate is scoped to a uri naming a peer that is not us; catching \
+                 this frame means it is keyed on something else, and every \
+                 foreign-row PASS above is then attributable to that instead"
+            );
+        }
+    }
+
+    /// §4.2 / §4.6 step 1 / §4.7 row 6 (FM-1) — an `authenticate` arriving
+    /// before any hello nonce has been issued is `401 invalid_nonce`, on BOTH
+    /// transports.
+    ///
+    /// We emitted `400 handshake_failed` — a code that appears nowhere in the
+    /// spec corpus, so non-conformant under any reading of §4.7's MUST-emit
+    /// contract. Both entry points matched on `conn.state` and never looked at
+    /// the frame's operation, so the frame was processed AS A HELLO and failed
+    /// through the catch-all.
+    ///
+    /// **The control is what stops this from being a rename.** Row 3 sends a
+    /// frame that is genuinely not a hello and not an `authenticate` either; it
+    /// must still exit through the catch-all as `400 handshake_failed`. Had we
+    /// "fixed" this by relabelling `handshake_error_envelope`'s default, rows 1
+    /// and 2 would pass and row 3 would go red — a conformant pair reached over
+    /// an incorrect path, reporting "invalid nonce" for a malformed `hello` too.
+    /// Status alone cannot separate the readings either, so the CODE is pinned
+    /// on every row.
+    ///
+    /// Both transports, because arch found the second one after the filing seat
+    /// named only the first: the TCP handshake reads its first frame in
+    /// `handle_connection` and the http-live dispatcher routes by session state
+    /// in `dispatch_session_envelope`. One helper serves both; two rows measure
+    /// both, so a fix applied to one is not mistaken for a fix.
+    #[tokio::test]
+    async fn prehello_authenticate_is_invalid_nonce_on_both_transports() {
+        use entity_wire::{read_frame, write_frame, DEFAULT_MAX_FRAME_SIZE};
+
+        fn pair_of(env: &entity_entity::Envelope) -> (u32, bool, bool) {
+            let status = entity_protocol::parse_execute_response(env)
+                .map(|r| r.status)
+                .unwrap_or(0);
+            let has = |needle: &str| {
+                env.root
+                    .data
+                    .windows(needle.len())
+                    .any(|w| w == needle.as_bytes())
+            };
+            (status, has("invalid_nonce"), has("handshake_failed"))
+        }
+
+        let peer = PeerBuilder::new()
+            .keypair(Keypair::from_seed([94u8; 32]))
+            .build()
+            .unwrap();
+        let shared = peer.shared();
+        let fmt = shared.config.home_hash_format;
+
+        // A well-formed `authenticate`, authored against a nonce this peer never
+        // issued — i.e. exactly a captured frame replayed onto a fresh
+        // connection, which is the attack §4.6 step 1 exists to stop.
+        let dialer = IdentityKeypair::from(Keypair::from_seed([95u8; 32]));
+        let captured_nonce = [7u8; 32];
+        let authenticate =
+            entity_protocol::build_authenticate_envelope(&dialer, &captured_nonce, fmt)
+                .expect("a well-formed authenticate");
+
+        // A frame that is neither a hello nor an `authenticate` — the control.
+        let junk = entity_entity::Entity::new(
+            "test/v1",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![])),
+        )
+        .expect("junk params");
+        let not_a_hello = entity_entity::Envelope::new(
+            entity_protocol::build_connect_execute("fm1-control", "goodbye", &junk)
+                .expect("connect execute"),
+        );
+
+        // Drive one frame as the FIRST thing a TCP-shaped connection ever sees.
+        let over_tcp = |frame_env: entity_entity::Envelope, shared: Arc<PeerShared>| async move {
+            let (mut client, server) = crate::transport::memory_transport_pair();
+            let handshake = tokio::spawn(async move {
+                // Returns Err after writing the refusal — the connection closes,
+                // which is correct and is not what these rows measure.
+                let _ = connection::handle_connection(server, shared).await;
+            });
+
+            let frame = entity_wire::encode_envelope(&frame_env);
+            write_frame(&mut client.writer, &frame)
+                .await
+                .expect("the dialer can send its first frame");
+            let response = read_frame(&mut client.reader, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect(
+                    "§4.6: the refusal MUST surface as a wire EXECUTE_RESPONSE, \
+                     not a bare close — an undiagnosable drop is non-conformant \
+                     whatever the peer thinks of the frame",
+                );
+            let _ = handshake.await;
+            entity_wire::decode_envelope(&response).expect("a decodable response")
+        };
+
+        // --- Row 1: TCP, the pre-hello `authenticate`. ---
+        assert_eq!(
+            pair_of(&over_tcp(authenticate.clone(), shared.clone()).await),
+            (401, true, false),
+            "TCP: a pre-hello `authenticate` MUST be `401 invalid_nonce` (§4.7 \
+             row 6). `handle_connection` reads its first frame and handed it to \
+             `build_hello_response_envelope`, which rejected it as a non-hello \
+             and exited through the `handshake_failed` catch-all — a code with \
+             zero occurrences in the spec corpus"
+        );
+
+        // --- Row 2: TCP control. Every OTHER out-of-order connect operation
+        //     keeps the catch-all. This is the row that fails if the "fix" was a
+        //     rename of `handshake_error_envelope`'s default code — and it lives
+        //     on the UNGATED path deliberately, so the anti-rename guard exists
+        //     in every feature configuration, not only where `http-live` is on. ---
+        {
+            let (status, invalid_nonce, _) =
+                pair_of(&over_tcp(not_a_hello.clone(), shared.clone()).await);
+            assert!(
+                status == 400 && !invalid_nonce,
+                "TCP: a connect frame that is neither `hello` nor `authenticate` \
+                 must NOT be reported as a nonce failure — it never named the \
+                 nonce. Reporting 401 `invalid_nonce` here means the \
+                 discrimination is not on the operation at all, and row 1 is then \
+                 passing for a reason that has nothing to do with §4.6 step 1"
+            );
+        }
+
+        // --- Rows 3+4: the http-live path, which routes by session state and so
+        //     reaches the same defect by a different route. Gated because
+        //     `dispatch_session_envelope` is; the rows above are not, because a
+        //     §4.6 refusal must not be reachable only through a feature gate. ---
+        #[cfg(feature = "http-live")]
+        {
+            let mut conn = entity_protocol::Connection::new(shared.keypair.peer_id());
+            let env =
+                connection::dispatch_session_envelope(&authenticate, &mut conn, shared.clone())
+                    .await;
+            assert_eq!(
+                pair_of(&env),
+                (401, true, false),
+                "http-live: same input, same pair. This transport reaches the \
+                 defect through `dispatch_session_envelope`'s `AwaitingHello` \
+                 arm rather than through the TCP first-frame read, so a fix \
+                 landed at one entry point does not cover it"
+            );
+
+            let mut conn = entity_protocol::Connection::new(shared.keypair.peer_id());
+            let env =
+                connection::dispatch_session_envelope(&not_a_hello, &mut conn, shared.clone())
+                    .await;
+            let (status, invalid_nonce, _) = pair_of(&env);
+            assert!(
+                status == 400 && !invalid_nonce,
+                "http-live: the control, on this transport's own catch-all — the \
+                 two transports build their error envelopes at two different call \
+                 sites, so a rename at one is invisible to the other's rows"
+            );
+        }
+    }
+
+    /// EXTENSION-RELAY §4.1 + §8 (v1.3) — the peer publishes a SIGNED
+    /// self-advertise carrying the store bounds it actually enforces.
+    ///
+    /// §8.1 makes publishing `max_retention_ms` a MUST for a relay that
+    /// enforces a ceiling, and §4.1 gives the reason: a ceiling that is
+    /// enforced but unpublished configures behaviour no counterparty can
+    /// observe before depending on it. A sender picking a relay, and a peer
+    /// choosing which relays to name in its own §3.5 inbox-relay declaration,
+    /// both depend on how long an entry will be held.
+    ///
+    /// Three claims: the entity is published at the §4.1 path, its limits are
+    /// the ENFORCED ones, and it is signed by `relay_peer_id` with the
+    /// signature reachable at the invariant pointer (§3.0 — no `refs:` block).
+    /// The signature is verified here rather than merely being present: an
+    /// unverifiable advertise is one a consumer must reject, so "published" is
+    /// not the property that matters.
+    #[tokio::test]
+    #[cfg(feature = "relay")]
+    async fn relay_self_advertise_publishes_the_enforced_bounds_signed() {
+        use entity_relay::{AdvertiseData, MODE_FORWARD, MODE_STORE};
+
+        let peer = PeerBuilder::new()
+            .keypair(Keypair::from_seed([98u8; 32]))
+            .config(PeerConfig {
+                relay_store_retention_ms: 3_600_000,
+                relay_max_storage_bytes: 4096,
+                ..PeerConfig::default()
+            })
+            .build()
+            .unwrap();
+        let shared = peer.shared();
+        let pid = shared.keypair.peer_id().as_str().to_string();
+
+        let path = entity_relay::advertise_path(&pid, &pid);
+        let hash = shared
+            .location_index
+            .get(&path)
+            .expect("§4.1: the relay MUST publish its advertise at system/relay/advertise/{self}");
+        let entity = shared.content_store.get(&hash).expect("advertise entity");
+        let advertise = AdvertiseData::from_entity(&entity).expect("decodes as an advertise");
+
+        assert_eq!(
+            advertise.limits.max_retention_ms,
+            Some(3_600_000),
+            "§8.1: a relay enforcing a ceiling MUST publish it as              limits.max_retention_ms — this is the field that tells a              counterparty whether store-and-forward is usable at all"
+        );
+        assert_eq!(advertise.limits.max_storage_bytes, Some(4096));
+        assert!(
+            advertise.modes.contains(&MODE_FORWARD.to_string())
+                && advertise.modes.contains(&MODE_STORE.to_string()),
+            "v1 ships both named modes (§10.1)"
+        );
+
+        // --- The signature, verified rather than merely located. ---
+        let sig_hash = shared
+            .location_index
+            .get(&entity_hash::invariant_signature_path(&pid, &hash))
+            .expect("§4.1: signed per V7 §5.2, reachable at the invariant pointer");
+        let sig = entity_types::SignatureData::from_entity(
+            &shared
+                .content_store
+                .get(&sig_hash)
+                .expect("signature entity"),
+        )
+        .expect("decodes as a signature");
+        assert_eq!(sig.target, hash, "the signature targets the advertise");
+        assert!(
+            entity_crypto::verify_for_key_type(
+                shared.keypair.key_type(),
+                shared.keypair.public_key_bytes().as_slice(),
+                &hash.to_bytes(),
+                &sig.signature,
+            )
+            .is_ok(),
+            "the advertise signature MUST verify against the relay's own key —              a consumer that cannot verify it must reject the advertise, so              'a signature entity exists' is not the property"
+        );
+    }
+
+    /// The §4.1 control — a relay enforcing NO bound omits the keys entirely.
+    ///
+    /// §8.1: absent means "declares no ceiling", which is a different statement
+    /// from "the ceiling is zero". This row is what fails if the bounds are ever
+    /// given a non-zero default, or if the encoder starts writing `0` for unset.
+    #[tokio::test]
+    #[cfg(feature = "relay")]
+    async fn relay_self_advertise_omits_bounds_it_does_not_enforce() {
+        let peer = PeerBuilder::new()
+            .keypair(Keypair::from_seed([99u8; 32]))
+            .build()
+            .unwrap();
+        let shared = peer.shared();
+        let pid = shared.keypair.peer_id().as_str().to_string();
+        let hash = shared
+            .location_index
+            .get(&entity_relay::advertise_path(&pid, &pid))
+            .expect("an advertise is published either way");
+        let advertise =
+            entity_relay::AdvertiseData::from_entity(&shared.content_store.get(&hash).unwrap())
+                .unwrap();
+        assert_eq!(advertise.limits.max_retention_ms, None);
+        assert_eq!(advertise.limits.max_storage_bytes, None);
+    }
+
+    /// §4.7 row 9 (G-28) — a second `hello` on an ESTABLISHED connection is
+    /// `409 connection_already_established`, over the real wire.
+    ///
+    /// We emitted `401 authentication_failed`. The frame fell past the
+    /// post-established connect intercept (which matched `authenticate` only)
+    /// into generic §5.2 verification, where the bare connect-EXECUTE shape has
+    /// no `author` — so the peer reported an authentication failure for a
+    /// caller that had *just authenticated successfully*. Wrong status class
+    /// (a state conflict is not an auth failure) and wrong code.
+    ///
+    /// **The control is what stops this from being a collapse.** A second
+    /// `authenticate` post-establishment is a DIFFERENT §4.7 row — RT-6 pins it
+    /// at `401 invalid_nonce` — and it arrives at the same intercept. Had row 9
+    /// been "fixed" by answering 409 for every post-established connect frame,
+    /// row 1 would pass and the control would go red. Both rows live on the
+    /// UNGATED TCP path deliberately: a §4.7 invariant must not be reachable
+    /// only through the `http-live` feature gate.
+    ///
+    /// Row 10 (`connection_sequence_error`) is deliberately NOT asserted here —
+    /// the §4.7 table pins 400 and core-go emits 409, and it is routed as
+    /// spec-issue `2026-09-01-b`. A row asserting either value would gate one
+    /// seat's reading of an unruled semantic.
+    #[tokio::test]
+    async fn second_hello_after_established_is_409_already_established() {
+        use entity_wire::{read_frame, write_frame, DEFAULT_MAX_FRAME_SIZE};
+
+        fn pair_of(env: &entity_entity::Envelope) -> (u32, String) {
+            let status = entity_protocol::parse_execute_response(env)
+                .map(|r| r.status)
+                .unwrap_or(0);
+            let code = [
+                "connection_already_established",
+                "invalid_nonce",
+                "authentication_failed",
+                "connection_sequence_error",
+            ]
+            .iter()
+            .find(|needle| {
+                env.root
+                    .data
+                    .windows(needle.len())
+                    .any(|w| w == needle.as_bytes())
+            })
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "<none of the §4.7 codes>".into());
+            (status, code)
+        }
+
+        let peer = PeerBuilder::new()
+            .keypair(Keypair::from_seed([96u8; 32]))
+            .build()
+            .unwrap();
+        let shared = peer.shared();
+        let fmt = shared.config.home_hash_format;
+        let dialer = IdentityKeypair::from(Keypair::from_seed([97u8; 32]));
+
+        let (mut client, server) = crate::transport::memory_transport_pair();
+        let handshake = tokio::spawn({
+            let shared = shared.clone();
+            async move {
+                let _ = connection::handle_connection(server, shared).await;
+            }
+        });
+
+        // A client-side `hello` EXECUTE. Built here rather than through a
+        // helper because the peer under test is the RESPONDER: what matters is
+        // that the frame is a well-formed hello naming the dialer, twice.
+        let build_hello = |nonce: u8| {
+            let hello = entity_protocol::HelloData {
+                peer_id: dialer.peer_id().as_str().to_string(),
+                nonce: vec![nonce; 32],
+                protocols: vec!["entity-core/1.0".to_string()],
+                hash_formats: vec![],
+                key_types: vec![dialer.key_type().label().to_string()],
+                timestamp: None,
+            };
+            entity_entity::Envelope::new(
+                entity_protocol::build_connect_execute(
+                    "row9-hello",
+                    "hello",
+                    &hello.to_entity().expect("hello entity"),
+                )
+                .expect("connect execute"),
+            )
+        };
+
+        async fn round_trip(
+            client: &mut crate::transport::Connection,
+            env: entity_entity::Envelope,
+        ) -> entity_entity::Envelope {
+            let frame = entity_wire::encode_envelope(&env);
+            write_frame(&mut client.writer, &frame).await.expect("send");
+            let response = read_frame(&mut client.reader, DEFAULT_MAX_FRAME_SIZE)
+                .await
+                .expect("§4.6: a coded EXECUTE_RESPONSE, never a bare close");
+            entity_wire::decode_envelope(&response).expect("a decodable response")
+        }
+
+        // --- Complete a genuine handshake. Everything below measures the
+        //     POST-established path, so reaching `Established` honestly is a
+        //     precondition, not a convenience. ---
+        let hello_response = round_trip(&mut client, build_hello(1)).await;
+        let nonce = entity_protocol::parse_execute_response(&hello_response)
+            .ok()
+            .and_then(|r| entity_protocol::HelloData::from_entity(&r.result).ok())
+            .map(|h| h.nonce)
+            .expect("the hello response carries the peer's issued nonce");
+
+        let authenticate = entity_protocol::build_authenticate_envelope(&dialer, &nonce, fmt)
+            .expect("a well-formed authenticate");
+        let auth_response = round_trip(&mut client, authenticate.clone()).await;
+        assert_eq!(
+            entity_protocol::parse_execute_response(&auth_response)
+                .map(|r| r.status)
+                .unwrap_or(0),
+            200,
+            "the handshake must actually complete — every row below is about \
+             what happens AFTER `Established`, and a failed authenticate would \
+             make them measure the handshake path instead"
+        );
+
+        // --- Row 1: the second hello. ---
+        assert_eq!(
+            pair_of(&round_trip(&mut client, build_hello(2)).await),
+            (409, "connection_already_established".to_string()),
+            "§4.7 row 9: a second `hello` after the handshake completes is a \
+             sequence/state conflict. We answered `401 authentication_failed` \
+             — telling a peer that had just authenticated that its credentials \
+             failed, which is both the wrong class and unactionable"
+        );
+
+        // --- Row 2 (the control): a second `authenticate` is a DIFFERENT row
+        //     and MUST keep its own pair. This is the row that fails if row 9
+        //     was satisfied by answering 409 for the whole connect path. ---
+        assert_eq!(
+            pair_of(&round_trip(&mut client, authenticate).await).1,
+            "invalid_nonce".to_string(),
+            "RT-6 / §4.7 row 6: a replayed `authenticate` on an established \
+             connection stays `invalid_nonce` — the issued nonce is single-use. \
+             Collapsing it into row 9's 409 would under-signal a REPLAY as a \
+             state conflict, which §4.6's Hardening block rejects by name"
+        );
+
+        drop(client);
+        let _ = handshake.await;
     }
 
     /// The §3 advertisement filter, on the real assembly rather than on the

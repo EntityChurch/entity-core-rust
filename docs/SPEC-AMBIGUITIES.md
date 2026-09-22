@@ -6216,3 +6216,56 @@ silent about the depth axis rather than confirming it.
 Routed to core-go (harness owner) and arch in
 `docs/validation/reports/2026-08-22-a-d3-closed-b1-fixed-and-cv9a-cannot-be-driven-over-the-wire.md`
 §3.
+
+---
+
+## V7 §4.6 — the proof-of-possession steps are NUMBERED, but only "0 before 3" is stated as an order, and step 2 vs step 3 is cross-impl observable
+
+**Passage.** §4.6: *"the responder ... MUST perform the following checks; the step-0 key-type gate is
+ordered **before** the step-3 identity binding"*, followed by four numbered steps — 0 key-type
+support, 1 nonce echo, 2 proof of possession (*"verify that signature against
+`authenticate.public_key`"*), 3 identity binding (*"`authenticate.peer_id` is the peer-id derived
+from `authenticate.public_key`"*). §4.7 then fixes a distinct `(status, code)` pair per step as a
+MUST-emit contract: step 2 → `401 authentication_failed`, step 3 → `401 identity_mismatch`.
+
+**The ambiguity.** The spec pins exactly one ordering constraint (0 before 3) and leaves the rest to
+the numbering. Two conformant-looking readings result, and they are **not** distinguishable by any
+input that fails only one step:
+
+- **Numbered order (ours).** 0 → 1 → 2 → 3. Textual support: the steps are numbered; step 3's own
+  rationale is written as a refinement of step 2 (*"Without this, step 2 proves possession of some
+  private key but not the key for the identity the caller claims"*), which reads as step 3 running
+  after step 2; and the step-0 hoist would be vacuous if the numbering carried no order at all — its
+  parenthetical says outright *"a peer running the numbered steps in order returned 401
+  identity_mismatch for an unknown key_type."*
+- **Identity-binding-first (core-go).** `handleAuthenticate` (`core/protocol/connect.go`) runs
+  `claimedPeerID.VerifyPublicKey` before the nonce and signature checks. Textual support: §4.6 pins
+  only 0-before-3, so any order satisfying that is arguably conformant.
+
+**Where it becomes visible, and it is a live conformance FAIL.** core-go's §4.7 row-8 wire check
+(`connect_authenticate_identity_mismatch`, `cmd/internal/validate/connectivity_conn_errors.go`)
+builds its probe by **signing with the key whose `peer_id` is claimed while presenting a different
+key's `public_key`.** That input fails step 2 under the numbered order —
+`verify(authenticate.public_key, hash, sig)` is false, because another key signed — and never
+reaches step 3. So the probe discriminates **check order**, not the presence of step 3: go answers
+`identity_mismatch`, we answer `authentication_failed`, and both peers implement all three checks.
+Status is **401 under both readings**; only the code differs.
+
+**Interim choice (ours).** Numbered order, stated at the `fn` (`process_authenticate`,
+`core/protocol/src/connect.rs`) and pinned by
+`authenticate_signing_key_mismatch_is_step_2` — written so that exactly one assertion flips if arch
+rules the other way. We did **not** converge on go's ordering to turn its check green: that would
+adopt a reading on the strength of who shipped the check first, and the numbering plus step 3's own
+rationale are the stronger textual case. We also did not claim go is non-conformant — 0-before-3 is
+the only order the spec states, and go satisfies it.
+
+**Ask — a ruling, not a winner.** Either (a) state that the numbering is normative order (in which
+case core-go moves its identity binding after step 2), or (b) state that the steps may run in any
+order satisfying 0-before-3 — in which case **the row-8 check is not gateable as written**, because
+its outcome is then implementation-defined for that input, and it should be rebuilt on the input
+that isolates step 3 under both readings: *signature valid against the presented `public_key`, and
+`peer_id` not derived from it*. That input is already pinned here as
+`peer_id_not_derived_from_public_key_is_401_identity_mismatch` and both seats should pass it today.
+
+Routed to core-go and arch in
+`docs/validation/reports/2026-09-01-a-4.7-connect-errors-landed-and-the-row-8-probe-measures-ordering.md`.

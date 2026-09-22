@@ -27,6 +27,9 @@ pub struct StoredEntry {
     /// ms-since-epoch expiry; `None` = no expiry. Expired entries are skipped
     /// on poll (and eligible for GC, §8).
     pub expires_at: Option<i64>,
+    /// **v1.3 (§8.2)** — this entry's contribution to the relay-wide live byte
+    /// total. See [`ModeStore::live_bytes`] for the metric and its caveat.
+    pub cost: u64,
 }
 
 #[derive(Default)]
@@ -61,17 +64,72 @@ impl ModeStore {
     /// Idempotent placement is NOT assumed — re-putting the same `entry_hash`
     /// appends a new seq (content-addressed dedup happens in the content store;
     /// the poll log records each placement).
-    pub fn put(&self, namespace: &str, entry_hash: Hash, expires_at: Option<i64>) -> u64 {
+    pub fn put(
+        &self,
+        namespace: &str,
+        entry_hash: Hash,
+        expires_at: Option<i64>,
+        cost: u64,
+        now_ms: i64,
+    ) -> u64 {
         let mut guard = self.inner.lock().expect("relay store mutex");
         let log = guard.entry(namespace.to_string()).or_default();
+        // §8 reclamation, taken on write. Expiry is honored on READ regardless
+        // (`poll` filters), so this is memory hygiene rather than a visibility
+        // rule — but it is what keeps `live_bytes` from counting bytes the
+        // relay is no longer obliged to hold, which would make §8.2 refuse a
+        // put for capacity that is in fact free.
+        log.entries.retain(|e| !is_expired(e.expires_at, now_ms));
         let seq = log.next_seq;
         log.next_seq += 1;
         log.entries.push(StoredEntry {
             entry_hash,
             seq,
             expires_at,
+            cost,
         });
         seq
+    }
+
+    /// Is a hash-equal entry already stored in this namespace? — the §8.2
+    /// **idempotency gate**.
+    ///
+    /// A re-put of an entry already held adds no bytes, so refusing it on a
+    /// full store would report `storage_full` for a request that needs no
+    /// storage. The store is content-addressed, so "same hash" is "same
+    /// entry" without qualification.
+    pub fn contains(&self, namespace: &str, entry_hash: &Hash) -> bool {
+        let guard = self.inner.lock().expect("relay store mutex");
+        guard
+            .get(namespace)
+            .is_some_and(|log| log.entries.iter().any(|e| &e.entry_hash == entry_hash))
+    }
+
+    /// Relay-wide live byte total (§8.2), summed over every namespace.
+    ///
+    /// **The metric is `len(store-entry.data) + len(inner.data)` per live
+    /// entry** — the two entity `data` payloads the relay actually holds on the
+    /// putter's behalf, and it matches core-go's `entryCost` so the two seats
+    /// bound the same quantity.
+    ///
+    /// **It is not ruled.** §8.2 says a full store refuses; it does not define
+    /// what `max_storage_bytes` counts (wire size? entity size? plus tree
+    /// index? plus per-entry overhead?), which is why core-go filed spec-issue
+    /// `2026-09-01-a` and deliberately did NOT ship the storage-full wire row —
+    /// a cross-impl check on this number would test one seat's reading. The
+    /// choice is written here so it is a stated interim, not a silent one.
+    ///
+    /// The bound is relay-wide rather than per-namespace: §8.2 names
+    /// `max_storage_bytes` as the relay's advertised limit (§4.1), and a
+    /// per-namespace reading would let N namespaces hold N times the bound.
+    pub fn live_bytes(&self, now_ms: i64) -> u64 {
+        let guard = self.inner.lock().expect("relay store mutex");
+        guard
+            .values()
+            .flat_map(|log| log.entries.iter())
+            .filter(|e| !is_expired(e.expires_at, now_ms))
+            .map(|e| e.cost)
+            .sum()
     }
 
     /// Page the namespace from `since` (exclusive; `None` = from start),

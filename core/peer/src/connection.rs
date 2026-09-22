@@ -9,7 +9,7 @@ use crate::{PeerError, PeerShared};
 use entity_entity::{EntityUri, Envelope};
 use entity_handler::{
     ExecuteFn, ExecuteOptions, HandlerContext, HandlerError, STATUS_AUTH_FAILED,
-    STATUS_BAD_REQUEST, STATUS_FORBIDDEN, STATUS_INTERNAL_ERROR, STATUS_NOT_FOUND,
+    STATUS_BAD_REQUEST, STATUS_CONFLICT, STATUS_FORBIDDEN, STATUS_INTERNAL_ERROR, STATUS_NOT_FOUND,
     STATUS_NOT_SUPPORTED,
 };
 use entity_protocol::{
@@ -64,6 +64,19 @@ pub async fn handle_connection(
     // remote `key_type`) rather than a transport-level EOF. Build the
     // error response from the inbound request_id, send it on the wire,
     // THEN return the error to close the connection cleanly.
+    // FM-1 (§4.2 / §4.6 step 1): discriminate the frame's OPERATION before
+    // treating it as a hello. Without this the TCP path hands a pre-hello
+    // `authenticate` to `build_hello_response_envelope` and reports the failure
+    // as `400 handshake_failed`. Same refusal as the http-live path — one
+    // helper, because both transports carried the identical defect.
+    if let Some(refusal) = prehello_authenticate_refusal(&hello_envelope) {
+        let frame = encode_envelope(&refusal);
+        let _ = write_frame(&mut writer, &frame).await;
+        return Err(PeerError::ConnectionError(
+            "authenticate before hello: no nonce has been issued on this connection".into(),
+        ));
+    }
+
     let hello_response = match build_hello_response_envelope(&hello_envelope, &mut conn) {
         Ok(env) => env,
         Err(e) => {
@@ -380,6 +393,50 @@ pub async fn handle_connection(
 /// [`handle_connection`] and by the HTTP-live transport via
 /// [`dispatch_session_envelope`]. Mutates `conn.state` from
 /// `AwaitingHello` to `AwaitingAuthenticate` on success.
+/// §4.2 / §4.6 step 1 / §4.7 row 6 (FM-1) — the pre-hello `authenticate`
+/// refusal, in ONE place because both transports had the same defect.
+///
+/// Returns `Some(401 invalid_nonce)` when this frame is a connect-EXECUTE whose
+/// operation is `authenticate`. Call it only where the connection is still
+/// `AwaitingHello`; there, an `authenticate` is definitionally one that arrived
+/// before any nonce was issued.
+///
+/// **The code string was the symptom; dispatch-on-state was the defect.** Both
+/// entry points matched on `conn.state` and never looked at the frame's
+/// operation, so a pre-hello `authenticate` was handed to the *hello* path,
+/// failed there as a non-hello (`connect.rs`, "expected operation hello"), and
+/// exited through `handshake_error_envelope`'s catch-all as **`400
+/// handshake_failed`** — a code that appears nowhere in the spec corpus, so
+/// non-conformant under any reading of §4.7's MUST-emit contract. Renaming the
+/// code at the catch-all would have produced a conformant pair over an incorrect
+/// path, and would have reported "invalid nonce" for a genuinely malformed
+/// `hello` too. So the discrimination happens on the OPERATION, ahead of the
+/// state match, and the catch-all keeps its meaning.
+///
+/// Why 401 and not a 4xx state-conflict: §4.6 step 1 and §4.7 row 6 pin this
+/// input to `401 invalid_nonce`, and §4.7 says outright it is **not** the
+/// out-of-order row. A captured `authenticate` replayed onto a fresh connection
+/// IS this input — the attack the nonce exists to stop — so it is an
+/// authentication failure, not a malformed request. Same status the Hardening
+/// block pins for the same-connection replay, which we already emit from
+/// `dispatch_request`'s RT-6 intercept. Every OTHER out-of-order connect
+/// operation is untouched and still exits through the catch-all.
+fn prehello_authenticate_refusal(envelope: &Envelope) -> Option<Envelope> {
+    let fields = entity_protocol::decode_execute_fields(&envelope.root.data).ok()?;
+    if fields.operation != "authenticate" || !Connection::is_connect_path(&fields.uri) {
+        return None;
+    }
+    Some(
+        build_error_response(
+            &fields.request_id,
+            STATUS_AUTH_FAILED,
+            "invalid_nonce",
+            "authenticate received before a hello nonce was issued on this connection",
+        )
+        .unwrap_or_else(|_| Envelope::new(envelope.root.clone())),
+    )
+}
+
 pub(crate) fn build_hello_response_envelope(
     hello_envelope: &Envelope,
     conn: &mut Connection,
@@ -969,7 +1026,13 @@ pub(crate) async fn dispatch_session_envelope(
     use entity_protocol::ConnectionState;
     let request_id = extract_request_id(envelope).unwrap_or_else(|| "unknown".to_string());
     let result = match conn.state {
-        ConnectionState::AwaitingHello => build_hello_response_envelope(envelope, conn),
+        // FM-1: the operation is discriminated ahead of the state match — see
+        // `prehello_authenticate_refusal`. The TCP path does the same thing at
+        // the same point in its own handshake.
+        ConnectionState::AwaitingHello => match prehello_authenticate_refusal(envelope) {
+            Some(refusal) => return refusal,
+            None => build_hello_response_envelope(envelope, conn),
+        },
         ConnectionState::AwaitingAuthenticate => {
             build_authenticate_response_envelope(envelope, conn, &shared)
         }
@@ -1075,16 +1138,47 @@ pub(crate) async fn dispatch_request(
         let local_pid = shared.keypair.peer_id();
         let bare_path = EntityUri::extract_handler_path(&fields.uri);
         let handler_path = EntityUri::qualify_path(bare_path, local_pid.as_str());
-        if handler_path == format!("/{}/{}", local_pid.as_str(), entity_protocol::CONNECT_PATH)
-            && fields.operation == "authenticate"
-        {
-            return build_error_response(
-                &fields.request_id,
-                STATUS_AUTH_FAILED,
-                "invalid_nonce",
-                "handshake nonce already consumed on this connection",
-            )
-            .unwrap_or_else(|_| Envelope::new(envelope.root.clone()));
+        if handler_path == format!("/{}/{}", local_pid.as_str(), entity_protocol::CONNECT_PATH) {
+            // §4.7's two post-established connect rows. Both are reached only
+            // here — `dispatch_request` runs exclusively post-Established, so
+            // the state is implied by the call site rather than re-tested.
+            match fields.operation.as_str() {
+                "authenticate" => {
+                    return build_error_response(
+                        &fields.request_id,
+                        STATUS_AUTH_FAILED,
+                        "invalid_nonce",
+                        "handshake nonce already consumed on this connection",
+                    )
+                    .unwrap_or_else(|_| Envelope::new(envelope.root.clone()));
+                }
+                // §4.7 row 9 → **409 `connection_already_established`**. A
+                // second `hello` on an established connection is a sequence /
+                // state conflict, not an authentication failure: the caller IS
+                // authenticated, and it is asking to redo a handshake that
+                // already completed. Without this arm the frame fell through to
+                // generic §5.2 verification, which rejected the bare connect-
+                // EXECUTE shape (no `author`) as `401 authentication_failed` —
+                // a wrong status AND a wrong code, and one that reads to the
+                // caller as "your credentials failed" when they did not.
+                //
+                // Scope, stated because the neighbouring row is contested: this
+                // arm fires on `hello` only. §4.7's out-of-order row (an unknown
+                // connect operation, or a second `hello` before `hello_done`) is
+                // `connection_sequence_error`/400 in the table and 409 in
+                // core-go, and is routed as spec-issue 2026-09-01-b — so it gets
+                // no discriminating behaviour here until it is ruled.
+                "hello" => {
+                    return build_error_response(
+                        &fields.request_id,
+                        STATUS_CONFLICT,
+                        "connection_already_established",
+                        "the connection handshake has already completed on this connection",
+                    )
+                    .unwrap_or_else(|_| Envelope::new(envelope.root.clone()));
+                }
+                _ => {}
+            }
         }
     }
 
@@ -1282,9 +1376,65 @@ pub(crate) async fn dispatch_request(
         "request verified"
     );
 
+    let local_pid = shared.keypair.peer_id();
+
+    // §1.4 / §6.5 step 3 (PD-1h) — INBOUND DISPATCH ROUTING GATE.
+    //
+    // An inbound EXECUTE whose HANDLER URI names a peer that is not us is
+    // refused *as an address*, `400 invalid_request`, before the path is
+    // interpreted and before any handler is resolved. §6.5 step 3 calls this a
+    // "gate, not an ordering preference" and forbids the shape we had: strip
+    // the foreign peer id, resolve the local handler at the remainder, and let
+    // §5.2 Dimension 4 decide. That path is a privilege escalation, not merely
+    // a wrong status — `extract_handler_path` drops the authority from
+    // `entity://{them}/system/tree` and `qualify_path` re-attaches OURS, so the
+    // request runs against our handler, and Dimension 4 *allows* it outright
+    // whenever the presented grant happens to carry a matching `peers` scope.
+    // Measured live by entity-core-go before this landed: foreign handler uri →
+    // 200, local control → 200 (all three ground-up impls).
+    //
+    // It must run BEFORE `validate_path_input`: the refusal precedes the
+    // interpretation, so a malformed foreign address is reported as the foreign
+    // address it is. And the code is `invalid_request`, never `404
+    // handler_not_found` (§6.2 — false: we HAVE the handler, we are refusing the
+    // address) and never `403 capability_denied` (§5.2a pre-dispatch row — there
+    // is no authorization verdict here, the request never reaches authorization).
+    //
+    // Scope: the handler uri only, NOT the resource target. A `system/tree:put`
+    // at `entity://{local}/system/tree` carrying `targets: ["/{them}/…"]` is the
+    // §1.4 universal-address-space slot — a LOCAL write into the region our own
+    // store holds for them — and stays conformant. That is the `resources`
+    // dimension; this is the address.
+    //
+    // Inbound only. `make_execute_fn` (§1.4 internal dispatch) never routes
+    // through here and returns at its own `is_remote` branch, so a handler's
+    // follow-mirror sub-dispatch is untouched.
+    //
+    // Reads `EntityUri::extract_peer` — the §5.2 `extract_peer` Dimension 4
+    // reads at the call site below. One implementation on purpose: a routing
+    // concept spelled twice is a fork nobody sees until a peer does.
+    let target_peer = EntityUri::extract_peer(&verified.uri, local_pid.as_str());
+    if target_peer != local_pid.as_str() {
+        tracing::warn!(
+            request_id = %verified.request_id,
+            uri = %verified.uri,
+            target_peer = %target_peer,
+            "inbound EXECUTE targets a foreign namespace — refused at canonicalization"
+        );
+        return build_error_response(
+            &verified.request_id,
+            STATUS_BAD_REQUEST,
+            "invalid_request",
+            &format!(
+                "handler uri targets peer {}, which is not this peer",
+                target_peer
+            ),
+        )
+        .unwrap_or_else(|_| Envelope::new(envelope.root.clone()));
+    }
+
     // V1: Validate and qualify handler path (R12)
     let bare_path = EntityUri::extract_handler_path(&verified.uri);
-    let local_pid = shared.keypair.peer_id();
 
     // Pre-qualify validation: reject ./, ../, empty segments
     if let Err(msg) = EntityUri::validate_path_input(bare_path) {

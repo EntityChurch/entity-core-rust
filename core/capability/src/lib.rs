@@ -278,13 +278,38 @@ pub fn wildcard_handler_grant() -> Vec<GrantEntry> {
     }]
 }
 
-/// Default scope for handlers that do not declare `internal_scope` (§6.9):
-/// all handlers, **all resources**, all operations, all peers.
+/// Default scope for handlers that do not declare `internal_scope` (§6.2, was
+/// §6.9): all handlers, **all resources**, all operations, and **the local peer
+/// only** — `peers` is deliberately absent.
 ///
-/// Identical to [`wildcard_handler_grant`] except that "all resources" is
+/// Differs from [`wildcard_handler_grant`] in two places. "All resources" is
 /// written in the R-5 cross-namespace peer-wildcard form `/*/*` rather than the
 /// bare `*` — the same distinction, and for the same reason, as
-/// [`debug_open_grants`].
+/// [`debug_open_grants`]. And `peers` is **omitted**, which is not the same as
+/// `*`.
+///
+/// **Why `resources` spans namespaces while `peers` does not.** The two
+/// dimensions are orthogonal and bound different things (§6.3). A peer's store
+/// is one local address space keyed by peer id (§1.4), so `/{them}/…` names a
+/// **local** region holding their cached or mirrored data; writing there is a
+/// local write, not a remote reach. The network bound is carried entirely by
+/// `peers`, which is absent here and therefore defaults to
+/// `{include: [local_peer_id]}` — **and is still checked** (§5.2 Dimension 4).
+/// A default-scope handler consequently cannot dispatch at a foreign peer,
+/// which is the escalation that matters, while it can still write the mirrors
+/// its own store legitimately holds.
+///
+/// §6.2 names `peers: ["*"]` here as "specifically wrong" and the one direction
+/// that must not be widened: it authorizes sub-dispatch at *foreign peers'*
+/// handlers under a bootstrap grant nobody minted for that purpose, undoing the
+/// dimension §5.2 Dimension 4 exists to close. We shipped `IdScope::all()` until
+/// arch ruled the question (go's spec-issue `2026-08-23-a`, ruled absent and
+/// folded into §6.2). Inert in this tree either way today — `make_execute_fn`
+/// returns at its `is_remote` branch before the ceiling check, so the path that
+/// reaches Dimension 4 always qualifies to the local peer — which is exactly why
+/// it is worth spelling correctly now: this is the same "harmless as
+/// documentation, wrong as an enforcement input" shape that produced the
+/// `resources` defect below.
 ///
 /// **Why the form matters here and did not before.** §6.9 describes this default
 /// as unrestricted, and until D1 (PROPOSAL-DISPATCH-AUTHORIZATION-FRAME, §5.2
@@ -316,7 +341,10 @@ pub fn default_handler_self_grant() -> Vec<GrantEntry> {
         // store holds.
         resources: PathScope::new(vec!["/*/*".into()]),
         operations: IdScope::all(),
-        peers: Some(IdScope::all()),
+        // ABSENT, not `*` — §6.2. Absent defaults to `{include: [local_peer_id]}`
+        // and is still checked; `*` would authorize dispatch at foreign peers'
+        // handlers. See the doc comment above before widening this.
+        peers: None,
         constraints: None,
         allowances: None,
     }]
@@ -1797,6 +1825,64 @@ mod tests {
     use super::*;
 
     const LOCAL_PEER: &str = "2DFfrCdapVgjiNBPRUdNpwKLfLsmUaKHod4jmhakzBDs3W";
+
+    /// §6.2 — the default per-handler self-grant carries `peers` **absent**, and
+    /// `resources` **`/*/*`**. The two are pinned in one test because they are
+    /// the two halves of one sentence and each is the wrong answer to the
+    /// other's question.
+    ///
+    /// `peers` absent defaults to `{include: [local_peer_id]}` and is still
+    /// checked (§5.2 Dimension 4), so a default-scope handler cannot dispatch at
+    /// a foreign peer. `IdScope::all()` — which we shipped until arch ruled go's
+    /// spec-issue `2026-08-23-a` — authorizes exactly that, under a bootstrap
+    /// grant nobody minted for the purpose. §6.2 names it "specifically wrong"
+    /// and "the one direction that must not be widened".
+    ///
+    /// `resources` stays `/*/*` and this test exists as much to hold that as to
+    /// move `peers`. Edit E proposed narrowing it to `/{local_peer_id}/*`;
+    /// entity-core-go refuted it by building it (their foreign-namespace ceiling
+    /// test failed), and arch withdrew the narrowing at 0.8.2.3. The reason the
+    /// two dimensions differ is §6.3: a peer's store is ONE local address space
+    /// keyed by peer id, so `/{them}/…` is a local region and writing there is a
+    /// local write. `resources` bounds the address space; `peers` bounds the
+    /// network. Narrowing `resources` closes no hole `peers` does not already
+    /// close, and it breaks the follow-mirror write.
+    ///
+    /// This is inert in this tree today — `make_execute_fn` returns at its
+    /// `is_remote` branch before the ceiling check, so Dimension 4 never sees a
+    /// foreign target on that path. That is the argument FOR pinning it, not
+    /// against: an unread field spelled wrong is the exact shape that produced
+    /// the `resources` defect the moment D1 made this grant an enforcement input.
+    #[test]
+    fn the_default_handler_self_grant_omits_peers_and_spans_namespaces() {
+        let grant = default_handler_self_grant();
+        assert_eq!(grant.len(), 1, "§6.2 describes a single default entry");
+        assert!(
+            grant[0].peers.is_none(),
+            "`peers` MUST be absent, not `*`. Absent means the local peer and is \
+             still checked; `*` authorizes sub-dispatch at foreign peers' \
+             handlers and undoes the dimension §5.2 Dimension 4 exists to close"
+        );
+        assert_eq!(
+            grant[0].resources.include,
+            vec!["/*/*".to_string()],
+            "`resources` MUST stay universal. Bare `*` canonicalizes to \
+             `/{{local}}/*` and a narrowed ceiling 403s a default-scope handler's \
+             follow-mirror write into the foreign-namespace region its OWN store \
+             holds (§1.4 Category A) — the regression Edit E proposed and arch \
+             withdrew at 0.8.2.3"
+        );
+
+        // The neighbouring constructor keeps `*`, and that is deliberate: it is
+        // the own-namespace form for call sites that want confinement. If a
+        // future edit "unifies" the two, this row is what says they were never
+        // the same function.
+        assert!(
+            wildcard_handler_grant()[0].peers.is_some(),
+            "`wildcard_handler_grant` is a different grant with a different \
+             purpose — collapsing the two is how the default gets re-widened"
+        );
+    }
 
     // --- resolve_granter_peer_id (PR-8 / V7 §5.5) ---
     //

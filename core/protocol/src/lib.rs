@@ -184,6 +184,31 @@ pub enum ProtocolError {
     #[error("authentication failed: {0}")]
     AuthenticationFailed(&'static str),
 
+    /// V7 §4.6 step 1 / §4.7 row 6: the `authenticate` did not echo the nonce
+    /// this responder issued in its `hello` response (or none had been issued).
+    /// **401 `invalid_nonce`** — the connection handshake is the authentication
+    /// boundary (§4.6), so a nonce failure is authentication-class, never the
+    /// 400 a malformed frame would earn and never a 409 state conflict (the
+    /// Hardening block pins that explicitly for a replayed authenticate).
+    ///
+    /// Distinct from [`Self::AuthenticationFailed`] because §4.7 is a MUST-emit
+    /// `(code, status)` contract: collapsing the two is non-conformant even
+    /// though both are 401.
+    #[error("invalid nonce: {0}")]
+    InvalidNonce(&'static str),
+
+    /// V7 §4.6 step 3 / §4.7 row 8: `authenticate.peer_id` is not the peer-id
+    /// derived from `authenticate.public_key`, or it disagrees with the
+    /// `hello.peer_id` for the same connection. **401 `identity_mismatch`**.
+    ///
+    /// Step 2 proves possession of *some* private key; step 3 is what binds
+    /// that proof to the identity the caller claims. Grants resolve by
+    /// `remote_peer_id`, so an unbound proof lets a caller act under another
+    /// peer's identity — which is why this is its own code and not folded into
+    /// `authentication_failed`.
+    #[error("identity mismatch: {0}")]
+    IdentityMismatch(&'static str),
+
     #[error("connection error: {0}")]
     ConnectionError(String),
 }
@@ -214,6 +239,11 @@ impl ProtocolError {
             Self::CapabilityExpired => Some("capability_denied"),
             Self::CapabilityNotYetValid => Some("capability_not_yet_valid"),
             Self::AuthenticationFailed(_) => Some("authentication_failed"),
+            // §4.7 rows 6 + 8 — the two connect-handshake failures that are 401
+            // but are NOT `authentication_failed`. The table forbids collapsing
+            // them (see the variants' docs).
+            Self::InvalidNonce(_) => Some("invalid_nonce"),
+            Self::IdentityMismatch(_) => Some("identity_mismatch"),
             Self::CapabilityFormatCodeMismatch(_, _) => Some("capability_denied"),
             Self::MissingEntity(_) => Some("capability_denied"),
             Self::UnresolvableGrantee => Some("unresolvable_grantee"),
@@ -238,8 +268,16 @@ impl ProtocolError {
     ///   excess, not an authorization denial).
     pub fn wire_status_code(&self) -> u32 {
         match self {
-            // 401 authentication-class (§5.2 step-1/step-2 + PR-3 grantee).
-            Self::UnresolvableGrantee | Self::AuthenticationFailed(_) => STATUS_AUTH_FAILED,
+            // 401 authentication-class (§5.2 step-1/step-2 + PR-3 grantee), plus
+            // the §4.6 proof-of-possession failures: "All proof-of-possession
+            // failures above (nonce mismatch, absent/invalid signature, identity
+            // mismatch) are authentication failures and MUST be reported with
+            // status 401." That sentence names three failures; all three land
+            // here, and only the `code` distinguishes them (§4.7).
+            Self::UnresolvableGrantee
+            | Self::AuthenticationFailed(_)
+            | Self::InvalidNonce(_)
+            | Self::IdentityMismatch(_) => STATUS_AUTH_FAILED,
             Self::CapabilityRevoked
             | Self::MissingSignature
             | Self::InvalidSignature

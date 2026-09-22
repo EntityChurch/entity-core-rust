@@ -28,11 +28,14 @@ use crate::store::ModeStore;
 use crate::{
     advertise_path, inner_store_path, is_valid_namespace, store_entry_path,
     CODE_EXPIRED_ON_ARRIVAL, CODE_INVALID_PARAMS, CODE_INVALID_REQUEST, CODE_NAMESPACE_INVALID,
-    CODE_NO_INBOX_RELAY, CODE_NO_ROUTE, CODE_PUT_BY_MISMATCH, CODE_TTL_EXHAUSTED,
-    CODE_UNKNOWN_OPERATION, FORWARD_STATUS_FORWARDED, FORWARD_STATUS_QUEUED_FALLBACK,
+    CODE_NO_INBOX_RELAY, CODE_NO_ROUTE, CODE_PUT_BY_MISMATCH, CODE_STORAGE_FULL,
+    CODE_TTL_EXHAUSTED, CODE_UNKNOWN_OPERATION, FORWARD_STATUS_FORWARDED,
+    FORWARD_STATUS_QUEUED_FALLBACK,
 };
 
 const STATUS_BAD_GATEWAY: u32 = 502;
+/// §4.3 / §8.2 — `storage_full` is a 507 (Insufficient Storage).
+const STATUS_INSUFFICIENT_STORAGE: u32 = 507;
 
 pub struct RelayHandler {
     content_store: Arc<dyn ContentStore>,
@@ -50,6 +53,14 @@ pub struct RelayHandler {
     /// `no_inbox_relay`/502 instead of using the default-convention namespace.
     /// Default `false` (default convention on).
     disable_default_fallback: bool,
+    /// **v1.3 §8.1** — the Mode-S retention CEILING in ms (`relay_store_retention`).
+    /// `None` = enforce no ceiling (hold to the entry's own `expires_at`).
+    /// When set it MUST also be published as `limits.max_retention_ms` (§4.1).
+    store_retention_ms: Option<u64>,
+    /// **v1.3 §8.2** — the relay-wide Mode-S store bound in bytes. `None` =
+    /// unbounded. When set it MUST also be published as
+    /// `limits.max_storage_bytes` (§4.1).
+    max_storage_bytes: Option<u64>,
 }
 
 impl RelayHandler {
@@ -68,6 +79,76 @@ impl RelayHandler {
             forwarder: None,
             inbox_relay_resolver: Arc::new(NopInboxRelayResolver),
             disable_default_fallback: false,
+            store_retention_ms: None,
+            max_storage_bytes: None,
+        }
+    }
+
+    /// Configure the §8.1 retention ceiling (`relay_store_retention`, ms).
+    /// `0` is read as "no ceiling", matching the operator flag's 0-default.
+    pub fn with_store_retention_ms(mut self, ms: u64) -> Self {
+        self.store_retention_ms = (ms > 0).then_some(ms);
+        self
+    }
+
+    /// Configure the §8.2 relay-wide store bound in bytes. `0` = unbounded.
+    pub fn with_max_storage_bytes(mut self, bytes: u64) -> Self {
+        self.max_storage_bytes = (bytes > 0).then_some(bytes);
+        self
+    }
+
+    /// The §4.1 `limits` this relay actually enforces — what the self-advertise
+    /// MUST publish. §8.1: "A Mode S relay that enforces a retention ceiling
+    /// MUST publish it here"; §8.2's bound is published for the same reason.
+    /// A limit that is enforced but unpublished configures behaviour no
+    /// counterparty can observe before depending on it (§4.1).
+    pub fn configured_limits(&self) -> crate::data::AdvertiseLimits {
+        crate::data::AdvertiseLimits {
+            max_envelope_size: None,
+            max_storage_bytes: self.max_storage_bytes,
+            max_retention_ms: self.store_retention_ms,
+            forward_rate_limit: None,
+        }
+    }
+
+    /// The §8.2 live byte total this relay is currently holding — the quantity
+    /// `max_storage_bytes` bounds. Operator/observability accessor (core-go's
+    /// `totalStoredBytes`); see [`ModeStore::live_bytes`](crate::store::ModeStore::live_bytes)
+    /// for the metric and the note that it is not yet ruled.
+    pub fn live_store_bytes(&self, now_ms: i64) -> u64 {
+        self.store.live_bytes(now_ms)
+    }
+
+    /// **The §8.1 ceiling, and the ONLY implementation of it.**
+    ///
+    /// Called from BOTH store-write producers — the wire `:put` and the §6.2.1
+    /// Mode-F fallback — because the two are one bound applied in two places,
+    /// and a second copy is how they drift. core-go shipped exactly that drift:
+    /// its fallback wrote `ExpiresAt: 0` while its `:put` clamped, so the
+    /// §6.2.1 path had neither the ceiling nor a deadline.
+    ///
+    /// Semantics, all three arms stated because `min(x, ceiling)` has no arm
+    /// for null:
+    /// - **no ceiling** → identity. A deadline survives verbatim, a null stays
+    ///   null. This is why the fallback can call it unconditionally.
+    /// - **`Some(t)` beyond the ceiling** → CLAMPED to `now + ceiling`, never
+    ///   refused. Refusing a long-lived put converts an operator's capacity
+    ///   policy into a delivery failure the sender cannot distinguish from an
+    ///   outage (§8.1).
+    /// - **`None` under a ceiling** → takes the ceiling as its lifetime (§8.1
+    ///   states this rather than deriving it).
+    ///
+    /// Never extends: the result is `min` of the input and the ceiling, so a
+    /// deadline shorter than the ceiling is untouched (§3.1 — "a relay MUST NOT
+    /// extend a deadline the originator set").
+    fn clamp_expiry(&self, now_ms: i64, expires_at: Option<i64>) -> Option<i64> {
+        let Some(ceiling_ms) = self.store_retention_ms else {
+            return expires_at;
+        };
+        let ceiling = now_ms.saturating_add(ceiling_ms as i64);
+        match expires_at {
+            Some(t) => Some(t.min(ceiling)),
+            None => Some(ceiling),
         }
     }
 
@@ -134,7 +215,10 @@ impl RelayHandler {
         }
 
         // §4.3 expired_on_arrival is 400 (creation-side dead-on-arrival), not
-        // 410 — nothing was ever stored, so no resource is Gone.
+        // 410 — nothing was ever stored, so no resource is Gone. Evaluated on
+        // the SUBMITTED value, before the clamp: the clamp only ever lowers a
+        // deadline toward `now + ceiling`, which is in the future whenever a
+        // ceiling is configured, so it can never manufacture this rejection.
         let now = now_ms();
         if matches!(entry.expires_at, Some(e) if e <= now) {
             return error(
@@ -143,6 +227,13 @@ impl RelayHandler {
                 "expires_at already past at put time",
             );
         }
+
+        // §8.1 — store-write producer 1 of 2. Clamped BEFORE the store-entry
+        // entity is built, so the clamped deadline is what is hashed, what is
+        // stored, and what the put-result echoes. A clamp applied after the
+        // entity was authored would return a value the relay is not holding.
+        let mut entry = entry;
+        entry.expires_at = self.clamp_expiry(now, entry.expires_at);
 
         self.store_entry(ctx, &entry, &entry.namespace)
     }
@@ -156,10 +247,71 @@ impl RelayHandler {
         entry: &StoreEntry,
         namespace: &str,
     ) -> HandlerResult {
+        // Author the store-entry and measure the cost BEFORE anything is
+        // written. §4.3 makes every relay op fail-closed — "on any error the op
+        // performs no partial effect (no forward, no store, no dequeue)" — so a
+        // §8.2 refusal must not leave the inner envelope or the entry bound at
+        // a namespace path. Authoring is pure; the writes all happen after the
+        // bound is cleared.
+        //
+        // The stored entry IS the request entity (§4.2 — request IS a
+        // store-entry); encoding it here reproduces the caller's bytes, so
+        // `entry_hash` is the caller's hash. For the fallback path the relay
+        // authors a fresh store-entry (put_by = relay, §3.2).
+        let store_entry_entity = match entry.to_entity() {
+            Ok(e) => e,
+            Err(e) => {
+                return error(
+                    entity_handler::STATUS_INTERNAL_ERROR,
+                    "store_entry_encode_failed",
+                    &e.to_string(),
+                )
+            }
+        };
+        let entry_hash = store_entry_entity.content_hash;
+        let inner = ctx.included.get(&entry.envelope_inner);
+        let cost = entry_cost(&store_entry_entity, inner);
+
+        // §8.2 (v1.3) — a full store REFUSES; it does not evict.
+        //
+        // The no-evict half is the load-bearing one, and it is a MUST. A silent
+        // eviction discards a message the sender was already told was `stored`
+        // — the deliver-or-signal failure §4.3's posture exists to prevent,
+        // arriving after the operation returned. A 507 instead tells the sender
+        // its message was not taken, so it can try another relay from the
+        // destination's §3.5 declaration. Nothing in this handler removes an
+        // accepted entry; the only reclamation anywhere is expiry, in
+        // `ModeStore::put`, which is time and not pressure.
+        //
+        // Checked in the path BOTH producers share, so the §6.2.1 fallback is
+        // bounded by the same number as a wire `:put` rather than being an
+        // unmetered second door into the same store.
+        //
+        // The idempotency gate: a re-put of a hash-equal entry adds no bytes,
+        // so it is never refused on a full store.
+        let now = now_ms();
+        if let Some(max) = self.max_storage_bytes {
+            if !self.store.contains(namespace, &entry_hash)
+                && self.store.live_bytes(now).saturating_add(cost) > max
+            {
+                return error(
+                    STATUS_INSUFFICIENT_STORAGE,
+                    CODE_STORAGE_FULL,
+                    &format!(
+                        "store full: accepting {} bytes would exceed max_storage_bytes {} \
+                         (§8.2 — the relay refuses and does not evict)",
+                        cost, max
+                    ),
+                );
+            }
+        }
+
+        // --- Past the bound: everything below writes. ---
+
         // Persist the opaque inner envelope so the poller can fetch it (§4.2
         // two-hop fetch). It rides in the EXECUTE `included` set, held as raw
         // bytes — stored verbatim, never decoded (§9).
-        if let Some(inner) = ctx.included.get(&entry.envelope_inner) {
+        if let Some(inner) = inner {
             let inner_hash = match self.content_store.put(inner.clone()) {
                 Ok(h) => h,
                 Err(e) => {
@@ -180,34 +332,18 @@ impl RelayHandler {
             self.location_index.set(&inner_path, inner_hash);
         }
 
-        // The stored entry IS the request entity (§4.2 — request IS a
-        // store-entry); store it verbatim so `entry_hash` is the caller's hash
-        // and bytes are preserved. For the fallback path the relay authors a
-        // fresh store-entry (put_by = relay), so re-encode there.
-        let store_entry_entity = match entry.to_entity() {
-            Ok(e) => e,
-            Err(e) => {
-                return error(
-                    entity_handler::STATUS_INTERNAL_ERROR,
-                    "store_entry_encode_failed",
-                    &e.to_string(),
-                )
-            }
-        };
-        let entry_hash = match self.content_store.put(store_entry_entity) {
-            Ok(h) => h,
-            Err(e) => {
-                return error(
-                    entity_handler::STATUS_INTERNAL_ERROR,
-                    "store_failed",
-                    &e.to_string(),
-                )
-            }
-        };
+        if let Err(e) = self.content_store.put(store_entry_entity) {
+            return error(
+                entity_handler::STATUS_INTERNAL_ERROR,
+                "store_failed",
+                &e.to_string(),
+            );
+        }
 
         let path = store_entry_path(&self.peer_id, namespace, &entry_hash.to_hex());
         self.location_index.set(&path, entry_hash);
-        self.store.put(namespace, entry_hash, entry.expires_at);
+        self.store
+            .put(namespace, entry_hash, entry.expires_at, cost, now);
 
         let result = PutResult {
             stored_at: path,
@@ -364,6 +500,11 @@ impl RelayHandler {
                     is_terminal,
                     ttl_hops: onward_ttl,
                     onward_route: &remaining,
+                    // §3.1 v1.3: the originator's deadline travels with the
+                    // envelope. Verbatim — not clamped in transit (see the
+                    // field's doc), and not dropped (see `handler_tests`'
+                    // multi-hop row).
+                    expires_at: req.expires_at,
                     inner: &inner,
                 })
                 .await
@@ -407,9 +548,20 @@ impl RelayHandler {
                     }
                 };
 
+                // §3.1 v1.3 + §8.1 — store-write producer 2 of 2, and the
+                // reason `expires_at` exists on the OUTER forward-request at
+                // all. The originator's real deadline is `bounds.ttl_absolute`
+                // inside the inner envelope, which §9 forbids the relay to
+                // decode — so before v1.3 the relay constructed this entry with
+                // NO deadline and held someone else's message forever. The
+                // request's `expires_at` carries the deadline where the relay
+                // may read it; `clamp_expiry` honors it, lowers it to the
+                // ceiling, and never extends it. Where the request carries
+                // none, the ceiling applies as if it were null — which is
+                // exactly `clamp_expiry(now, None)`.
                 let fallback_entry = StoreEntry {
                     namespace: namespace.clone(),
-                    expires_at: None,
+                    expires_at: self.clamp_expiry(now_ms(), req.expires_at),
                     put_by: self.peer_id.clone(),
                     envelope_inner: req.envelope_inner,
                 };
@@ -522,6 +674,19 @@ impl Handler for RelayHandler {
     fn operations(&self) -> &[&str] {
         &["forward", "put", "poll", "advertise"]
     }
+}
+
+/// The §8.2 byte cost of one stored entry: the two entity `data` payloads the
+/// relay holds on the putter's behalf. Matches core-go's `entryCost`, so both
+/// seats bound the same quantity.
+///
+/// **The metric is not ruled** — §8.2 says a full store refuses and never says
+/// what `max_storage_bytes` counts. core-go filed spec-issue `2026-09-01-a` and
+/// deliberately shipped no storage-full wire row for exactly that reason: a
+/// cross-impl check here would gate one seat's reading. Written down so this is
+/// a stated interim rather than a silent choice. See [`ModeStore::live_bytes`].
+fn entry_cost(store_entry: &entity_entity::Entity, inner: Option<&entity_entity::Entity>) -> u64 {
+    store_entry.data.len() as u64 + inner.map(|i| i.data.len() as u64).unwrap_or(0)
 }
 
 fn now_ms() -> i64 {

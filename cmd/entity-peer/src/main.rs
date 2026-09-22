@@ -276,6 +276,25 @@ enum PeerAction {
         /// Matches Go peer's `-keepalive-max-missed`.
         #[arg(long, default_value_t = 0)]
         keepalive_max_missed: u32,
+        /// EXTENSION-RELAY §8.1 (v1.3) — Mode-S retention CEILING in ms.
+        /// A `:put` whose `store-entry.expires_at` exceeds `now + ceiling`
+        /// (or is null) is CLAMPED to the ceiling, never refused — refusing
+        /// would turn a capacity policy into a delivery failure the sender
+        /// cannot tell from an outage. Also applies to the §6.2.1 Mode-F
+        /// store fallback. 0 = no ceiling (hold to the entry's own
+        /// `expires_at`). When set it is published as
+        /// `limits.max_retention_ms` in the §4.1 self-advertise.
+        /// Matches Go peer's `-relay-store-retention-ms`.
+        #[arg(long, default_value_t = 0)]
+        relay_store_retention_ms: u64,
+        /// EXTENSION-RELAY §8.2 (v1.3) — relay-wide Mode-S store bound in
+        /// bytes. A `:put` that would push the live total over the bound is
+        /// REFUSED with `storage_full`/507; the relay MUST NOT evict an
+        /// accepted entry to make room. 0 = unbounded. When set it is
+        /// published as `limits.max_storage_bytes` in the §4.1
+        /// self-advertise. Matches Go peer's `-relay-max-storage-bytes`.
+        #[arg(long, default_value_t = 0)]
+        relay_max_storage_bytes: u64,
     },
     /// List all peers
     List,
@@ -404,6 +423,8 @@ async fn main() -> anyhow::Result<()> {
                     keepalive_interval_ms,
                     keepalive_timeout_ms,
                     keepalive_max_missed,
+                    relay_store_retention_ms,
+                    relay_max_storage_bytes,
                 } => {
                     commands::peer::start(
                         &name,
@@ -432,6 +453,10 @@ async fn main() -> anyhow::Result<()> {
                             interval_ms: keepalive_interval_ms,
                             timeout_ms: keepalive_timeout_ms,
                             max_missed: keepalive_max_missed,
+                        },
+                        commands::peer::RelayStoreBounds {
+                            retention_ms: relay_store_retention_ms,
+                            max_storage_bytes: relay_max_storage_bytes,
                         },
                     )
                     .await?

@@ -61,6 +61,19 @@ pub struct ForwardCtx<'a> {
     /// so a downstream receiver that reads `next_hop` first still resolves
     /// (cross-impl trap #3). Ignored on the terminal hop.
     pub onward_route: &'a [String],
+    /// **v1.3 (§3.1)** — the originator's `expires_at`, carried onward
+    /// UNCHANGED on an intermediate hop.
+    ///
+    /// This is a deadline the originator set, and §3.1 says a relay MUST NOT
+    /// extend one. Dropping it is the same failure in slow motion: the next hop
+    /// receives a request with no deadline, so if IT takes the §6.2.1 store
+    /// fallback it holds the message under its own ceiling — or forever — and
+    /// the originator's bound silently stops existing one hop in. The §8.1
+    /// clamp is a *storage-side* decision made by whichever relay ends up
+    /// holding the entry; it is not applied here, because clamping in transit
+    /// would let each hop ratchet the deadline down by its own ceiling.
+    /// Ignored on the terminal hop (nothing is stored there).
+    pub expires_at: Option<i64>,
     /// The opaque inner envelope — `data` is the raw inner bytes; MUST NOT be
     /// decoded/re-encoded (§9).
     pub inner: &'a Entity,

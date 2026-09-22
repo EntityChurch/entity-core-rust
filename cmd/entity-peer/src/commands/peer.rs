@@ -91,6 +91,22 @@ impl KeepaliveOverrides {
     }
 }
 
+/// EXTENSION-RELAY §8 (v1.3) operator bounds for the Mode-S store, carried as
+/// one struct so the two halves of "the relay's capacity policy" stay together
+/// — they are enforced together (§8.2's refusal is only safe because §8.1's
+/// ceiling bounds the store in time) and published together in the §4.1
+/// self-advertise.
+///
+/// Both `0` = off, which is the §8.1/§8.2 "declares no bound" posture, NOT a
+/// claim of unlimited capacity.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RelayStoreBounds {
+    /// §8.1 `relay_store_retention` in ms; 0 = no ceiling.
+    pub retention_ms: u64,
+    /// §8.2 relay-wide store bound in bytes; 0 = unbounded.
+    pub max_storage_bytes: u64,
+}
+
 /// Start a peer.
 #[allow(clippy::too_many_arguments)]
 pub async fn start(
@@ -117,6 +133,7 @@ pub async fn start(
     peer_issued_registries: &[String],
     publish_descriptors: bool,
     keepalive_overrides: KeepaliveOverrides,
+    relay_store_bounds: RelayStoreBounds,
 ) -> anyhow::Result<()> {
     // A serving scope is either a content namespace or closure-of-signed-root
     // (NETWORK §6.5.6 Amendment 10). Exactly one may be selected (clap enforces
@@ -220,6 +237,11 @@ pub async fn start(
         connection_timeout_secs: peer_toml.peer.connection_timeout_secs.unwrap_or(30),
         debug_open_grants: debug_grants,
         home_hash_format,
+        // EXTENSION-RELAY §8.1 / §8.2 (v1.3). Both default-off; when set they
+        // are enforced on BOTH store-write paths (`:put` and the §6.2.1
+        // fallback) and published in the §4.1 self-advertise.
+        relay_store_retention_ms: relay_store_bounds.retention_ms,
+        relay_max_storage_bytes: relay_store_bounds.max_storage_bytes,
         ..PeerConfig::default()
     };
 

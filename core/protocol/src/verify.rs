@@ -107,7 +107,9 @@ pub fn verify_request(
 
     // 2b. Validate content hash on every envelope.included entity.
     //
-    // PROPOSAL-CROSS-IMPL-STANDARDIZATION-CATCHUP §4 / MACHINE-SPEC §1.8:
+    // PROPOSAL-CROSS-IMPL-STANDARDIZATION-CATCHUP §4 / `ENTITY-CBOR-ENCODING`
+    // §5.4 (Entity Fidelity — the canonical home of this contract; the
+    // MACHINE-SPEC §1.8 this used to cite is a RETIRED document, arch Q-2):
     // an entity's claimed hash MUST be verified before trust. Prior to this
     // pass only the root was checked; included caps, identities, signatures,
     // and chain entities reached downstream consumers with their claimed

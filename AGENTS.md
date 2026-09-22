@@ -92,6 +92,27 @@ misread as an absent surface, but a gated symbol quietly removing a guard that
 depends on it. **A security invariant of the dispatch core must not be reachable
 only through an extension's feature gate** — say so at the `fn` when you un-gate one.
 
+**And the same shape one level IN, at the TEST set: `make features` runs
+`cargo clippy -p entity-peer …`, with no `--tests`, so the 27-configuration matrix
+never compiles the test module — a `#[cfg(feature = …)]` mistake in a TEST is
+invisible to the one gate that exists to find cfg mistakes.** *(Candidate: bit us
+once, 2026-09-01, caught before landing.)* The FM-1 rows for the http-live transport
+call `dispatch_session_envelope`, which is `#[cfg(all(feature = "http-live", …))]`;
+written without a gate they compiled fine under the default set and would have broken
+every config in the matrix that drops `http-live` — and all six `make` verbs would
+still have gone green, because none of them builds `entity-peer`'s tests off-default.
+**Enforcement:** when a test touches a cfg-gated symbol, run
+`cargo check -p entity-peer --tests --no-default-features` (and `--all-features`)
+directly — `make features` does not cover it, and the fix is not to widen that verb
+casually, because `--tests` across 27 configurations is a different cost class.
+**The corollary is the sharper half, and it is about where a CONTROL row lives.** A
+fix's control — the row that fails if you "fixed" the defect by relabelling a
+catch-all rather than by discriminating — is worthless in any configuration it does
+not compile into. FM-1's anti-rename control is therefore on the **ungated TCP**
+path, with the http-live rows gated beside it: the same rule as the `fn`-level one
+above (*a security invariant must not be reachable only through a feature gate*),
+applied to the test that proves the invariant rather than to the invariant.
+
 **And the same shape one level out, at the PACKAGE set: `make test` / `make clippy` /
 `make fmt` run `default-members`, so a member left out of that list is out of the gate
 entirely — and the gate will report a green number for the set it ran.** This repo has
@@ -471,6 +492,28 @@ gates by making the TCP path compile on wasm32.
   measuring anything; write the unreachability down (see
   `merge_spec_key_3_pattern_order_is_unreachable_by_construction`) rather than leave a
   branch that reads as covered.
+  **Fourth axis, and it is the one that makes a sibling's red row *your* evidence problem: within a
+  NUMBERED algorithm, a probe aimed at step N must FAIL step N and PASS steps 1..N−1 on their own
+  terms — otherwise it discriminates check ORDER, and order may be a freedom the spec left open.**
+  *(Candidate: bit us once, 2026-09-01, caught before converging.)* core-go's §4.7 row-8 probe
+  ("`peer_id` not derived from `public_key`" → 401 `identity_mismatch`) signs with the key whose
+  `peer_id` is claimed while presenting a *different* key's `public_key`. §4.6 **step 2** says
+  verify the signature against `authenticate.public_key` — so that input fails step 2 and never
+  reaches the step-3 binding it is named for. go answers `identity_mismatch` because go runs the
+  binding first; we answer `authentication_failed` because we run the numbered order. **Both seats
+  implement all three checks**, and §4.6 pins order for exactly one pair (0 before 3). The red row
+  was a divergence about sequencing wearing the shape of a missing check — and the pull to "just
+  make it green" was to adopt an ordering with no text behind it.
+  **Enforcement, and it is constructive rather than a standoff:** for a probe against step N of an
+  ordered algorithm, write down what each earlier step does with that input; if any earlier step
+  rejects it, the probe is not measuring step N and the fix is a *better input*, not a code change.
+  Here the step-3-isolating input is one field different — sign with the key you present, claim
+  someone else's `peer_id` — and it is unambiguous under every reading
+  (`peer_id_not_derived_from_public_key_is_401_identity_mismatch`). Offer that input in the reply.
+  Note the sibling's own rule usually disqualifies their row for them: go kept four §4.7 rows out of
+  the suite for discriminating on an unruled semantic, and this is a fifth. Pin your reading in a
+  test whose assertion is written to flip in one edit (`authenticate_signing_key_mismatch_is_step_2`)
+  and route the ordering, per *"ask for a ruling, not a winner"* below.
   **Third axis, and the cheapest to miss: the process ENVIRONMENT can be the thing the row does
   not control** *(B-1, `bd44465`)*. The obvious test for the 0600 key fix —
   `assert mode == 0o600` after a mint — is a claim about the **umask**, not about the code:
@@ -540,6 +583,17 @@ gates by making the TCP path compile on wasm32.
   `registry_issuer` **did** carry `set_issuer_policy_max_ttl_ceiling`,
   `register_ttl_clamped_to_max` and `renew_ttl_clamped_to_max`, so the TTL half is
   wire-verified and the other three surfaces are in-tree only. Report the difference.
+  **And one level OUT, at the multi-pass GATE: a pass can exit 0 without running.** *(Candidate:
+  bit us once, 2026-09-01, caught by reading the pass line.)* `validate-complete.sh rust` reports
+  `PASS 4 exit 0 (relay_store_bounds, §8.1 armed)` — and PASS 4 never scored us, because
+  `startRustPeer` does not forward `--relay-store-retention-ms`, so both rows report
+  `SKIP [excluded from scoring]` and the pass exits 0 **trivially**. An exit code is a claim about
+  the checks that *ran*; a harness that cannot arm your peer produces the same 0 as a clean sweep.
+  We had just landed §8.1, so citing that 0 would have read as confirmation of the thing it could
+  not see. **Enforcement:** for any posture-gated pass, grep the run for the category's rows and
+  confirm they are `PASS`, not `SKIP` — and when the harness cannot arm you, drive the category by
+  hand against a peer you started with the flags, report *that* number, and say at the report that
+  the gate's pass is structural. Then hand the sibling the flag names so the gap closes.
   **The same holds *inside* a check, and that half is newly earned (`898e55b`).** A
   multi-row check short-circuits at the first failing row, so a FAIL is evidence about **one**
   row and silence about the rest — including rows measuring the *same* defect. go's
@@ -568,6 +622,17 @@ gates by making the TCP path compile on wasm32.
   routed item as written — a seat that silently absorbs three versions into a one-line item
   leaves the ledger claiming a parity that nobody measured. Corollary for the reply: name the
   versions you actually landed, not the version the routing was titled with.
+  **The delta runs in BOTH directions, and the over-statement is the one that wastes a rewrite**
+  *(2026-09-01; the rule worked, so it stays a candidate — vindicated by the outcome it predicts,
+  not by a second bite).* core-go's §4.7 report read our collapsed `403 invalid_signature` as
+  *"rust does not distinguish an identity mismatch from a signature failure"* — but our §4.6 step-3
+  binding was there all along, just ordered after step 2 where their probe could not reach it.
+  Implementing the item as written would have added a check we already had. Recomputing found the
+  real gap one sentence over, which the routing did not name: §4.6's *"MUST **also** verify
+  `authenticate.peer_id == hello.peer_id`"*, absent here, so the handshake could change its claimed
+  identity between frames. **A red row tells you the OUTPUT is wrong; it does not tell you which
+  input produced it** — read your own function before believing a report about it, and put the
+  correction in the reply as a measurement rather than leaving the ledger wrong.
 - **A ruling that changes a PUBLISHED DESCRIPTOR cannot be landed seat-by-seat — the first
   seat to land it goes red, and that is the check working, not a defect.** *(Candidate: bit us
   once, 2026-08-21, caught on the wire and backed out the same session.)* C-11 Corner 2 (D3)

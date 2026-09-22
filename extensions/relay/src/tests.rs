@@ -100,6 +100,7 @@ fn forward_request_round_trip() {
         route: None,
         next_hop: Some("z6MkHop".into()),
         ttl_hops: 8,
+        expires_at: None,
         envelope_inner: lit_hash(0xAB),
     };
     let e = fr.to_entity().unwrap();
@@ -163,6 +164,7 @@ fn advertise_round_trip() {
         limits: AdvertiseLimits {
             max_envelope_size: Some(1 << 20),
             max_storage_bytes: None,
+            max_retention_ms: None,
             forward_rate_limit: Some(100),
         },
         caps_required: vec![CAP_RELAY_FORWARD.into()],
@@ -194,6 +196,7 @@ fn peer_id_fields_are_text_not_hash() {
         route: None,
         next_hop: Some("z6MkHop".into()),
         ttl_hops: 1,
+        expires_at: None,
         envelope_inner: lit_hash(0x01),
     };
     let map = decode(&fr.to_entity().unwrap().data);
@@ -451,6 +454,7 @@ async fn forward_ttl_zero_rejected() {
         route: None,
         next_hop: Some("z6MkDest".into()),
         ttl_hops: 0,
+        expires_at: None,
         envelope_inner: inner.content_hash,
     };
     let res = r.handle(&forward_ctx(&req, &inner)).await.unwrap();
@@ -468,6 +472,7 @@ async fn forward_no_next_hop_is_no_route() {
         route: None,
         next_hop: None,
         ttl_hops: 4,
+        expires_at: None,
         envelope_inner: inner.content_hash,
     };
     let res = r.handle(&forward_ctx(&req, &inner)).await.unwrap();
@@ -486,6 +491,7 @@ async fn forward_unreachable_falls_back_to_mode_s() {
         route: None,
         next_hop: Some(dest.into()),
         ttl_hops: 4,
+        expires_at: None,
         envelope_inner: inner.content_hash,
     };
     let res = r.handle(&forward_ctx(&req, &inner)).await.unwrap();
@@ -540,6 +546,7 @@ struct RecordedHop {
     is_terminal: bool,
     ttl_hops: u32,
     onward_route: Vec<String>,
+    expires_at: Option<i64>,
 }
 
 #[async_trait::async_trait]
@@ -551,6 +558,7 @@ impl crate::forwarder::RelayForwarder for RecordingForwarder {
             is_terminal: ctx.is_terminal,
             ttl_hops: ctx.ttl_hops,
             onward_route: ctx.onward_route.to_vec(),
+            expires_at: ctx.expires_at,
         });
         ForwardOutcome::Forwarded {
             next_hop: ctx.next_hop.to_string(),
@@ -608,6 +616,7 @@ async fn source_route_next_hop_mismatch_rejected_pre_dispatch() {
         route: Some(vec![HOP_B.into(), DEST.into()]),
         next_hop: Some("z6MkSomethingElse".into()), // ≠ route[0]
         ttl_hops: 8,
+        expires_at: None,
         envelope_inner: lit_hash(0x21),
     };
     let (res, recorded) = forward_recorded(req).await;
@@ -627,6 +636,7 @@ async fn source_route_next_hop_matching_head_ok() {
         route: Some(vec![HOP_B.into(), DEST.into()]),
         next_hop: Some(HOP_B.into()), // == route[0]
         ttl_hops: 8,
+        expires_at: None,
         envelope_inner: lit_hash(0x22),
     };
     let (res, recorded) = forward_recorded(req).await;
@@ -643,6 +653,7 @@ async fn source_route_intermediate_pops_head() {
         route: Some(vec![HOP_B.into(), HOP_C.into(), DEST.into()]),
         next_hop: None,
         ttl_hops: 8,
+        expires_at: None,
         envelope_inner: lit_hash(0x23),
     };
     let (res, recorded) = forward_recorded(req).await;
@@ -662,6 +673,7 @@ async fn source_route_single_element_is_terminal_equiv() {
         route: Some(vec![DEST.into()]),
         next_hop: None,
         ttl_hops: 5,
+        expires_at: None,
         envelope_inner: lit_hash(0x24),
     };
     let (res_r, hop_r) = forward_recorded(via_route).await;
@@ -670,6 +682,7 @@ async fn source_route_single_element_is_terminal_equiv() {
         route: None,
         next_hop: Some(DEST.into()),
         ttl_hops: 5,
+        expires_at: None,
         envelope_inner: lit_hash(0x24),
     };
     let (res_n, hop_n) = forward_recorded(via_next_hop).await;
@@ -704,6 +717,7 @@ async fn route_table_forward_resolves_via() {
         route: None,
         next_hop: None, // no source route, no next_hop → table read
         ttl_hops: 4,
+        expires_at: None,
         envelope_inner: lit_hash(0x25),
     };
     let (res, recorded) = forward_recorded_with(&cs, &li, req).await;
@@ -733,6 +747,7 @@ async fn route_table_deliver_is_terminal() {
         route: None,
         next_hop: None,
         ttl_hops: 4,
+        expires_at: None,
         envelope_inner: lit_hash(0x26),
     };
     let (res, recorded) = forward_recorded_with(&cs, &li, req).await;
@@ -763,6 +778,7 @@ async fn source_route_takes_precedence_over_table() {
         route: Some(vec![HOP_B.into(), DEST.into()]),
         next_hop: None,
         ttl_hops: 6,
+        expires_at: None,
         envelope_inner: lit_hash(0x27),
     };
     let (res, recorded) = forward_recorded_with(&cs, &li, req).await;
@@ -795,6 +811,7 @@ async fn route_table_no_match_is_no_route() {
         route: None,
         next_hop: None,
         ttl_hops: 4,
+        expires_at: None,
         envelope_inner: lit_hash(0x28),
     };
     let (res, recorded) = forward_recorded_with(&cs, &li, req).await;
@@ -859,6 +876,7 @@ async fn fallback_honors_declared_inbox_relay_namespace() {
         route: None,
         next_hop: Some("z6MkOffline".into()),
         ttl_hops: 4,
+        expires_at: None,
         envelope_inner: inner.content_hash,
     };
     let res = r.handle(&forward_ctx(&req, &inner)).await.unwrap();
@@ -904,6 +922,7 @@ async fn fallback_no_inbox_relay_when_mx_required() {
         route: None,
         next_hop: Some("z6MkOffline".into()),
         ttl_hops: 4,
+        expires_at: None,
         envelope_inner: inner.content_hash,
     };
     let res = r.handle(&forward_ctx(&req, &inner)).await.unwrap();
@@ -1038,6 +1057,7 @@ fn fixture_f1_forward_request_full() {
         route: None,
         next_hop: Some(FIX_RELAY.into()),
         ttl_hops: 5,
+        expires_at: None,
         envelope_inner: lit_hash(0xEE),
     }
     .to_entity()
@@ -1057,6 +1077,7 @@ fn fixture_f2_forward_request_no_next_hop() {
         route: None,
         next_hop: None,
         ttl_hops: 3,
+        expires_at: None,
         envelope_inner: lit_hash(0xEE),
     }
     .to_entity()
@@ -1237,4 +1258,502 @@ fn namespace_validation() {
     assert!(!is_valid_namespace("trailing/"));
     assert!(!is_valid_namespace("a//b"));
     assert!(!is_valid_namespace("a/../b"));
+}
+
+// ---------------------------------------------------------------------------
+// EXTENSION-RELAY v1.3 — §8.1 retention ceiling, §8.2 storage bound,
+// §3.1 forward-request.expires_at
+// ---------------------------------------------------------------------------
+
+/// The put-result's `expires_at` — which §8.1 makes the STORED value, not the
+/// submitted one. core-go's `relay_store_bounds` wire rows compare exactly this
+/// field across a null put and a far-future put, so it is the cross-impl
+/// observable and not an internal detail.
+fn stored_expiry(res: &HandlerResult) -> Option<i64> {
+    match field(&decode(&res.result.data), "expires_at") {
+        Some(Value::Integer(i)) => Some(i64::try_from(*i).unwrap()),
+        _ => None,
+    }
+}
+
+fn now_ms_test() -> i64 {
+    web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// §8.1 — a `:put` whose `expires_at` is beyond the ceiling is CLAMPED, not
+/// refused, and the put-result echoes the clamped value.
+///
+/// "Not refused" is the half worth naming: refusing a long-lived put converts
+/// an operator's capacity policy into a delivery failure the sender cannot
+/// distinguish from an outage, so a 400/507 here would be conformant-looking
+/// and wrong.
+///
+/// Mutation: dropping the `clamp_expiry` call in `handle_put` stores the
+/// submitted century-away deadline verbatim and this goes red.
+#[tokio::test]
+async fn far_future_expiry_is_clamped_to_the_ceiling_not_refused() {
+    let (cs, li) = stores();
+    let ceiling_ms = 3_600_000; // 1h
+    let r = relay(&cs, &li).with_store_retention_ms(ceiling_ms);
+    let kp = IdentityKeypair::from(Keypair::generate());
+    let inner = inner_envelope(1);
+
+    let far = now_ms_test() + 100 * 365 * 24 * 3600 * 1000; // ~a century out
+    let put = r
+        .handle(&put_ctx(&kp, "alice-ns", Some(far), &inner))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        put.status,
+        200,
+        "§8.1: CLAMPED, never refused — got {:?}",
+        result_code(&put)
+    );
+    let stored = stored_expiry(&put).expect("a clamped put has a deadline");
+    assert!(
+        stored < far,
+        "far expires_at was stored verbatim ({stored}) — no ceiling applied"
+    );
+    let expected = now_ms_test() + ceiling_ms as i64;
+    assert!(
+        (stored - expected).abs() < 60_000,
+        "clamped to {stored}, expected ~now+ceiling ({expected})"
+    );
+}
+
+/// §8.1 — a NULL `expires_at` takes the ceiling as its lifetime.
+///
+/// The spec states this arm rather than deriving it, because `min(x, ceiling)`
+/// has no arm for null — and an implementation that only ever computes a `min`
+/// silently gives a null-expiry put unbounded life, which is the accumulation
+/// §8.1 exists to stop.
+///
+/// Mutation: changing `clamp_expiry`'s `None` arm back to `None` leaves the
+/// entry unbounded and this goes red while the far-clamp row above stays green
+/// — which is why the two arms are two tests.
+#[tokio::test]
+async fn null_expiry_takes_the_ceiling() {
+    let (cs, li) = stores();
+    let ceiling_ms = 3_600_000;
+    let r = relay(&cs, &li).with_store_retention_ms(ceiling_ms);
+    let kp = IdentityKeypair::from(Keypair::generate());
+    let inner = inner_envelope(2);
+
+    let put = r
+        .handle(&put_ctx(&kp, "alice-ns", None, &inner))
+        .await
+        .unwrap();
+    assert_eq!(put.status, 200);
+    let stored = stored_expiry(&put).expect("§8.1: a null expires_at TAKES the ceiling");
+    let expected = now_ms_test() + ceiling_ms as i64;
+    assert!(
+        (stored - expected).abs() < 60_000,
+        "null put stored {stored}, expected ~now+ceiling ({expected})"
+    );
+}
+
+/// §8.1 — the ceiling is a `min`, never an extension. A deadline SHORTER than
+/// the ceiling survives verbatim (§3.1: "a relay MUST NOT extend a deadline the
+/// originator set").
+///
+/// Mutation: replacing `t.min(ceiling)` with `ceiling` — a plausible reading of
+/// "takes the ceiling" — passes both rows above and fails only this one.
+#[tokio::test]
+async fn a_deadline_inside_the_ceiling_is_not_extended() {
+    let (cs, li) = stores();
+    let r = relay(&cs, &li).with_store_retention_ms(3_600_000);
+    let kp = IdentityKeypair::from(Keypair::generate());
+    let inner = inner_envelope(3);
+
+    let soon = now_ms_test() + 60_000; // 1 min: well inside the 1h ceiling
+    let put = r
+        .handle(&put_ctx(&kp, "alice-ns", Some(soon), &inner))
+        .await
+        .unwrap();
+    assert_eq!(put.status, 200);
+    assert_eq!(
+        stored_expiry(&put),
+        Some(soon),
+        "a deadline inside the ceiling MUST survive verbatim — the ceiling is a \
+         min, and extending the originator's deadline is forbidden (§3.1)"
+    );
+}
+
+/// §8.1's control — with NO ceiling configured, `clamp_expiry` is the identity.
+///
+/// This is what lets the §6.2.1 fallback call it unconditionally, and it is the
+/// row that fails if the "ceiling" is ever given a non-zero default. A relay
+/// that declares no ceiling holds entries to their own `expires_at` (§8.1).
+#[tokio::test]
+async fn no_ceiling_configured_leaves_both_arms_untouched() {
+    let (cs, li) = stores();
+    let r = relay(&cs, &li); // default: no ceiling
+    let kp = IdentityKeypair::from(Keypair::generate());
+
+    let far = now_ms_test() + 100 * 365 * 24 * 3600 * 1000;
+    let put = r
+        .handle(&put_ctx(&kp, "alice-ns", Some(far), &inner_envelope(4)))
+        .await
+        .unwrap();
+    assert_eq!(stored_expiry(&put), Some(far), "no ceiling ⇒ verbatim");
+
+    let put = r
+        .handle(&put_ctx(&kp, "alice-ns", None, &inner_envelope(5)))
+        .await
+        .unwrap();
+    assert_eq!(
+        stored_expiry(&put),
+        None,
+        "no ceiling ⇒ a null expiry stays null; the ceiling is the ONLY thing \
+         that turns 'hold until polled' into a deadline"
+    );
+}
+
+/// §8.2 — a full store REFUSES with `storage_full`/507 and does NOT evict.
+///
+/// The no-evict half is asserted directly, because it is the MUST and it is the
+/// one a plausible implementation gets wrong: an LRU that made room would
+/// return 200 here and silently discard a message the first sender was already
+/// told was `stored`.
+///
+/// Mutation: deleting the §8.2 block accepts B and this goes red on the status.
+#[tokio::test]
+async fn a_full_store_refuses_and_does_not_evict() {
+    let (cs, li) = stores();
+    let kp = IdentityKeypair::from(Keypair::generate());
+    let inner_a = inner_envelope(6);
+
+    // Size the bound to exactly one entry by measuring A's cost against an
+    // unbounded relay first — a hardcoded byte count would be a claim about
+    // the codec's output, not about the bound.
+    let probe = relay(&cs, &li);
+    let put_a = probe
+        .handle(&put_ctx(&kp, "ns", None, &inner_a))
+        .await
+        .unwrap();
+    assert_eq!(put_a.status, 200);
+    let cost_a = probe.live_store_bytes(now_ms_test());
+    assert!(cost_a > 0, "the probe must have measured something");
+
+    // Fresh relay, bound at exactly A's cost.
+    let (cs, li) = stores();
+    let r = relay(&cs, &li).with_max_storage_bytes(cost_a);
+    let put_a = r.handle(&put_ctx(&kp, "ns", None, &inner_a)).await.unwrap();
+    assert_eq!(put_a.status, 200, "A fits exactly");
+    let entry_a = match field(&decode(&put_a.result.data), "entry_hash") {
+        Some(Value::Bytes(b)) => Hash::from_bytes(b).unwrap(),
+        _ => panic!("missing entry_hash"),
+    };
+
+    // B does not fit.
+    let inner_b = inner_envelope(7);
+    let put_b = r.handle(&put_ctx(&kp, "ns", None, &inner_b)).await.unwrap();
+    assert_eq!(put_b.status, 507, "§8.2: a full store refuses");
+    assert_eq!(result_code(&put_b).as_deref(), Some(CODE_STORAGE_FULL));
+
+    // --- The no-evict MUST. ---
+    assert!(
+        li.get(&store_entry_path(PEER, "ns", &entry_a.to_hex()))
+            .is_some(),
+        "§8.2: the relay MUST NOT evict an already-accepted entry to make room \
+         — a silent eviction discards a message the sender was told was stored"
+    );
+    // And the refusal was fail-closed: B left nothing behind (§4.3).
+    let poll = r
+        .handle(&ctx(
+            "poll",
+            PollRequest {
+                namespace: "ns".into(),
+                since: None,
+                limit: None,
+            }
+            .to_entity()
+            .unwrap(),
+            None,
+            vec![],
+        ))
+        .await
+        .unwrap();
+    let entries = field(&decode(&poll.result.data), "entries")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        entries.len(),
+        1,
+        "§4.3 fail-closed: a refused :put performs no partial store"
+    );
+}
+
+/// §8.2's idempotency gate — a re-put of a hash-equal entry adds no bytes, so a
+/// full store MUST NOT refuse it.
+///
+/// Without the `contains` check this returns 507 for a request that needs no
+/// storage at all, which would make a retry (the normal response to a dropped
+/// ack) fail against a store that already holds the entry.
+///
+/// Mutation: dropping `!self.store.contains(..)` reddens exactly this row and
+/// leaves the refusal row above green.
+#[tokio::test]
+async fn a_reput_of_a_stored_entry_is_not_refused_on_a_full_store() {
+    let (cs, li) = stores();
+    let kp = IdentityKeypair::from(Keypair::generate());
+    let inner = inner_envelope(8);
+
+    let probe = relay(&cs, &li);
+    probe
+        .handle(&put_ctx(&kp, "ns", None, &inner))
+        .await
+        .unwrap();
+    let cost = probe.live_store_bytes(now_ms_test());
+
+    let (cs, li) = stores();
+    let r = relay(&cs, &li).with_max_storage_bytes(cost);
+    assert_eq!(
+        r.handle(&put_ctx(&kp, "ns", None, &inner))
+            .await
+            .unwrap()
+            .status,
+        200
+    );
+    // Byte-identical re-put: the store is full, but this adds nothing.
+    assert_eq!(
+        r.handle(&put_ctx(&kp, "ns", None, &inner))
+            .await
+            .unwrap()
+            .status,
+        200,
+        "§8.2 dedup gate: a hash-equal re-put adds no bytes and MUST NOT be \
+         refused on a full store"
+    );
+}
+
+/// §4.1 — `max_retention_ms` and `max_storage_bytes` round-trip through the
+/// advertise codec, and are ABSENT when the relay enforces no bound.
+///
+/// Absent is the encoding, not `0`: §8.1 says absent means "declares no
+/// ceiling", which is a different statement from "the ceiling is zero", and a
+/// `0` on the wire would read as the latter.
+#[test]
+fn advertise_limits_carry_the_v13_bounds_and_omit_them_when_unset() {
+    let adv = AdvertiseData {
+        modes: vec![MODE_STORE.into()],
+        endpoints: vec![],
+        limits: AdvertiseLimits {
+            max_envelope_size: None,
+            max_storage_bytes: Some(4096),
+            max_retention_ms: Some(3_600_000),
+            forward_rate_limit: None,
+        },
+        caps_required: vec![],
+        expires_at: None,
+    };
+    let round = AdvertiseData::from_entity(&adv.to_entity().unwrap()).unwrap();
+    assert_eq!(round.limits.max_retention_ms, Some(3_600_000));
+    assert_eq!(round.limits.max_storage_bytes, Some(4096));
+
+    let bare = AdvertiseData {
+        limits: AdvertiseLimits::default(),
+        ..adv
+    };
+    let entity = bare.to_entity().unwrap();
+    let limits = match field(&decode(&entity.data), "limits") {
+        Some(Value::Map(m)) => m.clone(),
+        other => panic!("limits must be a map, got {other:?}"),
+    };
+    assert!(
+        field(&limits, "max_retention_ms").is_none(),
+        "a relay enforcing no ceiling OMITS the key — absent means 'declares no \
+         ceiling', which is not the same claim as a zero ceiling (§8.1)"
+    );
+    assert!(field(&limits, "max_storage_bytes").is_none());
+}
+
+/// §3.1 (v1.3) — `forward-request.expires_at` round-trips, and is ABSENT when
+/// `None` so a v1.2 single-hop request encodes byte-identically.
+#[test]
+fn forward_request_expires_at_round_trips_and_is_omitempty() {
+    let base = ForwardRequest {
+        destination: "z6MkDest".into(),
+        route: None,
+        next_hop: Some("z6MkHop".into()),
+        ttl_hops: 4,
+        expires_at: None,
+        envelope_inner: lit_hash(9),
+    };
+    let without = base.to_entity().unwrap();
+    assert!(
+        field(&decode(&without.data), "expires_at").is_none(),
+        "omitempty: a v1.2 request must encode byte-identically"
+    );
+
+    let with = ForwardRequest {
+        expires_at: Some(1_730_000_000_000),
+        ..base.clone()
+    };
+    let decoded = ForwardRequest::from_params(&with.to_entity().unwrap().data).unwrap();
+    assert_eq!(decoded.expires_at, Some(1_730_000_000_000));
+    assert_eq!(decoded.ttl_hops, 4);
+    // And the two encodings differ ONLY by that key.
+    assert_ne!(without.content_hash, with.to_entity().unwrap().content_hash);
+}
+
+/// §3.1 + §6.2.1 + §8.1 (v1.3) — **the second store-write producer.**
+///
+/// The §6.2.1 fallback constructs the `store-entry` itself, so before v1.3 the
+/// relay chose the expiry for a message it holds on someone else's behalf — and
+/// the only party who knows how long the message is worth holding (the
+/// originator) had no field to say so, because its real deadline
+/// (`bounds.ttl_absolute`) rides inside the inner envelope §9 forbids the relay
+/// to decode. We wrote `expires_at: None` and held it forever.
+///
+/// **This is the row core-go's own D7 audit found missing after recording the
+/// item as done** — their `queueFallback` wrote `ExpiresAt: 0` while their
+/// `:put` clamped. Two producers of one store shape drift unless they share the
+/// implementation, which is why `clamp_expiry` is called from both and why this
+/// row exists next to the `:put` rows rather than instead of them.
+///
+/// Three claims, because the fallback has to get all three right:
+///   1. the request's `expires_at` becomes the stored entry's deadline;
+///   2. it is CLAMPED by the §8.1 ceiling (never extended);
+///   3. a request carrying NO deadline takes the ceiling, exactly as a null
+///      `:put` does.
+#[tokio::test]
+async fn the_fallback_honors_the_request_deadline_clamped_by_the_ceiling() {
+    let dest = "z6MkOfflineDest";
+    let ceiling_ms: u64 = 3_600_000;
+
+    // Poll the fallback namespace and return the one stored entry's expires_at.
+    async fn fallback_expiry(
+        r: &RelayHandler,
+        cs: &Arc<dyn ContentStore>,
+        dest: &str,
+    ) -> Option<i64> {
+        let poll = r
+            .handle(&ctx(
+                "poll",
+                PollRequest {
+                    namespace: dest.into(),
+                    since: None,
+                    limit: None,
+                }
+                .to_entity()
+                .unwrap(),
+                None,
+                vec![],
+            ))
+            .await
+            .unwrap();
+        let entries = field(&decode(&poll.result.data), "entries")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap();
+        assert_eq!(entries.len(), 1, "the fallback stored exactly one entry");
+        let h = match &entries[0] {
+            Value::Bytes(b) => Hash::from_bytes(b).unwrap(),
+            _ => panic!("entry must be a hash"),
+        };
+        StoreEntry::from_entity(&cs.get(&h).expect("store-entry is fetchable"))
+            .unwrap()
+            .expires_at
+    }
+
+    let run = |expires_at: Option<i64>, ceiling: u64| async move {
+        let (cs, li) = stores();
+        // No forwarder ⇒ every destination is unreachable ⇒ the §6.2.1 path.
+        let r = relay(&cs, &li).with_store_retention_ms(ceiling);
+        let inner = inner_envelope(11);
+        let req = ForwardRequest {
+            destination: dest.into(),
+            route: None,
+            next_hop: Some(dest.into()),
+            ttl_hops: 4,
+            expires_at,
+            envelope_inner: inner.content_hash,
+        };
+        let res = r.handle(&forward_ctx(&req, &inner)).await.unwrap();
+        assert_eq!(res.status, 200, "{:?}", result_code(&res));
+        assert_eq!(
+            field(&decode(&res.result.data), "status").and_then(|v| v.as_text()),
+            Some(FORWARD_STATUS_QUEUED_FALLBACK)
+        );
+        fallback_expiry(&r, &cs, dest).await
+    };
+
+    // 1. A deadline inside the ceiling is honored verbatim. Pre-v1.3 this was
+    //    `None` — the originator's bound simply did not survive the fallback.
+    let soon = now_ms_test() + 60_000;
+    assert_eq!(
+        run(Some(soon), ceiling_ms).await,
+        Some(soon),
+        "§3.1: the fallback store-entry's expires_at IS the request's, and a \
+         relay MUST NOT extend a deadline the originator set"
+    );
+
+    // 2. A deadline beyond the ceiling is clamped down to it.
+    let far = now_ms_test() + 100 * 365 * 24 * 3600 * 1000;
+    let clamped = run(Some(far), ceiling_ms).await.expect("clamped, not null");
+    assert!(
+        clamped < far && (clamped - (now_ms_test() + ceiling_ms as i64)).abs() < 60_000,
+        "§8.1 applies to the fallback too: stored {clamped}, expected ~now+ceiling"
+    );
+
+    // 3. No deadline on the request ⇒ "the ceiling applies as if it were null"
+    //    (§3.1), which is the same null arm as a `:put`.
+    let defaulted = run(None, ceiling_ms).await.expect("null takes the ceiling");
+    assert!(
+        (defaulted - (now_ms_test() + ceiling_ms as i64)).abs() < 60_000,
+        "a request with no expires_at takes the ceiling, stored {defaulted}"
+    );
+
+    // 4. Control: with no ceiling, a request with no deadline still stores none
+    //    — the fallback must not invent a bound the operator never set.
+    assert_eq!(
+        run(None, 0).await,
+        None,
+        "no ceiling ⇒ no invented deadline"
+    );
+}
+
+/// §3.1 (v1.3) — an INTERMEDIATE hop carries `expires_at` onward unchanged.
+///
+/// The deadline is only consumed where an entry is actually stored, which may be
+/// several hops downstream. Dropping it here would erase the originator's bound
+/// one hop in: the next relay receives a request with no deadline and, if IT
+/// takes the §6.2.1 fallback, holds the message under its own ceiling or
+/// forever. Clamping it here would be the opposite error — each hop ratcheting
+/// the deadline down by its own ceiling.
+///
+/// Found by asking what else constructs a `forward-request`, not by following
+/// the routed items: `PeerRelayForwarder` rebuilds the request for the onward
+/// hop, so the field had to be threaded through `ForwardCtx` to reach it.
+///
+/// Mutation: dropping `expires_at: req.expires_at` from the `ForwardCtx` reddens
+/// this row and nothing else.
+#[tokio::test]
+async fn an_intermediate_hop_carries_the_deadline_onward_unchanged() {
+    let deadline = 1_730_000_000_000;
+    let (res, hop) = forward_recorded(ForwardRequest {
+        destination: "z6MkDest".into(),
+        route: Some(vec!["z6MkHopB".into(), "z6MkDest".into()]),
+        next_hop: None,
+        ttl_hops: 5,
+        expires_at: Some(deadline),
+        envelope_inner: lit_hash(12),
+    })
+    .await;
+    assert_eq!(res.status, 200, "{:?}", result_code(&res));
+    let hop = hop.expect("the forwarder saw a hop");
+    assert!(!hop.is_terminal, "next is z6MkHopB, not the destination");
+    assert_eq!(
+        hop.expires_at,
+        Some(deadline),
+        "§3.1: the originator's deadline travels with the envelope — not \
+         dropped (the next hop would store it unbounded) and not clamped in \
+         transit (each hop would ratchet it down by its own ceiling)"
+    );
 }

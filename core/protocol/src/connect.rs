@@ -440,55 +440,107 @@ impl Connection {
         // Parse authenticate data from the params entity
         let auth_data = AuthenticateData::from_entity(&exec.params)?;
 
-        // Verify the nonce matches what we sent
+        // ------------------------------------------------------------------
+        // §4.6 proof-of-possession. The steps run in the spec's numbered order
+        // — 0 (key-type support) → 1 (nonce echo) → 2 (signature) → 3 (identity
+        // binding) — and §4.7 fixes the `(status, code)` pair each one emits as
+        // a MUST-emit contract. Every failure below is 401 EXCEPT step 0, which
+        // is 400 (`unsupported_key_type`): the algorithm is unsupported, the
+        // identity was never mismatched. The spec pins step 0 BEFORE step 3
+        // explicitly; the rest of the ordering is the numbering, and it is
+        // observable — see `authenticate_signing_key_mismatch_is_step_2` for why
+        // the step-2/step-3 boundary is load-bearing rather than cosmetic.
+        // ------------------------------------------------------------------
+
+        let pub_key = auth_data.public_key.as_slice();
+        let claimed_pid = PeerId::from(auth_data.peer_id.as_str());
+
+        // Step 0 — key-type support (§4.6 step 0, §4.7 row 4 → 400
+        // `unsupported_key_type`). Ordered ahead of step 3 by explicit spec
+        // MUST: a peer running the numbered steps without this hoist answered
+        // `401 identity_mismatch` for an unknown key_type, which names the
+        // wrong failure.
+        let decoded_pid = claimed_pid
+            .decode()
+            .map_err(|e| ProtocolError::Invalid(format!("authenticate peer_id decode: {e}")))?;
+        let remote_key_type = KeyType::from_byte(decoded_pid.key_type)
+            .map_err(|_| ProtocolError::UnsupportedKeyType(decoded_pid.key_type))?;
+
+        // Step 1 — nonce echo (§4.6 step 1, §4.7 row 6 → 401 `invalid_nonce`).
+        // Replay resistance: the proof is bound to THIS connection's challenge.
         if auth_data.nonce != self.local_nonce {
-            return Err(ProtocolError::ConnectionError(
-                "authenticate nonce does not match".into(),
+            return Err(ProtocolError::InvalidNonce(
+                "authenticate nonce does not echo the nonce issued in this connection's hello",
             ));
         }
 
-        // Verify signature on the authenticate entity (params entity, not EXECUTE root).
-        // The authenticate entity may be in the envelope's included map, or we can
-        // look for a signature targeting its content_hash.
+        // Step 2 — proof of possession (§4.6 step 2, §4.7 row 7 → 401
+        // `authentication_failed`). The signature targets the params
+        // (authenticate) entity, NOT the EXECUTE root. §4.6: "An **absent**
+        // signature and an **invalid** signature MUST both be rejected with
+        // status 401 `authentication_failed`" — so the two share one code here
+        // rather than surfacing `missing_signature` / `invalid_signature`. The
+        // pre-v7.61 spelling `invalid_signature` is superseded for this failure
+        // (§4.7) and MUST NOT be emitted on the connect path; it stays the §5.2
+        // capability-chain code, where 403 is correct.
         let params_hash = exec.params.content_hash;
-        let sig_entity = envelope
-            .find_signature_for(&params_hash)
-            .ok_or(ProtocolError::MissingSignature)?;
-        let sig_data = SignatureData::from_entity(sig_entity)
-            .map_err(|e| ProtocolError::Invalid(e.to_string()))?;
+        let sig_entity = envelope.find_signature_for(&params_hash).ok_or(
+            ProtocolError::AuthenticationFailed("no signature found for the authenticate entity"),
+        )?;
+        let sig_data = SignatureData::from_entity(sig_entity).map_err(|_| {
+            ProtocolError::AuthenticationFailed("malformed authenticate signature entity")
+        })?;
 
         // v7.67 Phase 2 (MATRIX-M2): dispatch signature verification on the
         // remote's key_type, decoded from its presented peer_id wire-prefix,
         // rather than assuming Ed25519. `public_key` length is validated by
-        // `verify_for_key_type` against the decoded scheme.
-        let pub_key = auth_data.public_key.as_slice();
-        let claimed_pid = PeerId::from(auth_data.peer_id.as_str());
-        let remote_key_type = KeyType::from_byte(
-            claimed_pid
-                .decode()
-                .map_err(|e| ProtocolError::Invalid(format!("authenticate peer_id decode: {e}")))?
-                .key_type,
-        )
-        .map_err(|e| ProtocolError::Invalid(e.to_string()))?;
-
+        // `verify_for_key_type` against the decoded scheme. §4.6 step 2 says to
+        // verify against `authenticate.public_key` — the FIELD, not the key of
+        // whatever identity the envelope happens to carry as `signature.signer`.
+        // That distinction is what makes step 2 and step 3 separate checks.
         verify_for_key_type(
             remote_key_type,
             pub_key,
             &params_hash.to_bytes(),
             &sig_data.signature,
         )
-        .map_err(|_| ProtocolError::InvalidSignature)?;
+        .map_err(|_| {
+            ProtocolError::AuthenticationFailed(
+                "authenticate signature does not verify against authenticate.public_key",
+            )
+        })?;
 
-        // Verify the PeerId matches the public key. Per v7.64 §1.5,
-        // PeerIDs come in two forms (identity-multihash and SHA-256
-        // fingerprint); `verify_public_key_bytes` handles both forms and
-        // variable-length keys (32-byte Ed25519 / 57-byte Ed448) — re-
-        // deriving a single form locally and string-comparing would reject
-        // the other form for the same keypair.
+        // Step 3 — identity binding (§4.6 step 3, §4.7 row 8 → 401
+        // `identity_mismatch`). Step 2 proved possession of the key presented in
+        // `public_key`; this binds that key to the identity being claimed.
+        // Grants resolve by `remote_peer_id`, so without it a caller proves a
+        // key it holds and then acts under someone else's id.
+        //
+        // Per v7.64 §1.5, PeerIDs come in two forms (identity-multihash and
+        // SHA-256 fingerprint); `verify_public_key_bytes` handles both forms and
+        // variable-length keys (32-byte Ed25519 / 57-byte Ed448) — re-deriving a
+        // single form locally and string-comparing would reject the other form
+        // for the same keypair.
         if !claimed_pid.verify_public_key_bytes(pub_key) {
-            return Err(ProtocolError::ConnectionError(
-                "authenticate peer_id does not match public key".into(),
+            return Err(ProtocolError::IdentityMismatch(
+                "authenticate peer_id is not derived from authenticate.public_key",
             ));
+        }
+
+        // Step 3, second half — §4.6's "The responder MUST also verify
+        // `authenticate.peer_id == hello.peer_id` for the same connection (the
+        // connection's claimed identity does not change mid-handshake;
+        // combined with step 3 this binds the whole handshake to one key)."
+        // §4.7 row 8 names this failure with the SAME code, so it is one check
+        // in two halves, not two rows. `remote_peer_id` is set by
+        // `process_hello` and cannot be `None` in `AwaitingAuthenticate`; the
+        // `if let` is total-function hygiene, not a permissive fallback.
+        if let Some(hello_pid) = self.remote_peer_id.as_ref() {
+            if hello_pid.as_str() != auth_data.peer_id.as_str() {
+                return Err(ProtocolError::IdentityMismatch(
+                    "authenticate peer_id does not match the peer_id presented in hello",
+                ));
+            }
         }
 
         self.state = ConnectionState::Established;
@@ -726,4 +778,371 @@ pub fn build_authenticate_envelope(
     envelope.include(sig_entity);
 
     Ok(envelope)
+}
+
+// ---------------------------------------------------------------------------
+// §4.6 / §4.7 connect-error contract tests
+// ---------------------------------------------------------------------------
+
+/// The V7 §4.7 MUST-emit `(status, code)` contract for the §4.6
+/// proof-of-possession failures, one test per numbered step.
+///
+/// Every row here was verified by mutation: reverting the step it names to the
+/// pre-fix error reddens exactly that row. Before this suite existed the peer
+/// answered `403 invalid_signature` for steps 2 AND 3 and `400
+/// authentication_failed` for step 1 — three wrong pairs and two rows collapsed
+/// onto one code, which §4.7 forbids in as many words.
+///
+/// **Why these are hand-built rather than driven through
+/// [`build_authenticate_envelope`]:** each probe must vary exactly ONE field
+/// and leave every other field the shape a real authenticate carries. A helper
+/// that derives `peer_id` and `public_key` from the same keypair cannot express
+/// "these two disagree", which is the entire content of step 3.
+#[cfg(test)]
+mod connect_error_contract_tests {
+    use super::*;
+    use entity_crypto::Keypair;
+
+    const FMT: u8 = entity_hash::HASH_ALGORITHM_SHA256;
+
+    fn kp(seed: u8) -> IdentityKeypair {
+        IdentityKeypair::Ed25519(Keypair::from_seed([seed; 32]))
+    }
+
+    /// A hand-assembled authenticate envelope with every hostile axis exposed
+    /// independently. `sign_with` is the key that actually signs; `peer_id` and
+    /// `public_key` are what the authenticate *claims*. A conformant probe for
+    /// step N varies only the field step N reads.
+    struct Authenticate<'a> {
+        peer_id: &'a str,
+        public_key: Vec<u8>,
+        nonce: &'a [u8],
+        sign_with: &'a IdentityKeypair,
+        corrupt_sig: bool,
+    }
+
+    impl Authenticate<'_> {
+        fn envelope(&self) -> Envelope {
+            let auth_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+                (
+                    entity_ecf::text("key_type"),
+                    entity_ecf::text(self.sign_with.key_type().label()),
+                ),
+                (
+                    entity_ecf::text("nonce"),
+                    entity_ecf::Value::Bytes(self.nonce.to_vec()),
+                ),
+                (entity_ecf::text("peer_id"), entity_ecf::text(self.peer_id)),
+                (
+                    entity_ecf::text("public_key"),
+                    entity_ecf::Value::Bytes(self.public_key.clone()),
+                ),
+            ]));
+            let auth_entity = Entity::new_with_format(TYPE_AUTHENTICATE, auth_data, FMT).unwrap();
+
+            let mut sig_bytes = self.sign_with.sign(&auth_entity.content_hash.to_bytes());
+            if self.corrupt_sig {
+                sig_bytes[0] ^= 0xFF;
+            }
+            let identity = self.sign_with.peer_entity().unwrap();
+            let sig_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+                (
+                    entity_ecf::text("algorithm"),
+                    entity_ecf::text(self.sign_with.key_type().label()),
+                ),
+                (
+                    entity_ecf::text("signature"),
+                    entity_ecf::Value::Bytes(sig_bytes.to_vec()),
+                ),
+                (
+                    entity_ecf::text("signer"),
+                    entity_ecf::Value::Bytes(identity.content_hash.to_bytes().to_vec()),
+                ),
+                (
+                    entity_ecf::text("target"),
+                    entity_ecf::Value::Bytes(auth_entity.content_hash.to_bytes().to_vec()),
+                ),
+            ]));
+            let sig_entity = Entity::new_with_format(TYPE_SIGNATURE, sig_data, FMT).unwrap();
+
+            let exec = build_connect_execute("connect-authenticate", "authenticate", &auth_entity)
+                .unwrap();
+            let mut envelope = Envelope::new(exec);
+            envelope.include(auth_entity);
+            envelope.include(identity);
+            envelope.include(sig_entity);
+            envelope
+        }
+    }
+
+    /// Drive a connection to `AwaitingAuthenticate` with `remote` as the hello
+    /// identity, then run `auth` through step 0-3. Returns the wire pair.
+    fn pair_for(
+        remote: &IdentityKeypair,
+        build: impl Fn(&Connection) -> Envelope,
+    ) -> (u32, String) {
+        let mut conn = Connection::new(kp(1).peer_id());
+        let hello = HelloData {
+            peer_id: remote.peer_id().as_str().to_string(),
+            nonce: vec![42u8; 32],
+            protocols: vec!["entity-core/1.0".to_string()],
+            hash_formats: vec![],
+            key_types: vec![remote.key_type().label().to_string()],
+            timestamp: None,
+        };
+        let hello_exec =
+            build_connect_execute("test-hello", "hello", &hello.to_entity().unwrap()).unwrap();
+        conn.process_hello(&Envelope::new(hello_exec))
+            .expect("hello leg must succeed — the probe measures the authenticate leg");
+
+        let envelope = build(&conn);
+        let err = conn
+            .process_authenticate(&envelope)
+            .expect_err("this input must be refused");
+        (
+            err.wire_status_code(),
+            err.wire_error_code().unwrap_or("<no registry code>").into(),
+        )
+    }
+
+    /// §4.7 row 7 — an authenticate whose signature does not verify.
+    ///
+    /// This is core-go's `connect_authenticate_bad_signature` input exactly:
+    /// a well-formed authenticate over the correct nonce whose signature bytes
+    /// are corrupted, so the responder REACHES step 2 and fails it rather than
+    /// short-circuiting on an absent signature.
+    ///
+    /// Mutation: restoring `ProtocolError::InvalidSignature` here yields
+    /// `(403, "invalid_signature")` — the pre-v7.61 spelling at the
+    /// *authorization* status. Both halves of the pair are wrong and the test
+    /// fails on both.
+    #[test]
+    fn invalid_authenticate_signature_is_401_authentication_failed() {
+        let remote = kp(2);
+        let (status, code) = pair_for(&remote, |conn| {
+            Authenticate {
+                peer_id: remote.peer_id().as_str(),
+                public_key: remote.public_key_bytes(),
+                nonce: &conn.local_nonce,
+                sign_with: &remote,
+                corrupt_sig: true,
+            }
+            .envelope()
+        });
+        assert_eq!(
+            (status, code.as_str()),
+            (401, "authentication_failed"),
+            "§4.7 row 7: an invalid authenticate signature is a §4.6 step-2 \
+             proof-of-possession failure — 401, and `invalid_signature` is the \
+             superseded pre-v7.61 spelling"
+        );
+    }
+
+    /// §4.7 row 7, the absent-signature half. §4.6 step 2: "An **absent**
+    /// signature and an **invalid** signature MUST both be rejected with status
+    /// 401 `authentication_failed`" — one code for two inputs, deliberately.
+    ///
+    /// Mutation: restoring `ProtocolError::MissingSignature` yields
+    /// `(403, "missing_signature")`, which is a code §4.7 does not list at a
+    /// status §4.6 forbids.
+    #[test]
+    fn absent_authenticate_signature_is_401_authentication_failed() {
+        let remote = kp(2);
+        let (status, code) = pair_for(&remote, |conn| {
+            let full = Authenticate {
+                peer_id: remote.peer_id().as_str(),
+                public_key: remote.public_key_bytes(),
+                nonce: &conn.local_nonce,
+                sign_with: &remote,
+                corrupt_sig: false,
+            }
+            .envelope();
+            // Same envelope minus the signature entity — the ONLY difference
+            // from the passing handshake.
+            let mut stripped = Envelope::new(full.root.clone());
+            for (_, e) in full.included.iter() {
+                if e.entity_type != TYPE_SIGNATURE {
+                    stripped.include(e.clone());
+                }
+            }
+            stripped
+        });
+        assert_eq!((status, code.as_str()), (401, "authentication_failed"));
+    }
+
+    /// §4.7 row 8 — `peer_id` not derived from `public_key`, isolated.
+    ///
+    /// **This is the input core-go's row-8 probe should carry and does not.**
+    /// The signature is made by the key whose `public_key` is presented, so
+    /// step 2 PASSES on its own terms (`verify(public_key, hash, sig)` holds)
+    /// and the only thing left to reject is the identity binding. That makes
+    /// this row a step-3 discriminator under every reading of §4.6's ordering —
+    /// which is what a conformance row for step 3 has to be.
+    ///
+    /// Mutation: deleting the `verify_public_key_bytes` guard establishes the
+    /// connection under a peer_id whose key the caller never proved, and this
+    /// row goes red on the `expect_err`.
+    #[test]
+    fn peer_id_not_derived_from_public_key_is_401_identity_mismatch() {
+        let claimed = kp(2); // the identity presented in hello + authenticate
+        let actual = kp(3); // the key actually held and actually signing
+        let (status, code) = pair_for(&claimed, |conn| {
+            Authenticate {
+                peer_id: claimed.peer_id().as_str(),
+                public_key: actual.public_key_bytes(),
+                nonce: &conn.local_nonce,
+                // Signs with `actual`, whose public_key is the one presented —
+                // so step 2 is satisfied and step 3 is the sole ground.
+                sign_with: &actual,
+                corrupt_sig: false,
+            }
+            .envelope()
+        });
+        assert_eq!(
+            (status, code.as_str()),
+            (401, "identity_mismatch"),
+            "§4.6 step 3: possession of the presented key is proven, but that \
+             key does not derive the claimed peer_id — grants resolve by \
+             peer_id, so this is the check that stops a caller acting under \
+             another peer's identity"
+        );
+    }
+
+    /// §4.7 row 8, second half — §4.6's "The responder MUST **also** verify
+    /// `authenticate.peer_id == hello.peer_id` for the same connection."
+    ///
+    /// A fully self-consistent authenticate (peer_id derives from public_key,
+    /// signature verifies) that names a DIFFERENT peer than the hello did.
+    /// Every per-entity check passes; only the cross-frame binding fails. This
+    /// check did not exist before this commit — the handshake could change its
+    /// claimed identity between hello and authenticate.
+    ///
+    /// Mutation: deleting the hello/authenticate comparison makes this the
+    /// only red row, and it establishes the connection under `switched`.
+    #[test]
+    fn authenticate_peer_id_disagreeing_with_hello_is_401_identity_mismatch() {
+        let hello_identity = kp(2);
+        let switched = kp(4); // internally consistent, but not who said hello
+        let (status, code) = pair_for(&hello_identity, |conn| {
+            Authenticate {
+                peer_id: switched.peer_id().as_str(),
+                public_key: switched.public_key_bytes(),
+                nonce: &conn.local_nonce,
+                sign_with: &switched,
+                corrupt_sig: false,
+            }
+            .envelope()
+        });
+        assert_eq!(
+            (status, code.as_str()),
+            (401, "identity_mismatch"),
+            "§4.6: the connection's claimed identity does not change \
+             mid-handshake"
+        );
+    }
+
+    /// §4.7 row 6 — a nonce that does not echo the one this connection issued.
+    ///
+    /// Not routed to us (go's wire row 6 covers only the *pre-hello* case, which
+    /// FM-1 already landed), but §4.6's status sentence names three failures —
+    /// "nonce mismatch, absent/invalid signature, identity mismatch" — so the
+    /// boundary is all three, not the two that were measured.
+    ///
+    /// Mutation: restoring `ProtocolError::ConnectionError` yields
+    /// `(400, "authentication_failed")`: a wrong status AND the wrong one of
+    /// the two 401 codes.
+    #[test]
+    fn wrong_authenticate_nonce_is_401_invalid_nonce() {
+        let remote = kp(2);
+        let (status, code) = pair_for(&remote, |_conn| {
+            Authenticate {
+                peer_id: remote.peer_id().as_str(),
+                public_key: remote.public_key_bytes(),
+                // A well-formed 32-byte nonce that is simply not ours.
+                nonce: &[7u8; 32],
+                sign_with: &remote,
+                corrupt_sig: false,
+            }
+            .envelope()
+        });
+        assert_eq!((status, code.as_str()), (401, "invalid_nonce"));
+    }
+
+    /// The step-2 / step-3 ORDERING pin, and the reason it is written down.
+    ///
+    /// core-go's `connect_authenticate_identity_mismatch` builds its probe by
+    /// signing with the key whose `peer_id` is claimed while presenting a
+    /// DIFFERENT key's `public_key`. Under §4.6's numbered order that input
+    /// fails **step 2** — `verify(authenticate.public_key, hash, sig)` is false,
+    /// because the signature was made by another key — and never reaches step 3.
+    /// core-go answers `identity_mismatch` because its implementation runs the
+    /// identity binding *before* the nonce and signature checks.
+    ///
+    /// So the probe discriminates check ORDER, not the presence of step 3, and
+    /// §4.6 pins order only for "step 0 before step 3". Both seats implement
+    /// three real checks; they disagree about which fires first. Routed as a
+    /// spec question rather than converged on — see
+    /// `docs/SPEC-AMBIGUITIES.md` (2026-09-01, §4.6 step ordering).
+    ///
+    /// This row exists so the reading is deliberate and one edit flips it: if
+    /// arch rules that step 3 precedes step 2, this assertion — and only this
+    /// assertion — changes to `identity_mismatch`.
+    #[test]
+    fn authenticate_signing_key_mismatch_is_step_2() {
+        let claimed = kp(2);
+        let other = kp(3);
+        let (status, code) = pair_for(&claimed, |conn| {
+            Authenticate {
+                peer_id: claimed.peer_id().as_str(),
+                public_key: other.public_key_bytes(),
+                nonce: &conn.local_nonce,
+                // Signs with the CLAIMED key while presenting the OTHER key —
+                // so the signature cannot verify against `public_key`.
+                sign_with: &claimed,
+                corrupt_sig: false,
+            }
+            .envelope()
+        });
+        assert_eq!(
+            (status, code.as_str()),
+            (401, "authentication_failed"),
+            "§4.6 runs step 2 (verify against authenticate.public_key) before \
+             step 3; this input fails step 2. The status is 401 under BOTH \
+             readings — only the code is at stake."
+        );
+    }
+
+    /// The control for the whole suite: the well-formed handshake still
+    /// establishes. Four new rejection paths landed in one function, and a
+    /// guard that refuses everything would make every row above pass.
+    #[test]
+    fn a_well_formed_authenticate_still_establishes() {
+        let remote = kp(2);
+        let mut conn = Connection::new(kp(1).peer_id());
+        let hello = HelloData {
+            peer_id: remote.peer_id().as_str().to_string(),
+            nonce: vec![42u8; 32],
+            protocols: vec!["entity-core/1.0".to_string()],
+            hash_formats: vec![],
+            key_types: vec![remote.key_type().label().to_string()],
+            timestamp: None,
+        };
+        let hello_exec =
+            build_connect_execute("test-hello", "hello", &hello.to_entity().unwrap()).unwrap();
+        conn.process_hello(&Envelope::new(hello_exec)).unwrap();
+
+        let auth = Authenticate {
+            peer_id: remote.peer_id().as_str(),
+            public_key: remote.public_key_bytes(),
+            nonce: &conn.local_nonce,
+            sign_with: &remote,
+            corrupt_sig: false,
+        }
+        .envelope();
+        let (pid, _) = conn
+            .process_authenticate(&auth)
+            .expect("a valid authenticate must still establish the connection");
+        assert_eq!(pid, remote.peer_id());
+        assert!(conn.is_established());
+    }
 }

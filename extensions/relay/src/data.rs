@@ -58,6 +58,21 @@ pub struct ForwardRequest {
     pub next_hop: Option<String>,
     /// Relay-transport hop budget; decremented per hop, reject at 0 (§3.1).
     pub ttl_hops: u32,
+    /// **v1.3 (§3.1)** — the ORIGINATOR's deadline for this envelope, in ms
+    /// since the epoch, carried on the OUTER request where a relay may read it.
+    ///
+    /// The originator's real deadline is `bounds.ttl_absolute`, which travels
+    /// inside the inner envelope the relay is forbidden to decode (§9) — so
+    /// without this field the relay picks the expiry for a message it holds on
+    /// someone else's behalf. *A bound whose enforcing party cannot read it is
+    /// not a bound.* On the §6.2.1 store fallback it becomes the constructed
+    /// `store-entry.expires_at`, clamped by §8.1; a relay MUST NOT extend a
+    /// deadline the originator set. No effect on a live forward, which
+    /// succeeds or falls back within one operation.
+    ///
+    /// **omitempty:** absent when `None`, so a v1.2 request encodes
+    /// byte-identically.
+    pub expires_at: Option<i64>,
     /// Content-addressed pointer to the opaque inner envelope (§3.1, bare hash).
     pub envelope_inner: Hash,
 }
@@ -80,6 +95,7 @@ impl ForwardRequest {
             route,
             next_hop: field_text_opt(&map, "next_hop"),
             ttl_hops: field_u64(&map, "ttl_hops")? as u32,
+            expires_at: field_i64_opt(&map, "expires_at"),
             envelope_inner: field_hash(&map, "envelope_inner")?,
         })
     }
@@ -94,6 +110,11 @@ impl ForwardRequest {
             (text("envelope_inner"), bytes(&self.envelope_inner)),
             (text("ttl_hops"), integer(self.ttl_hops as i64)),
         ];
+        // omitempty (§3.1 v1.3): absent when None so a v1.2 request is
+        // byte-identical.
+        if let Some(e) = self.expires_at {
+            fields.push((text("expires_at"), integer(e)));
+        }
         if let Some(nh) = &self.next_hop {
             fields.push((text("next_hop"), text(nh)));
         }
@@ -170,6 +191,15 @@ impl StoreEntry {
 pub struct AdvertiseLimits {
     pub max_envelope_size: Option<u64>,
     pub max_storage_bytes: Option<u64>,
+    /// **v1.3 (§4.1, §8.1)** — the Mode-S retention CEILING in milliseconds.
+    ///
+    /// `max_retention_ms` is how LONG, where the rest of `limits` is how BIG.
+    /// A relay that enforces a §8.1 ceiling **MUST** publish it here: duration
+    /// is the number that decides whether store-and-forward is usable, and a
+    /// ceiling that is enforced but unpublished configures behaviour no
+    /// counterparty can observe before depending on it. Absent means the relay
+    /// declares no ceiling — it does **not** mean unbounded (§8).
+    pub max_retention_ms: Option<u64>,
     pub forward_rate_limit: Option<u32>,
 }
 
@@ -182,6 +212,9 @@ impl AdvertiseLimits {
         if let Some(v) = self.max_envelope_size {
             fields.push((text("max_envelope_size"), integer(v as i64)));
         }
+        if let Some(v) = self.max_retention_ms {
+            fields.push((text("max_retention_ms"), integer(v as i64)));
+        }
         if let Some(v) = self.max_storage_bytes {
             fields.push((text("max_storage_bytes"), integer(v as i64)));
         }
@@ -193,6 +226,7 @@ impl AdvertiseLimits {
         Self {
             max_envelope_size: field_u64_opt(&map, "max_envelope_size"),
             max_storage_bytes: field_u64_opt(&map, "max_storage_bytes"),
+            max_retention_ms: field_u64_opt(&map, "max_retention_ms"),
             forward_rate_limit: field_u64_opt(&map, "forward_rate_limit").map(|v| v as u32),
         }
     }

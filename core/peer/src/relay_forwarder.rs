@@ -192,6 +192,11 @@ impl RelayForwarder for PeerRelayForwarder {
                 route: (!onward_route.is_empty()).then_some(onward_route),
                 next_hop: next_hop_prime,
                 ttl_hops: ctx.ttl_hops,
+                // §3.1 v1.3 — carried onward unchanged. A relay MUST NOT extend
+                // the originator's deadline, and dropping it here would erase
+                // the bound one hop in: the next relay would fall back to Mode S
+                // with no deadline at all.
+                expires_at: ctx.expires_at,
                 envelope_inner: ctx.inner.content_hash,
             };
             let fr_entity = match fr.to_entity() {
