@@ -13,6 +13,27 @@ release. Published numbers are oracle-pinned and reproducible.
 
 Development lands on `dev`; `master` carries the last release.
 
+### Documentation
+
+- **`AGENTS.md` split into `AGENTS.md` + `docs/agents/memory/`.** It had reached
+  217,374 bytes — one file, loaded in full by every agent, holding both *how to
+  work here* and every failure mode this implementation has earned. `AGENTS.md`
+  is now ~17 KiB of the first thing; the 55 catalogued anti-patterns moved
+  verbatim into eight topic files indexed **by symptom** in
+  `docs/agents/memory/INDEX.md`. Nothing was deleted, and the scripts that
+  performed the move are in `tools/` so the diff is checkable as a move.
+- **`README.md`** gained a *Working on this repo* section and had two lines
+  corrected that had been wrong for some time: `make check` is `lint + test +
+  godot` (not `lint + test`), and the downstream-consumer example pinned a
+  release tag that does not exist. The **standalone-build contract is now
+  measured** rather than asserted: a clean clone with no sibling checkouts
+  present runs `make test` green — 131 suites, 2,774 tests, exit 0.
+- **Routing packets moved to `docs/outbox/`**, with the receiving half
+  (per-counterpart watermarks) in `docs/status/TRACKER-*.md`. Internal;
+  neither publishes.
+- **`CANONICAL-DOCS.toml`** now declares what each documentation directory *is*,
+  so the release gates stop inferring it from path names.
+
 ## [0.9.0] — 2026-08-23
 
 _This number is this implementation's own, not the protocol's_ ([ADR-0002]:

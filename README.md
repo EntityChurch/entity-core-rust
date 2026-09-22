@@ -60,12 +60,14 @@ entity-systems/
 ```
 
 Other repos in the ecosystem (e.g. `entity-browser-rust`,
-`entity-core-godot`) consume this workspace's crates via a Cargo
-**git dependency** pinned to a release tag
-(`git = "https://github.com/EntityChurch/entity-core-rust", tag = "v0.9.0"`),
-so a lone clone builds standalone. Sibling-folder development is kept as a
-**local, gitignored** `.cargo/config.toml` `paths = [...]` override — never a
-committed `[patch]`/path dependency.
+`entity-core-godot`) consume this workspace's crates as an **external
+dependency** — a Cargo git dependency pinned to a release tag
+(`git = "https://github.com/EntityChurch/entity-core-rust", tag = "<release tag>"`),
+or, when they are developed in a sibling checkout, a path dependency on that
+checkout. Either way a lone clone of *this* repo builds standalone: nothing here
+points outwards. Sibling-folder development on **our** side is kept as a **local,
+gitignored** `.cargo/config.toml` `paths = [...]` override — never a committed
+`[patch]`/path dependency.
 
 ---
 
@@ -84,18 +86,31 @@ Only **`make`** and **`podman`** on the host. Nothing else — no Rust,
 in-container tasks bind-mount the source with a persistent cargo cache.
 
 ```bash
+make help       # the verb list, printed from the Makefile itself
 make build      # build the release runtime image (entity binary)
 make test       # cargo test --release in the toolchain container
 make lint       # cargo clippy -D warnings + cargo fmt --check (read-only)
 make fmt        # cargo fmt (writes — autoformat)
-make check      # lint + test (the green gate)
+make check      # lint + test + godot (the green gate)
 make clean      # remove the build + toolchain images
 make clippy     # cargo clippy --all-targets -- -D warnings
 make wasm       # wasm32-unknown-unknown cross-compile check
+make godot      # the GDExtension lane — see below
+make features   # the 27-configuration cargo-feature matrix
 ```
 
+`make test`, `make lint` and `make fmt` run over the workspace's
+**`default-members`**, which is deliberately not every member: `bindings/godot`
+has its own lane (`make godot`) because its `codegen-full` build peaks around
+4.4 GiB on its own, and the four `bindings/wasm-worker-*` crates are wasm32-only
+and covered by `make wasm`. **So the full gate is four commands — `make test`,
+`make lint`, `make godot`, `make wasm`** — plus `make features` whenever a change
+adds or moves a `#[cfg(feature = …)]` guard. Each exclusion names its covering
+lane at the `default-members` list itself.
+
 A fresh clone with no siblings present must pass `make build` and
-`make test` — that's the standalone-build contract.
+`make test` — that's the standalone-build contract, and it is re-run against an
+actual clean clone rather than assumed.
 
 For live-mounted iteration (interactive shell, fast incremental
 rebuilds), `compose.yaml` is an optional developer convenience — **not**
@@ -175,8 +190,31 @@ The `make` targets (`build`/`test`/`clippy`/`fmt`/`wasm`) are documented under
   under `[workspace.dependencies]`. Member crates pick them up with
   `dep.workspace = true`. Add new external deps to the root, not to
   individual members.
-- The crate DAG is strict (see `CLAUDE.md`). A crate may only depend
+- The crate DAG is strict (see `docs/ARCHITECTURE.md`). A crate may only depend
   on crates above it in the list — no cycles.
+
+---
+
+## Working on this repo
+
+Whether you are a person or an agent, the operating context is in plain files at
+the root and it is meant to be read before the first change:
+
+- **[`AGENTS.md`](AGENTS.md)** — how we work here: the build gate, the boundaries
+  (this repo *implements* the spec, it does not design protocol), and the wire
+  invariants that cross-impl bugs keep coming from. It imports
+  **[`AGENTS-STANDARD.md`](AGENTS-STANDARD.md)**, the conventions shared by every
+  repo in the ecosystem.
+- **[`METHODOLOGY.md`](METHODOLOGY.md)** — the disciplines, the audit doctrine,
+  and the promotion ladder that decides when an observation becomes a rule.
+  Carried, not loaded: open it when its trigger arrives.
+- **[`docs/agents/memory/`](docs/agents/memory/INDEX.md)** — what this repo would
+  otherwise rediscover the hard way, **indexed by symptom**. Each entry carries
+  the mechanism, the enforcement point, and the bug that earned it. If something
+  here surprises you, that index is the first place to look.
+
+Contributions need a DCO sign-off (`git commit -s`) and a green gate — see
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ---
 

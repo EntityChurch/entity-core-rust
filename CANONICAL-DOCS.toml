@@ -18,6 +18,61 @@ capabilities, and tree semantics are interop-validated against the Go and Python
 peers, not just self-tested.
 """
 
+# ── What each directory IS ────────────────────────────────────────────────────
+# Declared because the defaults cannot know our layout. Declaring nothing would
+# leave the old defaults in force; each of these exists because a check would
+# otherwise be wrong about this repo.
+
+[[area]]
+path      = "docs/status"
+kind      = "status"      # dated snapshots — HANDOFF/CHECKPOINT/PLAN. Ages out.
+publishes = false
+
+[[area]]
+path      = "docs/outbox"
+kind      = "outbox"      # routing packets we SENT. Never published.
+publishes = false
+
+[[area]]
+path      = "docs/archive/outbox"
+kind      = "outbox"      # acknowledged packets. Never published.
+publishes = false
+
+# Closed working memory. Dated BY DESIGN and does not age out — a snapshot is
+# immutable once written, and several are cited by SHA from packets in the outbox.
+[[area]]
+path      = "docs/archive/status"
+kind      = "archive"
+publishes = false
+
+# Implementation-side proposals routed upstream. Internal: the normative text is
+# arch's, and two documents with different statuses in front of one reader is the
+# mistake this avoids.
+[[area]]
+path      = "docs/proposals"
+kind      = "archive"
+publishes = false
+
+[[area]]
+path      = "docs/agents/memory"
+kind      = "memory"      # living, indexed; every file declared below.
+publishes = true
+
+# `docs/validation/reports/` is dated BY DESIGN and does not age out: each file is
+# the record of one cross-impl measurement, cited by SHA from routing packets and
+# from the charter. It is an archive, not a status queue.
+[[area]]
+path      = "docs/validation/reports"
+kind      = "archive"
+publishes = false
+
+# The per-counterpart outbox watermarks (the routing standard's receiving half).
+# Durable and edited in place, and they must NEVER publish — they name sibling
+# repos, their tips, and what we have and have not read.
+[[living]]
+glob     = "docs/status/TRACKER-*.md"
+internal = true
+
 [[doc]]
 path  = "README.md"
 title = "Overview & build"
@@ -142,4 +197,65 @@ group = "Working here"
 path  = "CLAUDE.md"
 title = "CLAUDE.md"
 blurb = "A one-line shim to AGENTS.md (ADR-0016)."
+group = "Working here"
+
+# ── Agent memory ──────────────────────────────────────────────────────────────
+# Split out of AGENTS.md (217,374 bytes → ~17 KiB) on 2026-09-17. This is durable
+# knowledge, not status: it publishes, because a newcomer hitting one of these
+# symptoms is exactly who it was written for. The index and the files must agree
+# in BOTH directions — a file here that INDEX.md does not list, or a link in
+# INDEX.md with no file, is a blocking error at the cut.
+
+[[doc]]
+path  = "docs/agents/memory/INDEX.md"
+title = "Agent memory — index"
+blurb = "What this repo would otherwise rediscover the hard way, indexed by symptom. An entry that could become a check should become one, and is then deleted from here."
+group = "Working here"
+
+[[doc]]
+path  = "docs/agents/memory/BUILD-AND-RUST.md"
+title = "Memory — build, feature gates, Rust idioms"
+blurb = "Which make verb sees what; where the cfg matrix and the package set stop; two Rust shapes that are expensive to retrofit."
+group = "Working here"
+
+[[doc]]
+path  = "docs/agents/memory/CONCURRENCY-AND-STATE.md"
+title = "Memory — concurrency, shared state, residue"
+blurb = "Read-modify-write under a cascade, hot-path config caching, collectors for spec'd writes, and what a previous attempt leaves behind."
+group = "Working here"
+
+[[doc]]
+path  = "docs/agents/memory/AUTHORIZATION-AND-CAPABILITY.md"
+title = "Memory — authorization and capabilities"
+blurb = "Whose authority a check spends, which argument decides it, and what a relocated or newly-consuming check starts reading."
+group = "Working here"
+
+[[doc]]
+path  = "docs/agents/memory/PATHS-AND-VALIDATION.md"
+title = "Memory — path helpers and boundary dispositions"
+blurb = "One path rule implemented by two helpers, what a boundary may do with a malformed path, and what a consuming validator does to the fixtures."
+group = "Working here"
+
+[[doc]]
+path  = "docs/agents/memory/WIRE-AND-ENCODING.md"
+title = "Memory — wire shapes, byte fidelity, error codes"
+blurb = "What may appear on the wire and what a peer must preserve: byte fidelity, closed grammars, the (status, field, spelling) of an error code, and validators with no caller."
+group = "Working here"
+
+[[doc]]
+path  = "docs/agents/memory/TESTING-AND-EVIDENCE.md"
+title = "Memory — tests, mutations, and evidence"
+blurb = "The difference between a test that passes and a test that measures something: controls, mutations actually run, and the boundary a row crosses."
+group = "Working here"
+
+[[doc]]
+path  = "docs/agents/memory/CONFORMANCE-GATES.md"
+title = "Memory — reading a cross-impl run"
+blurb = "What a green category, a passing gate, a WARN, a SKIP and a FAIL detail line are each evidence of — and how a run says clean about a surface it never touched."
+group = "Working here"
+
+[[doc]]
+path  = "docs/agents/memory/SPEC-RULINGS-AND-ROUTING.md"
+title = "Memory — reading a ruling, a fold, a routed item"
+blurb = "A routed pointer is where somebody looked; the spec says what binds. Deriving the boundary, recounting an enumeration against this tree, answering with a measurement."
 group = "Working here"

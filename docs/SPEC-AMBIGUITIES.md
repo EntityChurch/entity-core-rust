@@ -3730,7 +3730,7 @@ conformance run exercises. A convergence vector would have to inject a tiny
 **Interim choice:** none needed — nothing collects today, and with the empty
 dead-peer tree nothing accumulates from the retry path. If a marker sink ever
 does grow, an operator can prune `system/runtime/chain-errors/**` out of band.
-**Routed to architecture** (`docs/status/ROUTING-2026-07-17-marker-feasibility-and-retention-rust.md`):
+**Routed to architecture** (`docs/outbox/ROUTING-2026-07-17-marker-feasibility-and-retention-rust.md`):
 is a self-collection MUST warranted for a surface this small, or should §5 stay a
 MAY (a peer that never collects is then conformant)? If the MUST stands, the
 one-knob spelling is confirmed and the sweep is a scoped follow-on, not this
@@ -4524,7 +4524,7 @@ illustrative. If illustrative, spell check (a) parametrically over `key_type` as
 > this crate report `true` — the §7 punch meets at the §3.2 `pair` key). The §6.11(b) consumer this
 > repo reported is resolved by the same ruling as **row 2**, not row 3: async inbox delivery now
 > authorizes under the caller's `deliver_token`. Remaining: arch folds the spec text on core-go's
-> ack. See `docs/status/ROUTING-2026-08-05-the-narrowing-is-in-and-the-discriminator-confirmed-to-arch.md`.
+> ack. See `docs/outbox/ROUTING-2026-08-05-the-narrowing-is-in-and-the-discriminator-confirmed-to-arch.md`.
 >
 > **FOLDED (2026-08-06):** arch folded Q1–Q4 + a new reach-back-serving MUST at
 > `entity-system-architecture` `f8f736a`. Absorbed here: **Q2** — the reciprocal grant is now the
@@ -6336,7 +6336,7 @@ control should say which ping it is asking about, since *"serves ping"* and *"se
 upheld on the record as a general point and does not fire here: under the ruling the
 unauthenticated probe **is** the rule, so go's control asks exactly the right question.
 
-Routed in `docs/status/ROUTING-2026-09-02-g-ce1-landed-and-the-must-not-was-on-the-code-not-the-input.md`;
+Routed in `docs/outbox/ROUTING-2026-09-02-g-ce1-landed-and-the-must-not-was-on-the-code-not-the-input.md`;
 ruled in arch `ROUTING-2026-09-03-a` §4 item 2. **Closed.**
 
 ---
