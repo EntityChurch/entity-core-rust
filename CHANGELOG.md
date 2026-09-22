@@ -13,6 +13,10 @@ release. Published numbers are oracle-pinned and reproducible.
 
 Development lands on `dev`; `master` carries the last release.
 
+## [0.10.0] — 2026-09-21
+
+Development lands on `dev`; `master` carries the last release.
+
 ### Changed in ways that can break an existing caller
 
 **Breaking: yes**, on all three counts — an exported signature moved, a published path

@@ -1,6 +1,6 @@
 [package]
 name = "entity-attestation"
-version = "0.9.0"
+version = "0.10.0"
 edition.workspace = true
 description = "system/attestation substrate primitive (EXTENSION-ATTESTATION v1.0)"
 
