@@ -117,9 +117,56 @@ pub fn verify_request(
     // an entity for a known hash via envelope manipulation (downstream
     // hash-keyed lookups like `included[h]` would index the substitute under
     // h, even though h ≠ recomputed(substitute.bytes)).
+    //
+    // ⛔ **That paragraph describes TWO checks and this loop used to run ONE.**
+    // `validate()` answers *"is this entity self-consistent?"* — it recomputes
+    // `Hash::compute(type, data)` and compares it to the entity's **own**
+    // `content_hash` field. The sentence above is about something else: the
+    // **map key**, which is the address every downstream lookup uses
+    // (`included.get(&fields.granter)`, `.get(&fields.grantee)`,
+    // `collect_authority_chain`'s resolver). Iterating `.values()` throws the
+    // key away, so a **self-consistent entity filed under a foreign hash**
+    // passed the guard written to stop exactly that — the comment named the
+    // attack and the code checked the other half of it.
+    //
+    // Measured, not reasoned (`core/protocol/tests/included_key_binding.rs`):
+    // file the attacker's own `system/peer` entity under a victim's identity
+    // hash and `verify_capability_chain` returns `Ok(())` on a delegation the
+    // victim never signed. The attacker needs **no key and no identity entity
+    // of the victim's** — only the victim's identity *hash*, which is the
+    // public `grantee` field of any capability the victim presents. Every
+    // per-link check passes on its own terms: `sig.signer == cap.granter`, the
+    // resolved entity is a `system/peer`, and `verify_peer_data_sig` verifies
+    // the attacker's signature against the attacker's key, because that is the
+    // key it just looked up under the victim's hash. So an observer of any
+    // chain could mint a leaf off it, up to the parent's own scope.
+    //
+    // The invariant is a property of the map, not of a code path: **in a
+    // content-addressed map the key IS the hash of the value** — see
+    // [`verify_included_key_binding`]. Three sites enforce it, and the
+    // mutations were run PER SITE rather than per behaviour:
+    //
+    // | site | mutation reddens |
+    // |---|---|
+    // | `entity_wire::decode_envelope` (the constructor, wire bytes) | the decoder row |
+    // | `verify_capability_chain` (the `pub fn` returning the verdict) | the forgery row |
+    // | **this call** | **nothing** |
+    //
+    // ⚠ **This call is defence in depth and is recorded as such rather than
+    // described as a guard.** Every path that reaches it goes through the
+    // decoder first and the chain verifier after, so no row in the suite can
+    // redden on it alone. What it covers that neither of those does is the
+    // **non-chain** hash-keyed lookups on an `Envelope` built in-process rather
+    // than decoded: `ctx.included` outlives this function and handlers address
+    // it by hash (`handle_diff`'s `included.get(&base_hash)`,
+    // `authorize_path`'s granter resolution), and `verify_capability_chain`
+    // does not run at all on an EXECUTE carrying no capability. That property
+    // is real and is currently **unmeasured**; do not read the green suite as
+    // evidence for it.
     for entity in envelope.included.values() {
         entity.validate().map_err(|_| ProtocolError::HashMismatch)?;
     }
+    verify_included_key_binding(&envelope.included)?;
 
     // 2. Extract author and capability hashes from execute data
     let execute_data = decode_execute_fields(&execute.data)?;
@@ -802,6 +849,37 @@ where
     })
 }
 
+/// ⛔ **In a content-addressed map the KEY is the hash of the VALUE.**
+///
+/// Every authority lookup on a received `included` map addresses it by a hash
+/// read out of *another entity's data* — `fields.granter`, `fields.grantee`,
+/// `fields.parent`, `collect_authority_chain`'s resolver. So the key is the
+/// only thing binding a `system/peer` entity to the identity a capability
+/// names, and an entity filed under a foreign hash is an **identity
+/// substitution**: it makes `verify_peer_data_sig` check the attacker's
+/// signature against the attacker's key while the capability says the granter
+/// was someone else.
+///
+/// This is NOT what `Entity::validate()` checks. `validate()` recomputes
+/// `Hash::compute(type, data)` against the entity's **own** `content_hash`
+/// field — self-consistency — and is satisfied by any honestly-built entity,
+/// including the attacker's. The two questions read alike and are different;
+/// `verify_request` step 2b asked only the first one for as long as it has
+/// existed, under a comment naming the second.
+///
+/// Kept as a named function rather than a loop at each site so the rule has one
+/// definition: three call paths need it (the security pass, the public chain
+/// verifier, and the wire decoder, which enforces the same rule structurally
+/// because it is the constructor).
+fn verify_included_key_binding(included: &BTreeMap<Hash, Entity>) -> Result<(), ProtocolError> {
+    for (key, entity) in included.iter() {
+        if *key != entity.content_hash {
+            return Err(ProtocolError::HashMismatch);
+        }
+    }
+    Ok(())
+}
+
 /// Verify a capability chain back to a root capability (§5.5).
 ///
 /// Restructured under PROPOSAL-UNIFIED-CHAIN-WALK-PRIMITIVE: walk the chain
@@ -817,6 +895,18 @@ pub fn verify_capability_chain(
     included: &BTreeMap<Hash, Entity>,
     local_peer_id: &str,
 ) -> Result<(), ProtocolError> {
+    // 0. ⛔ The map this function is handed must be **content-addressed**, and
+    //    that is a precondition of every line below rather than a nicety: the
+    //    chain walk resolves `granter`, `grantee` and `parent` by KEY, so an
+    //    entity filed under someone else's hash is an identity substitution.
+    //    Checked here and not only at the caller because this is a `pub fn`
+    //    whose return value is a security verdict, and its two callers build
+    //    their maps differently — `verify_request` from `envelope.included`,
+    //    `connection.rs::presented_authority_authorizes` from a §7a.2a chain
+    //    bundle merged with the parent envelope's `included`. An invariant that
+    //    lives in the callers is one the next caller does not inherit.
+    verify_included_key_binding(included)?;
+
     // 1. Collect the full chain. Reachability errors fire here, before any
     //    per-level validation runs. Fields are decoded once during the walk.
     let chain = collect_authority_chain(capability_hash, |h| included.get(h).cloned()).map_err(

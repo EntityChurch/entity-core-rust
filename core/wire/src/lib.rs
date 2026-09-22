@@ -277,6 +277,44 @@ pub fn decode_envelope(data: &[u8]) -> Result<Envelope, WireError> {
                     let entity_start = after_hash;
                     let entity_end = cbor_item_end(data, entity_start)?;
                     let entity = decode_entity(&data[entity_start..entity_end])?;
+                    // ⛔ **The key IS the hash of the value — an `included` map
+                    // is content-addressed, and every downstream consumer uses
+                    // the KEY as the address.**
+                    //
+                    // `decode_entity` takes `content_hash` from the wire
+                    // verbatim (it must — §5.4 byte fidelity forbids a
+                    // decode+re-encode), so at this point neither the key nor
+                    // the field has been checked against the bytes. The
+                    // security pass that recomputes the field is
+                    // `verify_request` step 2b; what belongs *here* is the
+                    // cheaper structural half it cannot express as a property
+                    // of the type: a mis-keyed entry is a malformed envelope,
+                    // and admitting one lets an attacker file their own
+                    // `system/peer` entity under a victim's identity hash and
+                    // sign a delegation as the victim
+                    // (`core/protocol/tests/included_key_binding.rs` drives it
+                    // end to end).
+                    //
+                    // Refused rather than silently re-keyed: re-keying turns a
+                    // forged lookup into a `MissingEntity` further downstream,
+                    // which is fail-closed but reports the wrong defect — and
+                    // this boundary has a caller to answer, which is where the
+                    // house rule puts a diagnostic.
+                    //
+                    // ⚠ Equality is over the WHOLE `Hash`, format byte
+                    // included, so this also refuses an entity addressed under
+                    // one `content_hash_format` while carrying another. That is
+                    // the intended reading of §5.5's per-chain format freeze;
+                    // if a cross-format addressing case is ever legitimate it
+                    // must be spelled as its own field, not as a key that does
+                    // not match its value.
+                    if hash != entity.content_hash {
+                        return Err(WireError::CborDecode(format!(
+                            "envelope.included entry is filed under a hash that is not its \
+                             own: key {} vs entity {}",
+                            hash, entity.content_hash
+                        )));
+                    }
                     included.insert(hash, entity);
                     inc_cursor = entity_end;
                 }

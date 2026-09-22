@@ -80,6 +80,35 @@ impl TreeHandler {
     /// path this handler is **about to touch**. `Ok(())` when allowed;
     /// `Err(403 capability_denied)` when not.
     ///
+    /// ⛔ **`base_permission` is the MAPPED permission, never the extension
+    /// operation name — `EXTENSION-TREE` §11 does the mapping and says whose job
+    /// it is.** `map_operation` there is closed: `get`/`snapshot`/`extract` →
+    /// **`get`**, `put`/`merge` → **`put`**, `diff`/`create`/`destroy` → no
+    /// path-level check at all. The section states the division in as many words
+    /// — *"this mapping is performed by the handler, not by `check_permission` or
+    /// `check_path_permission` — those functions receive the already-mapped
+    /// permission name."*
+    ///
+    /// This function passed `ctx.operation` through unmapped at
+    /// `handle_snapshot` and `handle_extract`, which is a fail-OPEN and the
+    /// direction is not obvious. The dispatch check asks the grant's
+    /// `operations` about the **literal** name (`"extract"`), as §11 item 1
+    /// requires; the path check must then ask about **`get`**. Feed it
+    /// `"extract"` and a grant of `{operations: {include: ["*"], exclude:
+    /// ["get"]}}` sails through both: the dispatch check because the exclude
+    /// does not name `extract`, and the path check because it was asked the
+    /// wrong question — and what leaves `handle_extract` is an envelope of every
+    /// bound entity under the prefix. `snapshot` is the same shape with a trie
+    /// root instead of the entities. Both seats that map (go's `checkPathPerm`
+    /// is called with a literal `"get"`/`"put"` at all seven of its sites, py's
+    /// `check_caller_permission("get", …)`) were already conformant here.
+    ///
+    /// The enforcement point is the *parameter name*: there is no `operation` in
+    /// this signature to fill from `ctx.operation`, and each caller names the
+    /// §11 row it is applying. A mapping function taking the extension name
+    /// would need a `_ =>` arm, and either answer to that arm is a defect
+    /// waiting for the next operation.
+    ///
     /// **This is not a secondary check `[MUST]` (§5.2, §6.3, §6.7 — 0.8.2.20.)**
     /// The *"defense-in-depth when `resource` is present"* characterization was
     /// withdrawn at seven sites in the corpus, because its premise — that the
@@ -128,7 +157,7 @@ impl TreeHandler {
     fn authorize_path(
         &self,
         ctx: &HandlerContext,
-        operation: &str,
+        base_permission: &str,
         path: &str,
     ) -> Result<(), HandlerResult> {
         // ⛔ **Scoped to an EXTERNAL dispatch, and the scope is the
@@ -197,7 +226,7 @@ impl TreeHandler {
             }
         };
         if entity_capability::check_path_permission(
-            operation,
+            base_permission,
             path,
             cap,
             &ctx.pattern,
@@ -208,7 +237,8 @@ impl TreeHandler {
         }
         tracing::warn!(
             request_id = %ctx.request_id,
-            operation = %operation,
+            operation = %ctx.operation,
+            base_permission = %base_permission,
             path = %path,
             "tree: handler-level path check denied (§6.3)"
         );
@@ -223,9 +253,32 @@ impl TreeHandler {
 
     /// [`Self::authorize_path`] as a boolean, for the per-entry listing filter
     /// and the per-path merge loop, where a denial is a *skip* or an abort
-    /// rather than a response.
-    fn path_allowed(&self, ctx: &HandlerContext, operation: &str, path: &str) -> bool {
-        self.authorize_path(ctx, operation, path).is_ok()
+    /// rather than a response. `base_permission` carries the same §11
+    /// obligation as there.
+    fn path_allowed(&self, ctx: &HandlerContext, base_permission: &str, path: &str) -> bool {
+        self.authorize_path(ctx, base_permission, path).is_ok()
+    }
+
+    /// Does [`Self::path_allowed`] *decide* anything on this dispatch, or is it
+    /// the identity function?
+    ///
+    /// ⛔ **This exists so a fast path and the filter it skips cannot disagree.**
+    /// `authorize_path` returns `Ok(())` unconditionally for a non-external or
+    /// capability-free dispatch — the two early returns at the top of it, each
+    /// of which is a deliberate decision documented there. Any caller that
+    /// *bypasses* an optimization in order to run the filter has to bypass it on
+    /// exactly that condition: bypass on a narrower one and the filter is
+    /// skipped through the optimization (the shape this predicate was extracted
+    /// for — a snapshot's tracked-root short-circuit returning a root over
+    /// unfiltered bindings); bypass on a wider one and every peer-root dispatch
+    /// pays an O(N) rebuild to run a filter that cannot remove anything.
+    ///
+    /// So the condition is not re-spelled at the call site. If the early returns
+    /// in `authorize_path` ever change, this changes with them, and
+    /// `snapshot_under_a_scoped_cap_does_not_take_the_tracked_root_fast_path`
+    /// is the row that fails if they drift apart.
+    fn cap_filter_active(ctx: &HandlerContext) -> bool {
+        ctx.is_external && ctx.caller_capability.is_some()
     }
 
     /// Get an entity by path.
@@ -1260,27 +1313,77 @@ impl TreeHandler {
         // reason. The `from_params` distinction is gone rather than widened:
         // there is no path into this function on which the handler-level check
         // is redundant.
-        if let Err(e) = self.authorize_path(ctx, "snapshot", &prefix) {
+        // `"get"`, not `"snapshot"` — EXTENSION-TREE §11's `map_operation` row.
+        // See `authorize_path` for why the unmapped name is a fail-open.
+        if let Err(e) = self.authorize_path(ctx, "get", &prefix) {
             return Ok(e);
         }
 
+        // ⛔ **A snapshot is a COMMITMENT, and §11's `diff` exemption is a claim
+        // about this function.** (V7 §6.3, EXTENSION-TREE §11 — the row go drove
+        // against us at `exclude_matrix.snapshot_diff_no_leak`, 2026-09-12.)
+        //
+        // The prefix check above authorizes the prefix *string*; what leaves
+        // here is a trie root committing to the *set* underneath it — `CP-12a`'s
+        // wider class again, one surface past the listing and extract filters.
+        // What makes it worse than either is the second half: §11 exempts `diff`
+        // from path checks, and that exemption is sound **only** while a
+        // snapshot cannot commit to bindings the caller may not see. Compose the
+        // two and the excluded key and its content hash fall out of
+        // `diff(empty, scoped).added` — through the one operation the spec says
+        // needs no authority. Measured against us: `secret` present in `added`
+        // under a cap whose `resources.exclude` names it, with the direct
+        // `get` on that same path correctly `403`.
+        //
+        // **A path-check EXEMPTION is a claim about the exempt operation's
+        // upstream PRODUCER.** `diff` reads two roots and authorizes neither, so
+        // the authority that governs its output was spent when the root was
+        // minted. Nothing about `handle_diff` is wrong; the entire fix is here.
+        //
+        // Filtering *before* `build_trie` is re-rooting, not redaction: the root
+        // is the canonical trie over what the caller may see, so it is internally
+        // complete, verifiable, and diffable — as opposed to handing back the
+        // full root and filtering the diff, which would leave the excluded hash
+        // reachable to anyone who walks the root's nodes directly.
+        let cap_scoped = Self::cap_filter_active(ctx);
+
         // Fast path: EXTENSION-TREE §3.4 — if an incremental trie root is
         // being maintained for this prefix, return it directly.
-        if let Some(tracked) = self.lookup_tracked_root(&prefix) {
-            tracing::debug!(prefix = %prefix, root = %tracked, "tree snapshot: tracked root");
-            let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
-                entity_ecf::text("root"),
-                entity_ecf::Value::Bytes(tracked.to_bytes().to_vec()),
-            )]));
-            let snapshot = Entity::new(entity_types::TYPE_TREE_SNAPSHOT, data)
-                .map_err(|e| HandlerError::Internal(e.to_string()))?;
-            return Ok(HandlerResult::ok(snapshot));
+        //
+        // ⚠ **Bypassed under a scoped cap, and that is the load-bearing half of
+        // the fix.** The tracked root is maintained by `RootTrackerEngine` over
+        // *every* binding under the prefix — it is a peer-level artifact with no
+        // caller in scope when it is built. A filter added only to the rebuild
+        // branch below would therefore be skipped whenever a root happened to be
+        // tracked for the prefix: same request, same cap, and the leak present or
+        // absent depending on whether a `system/tree/root/{prefix}` binding
+        // exists. That is the worst available failure mode, because the surviving
+        // test would pass on an untracked fixture.
+        if !cap_scoped {
+            if let Some(tracked) = self.lookup_tracked_root(&prefix) {
+                tracing::debug!(prefix = %prefix, root = %tracked, "tree snapshot: tracked root");
+                let data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+                    entity_ecf::text("root"),
+                    entity_ecf::Value::Bytes(tracked.to_bytes().to_vec()),
+                )]));
+                let snapshot = Entity::new(entity_types::TYPE_TREE_SNAPSHOT, data)
+                    .map_err(|e| HandlerError::Internal(e.to_string()))?;
+                return Ok(HandlerResult::ok(snapshot));
+            }
         }
 
-        // Collect all bindings under prefix
+        // Collect all bindings under prefix, per-binding filtered against the
+        // caller capability exactly as `handle_extract` and the listing are.
+        // `"get"` per EXTENSION-TREE §11's `map_operation` row — see
+        // `authorize_path` for why the unmapped name is a fail-open — and the
+        // filter runs on the entry's own ABSOLUTE path, which is the frame
+        // `check_path_permission` canonicalizes in.
         let entries = self.location_index.list(&prefix);
         let mut bindings = BTreeMap::new();
         for entry in &entries {
+            if cap_scoped && !self.path_allowed(ctx, "get", &entry.path) {
+                continue;
+            }
             let rel = entry.path.strip_prefix(&prefix).unwrap_or(&entry.path);
             bindings.insert(rel.to_string(), entry.hash);
         }
@@ -1861,7 +1964,10 @@ impl TreeHandler {
         // none. It is a READ that returns an envelope of every binding under
         // the prefix, so §6.7's act-neutral reading (0.8.2.20) is the whole
         // point: the harm is disclosure.
-        if let Err(e) = self.authorize_path(ctx, "extract", &prefix) {
+        // `"get"`, not `"extract"` — EXTENSION-TREE §11's `map_operation` row,
+        // and the site where the unmapped name cost the most: what this function
+        // returns is the bound entities themselves.
+        if let Err(e) = self.authorize_path(ctx, "get", &prefix) {
             return Ok(e);
         }
 
@@ -1943,8 +2049,13 @@ impl TreeHandler {
                 })
                 .collect()
         };
+        // `"get"` per §11, as at the prefix check above — and it is the same
+        // base permission the listing filter uses, which is what §8.2's
+        // *"entries the capability grants `get` access to"* and §6.3's
+        // `filter_listing` both name. go filters extract entries with a literal
+        // `"get"` at `operations.go:436`/`:457`; this row was `"extract"` here.
         bindings.retain(|rel_path, _| {
-            self.path_allowed(ctx, "extract", &format!("{}{}", prefix, rel_path))
+            self.path_allowed(ctx, "get", &format!("{}{}", prefix, rel_path))
         });
 
         // Build trie and snapshot entity as root
@@ -3472,6 +3583,405 @@ mod tests {
 
     fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
         haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// Decode a `system/tree/snapshot` result and walk its trie root back into
+    /// the binding set it commits to.
+    ///
+    /// ⚠ The assertion has to be made on the WALKED SET, not on the response
+    /// bytes. A snapshot response is `{root: <33 bytes>}` and nothing else — the
+    /// excluded key and its content hash are not *in* it under either
+    /// implementation, so `contains_subslice` over the body (which is what the
+    /// extract row two functions up can legitimately use) is green against the
+    /// leak. That is the whole reason this class needed a cross-impl drive
+    /// composing two operations to surface: the disclosure is one dereference
+    /// away from the response, and an assertion that stops at the response
+    /// cannot see it.
+    fn snapshot_bindings(tree: &TreeHandler, result: &HandlerResult) -> BTreeMap<String, Hash> {
+        let val = decode_cbor(&result.result.data);
+        let map = val.as_map().expect("snapshot result is a map");
+        let root_bytes = cbor_map_get(map, "root").as_bytes().expect("root is bstr");
+        let root = Hash::from_bytes(root_bytes).expect("root hash");
+        trie::collect_all_bindings(tree.content_store.as_ref(), root, "")
+    }
+
+    /// ⛔ **The composed leak: `snapshot` under an excluding cap + the §11
+    /// `diff` exemption.** (V7 §6.3, EXTENSION-TREE §11 — core-go's
+    /// `exclude_matrix.snapshot_diff_no_leak`, which scored us `1F` at
+    /// `74e2afb` and is the cohort's only scored FAIL that round.)
+    ///
+    /// `snapshot` is the third member of the enumerating-consumer family
+    /// (`listing`, `extract`, `snapshot`) and was the one left unfiltered. It
+    /// reads worse than the other two on the wire because the disclosure is
+    /// **deferred**: the response is a single 33-byte root and discloses
+    /// nothing by itself, so the caller spends it at `diff`, which §11 exempts
+    /// from path checks entirely. `diff(empty_baseline, scoped_snapshot).added`
+    /// then hands back `secret` **and its content hash** — with no
+    /// authorization run anywhere in the composition, because `snapshot`
+    /// authorized the prefix string and `diff` is exempt by construction.
+    ///
+    /// **A path-check EXEMPTION is a claim about the exempt operation's
+    /// upstream producer.** §11 is not wrong and `handle_diff` needs no change;
+    /// the exemption's premise — that a root cannot commit to what the caller
+    /// may not see — is what this function has to make true.
+    ///
+    /// **Mutation-verified (M1, run):** dropping the
+    /// `cap_scoped && !path_allowed(…)` `continue` from the collection loop puts
+    /// `secret` back in the walked set — RED here and on
+    /// `snapshot_under_a_scoped_cap_does_not_take_the_tracked_root_fast_path`,
+    /// with `a_listing_omits_…` and `an_extract_omits_…` green, which is what
+    /// says the three filters are three call sites and not one. The `public`
+    /// assertion is the control that separates *"filters correctly"* from
+    /// *"returns an empty trie"*, and the direct-`get` 403 is the one that
+    /// separates it from *"denies this caller everything"*.
+    #[tokio::test]
+    async fn a_snapshot_root_omits_a_binding_the_callers_grant_excludes() {
+        let tree = make_tree();
+        let peer = test_peer_id();
+        tree.put(&qp("app/public"), make_entity("t", "public"))
+            .unwrap();
+        tree.put(&qp("app/secret"), make_entity("t", "secret"))
+            .unwrap();
+        let cap = prefix_cap_excluding_secret(&peer);
+
+        let ctx = external_ctx("snapshot", None, Some(vec![qp("app/")]), cap.clone());
+        let result = tree.handle(&ctx).await.unwrap();
+        assert_eq!(
+            result.status, STATUS_OK,
+            "the prefix snapshot is authorized"
+        );
+
+        let committed = snapshot_bindings(&tree, &result);
+        assert!(
+            !committed.contains_key("secret"),
+            "§6.3: the snapshot committed to a binding the caller's grant excludes \
+             — `diff` against an empty snapshot returns the key and its content \
+             hash through the §11 path-check exemption (committed: {:?})",
+            committed.keys().collect::<Vec<_>>()
+        );
+        // CONTROL — without this the row above passes against a snapshot that
+        // commits to nothing at all, which is the other way to be "secure".
+        assert_eq!(
+            committed.get("public"),
+            Some(&make_entity("t", "public").content_hash),
+            "CONTROL: the in-grant binding IS committed, at its real hash"
+        );
+
+        // CONTROL — the same caller reading the excluded child directly is still
+        // refused. This row passing is what made the leak read as a working
+        // guard: the direct read is denied and the commitment is not.
+        let direct = external_ctx("get", None, Some(vec![qp("app/secret")]), cap);
+        assert_eq!(tree.handle(&direct).await.unwrap().status, STATUS_FORBIDDEN);
+    }
+
+    /// ⛔ **The filter has to survive the O(1) fast path, and that is a separate
+    /// claim from "the filter exists".**
+    ///
+    /// `handle_snapshot` short-circuits on a tracked trie root
+    /// (EXTENSION-TREE §3.4) when `RootTrackerEngine` maintains one for the
+    /// prefix. That root is a **peer-level** artifact built over every binding,
+    /// with no caller in scope at the time it is built — so a filter placed only
+    /// on the rebuild branch is skipped whenever a root happens to be tracked.
+    /// The failure mode that makes this worth its own row: the same request
+    /// under the same cap leaks or does not leak depending on whether a
+    /// `system/tree/root/{prefix}` binding exists, and the row above — which
+    /// builds no tracker — would stay green through it.
+    ///
+    /// Row 1 drives the fast-path-armed tree under a scoped cap and asserts the
+    /// answer is the FILTERED root, not the tracked one. Row 2 is the control
+    /// that keeps the bypass honest in the other direction: cap-free, the
+    /// tracked root is still returned verbatim, so "bypass under a scoped cap"
+    /// cannot be satisfied by deleting the fast path.
+    ///
+    /// **Mutation-verified, both run, and the disjointness is the result worth
+    /// recording:**
+    ///
+    /// | mutation | this row | `a_snapshot_root_omits_…` | pre-existing `…uses_tracked_root_…` |
+    /// |---|---|---|---|
+    /// | M2 — `if !cap_scoped` → `if true` (fast path not bypassed) | **RED** | green | green |
+    /// | M3 — `if !cap_scoped` → `if false` (fast path deleted) | **RED** | green | **RED** |
+    ///
+    /// M2 is the one that earns this row its existence: the plain filter row
+    /// **cannot see** the fast-path skip, because it builds no tracker, so
+    /// without this fixture a peer that filters the rebuild branch and
+    /// short-circuits past it is green on every row in the file. M3 reddening
+    /// the §3.4 row as well is the fast path's own pin, and it reddens *here*
+    /// through the sentinel rather than through a root comparison.
+    #[tokio::test]
+    async fn snapshot_under_a_scoped_cap_does_not_take_the_tracked_root_fast_path() {
+        let tree = make_tree();
+        let peer = test_peer_id();
+        tree.put(&qp("app/public"), make_entity("t", "public"))
+            .unwrap();
+        tree.put(&qp("app/secret"), make_entity("t", "secret"))
+            .unwrap();
+
+        // Arm the fast path as `RootTrackerEngine` does — the UNFILTERED root
+        // over the prefix, bound at `system/tree/root/{bare_prefix}` — plus one
+        // SENTINEL key that exists only inside the tracked root and has no
+        // binding in the location index.
+        //
+        // ⚠ The sentinel is what makes row 2 a control at all, and the first
+        // draft of this fixture did without it and was a **tautology**: a
+        // tracked root built as the canonical trie over exactly the indexed
+        // bindings is *equal to* what the rebuild branch produces, so `== root`
+        // is satisfied whether the fast path fired or not. Measured — deleting
+        // the fast path outright left that version GREEN and reddened only the
+        // pre-existing `test_handler_snapshot_uses_tracked_root_when_present`,
+        // which uses a fabricated root for this same reason. A root no rebuild
+        // can produce is the only thing that observes which branch ran.
+        let mut all = BTreeMap::new();
+        all.insert(
+            "public".to_string(),
+            tree.location_index.get(&qp("app/public")).unwrap(),
+        );
+        all.insert(
+            "secret".to_string(),
+            tree.location_index.get(&qp("app/secret")).unwrap(),
+        );
+        all.insert(
+            "tracked-sentinel".to_string(),
+            make_entity("t", "sentinel").content_hash,
+        );
+        let tracked_root = trie::build_trie(tree.content_store.as_ref(), &all).unwrap();
+        tree.location_index
+            .set(&qp("system/tree/root/app"), tracked_root);
+        // The fixture is only meaningful if the fast path would actually fire.
+        assert_eq!(
+            tree.lookup_tracked_root(&qp("app/")),
+            Some(tracked_root),
+            "fixture: the tracked root must be reachable, or row 1 passes vacuously"
+        );
+
+        // Row 1 — scoped cap: the tracked root is bypassed and the answer is the
+        // re-rooted, filtered trie.
+        let cap = prefix_cap_excluding_secret(&peer);
+        let ctx = external_ctx("snapshot", None, Some(vec![qp("app/")]), cap);
+        let result = tree.handle(&ctx).await.unwrap();
+        assert_eq!(result.status, STATUS_OK);
+        let committed = snapshot_bindings(&tree, &result);
+        assert!(
+            !committed.contains_key("tracked-sentinel"),
+            "the tracked-root fast path FIRED under a scoped cap — it returns a \
+             root over bindings nothing filtered (committed: {:?})",
+            committed.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !committed.contains_key("secret"),
+            "the excluded binding is committed to — the filter on the rebuild \
+             branch was skipped through the fast path"
+        );
+        assert!(committed.contains_key("public"), "CONTROL: still re-rooted");
+
+        // Row 2 — CONTROL, cap-free (a peer-root dispatch): the O(1) fast path
+        // is still taken, so the bypass is scoped to the case that needs it and
+        // not a deletion of §3.4.
+        let internal = make_handler_context("snapshot", None, Some(vec![qp("app/")]));
+        // Stated rather than implied by an absent line: this fixture's claim is
+        // that the dispatch is the kind on which the filter decides nothing.
+        assert!(!TreeHandler::cap_filter_active(&internal));
+        let result = tree.handle(&internal).await.unwrap();
+        assert_eq!(result.status, STATUS_OK);
+        let val = decode_cbor(&result.result.data);
+        let root_bytes = cbor_map_get(val.as_map().unwrap(), "root")
+            .as_bytes()
+            .unwrap();
+        assert_eq!(
+            Hash::from_bytes(root_bytes).unwrap(),
+            tracked_root,
+            "CONTROL: cap-free, EXTENSION-TREE §3.4's tracked root is returned \
+             verbatim — the bypass must not have deleted the fast path"
+        );
+        assert!(
+            snapshot_bindings(&tree, &result).contains_key("tracked-sentinel"),
+            "CONTROL: and the answer is the TRACKED root specifically — the \
+             sentinel has no binding in the index, so no rebuild can mint it"
+        );
+    }
+
+    /// ⛔ **`EXTENSION-TREE` §11: the path-level check is asked about the MAPPED
+    /// base permission (`get`), never about the extension operation name.**
+    ///
+    /// The discriminating grant is the one where the two disagree:
+    /// `operations: {include: ["*"], exclude: ["get"]}`. The **dispatch** check
+    /// asks about the literal name and allows — `extract` is not `get`, which is
+    /// §11 item 1 working as written. The **path** check must then ask about
+    /// `get` and refuse. Handed `"extract"` instead it agreed with the dispatch
+    /// check, so §6.3 answered a question nobody asked and `handle_extract`
+    /// returned an envelope of every bound entity under the prefix. `snapshot`
+    /// is the same row with a trie root in place of the entities.
+    ///
+    /// Note which way a mis-mapping fails and why no green suite could see it:
+    /// every ordinary cap lists `get` alongside `extract` (§11's own example
+    /// does), and for those two the mapped and unmapped questions have the same
+    /// answer. Only a cap that grants the operation while withholding the base
+    /// permission separates them.
+    ///
+    /// **Mutation-verified**, both directions, both sites: restoring
+    /// `authorize_path(ctx, "extract", …)` / `(ctx, "snapshot", …)` turns rows 1
+    /// and 2 from `403` to `200` — RED — and leaves the control green, because
+    /// the control's cap satisfies both readings. The control is the half that
+    /// matters here: "asks about `get`" and "denies everything" are one edit
+    /// apart, and only the control tells them apart.
+    #[tokio::test]
+    async fn extract_and_snapshot_authorize_the_mapped_get_not_the_operation_name() {
+        let peer = test_peer_id();
+        let grant_without_get =
+            |ops: entity_capability::IdScope| entity_capability::CapabilityToken {
+                grants: vec![entity_capability::GrantEntry {
+                    handlers: entity_capability::PathScope::new(vec![format!(
+                        "/{}/system/tree",
+                        peer
+                    )]),
+                    resources: entity_capability::PathScope::new(vec![format!("/{}/app/*", peer)]),
+                    operations: ops,
+                    peers: None,
+                    constraints: None,
+                    allowances: None,
+                }],
+                granter: entity_capability::Granter::Single(Hash::zero()),
+                grantee: Hash::zero(),
+                parent: None,
+                created_at: 0,
+                expires_at: None,
+                not_before: None,
+                delegation_caveats: None,
+            };
+
+        // The cap that separates the two readings: every operation EXCEPT the
+        // base permission the §11 table maps `extract`/`snapshot` onto.
+        let all_but_get = entity_capability::IdScope::with_exclude(
+            vec!["*".to_string()],
+            vec!["get".to_string()],
+        );
+
+        // Row 1 — extract.
+        let tree = make_tree();
+        tree.put(&qp("app/public"), make_entity("t", "public"))
+            .unwrap();
+        let ctx = external_ctx(
+            "extract",
+            None,
+            Some(vec![qp("app/")]),
+            grant_without_get(all_but_get.clone()),
+        );
+        let result = tree.handle(&ctx).await.unwrap();
+        assert_eq!(
+            result.status, STATUS_FORBIDDEN,
+            "§11 map_operation: extract → get, and this grant excludes get"
+        );
+
+        // Row 2 — snapshot, same grant, same mapping row.
+        let ctx = external_ctx(
+            "snapshot",
+            None,
+            Some(vec![qp("app/")]),
+            grant_without_get(all_but_get),
+        );
+        let result = tree.handle(&ctx).await.unwrap();
+        assert_eq!(
+            result.status, STATUS_FORBIDDEN,
+            "§11 map_operation: snapshot → get, and this grant excludes get"
+        );
+
+        // CONTROL — the ordinary shape §11's own example grant uses. Both
+        // readings allow it, so a "deny extract outright" mutation reddens here
+        // and nowhere else.
+        let ctx = external_ctx(
+            "extract",
+            None,
+            Some(vec![qp("app/")]),
+            grant_without_get(entity_capability::IdScope::new(vec![
+                "get".to_string(),
+                "snapshot".to_string(),
+                "extract".to_string(),
+            ])),
+        );
+        let result = tree.handle(&ctx).await.unwrap();
+        assert_eq!(
+            result.status, STATUS_OK,
+            "CONTROL: a cap listing get alongside extract still extracts"
+        );
+        let public_hash = make_entity("t", "public").content_hash;
+        assert!(
+            contains_subslice(&result.result.data, &public_hash.to_bytes()),
+            "CONTROL: the in-grant binding IS in the envelope"
+        );
+    }
+
+    /// The §11 mapping binds the **per-entry** extract filter as well as the
+    /// prefix check, and that site needs its own row — *"the feature is mapped"*
+    /// and *"this call site is mapped"* are different claims, and a mutation
+    /// only measures the second.
+    ///
+    /// The shape that separates them is two grants whose dimensions cross, which
+    /// is also §5.2's *all dimensions from ONE grant entry* rule:
+    ///
+    /// | grant | resources | operations |
+    /// |---|---|---|
+    /// | G1 | `/{p}/app/` — the prefix string, EXACT | `get` |
+    /// | G2 | `/{p}/app/*` — the children | `extract`, no `get` |
+    ///
+    /// The prefix check (`get` on `/{p}/app/`) is satisfied by G1, so the
+    /// request is not refused and the filter is actually reached. Each child
+    /// then needs `get` on `/{p}/app/{name}`, which G1's exact include does not
+    /// cover and G2's operations do not grant — so nothing is extractable.
+    /// Ask the filter about `"extract"` instead and G2 answers yes, and the
+    /// envelope ships the entity.
+    ///
+    /// **Mutation-verified:** `path_allowed(ctx, "extract", …)` on the
+    /// `bindings.retain` line turns the first assertion RED (the entity appears)
+    /// while the prefix-level rows above stay green.
+    #[tokio::test]
+    async fn the_per_entry_extract_filter_asks_about_get_too() {
+        let tree = make_tree();
+        let peer = test_peer_id();
+        tree.put(&qp("app/public"), make_entity("t", "public"))
+            .unwrap();
+        let cap = entity_capability::CapabilityToken {
+            grants: vec![
+                entity_capability::GrantEntry {
+                    handlers: entity_capability::PathScope::new(vec![format!(
+                        "/{}/system/tree",
+                        peer
+                    )]),
+                    resources: entity_capability::PathScope::new(vec![format!("/{}/app/", peer)]),
+                    operations: entity_capability::IdScope::new(vec!["get".into()]),
+                    peers: None,
+                    constraints: None,
+                    allowances: None,
+                },
+                entity_capability::GrantEntry {
+                    handlers: entity_capability::PathScope::new(vec![format!(
+                        "/{}/system/tree",
+                        peer
+                    )]),
+                    resources: entity_capability::PathScope::new(vec![format!("/{}/app/*", peer)]),
+                    operations: entity_capability::IdScope::new(vec!["extract".into()]),
+                    peers: None,
+                    constraints: None,
+                    allowances: None,
+                },
+            ],
+            granter: entity_capability::Granter::Single(Hash::zero()),
+            grantee: Hash::zero(),
+            parent: None,
+            created_at: 0,
+            expires_at: None,
+            not_before: None,
+            delegation_caveats: None,
+        };
+
+        let ctx = external_ctx("extract", None, Some(vec![qp("app/")]), cap);
+        let result = tree.handle(&ctx).await.unwrap();
+        // Reached the filter, not refused at the prefix — that is what G1 is for.
+        assert_eq!(result.status, STATUS_OK);
+        let public_hash = make_entity("t", "public").content_hash;
+        assert!(
+            !contains_subslice(&result.result.data, &public_hash.to_bytes()),
+            "§11: the per-entry filter asks about `get`, which no single grant \
+             here answers for a child path"
+        );
     }
 
     /// `EXTENSION-TREE` §11 + §12.1: *"Merge requires `put` authorization on

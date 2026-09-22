@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use entity_capability::{matches_scope, GrantEntry};
+use entity_capability::GrantEntry;
 use entity_ecf::Value;
 use entity_entity::Entity;
 use entity_handler::{
@@ -186,12 +186,16 @@ impl QueryHandler {
             ));
         }
 
-        // Validate type_filter against type_scope (spec §5.1 step 3)
+        // Validate type_filter against type_scope (spec §5.2 step 3).
+        // `matches_id_scope`, not `matches_scope`: the subject is a TYPE NAME and
+        // `type_scope` is a `system/capability/id-scope` (§5.5.1), so it matches
+        // literally with the two id wildcards and carries no peer-id frame — see
+        // `filter_by_capability`, which had the same confusion at step 6a.
         if let (Some(ref type_filter), Some(ref type_scope)) =
             (&expr.type_filter, &constraints.type_scope_include)
         {
             let exclude = constraints.type_scope_exclude.as_deref().unwrap_or(&[]);
-            if !matches_scope(type_filter, type_scope, exclude, &self.local_peer_id) {
+            if !entity_capability::matches_id_scope(type_filter, type_scope, exclude) {
                 return Ok(HandlerResult::error(
                     STATUS_FORBIDDEN,
                     make_error_entity("type_not_authorized", "type_filter not in type_scope"),
@@ -463,52 +467,122 @@ impl QueryHandler {
         candidates
     }
 
+    /// `EXTENSION-QUERY` §5.2 steps **6a** (type scope) and **6b** (per-result
+    /// path permission), and the two steps do not share an authority.
+    ///
+    /// ⛔ **6b is `check_path_permission`, and the reason is the sentence §5.5.2
+    /// uses to describe it: *"capability filtering uses `check_path_permission`
+    /// per result — same pattern as tree listing."*** `find` is the widest
+    /// enumerating consumer in the corpus: the dispatch check saw a handler, an
+    /// operation and — only if the EXECUTE carried a `resource` — a target
+    /// *string*; what leaves this function is a **set** drawn straight off the
+    /// indexes. That is `CP-12a`/`F71`'s class, and §6.3's listing MUST is the
+    /// same rule one handler over.
+    ///
+    /// This ran a hand-rolled predicate instead, and it was wrong in three
+    /// independent ways:
+    ///
+    /// 1. **Resources only, so the dimensions came apart.** It looped *every*
+    ///    grant asking only about `resources`, so a path covered by grant B was
+    ///    admitted for a query authorized by grant A — a cap holding
+    ///    `{handlers:[system/inbox], resources:[/{p}/secret/*]}` beside a narrow
+    ///    query grant enumerated `/{p}/secret/*`. §5.2 answers all dimensions
+    ///    **from one grant entry**; splitting them across entries is the same
+    ///    defect `F67` was, reached from a filter instead of a bypass.
+    /// 2. **The wrong PR-8 frame.** Grant patterns canonicalized against
+    ///    `local_peer_id`, so a foreign-granted bare `*` in `resources` landed in
+    ///    *our* namespace — the V1' escalation, and this is a path with no
+    ///    dispatch-level resource check behind it whenever `resource` is absent.
+    /// 3. **`content_store` scope skipped the path check entirely.** §5.5.2's own
+    ///    table says the filter is *"applied to entities with paths"* there;
+    ///    only **pathless** results are authorized by `type_scope` alone.
+    ///
+    /// **The authority for 6b is the caller's capability and therefore EXTERNAL
+    /// dispatch only** — the same scope, for the same measured reason, as
+    /// `TreeHandler::authorize_path`: on an in-process sub-dispatch
+    /// `caller_capability` is propagated *for attribution* (`make_execute_fn`
+    /// says so at the site that writes it), so reading it as an authorization
+    /// input refuses legitimate traffic. That gate is new here and it is a
+    /// widening; it is stated because the previous code gated on the capability
+    /// being *present*, which is the shape that cost us five days at `tree:put`.
+    ///
+    /// **6a is not gated, and that is deliberate.** `type_scope` is a
+    /// *constraint* carried by `ctx.matching_grant` — the grant that authorized
+    /// **this** dispatch, whichever kind it is — so it binds an internal caller
+    /// exactly as it binds a wire caller. It is also an **id-scope** of type
+    /// names (§5.5.1: `{type_ref: "system/capability/id-scope"}`), so it matches
+    /// literally with the two id wildcards and takes no `local_peer_id`:
+    /// `matches_scope` was canonicalizing a *type name* as though it were a
+    /// path, which made a `*/`-leading pattern NEVER_MATCH and diverged from
+    /// both sibling seats (go's `matchesScope` and py's `_type_authorized_by_scope`
+    /// both match the raw name).
     fn filter_by_capability(
         &self,
         candidates: Vec<QueryMatch>,
         constraints: &QueryConstraints,
         ctx: &HandlerContext,
     ) -> Vec<QueryMatch> {
-        // For internal dispatch (no capability), return all
-        if ctx.caller_capability.is_none() {
-            return candidates;
-        }
+        // Step 6b's authority. `None` = no path check: a peer-root or in-process
+        // dispatch, bounded by §5.2's `DispatchCeiling` rather than by this.
+        let path_authority = if ctx.is_external {
+            ctx.caller_capability.as_ref()
+        } else {
+            None
+        };
 
-        let cap = ctx.caller_capability.as_ref().unwrap();
+        // The cap's own granter frame (PR-8). Fail CLOSED when it cannot be
+        // resolved (§1.11) — a frame we cannot compute is not a frame we may
+        // guess at, and §5.5.3 requires an out-of-scope entity to be
+        // indistinguishable from a non-existent one, so the answer is an empty
+        // result rather than an error.
+        let granter_peer_id = match path_authority {
+            Some(cap) => {
+                match entity_capability::resolve_granter_peer_id(
+                    &cap.granter,
+                    &self.local_peer_id,
+                    |h| ctx.included.get(h),
+                ) {
+                    Some(g) => Some(g),
+                    None => return Vec::new(),
+                }
+            }
+            None => None,
+        };
 
         candidates
             .into_iter()
             .filter(|candidate| {
-                // Type check
+                // 6a — type scope (id-scope, literal; see the doc comment).
                 if let Some(ref type_include) = constraints.type_scope_include {
                     let type_exclude = constraints.type_scope_exclude.as_deref().unwrap_or(&[]);
-                    if !matches_scope(
+                    if !entity_capability::matches_id_scope(
                         &candidate.entity_type,
                         type_include,
                         type_exclude,
-                        &self.local_peer_id,
                     ) {
                         return false;
                     }
                 }
 
-                // Path check — tree scope requires path permission
-                if constraints.scope == "tree" {
-                    // Check resource scope against caller's capability
-                    for grant in &cap.grants {
-                        if matches_scope(
-                            &candidate.path,
-                            &grant.resources.include,
-                            &grant.resources.exclude,
-                            &self.local_peer_id,
-                        ) {
-                            return true;
-                        }
-                    }
-                    return false;
+                // 6b — per-result path permission (§6.3).
+                if candidate.path.is_empty() {
+                    // Pathless: reachable only under the `content_store`
+                    // allowance, where §5.2's algorithm authorizes it by
+                    // `type_scope` above. Under tree scope every result MUST
+                    // have a path, so a pathless one is dropped.
+                    return constraints.scope == "content_store";
                 }
-
-                true
+                match (path_authority, granter_peer_id.as_deref()) {
+                    (Some(cap), Some(granter)) => entity_capability::check_path_permission(
+                        "get",
+                        &candidate.path,
+                        cap,
+                        &ctx.pattern,
+                        &self.local_peer_id,
+                        granter,
+                    ),
+                    _ => true,
+                }
             })
             .collect()
     }
@@ -1095,6 +1169,226 @@ mod tests {
         ctx3.caller_capability = Some(cap);
         let result3 = handler.handle(&ctx3).await.unwrap();
         assert_eq!(result3.status, STATUS_FORBIDDEN);
+    }
+
+    /// The local peer's own `system/peer` entity, for the cap's PR-8 granter
+    /// frame. `filter_by_capability` fails CLOSED when it cannot resolve the
+    /// granter, and a fixture whose granter is `Hash::zero()` against an empty
+    /// `included` map is exactly that case — on the wire §5.2 has already
+    /// resolved the same granter out of `envelope.included` and refused the
+    /// dispatch if it could not, so a handler never sees an unresolvable one.
+    fn granter_in_included() -> (entity_hash::Hash, Entity) {
+        let kp = entity_crypto::Keypair::from_seed([7u8; 32]);
+        let ent = entity_crypto::peer_entity_from_components(&kp.public_key_bytes())
+            .expect("peer entity");
+        (ent.content_hash, ent)
+    }
+
+    fn external_find_ctx(
+        expr_data: Value,
+        grants: Vec<entity_capability::GrantEntry>,
+    ) -> HandlerContext {
+        let (granter_hash, granter_entity) = granter_in_included();
+        let mut ctx = make_find_ctx(expr_data);
+        ctx.caller_capability = Some(entity_capability::CapabilityToken {
+            grants,
+            granter: entity_capability::Granter::Single(granter_hash),
+            grantee: entity_hash::Hash::zero(),
+            parent: None,
+            created_at: 0,
+            expires_at: None,
+            not_before: None,
+            delegation_caveats: None,
+        });
+        ctx.included.insert(granter_hash, granter_entity);
+        // §6.3's authority is the caller's VERIFIED capability, which
+        // `caller_capability` is on an inbound wire EXECUTE and nowhere else —
+        // see `filter_by_capability`.
+        ctx.is_external = true;
+        ctx
+    }
+
+    fn match_paths(result: &HandlerResult) -> Vec<String> {
+        let val: ciborium::Value = ciborium::from_reader(result.result.data.as_slice()).unwrap();
+        let map = val.as_map().unwrap();
+        map.iter()
+            .find(|(k, _)| k.as_text() == Some("matches"))
+            .map(|(_, v)| {
+                v.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|m| {
+                        m.as_map()
+                            .unwrap()
+                            .iter()
+                            .find(|(k, _)| k.as_text() == Some("path"))
+                            .unwrap()
+                            .1
+                            .as_text()
+                            .unwrap()
+                            .to_string()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// ⛔ **`EXTENSION-QUERY` §5.2 step 6b: every result is filtered with
+    /// `check_path_permission`, which answers all dimensions from ONE grant
+    /// entry — not with a resources-only scan across every grant the cap
+    /// holds.**
+    ///
+    /// `find` is the widest enumerating consumer in the corpus, and the
+    /// dimensions coming apart is what made it wide. The discriminating cap
+    /// holds two grants that cross:
+    ///
+    /// | grant | handlers | operations | resources |
+    /// |---|---|---|---|
+    /// | G1 | `*` | `find` | `/{p}/users/*` |
+    /// | G2 | `system/inbox` | `receive` | `/{p}/secret/*` |
+    ///
+    /// G2 authorizes nothing about a query — wrong handler, wrong operation —
+    /// and its `resources` is the only thing the old filter looked at, so
+    /// `/{p}/secret/*` was enumerated by a query G1 authorized. That is `F67`'s
+    /// shape arrived at from a filter instead of a bypass: **an outcome
+    /// reachable from more than one authority source, measured as their union.**
+    ///
+    /// Note which rows the previous test set could not separate: with a single
+    /// broad grant, "any grant's resources" and "the matching grant's
+    /// resources" give the same answer. The sources have to DISAGREE.
+    ///
+    /// **Mutation-verified:** restoring the `for grant in &cap.grants { if
+    /// matches_scope(path, grant.resources…) { return true } }` loop puts
+    /// `secret/s` back in the result — `["secret/s", "users/alice"]` against the
+    /// expected `["users/alice"]` — with the control row green.
+    #[tokio::test]
+    async fn a_query_result_is_filtered_by_one_grant_not_the_union_of_all_grants() {
+        let (indexes, cs, li, handler) = setup();
+        put_entity(&cs, &li, &indexes, "users/alice", "app/user", "alice");
+        put_entity(&cs, &li, &indexes, "secret/s", "app/user", "secret");
+
+        let g1 = entity_capability::GrantEntry {
+            handlers: entity_capability::PathScope::new(vec!["*".into()]),
+            resources: entity_capability::PathScope::new(vec!["/test_peer/users/*".into()]),
+            operations: entity_capability::IdScope::new(vec!["find".into(), "get".into()]),
+            peers: None,
+            constraints: None,
+            allowances: None,
+        };
+        let g2 = entity_capability::GrantEntry {
+            handlers: entity_capability::PathScope::new(vec!["system/inbox".into()]),
+            resources: entity_capability::PathScope::new(vec!["/test_peer/secret/*".into()]),
+            operations: entity_capability::IdScope::new(vec!["receive".into()]),
+            peers: None,
+            constraints: None,
+            allowances: None,
+        };
+
+        let ctx = external_find_ctx(
+            entity_ecf::cbor_map! { "type_filter" => entity_ecf::text("app/user") },
+            vec![g1.clone(), g2],
+        );
+        let result = handler.handle(&ctx).await.unwrap();
+        assert_eq!(result.status, STATUS_OK);
+        assert_eq!(
+            match_paths(&result),
+            vec!["users/alice".to_string()],
+            "§5.2 step 6b: only the path G1 covers — G2 authorizes no query"
+        );
+
+        // CONTROL: G1 alone still returns its own path. Without this the row
+        // above passes against a filter that drops everything.
+        let ctx = external_find_ctx(
+            entity_ecf::cbor_map! { "type_filter" => entity_ecf::text("app/user") },
+            vec![g1],
+        );
+        let result = handler.handle(&ctx).await.unwrap();
+        assert_eq!(
+            match_paths(&result),
+            vec!["users/alice".to_string()],
+            "CONTROL: the in-grant path IS returned"
+        );
+    }
+
+    /// The payoff of routing step 6b through `check_path_permission`: the
+    /// `resources.exclude` arm and `0.8.2.21`'s **H1** arm arrive for free,
+    /// because there is one implementation of the rule rather than a copy here.
+    ///
+    /// Row 1 is `CP-12a`'s class at `find` — the grant covers `users/*` and
+    /// excludes one child; the query enumerates the subtree and must omit it.
+    /// Row 2 is H1: an **unmatchable** exclude (`*/secret`, the plausible
+    /// misspelling of `/*/secret`) excludes EVERYTHING, so the result is empty
+    /// rather than silently unfiltered. Row 3 is the control the H1 vector
+    /// demands — a well-formed exclude that still ALLOWS its sibling — because
+    /// every row here is a denial and a filter that returns nothing passes both
+    /// of the first two.
+    ///
+    /// ⚠ **Recorded because an unreachable-by-construction row looks identical
+    /// to a toothless one from outside: this test stays GREEN under the
+    /// union-scan mutation** that reddens its neighbour. With a single grant,
+    /// *"any grant's resources"* and *"the matching grant, all dimensions"*
+    /// return the same answer — which is exactly why the neighbour needs two
+    /// grants that disagree. These rows are a **containment** pin: they fail if
+    /// step 6b ever stops going through `check_path_permission` and starts
+    /// re-implementing the exclude arms locally, which is the drift the one-call
+    /// shape exists to prevent. The arms themselves have their teeth in
+    /// `core/capability`.
+    #[tokio::test]
+    async fn the_query_filter_inherits_the_exclude_arms_including_h1() {
+        let (indexes, cs, li, handler) = setup();
+        put_entity(&cs, &li, &indexes, "users/alice", "app/user", "alice");
+        put_entity(&cs, &li, &indexes, "users/secret", "app/user", "secret");
+
+        let grant_with_exclude = |exclude: Vec<String>| entity_capability::GrantEntry {
+            handlers: entity_capability::PathScope::new(vec!["*".into()]),
+            resources: entity_capability::PathScope::with_exclude(
+                vec!["/test_peer/users/*".into()],
+                exclude,
+            ),
+            operations: entity_capability::IdScope::new(vec!["find".into(), "get".into()]),
+            peers: None,
+            constraints: None,
+            allowances: None,
+        };
+
+        let rows: Vec<(&str, Vec<String>, Vec<String>)> = vec![
+            (
+                "a well-formed exclude omits its own child (CP-12a at find)",
+                vec!["/test_peer/users/secret".into()],
+                vec!["users/alice".into()],
+            ),
+            (
+                "an UNMATCHABLE exclude excludes everything (H1)",
+                vec!["*/secret".into()],
+                vec![],
+            ),
+            (
+                "CONTROL: a well-formed exclude that matches nothing here still ALLOWS",
+                vec!["/test_peer/users/nobody".into()],
+                vec!["users/alice".into(), "users/secret".into()],
+            ),
+        ];
+
+        let mut mismatches: Vec<String> = Vec::new();
+        for (label, exclude, expected) in rows {
+            let ctx = external_find_ctx(
+                entity_ecf::cbor_map! { "type_filter" => entity_ecf::text("app/user") },
+                vec![grant_with_exclude(exclude)],
+            );
+            let result = handler.handle(&ctx).await.unwrap();
+            let got = match_paths(&result);
+            if got != expected {
+                mismatches.push(format!(
+                    "[{}]: got {:?}, expected {:?}",
+                    label, got, expected
+                ));
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "§5.2 step 6b + 0.8.2.21 H1:\n  {}",
+            mismatches.join("\n  ")
+        );
     }
 
     #[tokio::test]

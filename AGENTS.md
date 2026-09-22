@@ -233,6 +233,62 @@ gates by making the TCP path compile on wasm32.
   the ordering is held by `test_distinct_timestamps_yield_distinct_paths` /
   `test_path_safety_sanitization` / `test_mirror_pointer_in_body`, which fail if the sweep
   moves after the bind.
+- **A guard's own comment is an INVENTORY of the checks it owes — read it as a checklist
+  against the code beneath it, because a loop that binds a variable and uses it only in the
+  error message has discarded half the invariant.** *(Candidate: bit us once, 2026-09-13, and
+  it had been shipping since the guard was written. Severity: capability forgery.)*
+  `verify_request` step 2b exists to close *"a forgery surface where a peer could substitute
+  an entity for a known hash via envelope manipulation — downstream hash-keyed lookups like
+  `included[h]` would index the substitute under h, even though h ≠ recomputed(substitute
+  .bytes)"*. That sentence names **two** checks. The loop was
+  `for entity in envelope.included.values() { entity.validate()?; }` and ran **one**:
+  `validate()` recomputes `Hash::compute(type, data)` against the entity's **own**
+  `content_hash` field — *self-consistency*, which any honestly-built entity satisfies,
+  **including the attacker's**. The half about the **map key** — the address every downstream
+  lookup actually uses — was thrown away by `.values()`.
+  **What that bought an attacker, measured (`core/protocol/tests/included_key_binding.rs`,
+  `verify_capability_chain` returned `Ok(())`):** file your own `system/peer` entity under a
+  victim's identity hash, and every per-link check passes on its own terms —
+  `sig.signer == cap.granter`, the resolved entity is a `system/peer`, and
+  `verify_peer_data_sig` verifies **your** signature against **your** key, because that is the
+  key it just looked up under the victim's hash. You need no key and no identity entity of the
+  victim's, only the victim's identity *hash*, which is the public `grantee` field of any
+  capability they present. So an observer of any chain could mint a leaf off it, up to the
+  parent's own scope. The root link stays genuine, attenuation holds because you wrote the
+  leaf, and nothing anywhere looks wrong.
+  **Three transferable parts.**
+  (a) **`validate()`-shaped and `is-this-the-right-one`-shaped are different questions that
+  read alike.** *Self-consistent* and *correctly addressed* are one word apart in English and
+  are unrelated properties; a function named `validate` answers the first and will be read as
+  answering both. Same family as *one representation carrying two meanings*, at the level of a
+  method name.
+  (b) **In a content-addressed map the KEY is the hash of the VALUE, and that is a property of
+  the TYPE, not of a code path.** Enforce it at the constructor — `decode_envelope`, which is
+  where such a map is built from received bytes — and at any `pub fn` whose return value is a
+  security verdict and whose callers build their maps differently
+  (`verify_capability_chain`: `verify_request` builds from `envelope.included`,
+  `presented_authority_authorizes` from a §7a.2a bundle merged with the parent envelope's).
+  An invariant that lives in the callers is one the next caller does not inherit.
+  (c) **The greps.** `grep -rn '\.values()' --include=*.rs` over any loop that validates a
+  hash-keyed map, and `grep -rn 'included.get(' --include=*.rs` to enumerate what addresses it
+  by key (here: `granter`, `grantee`, `parent`, `collect_authority_chain`'s resolver,
+  `handle_diff`'s snapshot resolution). If a lookup keys on a hash read out of *another
+  entity's data*, the key is load-bearing and something must bind it.
+  **Enforcement and the measured per-site result**, because this rule is satisfiable at three
+  sites and three sites is where one becomes an unmeasured claim: the decoder mutation reddens
+  the decoder row, the `verify_capability_chain` mutation reddens the forgery row — **disjoint**
+  — and the `verify_request` step-2b mutation reddens **nothing**, so that call is recorded at
+  the code as defence in depth with the property it *would* cover (non-chain `ctx.included`
+  lookups on an in-process `Envelope`) named as **unmeasured**. The control
+  (`a_correctly_filed_delegation_chain_still_verifies`) is not optional: the fix is a
+  comparison of two `Hash`es and getting it backwards refuses every well-formed envelope in
+  the system.
+  **Cohort note, and the evidence level is stated because it differs by seat.** Read at the
+  line, core-go's `Envelope.ValidateAll` (`core/entity/envelope.go:57-62`) has the identical
+  shape — it binds `h` in `for h, ent := range e.Included` and uses it only in the error
+  string — and `grep -rn '!= ent.ContentHash' core/` finds no key comparison. That is a code
+  read, **not a drive**: routed to go and py to confirm and drive in their own trees. Our own
+  finding is measured; theirs is not, and the report says which is which.
 - **A hypothetical you check MUST carry the shape you will write.** *(Ratified: bit us
   twice, in opposite directions.)* When a decision is made by probing a synthetic value
   through the real validator — `is_attenuated(&child, parent)`, an RL2 hypothetical, any
@@ -846,6 +902,55 @@ gates by making the TCP path compile on wasm32.
   in-tree model, and it is the one enumerating consumer that gets it right) or a refusal. A negative
   control is mandatory and it is the non-obvious half: the **child's own path must still be refused**,
   because that row passing is exactly what makes the leak read as a working guard.
+  **Ratified 2026-09-13, and the third enumerating consumer is the one where the disclosure is
+  DEFERRED: a path-check EXEMPTION is a claim about the exempt operation's upstream PRODUCER.**
+  `listing` and `extract` disclose in their own response, so the entry above found them by asking
+  what leaves the function. `snapshot` leaves a **33-byte root** and discloses nothing — the caller
+  spends it one operation later at `diff`, which `EXTENSION-TREE` §11 exempts from path checks
+  *entirely*. Compose them and `diff(empty, scoped_snapshot).added` returns the excluded key **and
+  its content hash**, with no authorization run anywhere in the composition: `snapshot` authorized
+  the prefix string, and `diff` is exempt by construction. Nothing about §11 or `handle_diff` is
+  wrong; the exemption's unstated premise — *a root cannot commit to what the caller may not see* —
+  is a proof obligation on `handle_snapshot`, and the entire fix is there.
+  **Enforcement:** for every operation a spec exempts from a check, write down what the exemption
+  assumes about its inputs and name the function that has to make it true — then test THAT function.
+  The grep is the exemption, not the check: `grep -n 'exempt\|no path check\|not authorized here'`
+  over the extension specs, and each hit names a producer. And the assertion cannot stop at the
+  response: a snapshot body contains neither the key nor the hash under either implementation, so
+  the row has to **walk the root** (`collect_all_bindings`) — which is also why no in-tree suite and
+  no single-operation vector could have caught it, and why it took a cross-impl check composing two
+  operations (`exclude_matrix.snapshot_diff_no_leak`).
+  **The second half is about the FAST PATH, and it is the one that would have shipped a green
+  suite over a live leak.** The tracked trie root (§3.4) is a *peer-level* artifact built over every
+  binding with no caller in scope, so a filter placed only on the rebuild branch is skipped whenever
+  a root happens to be tracked — the same request under the same cap leaking or not depending on
+  whether a `system/tree/root/{prefix}` binding exists. **A fast path that returns a precomputed
+  answer must be bypassed on exactly the condition that makes the filter decide something**, and the
+  way to stop those two conditions drifting is to not spell them twice: `cap_filter_active(ctx)` is
+  one predicate, used by the bypass and documented as tracking `authorize_path`'s early returns.
+  **And the fixture lesson, which is a new shape of *a control the code path can MASK*: a control
+  armed with the CANONICAL value cannot observe which branch produced it.** The first draft armed
+  the tracker with `build_trie` over exactly the indexed bindings and asserted the cap-free answer
+  `== tracked_root` — a **tautology**, because that is precisely what the rebuild branch also
+  produces. Measured rather than reasoned: deleting the fast path outright left it GREEN and
+  reddened only the pre-existing `test_handler_snapshot_uses_tracked_root_when_present`, which uses
+  a fabricated root for this exact reason. The fix is a **sentinel** the other branch cannot mint (a
+  key present in the tracked root with no binding in the index). **When a test asserts that an
+  optimization ran, the expected value must be one only the optimization can produce** — otherwise
+  it measures the answer, and both branches agree on the answer, which is the whole point of an
+  optimization. Teeth: `a_snapshot_root_omits_a_binding_the_callers_grant_excludes` and
+  `snapshot_under_a_scoped_cap_does_not_take_the_tracked_root_fast_path`, whose three mutations were
+  RUN and redden **disjoint** rows (filter removed → both; fast path un-bypassed → only the
+  fast-path row, the plain filter row **stays green**, which is what earns that row its existence;
+  fast path deleted → the fast-path row and the §3.4 row).
+  **⚠ And the boundary this closed does NOT reach, stated because an unstated gap is an exemption:**
+  `check_path_permission` has exactly **two** production consumers in this tree (`core/tree`,
+  `extensions/query` — `grep -rn 'check_path_permission(' --include=*.rs`), while
+  `grep -rn 'location_index.list(' --include=*.rs extensions/` returns ~15 enumerating handlers that
+  run **zero** per-entry filter (registry name listing, role assignment/derived sweeps, subscription,
+  revision branch/tag listing, relay, identity, local-files). §6.3's sentence says *"the **tree
+  handler** returns a listing"*, so whether it binds a **domain** listing is a spec question and not
+  ours to decide — routed. Do not read the three-green tree filters as covering the class.
 
 - **An identifier in a relayed packet is a citation — resolve it in the ISSUING repo's register before
   you propagate it, and never mint one for a finding that arrived unnamed.** *(Candidate: bit us
@@ -1037,6 +1142,62 @@ gates by making the TCP path compile on wasm32.
   `python3 -c "print(len(s)>=46 and all(c in '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz' for c in s))"`.
   And prefer deriving one (`Keypair::from_seed(...).peer_id()`) to writing one, which is what the
   surviving fixtures now do.
+
+- **A rule about an EXCLUDE is a rule about a matrix, and the axis nobody enumerates is the
+  ARGUMENT the check is asked about.** *(Candidate: bit us once, 2026-09-12, and the finding came
+  out of auditing a sibling's sweep rather than our own.)* `0.8.2.21`'s H1 is *"an unmatchable
+  exclude excludes everything"*, and our four-site sweep at `9beb723` was complete **on the axes
+  the ruling names** — the sites that read an exclude, × include/exclude, × concrete/pattern. go's
+  `77da7ea` then closed five coordinates on axes the ruling does not name (the handlers dimension
+  at both read sites, the authoring gate walking handlers as well as resources, the §5.2 pattern
+  arm, and the §8.2 listing/extract filter), and go's own ratchet calls the lesson *the matrix
+  blast-radius*. Re-running that matrix against **our** tree found three more, and none of them is
+  an exclude-reading site at all:
+  - **`extensions/query`'s step-6b filter read `resources` only, across EVERY grant.** So a path
+    covered by grant B was enumerated for a query grant A authorized — `{handlers:[system/inbox],
+    resources:[/{p}/secret/*]}` beside a narrow query grant enumerated the secret subtree.
+    Measured: `["secret/s","users/alice"]` where one path is authorized. §5.2 answers **all
+    dimensions from one grant entry**; a filter that consults one dimension across the union of
+    grants is `F67`'s shape reached from a filter instead of a bypass. It also used the wrong PR-8
+    frame and skipped the check entirely under the `content_store` allowance. Fix is the one
+    function §5.2 step 6b names — `check_path_permission` — never a local predicate.
+  - **`core/peer/src/http_live`'s content face decided membership with an open-coded literal scope
+    test** (`h == "*" || h == "system/tree"`). A *patterned* handler exclude (`system/*`) and an
+    *unmatchable* one (`*/tree`) were both invisible to it, `resources.exclude` was never read on
+    that face at all, and there is no second layer behind it. This is go's G-3 in a file go does
+    not have.
+  - **`core/tree` asked §6.3 about the wrong ARGUMENT, and this is the transferable half.**
+    `EXTENSION-TREE` §11's `map_operation` is closed — `get`/`snapshot`/`extract` → **`get`**,
+    `put`/`merge` → **`put`** — and says whose job it is: *"performed by the handler, not by
+    `check_permission` or `check_path_permission` — those functions receive the already-mapped
+    permission name."* We passed `ctx.operation` through unmapped at `handle_snapshot` and
+    `handle_extract`. The dispatch check asks the grant's `operations` about the **literal** name
+    and the path check must then ask about **`get`**; ask it about `"extract"` and it agrees with
+    the dispatch check, so a grant of `{operations:{include:["*"], exclude:["get"]}}` sails through
+    both and `extract` returns an envelope of every bound entity under the prefix (`200` where the
+    mapped question answers `403`, both sites mutation-measured). **The exclude was well-formed,
+    the matcher was correct, the site was one of the four we had just fixed — and the check was
+    asked a question whose answer does not bind.** Both siblings map (go's `checkPathPerm` takes a
+    literal `"get"`/`"put"` at all seven of its sites; py's `check_caller_permission("get", …)`),
+    so this was rust-only and invisible to every cross-impl row.
+  **Enforcement, and it is three greps, in this order.** (a) For any rule about a *scope*, grep for
+  **re-implementations** rather than for the rule's name — the tell is a literal comparison
+  (`== "*"`, `.contains(`, `.iter().any(|h| h ==`) or a containment helper standing in for
+  `matches_scope`/`matches_id_scope`/`check_path_permission` on a path that is *implementing a
+  scope*. (b) For every authorization call, read the **arguments** against the spec's own
+  parameter list: which permission, whose capability, whose frame — a correct predicate asked the
+  wrong question is a fail-open with nothing wrong at the site. The enforcement point we shipped is
+  the *parameter name*: `authorize_path(ctx, base_permission, path)` has no `operation` to fill
+  from `ctx.operation`, and each caller names the §11 row it applies. (c) For any enumerating
+  handler (`location_index.list(`, an index scan, a trie walk), ask whether its per-entry filter is
+  `check_path_permission` or a local approximation; `extensions/query` was cited **in this file**
+  as *"the in-tree model for an enumerating consumer"* and was the weakest of the three.
+  **And the reporting half: a green cross-impl category is not evidence about any of them.**
+  Measured before citing: `query` 47P/0F contains **zero** `Exclude` in any grant it delegates and
+  **zero** omission assertions, so it cannot witness step 6b; `tree_operations` 62P/0F drives
+  `extract` on the connection's broad cap, so it cannot witness the §11 mapping; `serving_mode`
+  runs `NamespaceScope`, not `CapTokenScope`. Three surfaces, three greens, three vector asks —
+  the same shape as `CORE-TREE-LISTING-1`, which we had already filed against ourselves.
 
 - **An operation added to a `Handler` has two registration sites, and the second one is in
   another crate.** `impl Handler::operations()` makes it answerable; `bootstrap_handler(...)` in

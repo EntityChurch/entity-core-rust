@@ -309,6 +309,34 @@ impl CapTokenScope {
     pub fn cap(&self) -> &CapabilityToken {
         &self.cap
     }
+
+    /// Does the published cap permit `system/tree:get` on this **concrete**
+    /// path? One evaluator for both faces — the content face resolves a hash to
+    /// a candidate bind path and asks this; the tree face asks it directly.
+    ///
+    /// Everything the decision needs is in `check_permission`: all four
+    /// dimensions from one grant entry (§5.2), both `exclude` arrays, and
+    /// 0.8.2.21's H1 arm on each. A hand-written predicate over
+    /// `handlers.include` is how the content face came to serve a namespace the
+    /// cap excluded — see `in_scope`.
+    ///
+    /// `granter == local` here by construction: a published-set cap is minted by
+    /// the publishing peer for its own surface, so the two PR-8 frames coincide
+    /// and passing `local_peer_id` twice is the honest call, not a shortcut.
+    fn permits_tree_get(&self, absolute_path: &str, local_peer_id: &str) -> bool {
+        let target = entity_capability::ResourceTarget {
+            targets: vec![absolute_path.to_string()],
+            exclude: vec![],
+        };
+        entity_capability::check_permission(
+            "get",
+            "system/tree",
+            local_peer_id,
+            Some(&target),
+            &self.cap,
+            local_peer_id,
+        )
+    }
 }
 
 #[async_trait]
@@ -321,13 +349,6 @@ impl ScopePredicate for CapTokenScope {
         let hex_h = super::hex_encode(&hash.to_bytes());
 
         for grant in &self.cap.grants {
-            // Only `system/tree:get` grants project to a content
-            // namespace under the published-set topology. Other
-            // grants (compute, identity, ...) are not in the
-            // serving-mode contract here.
-            if !grant_allows_tree_get(grant) {
-                continue;
-            }
             for pat in &grant.resources.include {
                 // A malformed pattern can't project to a namespace — it
                 // canonicalizes to NEVER_MATCH (§5.4), which has no `/*`
@@ -340,7 +361,24 @@ impl ScopePredicate for CapTokenScope {
                     None => continue,
                 };
                 let bind_path = format!("{}/{}", ns_prefix, hex_h);
-                if shared.location_index.get(&bind_path).is_some() {
+                if shared.location_index.get(&bind_path).is_none() {
+                    continue;
+                }
+                // ⛔ **The grant loop ENUMERATES candidate namespaces; the
+                // decision is the real evaluator's.** This arm used to decide
+                // membership from `grant_allows_tree_get` — an open-coded
+                // handler/operation scope test comparing `h == "*" || h ==
+                // "system/tree"` — with `resources.exclude` never read at all.
+                // Both halves were fail-open on the content face, which has no
+                // second layer behind it: a published cap whose handlers
+                // `exclude` was *patterned* (`system/*`) or **unmatchable**
+                // (`*/tree`, which 0.8.2.21 H1 makes exclude EVERYTHING) passed
+                // the literal test and served the namespace anyway. Asking
+                // `check_permission` about the concrete `bind_path` answers all
+                // four dimensions from one grant entry (§5.2) and carries the H1
+                // arms, and it is the same evaluator the tree face and the live
+                // EXECUTE surface use — so the three cannot drift.
+                if self.permits_tree_get(&bind_path, local_pid.as_str()) {
                     return Ok(true);
                 }
             }
@@ -365,19 +403,7 @@ impl ScopePredicate for CapTokenScope {
         let local_pid = shared.keypair.peer_id();
 
         // Direct cap eval — same evaluator the live surface uses.
-        let target = entity_capability::ResourceTarget {
-            targets: vec![absolute_path.to_string()],
-            exclude: vec![],
-        };
-        let allowed = entity_capability::check_permission(
-            "get",
-            "system/tree",
-            local_pid.as_str(),
-            Some(&target),
-            &self.cap,
-            local_pid.as_str(),
-        );
-        if allowed {
+        if self.permits_tree_get(absolute_path, local_pid.as_str()) {
             return Ok(true);
         }
 
@@ -385,7 +411,7 @@ impl ScopePredicate for CapTokenScope {
         // `absolute_path/`? Universal root `/` is reachable as long
         // as any include exists.
         for grant in &self.cap.grants {
-            if !grant_allows_tree_get(grant) {
+            if !grant_allows_tree_get(grant, local_pid.as_str()) {
                 continue;
             }
             for pat in &grant.resources.include {
@@ -441,31 +467,30 @@ fn is_bare_top_level_segment(path: &str) -> bool {
     }
 }
 
-/// Does this grant entry include `system/tree` in handlers and `get`
-/// in operations? (`*` matches.) Cheap predicate; used to skip
-/// non-relevant grants when deriving content namespaces.
-fn grant_allows_tree_get(grant: &entity_capability::GrantEntry) -> bool {
-    let handler_ok = grant
-        .handlers
-        .include
-        .iter()
-        .any(|h| h == "*" || h == "system/tree")
-        && !grant
-            .handlers
-            .exclude
-            .iter()
-            .any(|h| h == "system/tree" || h == "*");
-    let op_ok = grant
-        .operations
-        .include
-        .iter()
-        .any(|o| o == "*" || o == "get")
-        && !grant
-            .operations
-            .exclude
-            .iter()
-            .any(|o| o == "get" || o == "*");
-    handler_ok && op_ok
+/// Does this grant entry admit `system/tree:get` at all? Used **only** to skip
+/// grants that cannot contribute an ancestor for listing-descent — the reachable
+/// decision itself is [`CapTokenScope::permits_tree_get`].
+///
+/// ⛔ **Call the scope matchers; do not re-spell them.** This was an open-coded
+/// literal test (`h == "*" || h == "system/tree"`, and an `exclude` scan for the
+/// same two spellings), which is the §6.3/G-3 shape both our sibling seats swept
+/// on 2026-09-11: a *patterned* exclude (`system/*`) was invisible to it, and so
+/// was an **unmatchable** one, which 0.8.2.21's H1 makes exclude EVERYTHING. It
+/// also read `include` too narrowly in the other direction — a grant of
+/// `handlers: {include: ["system/*"]}` does grant `system/tree` and was being
+/// skipped. `matches_scope` (path-scope, §5.4 — handlers) and `matches_id_scope`
+/// (id-scope, §5.2 — operations) are the one implementation of each rule.
+fn grant_allows_tree_get(grant: &entity_capability::GrantEntry, local_peer_id: &str) -> bool {
+    entity_capability::matches_scope(
+        "system/tree",
+        &grant.handlers.include,
+        &grant.handlers.exclude,
+        local_peer_id,
+    ) && entity_capability::matches_id_scope(
+        "get",
+        &grant.operations.include,
+        &grant.operations.exclude,
+    )
 }
 
 // ===========================================================================

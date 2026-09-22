@@ -2142,6 +2142,131 @@ async fn amendment5_cap_token_scope_is_drift_free_vs_check_permission() {
     );
 }
 
+/// ⛔ **The content face decided membership with an open-coded handler-scope
+/// test, and that is the G-3 shape both sibling seats swept on 2026-09-11.**
+///
+/// `grant_allows_tree_get` compared spellings — `h == "*" || h ==
+/// "system/tree"`, and an `exclude` scan for the same two literals — so a
+/// published cap whose handlers `exclude` was **patterned** (`system/*`) or
+/// **unmatchable** (`*/tree`, which `0.8.2.21`'s H1 makes exclude EVERYTHING)
+/// passed it and the namespace was served anyway. `resources.exclude` was never
+/// read on that face at all. There is no second layer behind the content face:
+/// what it answers is what goes on the wire.
+///
+/// The fix is not a better predicate, it is *the* evaluator — `in_scope` now
+/// resolves a hash to its candidate bind path and asks `check_permission`, the
+/// same function the tree face and the live EXECUTE surface use, which answers
+/// all four dimensions from one grant entry and carries the H1 arms.
+///
+/// **Two controls, and both are load-bearing**, because "ask the evaluator" and
+/// "serve nothing" are one edit apart, and because the literal test was ALSO
+/// wrong in the narrowing direction:
+/// - a well-formed exclude naming a different handler still SERVES (row 3);
+/// - `handlers: {include: ["system/*"]}` — which does grant `system/tree` and
+///   which the literal include test skipped — now serves (row 4).
+///
+/// **Mutation-verified:** restoring the literal predicate as `in_scope`'s gate
+/// turns rows 1 and 2 from `false` to `true` and row 4 from `true` to `false`.
+#[tokio::test]
+async fn cap_token_content_face_honors_patterned_and_unmatchable_handler_excludes() {
+    use entity_capability::{CapabilityToken, GrantEntry, Granter, IdScope, PathScope};
+    use entity_peer::http_live::CapTokenScope;
+
+    let server = PeerBuilder::new()
+        .keypair(Keypair::from_seed([123u8; 32]))
+        .build()
+        .expect("peer builds");
+    let peer_id = server.peer_id().to_string();
+    let shared = server.shared();
+    server.start_engines(&shared);
+
+    // One published entity, bound in the namespace every cap below includes.
+    let entity = Entity::new("test/blob", b"published".to_vec()).expect("entity");
+    let h = entity.content_hash;
+    shared.content_store.put(entity).expect("put");
+    let ns_path = format!(
+        "/{}/system/content/public/{}",
+        peer_id,
+        hex_encode(&h.to_bytes())
+    );
+    shared.location_index.set(&ns_path, h);
+    let leaf_path = format!("/{}/system/content/public/leaf", peer_id);
+
+    let cap_with_handlers = |handlers: PathScope| CapabilityToken {
+        grants: vec![GrantEntry {
+            handlers,
+            operations: IdScope::new(vec!["get".to_string()]),
+            resources: PathScope::new(vec![format!("/{}/system/content/public/*", peer_id)]),
+            peers: None,
+            constraints: None,
+            allowances: None,
+        }],
+        granter: Granter::Single(Hash::compute("test/granter", b"x")),
+        grantee: Hash::compute("test/grantee", b"y"),
+        parent: None,
+        created_at: 0,
+        expires_at: None,
+        not_before: None,
+        delegation_caveats: None,
+    };
+
+    let rows: Vec<(&str, PathScope, bool)> = vec![
+        (
+            "a PATTERNED handler exclude covering system/tree",
+            PathScope::with_exclude(vec!["*".to_string()], vec!["system/*".to_string()]),
+            false,
+        ),
+        (
+            "an UNMATCHABLE handler exclude (H1: excludes everything)",
+            PathScope::with_exclude(vec!["*".to_string()], vec!["*/tree".to_string()]),
+            false,
+        ),
+        (
+            "CONTROL: a well-formed exclude naming a DIFFERENT handler",
+            PathScope::with_exclude(vec!["*".to_string()], vec!["system/inbox".to_string()]),
+            true,
+        ),
+        (
+            "CONTROL: a patterned INCLUDE that does grant system/tree",
+            PathScope::new(vec!["system/*".to_string()]),
+            true,
+        ),
+    ];
+
+    // Every row is MEASURED before anything is asserted, deliberately: an
+    // assertion inside the loop short-circuits at the first failure, and then a
+    // single mutation run tells you about one row instead of all four. The
+    // mismatch list below is the whole result.
+    let mut mismatches: Vec<String> = Vec::new();
+    for (label, handlers, expected) in rows {
+        let scope = CapTokenScope::new(cap_with_handlers(handlers));
+        let content_face = scope.in_scope(&h, &shared).await.expect("in_scope");
+        if content_face != expected {
+            mismatches.push(format!(
+                "content face [{}]: in_scope = {}, expected {}",
+                label, content_face, expected
+            ));
+        }
+        // The tree face went through `check_permission` all along; asserting it
+        // beside the content face is what pins the two to one answer.
+        let tree_face = scope
+            .in_scope_path(&leaf_path, &shared)
+            .await
+            .expect("in_scope_path");
+        if tree_face != expected {
+            mismatches.push(format!(
+                "tree face [{}]: in_scope_path = {}, expected {} (the two faces MUST agree)",
+                label, tree_face, expected
+            ));
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "§6.5.6 + 0.8.2.21 H1:\n  {}",
+        mismatches.join("\n  ")
+    );
+}
+
 /// §6.5.6 universal-tree-root listing: a bare `/{peer_id}` is reachable under
 /// EVERY scope predicate, so `peers.list` enumerates every peer-id the local
 /// view binds under and a consumer can descend into a foreign subtree.
