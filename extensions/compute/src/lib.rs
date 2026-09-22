@@ -108,34 +108,19 @@ impl ComputeHandler {
         // Path-as-resource (PROPOSAL-PATH-AS-RESOURCE-HYGIENE §3.1, P-COMPUTE-1):
         // the expression path is carried in resource, not params. Single-target
         // URI-only resource shape — anything else is 400 ambiguous_resource.
-        let expression_uri = match ctx.resource_target.as_ref() {
-            Some(rt) if rt.targets.len() == 1 && rt.exclude.is_empty() => rt.targets[0].clone(),
-            // §3.3 (0.8.2.18): ABSENT is `path_required`, MORE THAN ONE is
-            // `ambiguous_resource` — two inputs, two remedies, and collapsing
-            // them is non-conformant on the absent case. A non-empty `exclude`
-            // stays on the ambiguous arm: §3.3 names two inputs and an
-            // exclusion set is neither.
-            None => {
-                let err = make_error_entity(
-                    "path_required",
-                    "eval requires a resource target (the expression path)",
-                );
-                return Ok(HandlerResult::error(STATUS_BAD_REQUEST, err));
-            }
-            Some(rt) if rt.targets.is_empty() => {
-                let err = make_error_entity(
-                    "path_required",
-                    "eval requires a resource target (the expression path)",
-                );
-                return Ok(HandlerResult::error(STATUS_BAD_REQUEST, err));
-            }
-            _ => {
-                let err = make_error_entity(
-                    "ambiguous_resource",
-                    "eval requires exactly one resource target (the expression path)",
-                );
-                return Ok(HandlerResult::error(STATUS_BAD_REQUEST, err));
-            }
+        // §3.3 + §5.2's subject rule (0.8.2.20): one function answers the
+        // arity AND returns the element, so the count and the index cannot
+        // come from different lists. The block this replaces required
+        // `rt.exclude.is_empty()` and answered `ambiguous_resource` to any
+        // request carrying one — the reading 0.8.2.20 withdraws. It also had
+        // no `malformed_resource` arm for a lone pattern target.
+        let expression_uri = match entity_handler::require_single_resource_path(
+            ctx.resource_target.as_ref(),
+            &self.local_peer_id,
+            "eval (the expression path)",
+        ) {
+            Ok(p) => p,
+            Err(e) => return Ok(e),
         };
 
         let params_data = decode_data(&ctx.params);
@@ -263,34 +248,19 @@ impl ComputeHandler {
         // the root expression path is carried in resource. result_path stays
         // in params — it's a handler-write target under the install grant, not
         // an authorization target the caller needs separate cover for.
-        let qualified_resource = match ctx.resource_target.as_ref() {
-            Some(rt) if rt.targets.len() == 1 && rt.exclude.is_empty() => rt.targets[0].clone(),
-            // §3.3 (0.8.2.18): ABSENT is `path_required`, MORE THAN ONE is
-            // `ambiguous_resource` — two inputs, two remedies, and collapsing
-            // them is non-conformant on the absent case. A non-empty `exclude`
-            // stays on the ambiguous arm: §3.3 names two inputs and an
-            // exclusion set is neither.
-            None => {
-                let err = make_error_entity(
-                    "path_required",
-                    "install requires a resource target (the root expression path)",
-                );
-                return Ok(HandlerResult::error(STATUS_BAD_REQUEST, err));
-            }
-            Some(rt) if rt.targets.is_empty() => {
-                let err = make_error_entity(
-                    "path_required",
-                    "install requires a resource target (the root expression path)",
-                );
-                return Ok(HandlerResult::error(STATUS_BAD_REQUEST, err));
-            }
-            _ => {
-                let err = make_error_entity(
-                    "ambiguous_resource",
-                    "install requires exactly one resource target (the root expression path)",
-                );
-                return Ok(HandlerResult::error(STATUS_BAD_REQUEST, err));
-            }
+        // §3.3 + §5.2's subject rule (0.8.2.20): one function answers the
+        // arity AND returns the element, so the count and the index cannot
+        // come from different lists. The block this replaces required
+        // `rt.exclude.is_empty()` and answered `ambiguous_resource` to any
+        // request carrying one — the reading 0.8.2.20 withdraws. It also had
+        // no `malformed_resource` arm for a lone pattern target.
+        let qualified_resource = match entity_handler::require_single_resource_path(
+            ctx.resource_target.as_ref(),
+            &self.local_peer_id,
+            "install (the root expression path)",
+        ) {
+            Ok(p) => p,
+            Err(e) => return Ok(e),
         };
         // Walker, dependency index, and stored subgraph metadata all expect a
         // bare path; resource arrives peer-qualified from dispatch, so strip
@@ -670,34 +640,19 @@ impl ComputeHandler {
         // `system/compute/uninstall-request` wrapper is eliminated. Params is
         // the empty-params shape (`primitive/any` with `a0` data) — decoded
         // but unused.
-        let qualified_resource = match ctx.resource_target.as_ref() {
-            Some(rt) if rt.targets.len() == 1 && rt.exclude.is_empty() => rt.targets[0].clone(),
-            // §3.3 (0.8.2.18): ABSENT is `path_required`, MORE THAN ONE is
-            // `ambiguous_resource` — two inputs, two remedies, and collapsing
-            // them is non-conformant on the absent case. A non-empty `exclude`
-            // stays on the ambiguous arm: §3.3 names two inputs and an
-            // exclusion set is neither.
-            None => {
-                let err = make_error_entity(
-                    "path_required",
-                    "uninstall requires a resource target (the subgraph path)",
-                );
-                return Ok(HandlerResult::error(STATUS_BAD_REQUEST, err));
-            }
-            Some(rt) if rt.targets.is_empty() => {
-                let err = make_error_entity(
-                    "path_required",
-                    "uninstall requires a resource target (the subgraph path)",
-                );
-                return Ok(HandlerResult::error(STATUS_BAD_REQUEST, err));
-            }
-            _ => {
-                let err = make_error_entity(
-                    "ambiguous_resource",
-                    "uninstall requires exactly one resource target (the subgraph path)",
-                );
-                return Ok(HandlerResult::error(STATUS_BAD_REQUEST, err));
-            }
+        // §3.3 + §5.2's subject rule (0.8.2.20): one function answers the
+        // arity AND returns the element, so the count and the index cannot
+        // come from different lists. The block this replaces required
+        // `rt.exclude.is_empty()` and answered `ambiguous_resource` to any
+        // request carrying one — the reading 0.8.2.20 withdraws. It also had
+        // no `malformed_resource` arm for a lone pattern target.
+        let qualified_resource = match entity_handler::require_single_resource_path(
+            ctx.resource_target.as_ref(),
+            &self.local_peer_id,
+            "uninstall (the subgraph path)",
+        ) {
+            Ok(p) => p,
+            Err(e) => return Ok(e),
         };
         let subgraph_path = EntityUri::strip_peer_prefix(&qualified_resource).to_string();
 
@@ -1162,7 +1117,7 @@ mod entity_native_tests {
     use entity_store::{ContentStore, LocationIndex, MemoryContentStore, MemoryLocationIndex};
     use std::collections::HashMap;
 
-    const TEST_PID: &str = "testpeer123456789012345678901234567890123456";
+    const TEST_PID: &str = "testpeer123456789ABCDEFGHJKLMNPQRSTUVWXYZabcde";
 
     fn wildcard_grant() -> entity_capability::CapabilityToken {
         entity_capability::CapabilityToken {

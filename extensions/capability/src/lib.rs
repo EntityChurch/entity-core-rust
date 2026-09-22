@@ -159,6 +159,32 @@ impl CapabilityHandler {
                 ),
             ));
         }
+        // ⛔ §5.4 (0.8.2.21) — an unmatchable scope pattern makes the capability
+        // INVALID, and the refusal belongs here because this is the last moment
+        // the **granter** can be told. `exclude: ["*/secret"]` is a plausible
+        // spelling of *not `secret`, in any peer's namespace* (the intended
+        // form is `/*/secret`); it canonicalizes to NEVER_MATCH, carves out
+        // nothing, and hands back a grant silently WIDER than its author wrote,
+        // with no error anywhere, because the sentinel is designed not to raise.
+        //
+        // `unmatchable_scope_pattern` is why this is not also a `MAY`: two
+        // conformant peers, one refusing and one honouring the wider grant,
+        // reach different authorization decisions on the same capability bytes.
+        // The evaluation-side deny in `matches_scope` / `check_resource_scope`
+        // is the other layer and neither substitutes for the other.
+        if let Some(bad) = entity_capability::unmatchable_scope_pattern(&req.grants) {
+            return Ok(HandlerResult::error(
+                STATUS_BAD_REQUEST,
+                error_entity(
+                    "invalid_path",
+                    &format!(
+                        "scope pattern matches nothing and would silently widen the grant: \
+                         {:?} (a peer-wildcard is `/*/…`, not `*/…`)",
+                        bad
+                    ),
+                ),
+            ));
+        }
 
         // The matched policy entry is consulted twice — as the scope CEILING
         // at step 3 below, and as the temporal ceiling (`ttl_ms`) at step 4 —
@@ -438,6 +464,24 @@ impl CapabilityHandler {
                 error_entity(
                     "invalid_params",
                     "delegate-request must specify at least one grant entry",
+                ),
+            ));
+        }
+        // ⛔ §5.4 (0.8.2.21) — see `handle_request`. Delegation is the second
+        // authoring surface the ruling names, and it is the one where the
+        // widening compounds: `is_attenuated` reads the child's `exclude` as a
+        // narrowing, so an unmatchable exclude passes the subset check as
+        // though it narrowed and then carves out nothing at use.
+        if let Some(bad) = entity_capability::unmatchable_scope_pattern(&req.grants) {
+            return Ok(HandlerResult::error(
+                STATUS_BAD_REQUEST,
+                error_entity(
+                    "invalid_path",
+                    &format!(
+                        "scope pattern matches nothing and would silently widen the grant: \
+                         {:?} (a peer-wildcard is `/*/…`, not `*/…`)",
+                        bad
+                    ),
                 ),
             ));
         }

@@ -1963,6 +1963,130 @@ mod tests {
         assert!(matches!(err, ProtocolError::UnresolvableGrantee));
     }
 
+    /// Build a valid self-rooted single-link chain carrying `resources_exclude`
+    /// on its one grant, signed by `local_kp`. Grantee is the local identity, so
+    /// the §5.5 grantee-resolution pass is satisfied.
+    fn build_self_chain_with_resource_exclude(
+        local_kp: &Keypair,
+        exclude: &str,
+    ) -> (Hash, std::collections::BTreeMap<Hash, Entity>) {
+        let local_identity = local_kp.peer_entity().unwrap();
+        let local_identity_hash = local_identity.content_hash;
+
+        let cap_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+            (entity_ecf::text("created_at"), entity_ecf::integer(0)),
+            (
+                entity_ecf::text("grantee"),
+                entity_ecf::Value::Bytes(local_identity_hash.to_bytes().to_vec()),
+            ),
+            (
+                entity_ecf::text("granter"),
+                entity_ecf::Value::Bytes(local_identity_hash.to_bytes().to_vec()),
+            ),
+            (
+                entity_ecf::text("grants"),
+                entity_ecf::Value::Array(vec![entity_ecf::Value::Map(vec![
+                    (
+                        entity_ecf::text("handlers"),
+                        entity_ecf::Value::Map(vec![(
+                            entity_ecf::text("include"),
+                            entity_ecf::Value::Array(vec![entity_ecf::text("*")]),
+                        )]),
+                    ),
+                    (
+                        entity_ecf::text("operations"),
+                        entity_ecf::Value::Map(vec![(
+                            entity_ecf::text("include"),
+                            entity_ecf::Value::Array(vec![entity_ecf::text("*")]),
+                        )]),
+                    ),
+                    (
+                        entity_ecf::text("resources"),
+                        entity_ecf::Value::Map(vec![
+                            (
+                                entity_ecf::text("exclude"),
+                                entity_ecf::Value::Array(vec![entity_ecf::text(exclude)]),
+                            ),
+                            (
+                                entity_ecf::text("include"),
+                                entity_ecf::Value::Array(vec![entity_ecf::text("/*/*")]),
+                            ),
+                        ]),
+                    ),
+                ])]),
+            ),
+        ]));
+        let cap = Entity::new(entity_types::TYPE_CAP_TOKEN, cap_data).unwrap();
+        let cap_hash = cap.content_hash;
+
+        let sig_bytes = local_kp.sign(&cap_hash.to_bytes());
+        let sig_data = entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![
+            (entity_ecf::text("algorithm"), entity_ecf::text("ed25519")),
+            (
+                entity_ecf::text("signature"),
+                entity_ecf::Value::Bytes(sig_bytes.to_vec()),
+            ),
+            (
+                entity_ecf::text("signer"),
+                entity_ecf::Value::Bytes(local_identity_hash.to_bytes().to_vec()),
+            ),
+            (
+                entity_ecf::text("target"),
+                entity_ecf::Value::Bytes(cap_hash.to_bytes().to_vec()),
+            ),
+        ]));
+        let sig = Entity::new(TYPE_SIGNATURE, sig_data).unwrap();
+
+        let mut included = std::collections::BTreeMap::new();
+        included.insert(local_identity_hash, local_identity);
+        included.insert(cap_hash, cap);
+        included.insert(sig.content_hash, sig);
+        (cap_hash, included)
+    }
+
+    /// ⛔ **§5.5 / §5.4 (0.8.2.21): a capability carrying an unmatchable scope
+    /// pattern is INVALID at chain verification, not merely evaluated as though
+    /// the pattern were absent.**
+    ///
+    /// The verification surface is where the `MUST` earns its strength. An
+    /// unmatchable `exclude` carves out nothing, so a peer that honours the
+    /// capability and a peer that refuses it reach **different authorization
+    /// decisions on the same capability bytes** — a cross-peer divergence, not
+    /// a local policy choice, which is the one thing a `MAY` here could not
+    /// tolerate.
+    ///
+    /// The control is the same chain, byte-for-byte except the exclude, with the
+    /// intended `/*/…` spelling: it MUST verify. Without it this row is passed
+    /// by a verifier that rejects every chain, which is the most likely way to
+    /// "implement" the ruling by accident.
+    #[test]
+    fn a_chain_link_with_an_unmatchable_scope_pattern_is_an_invalid_capability() {
+        let local_kp = Keypair::from_seed([99u8; 32]);
+        let local_peer_id = local_kp.peer_id();
+
+        let (cap_hash, included) = build_self_chain_with_resource_exclude(&local_kp, "*/secret");
+        let err =
+            verify_capability_chain(&cap_hash, &included, local_peer_id.as_str()).unwrap_err();
+        assert!(
+            matches!(err, ProtocolError::CapabilityInvalid(_)),
+            "expected CapabilityInvalid, got {err:?}"
+        );
+        assert_eq!(
+            err.wire_status_code(),
+            403,
+            "§3.3 status normalization: an invalid capability is 403, not a 400 \
+             malformed-request"
+        );
+
+        // CONTROL: the intended spelling verifies.
+        let (cap_hash, included) = build_self_chain_with_resource_exclude(&local_kp, "/*/secret");
+        assert!(
+            verify_capability_chain(&cap_hash, &included, local_peer_id.as_str()).is_ok(),
+            "a well-formed exclude verifies — the refusal above is not a \
+             verifier that rejects every chain"
+        );
+    }
+
     // -------------------------------------------------------------------
     // V7.62 closeout F2: is_revoked wired into verify_request
     // -------------------------------------------------------------------

@@ -684,6 +684,147 @@ impl HandlerResult {
     }
 }
 
+// ---------------------------------------------------------------------------
+// §3.3 resource selection — the ONE arity+selection site (0.8.2.20)
+// ---------------------------------------------------------------------------
+
+// `HandlerResult` is 176 bytes (a status plus an `Entity`) and these three
+// return it as the `Err` arm, which is the point: a §3.3 refusal is a
+// *response*, not a transport error. Boxing to satisfy
+// `clippy::result_large_err` would put a `Box` in every handler's `?`/`match`
+// and buy nothing on a cold refusal path — the same call `extensions/local-files`
+// already makes at `resource_bare_path`.
+/// Resolve the single concrete subject of a **resource-requiring** operation
+/// from the effective target list (§3.3 + §5.2's subject rule, 0.8.2.20).
+///
+/// Returns `Ok(path)` with the canonicalized `effective[0]`, or `Err` carrying
+/// the §3.3 refusal:
+///
+/// | effective list | answer |
+/// |---|---|
+/// | empty (absent resource, **or one target the caller excluded**) | `400 path_required` |
+/// | more than one entry | `400 ambiguous_resource` |
+/// | one entry, and it is a **pattern** | `400 malformed_resource` |
+/// | one concrete entry | `Ok(that entry)` |
+///
+/// ⛔ **The count is the ambiguity rule and carries none of the authority; the
+/// SELECTION does.** `targets:[P,Q] exclude:[P]` with `Q` in-grant has an
+/// effective list of exactly one, so an arity check *passes* — and
+/// `resource.targets[0]` is still `P`, a path nothing authorized. A handler
+/// that counts the effective list and then indexes `targets[0]` has
+/// implemented the arithmetic completely and shipped the bypass. This helper
+/// exists so that the count and the index cannot come from different lists: it
+/// returns the element, never a length.
+///
+/// **Why this lives here and not in each handler.** It is the enforcement
+/// point for a rule that would otherwise be an obligation discharged
+/// independently at ~20 sites with no gate — the shape our charter calls
+/// theater. Before 0.8.2.20 seven sites open-coded
+/// `targets.len() == 1 && exclude.is_empty()`, which *refused* every request
+/// carrying an exclusion (too strict), and ~14 more took `targets.first()`
+/// unguarded (the live bypass). Both classes are one call to this function.
+///
+/// A non-empty `exclude` is **not** an error. That reading — "§3.3 names two
+/// inputs and an exclusion set is neither" — is exactly what 0.8.2.20
+/// withdraws: the exclusion is applied, and then the *result* is counted.
+#[allow(clippy::result_large_err)]
+pub fn require_single_resource_path(
+    resource_target: Option<&entity_capability::ResourceTarget>,
+    local_peer_id: &str,
+    what: &str,
+) -> Result<String, HandlerResult> {
+    match optional_single_resource_path(resource_target, local_peer_id, what)? {
+        Some(path) => Ok(path),
+        None => Err(HandlerResult::error(
+            STATUS_BAD_REQUEST,
+            error_entity(
+                "path_required",
+                &format!("{what} requires a resource target"),
+            ),
+        )),
+    }
+}
+
+/// [`require_single_resource_path`] for an operation whose `resource` is
+/// **optional** — the empty effective list is `Ok(None)` rather than
+/// `path_required`.
+///
+/// The subject rule still binds for the present case, which is the whole point
+/// of having this rather than `targets.first()`: an optional resource that IS
+/// supplied must still be `effective[0]`, must still refuse more than one, and
+/// must still refuse a lone pattern. `require_single_resource_path` is this plus
+/// one arm, so there is exactly one derivation of the subject in the tree.
+#[allow(clippy::result_large_err)]
+pub fn optional_single_resource_path(
+    resource_target: Option<&entity_capability::ResourceTarget>,
+    local_peer_id: &str,
+    what: &str,
+) -> Result<Option<String>, HandlerResult> {
+    match single_effective_target(resource_target, local_peer_id, what)? {
+        None => Ok(None),
+        Some(path) => {
+            // §3.3 (0.8.2.20): a resource-requiring operation takes a CONCRETE
+            // path. A lone pattern target is `malformed_resource` — distinct
+            // from `invalid_path` (structurally invalid anywhere) and from
+            // `path_required` (there is no target).
+            if path.contains('*') {
+                return Err(HandlerResult::error(
+                    STATUS_BAD_REQUEST,
+                    error_entity(
+                        "malformed_resource",
+                        &format!(
+                            "{what} requires a concrete resource path, not the pattern {path}"
+                        ),
+                    ),
+                ));
+            }
+            Ok(Some(path))
+        }
+    }
+}
+
+/// The arity layer alone: `effective_targets(...)` reduced to at most one
+/// element, with §3.3's `ambiguous_resource` on more than one.
+///
+/// **A pattern is permitted here** — this is for the operations whose
+/// specification defines a pattern subject (`system/subscription:subscribe`),
+/// where §3.3's *"a resource-requiring operation takes a CONCRETE path"* clause
+/// does not bind. Everything else wants [`require_single_resource_path`] or
+/// [`optional_single_resource_path`], which are this plus one arm each. Three
+/// entry points, one derivation of the subject.
+///
+/// **Canonicalizes the survivor, and that is this function's job rather than
+/// `effective_targets`' (§5.2, 0.8.2.21).** `effective_targets` returns the
+/// target *as the caller wrote it* so that §6.13's install-pattern derivation
+/// against the `system/handler/` prefix still fires on a peer-relative target;
+/// every handler reached through the three entry points here wants an absolute
+/// tree path, so the `canonicalize` the spec says the consumer must do is done
+/// once, here, and not fourteen times at the call sites. The arity is decided
+/// on the same set either way — the skip inside `effective_targets` is
+/// canonical.
+#[allow(clippy::result_large_err)]
+pub fn single_effective_target(
+    resource_target: Option<&entity_capability::ResourceTarget>,
+    local_peer_id: &str,
+    what: &str,
+) -> Result<Option<String>, HandlerResult> {
+    let mut effective = entity_capability::effective_targets(resource_target, local_peer_id);
+    match effective.len() {
+        0 => Ok(None),
+        1 => Ok(Some(entity_capability::canonicalize(
+            &effective.remove(0),
+            local_peer_id,
+        ))),
+        n => Err(HandlerResult::error(
+            STATUS_BAD_REQUEST,
+            error_entity(
+                "ambiguous_resource",
+                &format!("{what} requires exactly one resource target, got {n}"),
+            ),
+        )),
+    }
+}
+
 /// Build a `system/protocol/error` entity carrying `code` and `message`.
 ///
 /// Shared by every handler that returns error results — keeps the wire shape

@@ -6501,3 +6501,85 @@ reasonably fold it in and keep the vocabulary at two codes.
 path-as-resource operation and MUST be ignored — which is a third coherent answer and the only
 one that needs no code at all. Whichever it is, the swept extension pseudocode is where it has to
 land, because that is what the next seat will implement from.
+
+**CLOSED by `0.8.2.20` (§5.2 `effective_targets`), and the ruling is the opposite of our interim
+choice.** The exclusion is **applied**, and the arity rule then counts the *result*: one target the
+caller excluded is the ABSENT case (`path_required`); `targets:[P,Q] exclude:[P]` has an effective
+list of exactly one and **proceeds on `Q`**. So the input is neither a third remedy nor invalid —
+it is a reduction, and the third code we argued for does not exist. All twelve sites now call
+`entity_handler::require_single_resource_path`, which has no `exclude`-shaped arm at all. Recorded
+rather than deleted because the interim choice was the *strict* direction and was wrong in a way
+worth remembering: it refused legitimate traffic, and every one of the seven sites carrying the
+`rt.exclude.is_empty()` guard read as conformant while doing so.
+
+---
+
+## §5.4's `NEVER_MATCH` rule is uniform, but its safety direction is position-dependent
+
+> ## ✅ RULED — `0.8.2.21` (`entity-core-protocol` `5e259e8`), and **both** of our asks were taken.
+>
+> Ask (b), the position split, is the evaluation-side ruling: **an unmatchable pattern in an
+> `exclude` array excludes EVERYTHING**, stated at the **scope layer** (which knows the position)
+> so `matches_pattern` stays uniform over its operands and remains transcribable into 46
+> languages — which is the objection we raised against our own (b) and the fold answers it.
+> Our third option is the other half and is **promoted from *permitted* to *required***: a
+> capability carrying an unmatchable scope pattern is **INVALID `[MUST]`** at mint, at
+> delegation, and at §5.5 verification, because a `MAY` there means two conformant peers reach
+> different authorization decisions on the same capability bytes. Two layers, neither
+> substituting for the other.
+>
+> Landed at `9beb723`. **The disposition at `matches_scope` is now the one this file records as
+> *"what we had"* before `0.8.2.20`** — the row has flipped twice and the test is deliberately
+> the same test, not a new one.
+>
+> ⚠ **One site of the ruling's own three is still fail-open as written, and it is routed**
+> (`ROUTING-2026-09-11-c`, §1): `check_resource_scope`'s **pattern** arm, which `0.8.2.21`
+> exempts as *"fail-closed by accident via a negated test."* The negated test is unreachable —
+> `patterns_overlap(ct, NEVER_MATCH)` is `false`, so the loop `continue`s first. Measured, and we
+> deny there anyway. **A fourth site, `check_path_permission`, was ours** — the spec delegates
+> that dimension to `matches_scope`; we open-coded it.
+
+**Spec:** `ENTITY-CORE-PROTOCOL` `0.8.2.20`, §5.4 — `canonicalize` is total, and the three
+consumers of `NEVER_MATCH` are ruled. Logged 2026-09-11 while implementing G5/R11.
+
+**The passage.** *"`matches_pattern` (§5.4) — **MUST return false** for either operand."* And:
+*"A `*/`-leading pattern in a grant now matches nothing rather than raising a diagnostic nobody
+receives. A peer that admits such a request and matches nothing is conformant; the sentinel is what
+makes that safe."*
+
+**The gap.** The matcher rule is uniform over operands; the *consequence* is not uniform over
+positions. `matches_scope` consults the same `matches_pattern` for `include` and for `exclude`:
+
+| position | `NEVER_MATCH` means | direction |
+|---|---|---|
+| `resources.include` | covers nothing | **narrows** — fail-closed, safe |
+| `resources.exclude` | carves out nothing | **widens** — fail-open |
+
+So a granter who writes `exclude: ["*/secret"]` — a plausible spelling of *"not `secret`, in any
+peer's namespace"* — gets an exclusion that excludes nothing, and the grant is silently wider than
+written. The sentinel's own safety argument (*"it is unreachable as a canonical path by
+construction"*) is an argument about the **include** side; nothing in §5.4 addresses the exclude
+side, and the ruled table is written about the matcher rather than about the two positions.
+
+**What we shipped.** The ruling, as written. This tree previously had the *other* disposition at
+`matches_scope` — `canonicalize(pattern).is_none_or(|cp| matches_pattern(...))`, i.e. a malformed
+exclude was treated as matching and therefore **denied** — under a comment saying so
+(*"fails closed: treat it as if it matched (deny), never as a silent no-op that would
+under-exclude"*). `0.8.2.20` reverses that, and it is the one place in the fold where the ruling is
+wider than what we had. Pinned as the ruled behaviour in
+`test_malformed_pattern_fails_closed`, with a well-formed-exclude control beside it so the row
+cannot be confused with having deleted the exclude arm.
+
+**Ask.** Either (a) confirm the widening is intended and say so where a granter can read it — §5.4
+is the right place, because the author of a `*/`-leading exclude is the party harmed; or (b) split
+the rule by position: `NEVER_MATCH` in an `include` matches nothing, in an `exclude` matches
+everything. (b) is what we had and it is the fail-closed direction, but it makes `matches_pattern`
+position-aware, which is a bigger change than the one-line table suggests. A third option, which
+needs no matcher change at all and is the shape our own charter prefers — *a closed grammar needs a
+writer that refuses* — is to refuse a `*/`-leading pattern **at the boundary that persists a
+capability**, leaving the matcher exactly as ruled. §5.4 explicitly permits a peer to admit such a
+pattern; it does not require one to.
+
+**Not asserted.** We have not measured what core-go or core-py do with a malformed grant exclude,
+and this is not filed as a divergence. It is a question about what the rule should mean, found by
+implementing it.

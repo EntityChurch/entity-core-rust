@@ -35,7 +35,7 @@ fn caller_cap_tree_get_all(local_pid: &str, identity_hash: Hash) -> CapabilityTo
     CapabilityToken {
         grants: vec![GrantEntry {
             handlers: PathScope::new(vec!["system/tree".into()]),
-            resources: PathScope::new(vec![canonicalize("data/*", local_pid).unwrap()]),
+            resources: PathScope::new(vec![canonicalize("data/*", local_pid)]),
             operations: IdScope::new(vec!["get".into(), "put".into()]),
             peers: None,
             constraints: None,
@@ -122,7 +122,7 @@ async fn request_returns_attenuated_grant_with_included_token() {
 
     let req_grants = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/foo", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/foo", &pid)]),
         operations: IdScope::new(vec!["get".into()]),
         peers: None,
         constraints: None,
@@ -217,7 +217,7 @@ async fn delegate_attenuates_caller_held_parent() {
     let caller = caller_cap_tree_self(&pid, identity_hash);
     let req_grants = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/foo", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/foo", &pid)]),
         operations: IdScope::new(vec!["get".into()]),
         peers: None,
         constraints: None,
@@ -288,7 +288,7 @@ async fn delegate_rejects_remote_caller_with_501() {
     let parent_token = CapabilityToken {
         grants: vec![GrantEntry {
             handlers: PathScope::new(vec!["system/tree".into()]),
-            resources: PathScope::new(vec![canonicalize("data/*", &pid).unwrap()]),
+            resources: PathScope::new(vec![canonicalize("data/*", &pid)]),
             operations: IdScope::new(vec!["get".into()]),
             peers: None,
             constraints: None,
@@ -306,7 +306,7 @@ async fn delegate_rejects_remote_caller_with_501() {
 
     let req_grants = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/foo", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/foo", &pid)]),
         operations: IdScope::new(vec!["get".into()]),
         peers: None,
         constraints: None,
@@ -335,7 +335,7 @@ fn caller_cap_tree_self(local_pid: &str, identity_hash: Hash) -> CapabilityToken
     CapabilityToken {
         grants: vec![GrantEntry {
             handlers: PathScope::new(vec!["system/tree".into()]),
-            resources: PathScope::new(vec![canonicalize("data/*", local_pid).unwrap()]),
+            resources: PathScope::new(vec![canonicalize("data/*", local_pid)]),
             operations: IdScope::new(vec!["get".into(), "put".into()]),
             peers: None,
             constraints: None,
@@ -362,7 +362,7 @@ async fn delegate_rejects_non_holder() {
     let parent_for_other = CapabilityToken {
         grants: vec![GrantEntry {
             handlers: PathScope::new(vec!["system/tree".into()]),
-            resources: PathScope::new(vec![canonicalize("data/*", &pid).unwrap()]),
+            resources: PathScope::new(vec![canonicalize("data/*", &pid)]),
             operations: IdScope::new(vec!["get".into()]),
             peers: None,
             constraints: None,
@@ -380,7 +380,7 @@ async fn delegate_rejects_non_holder() {
 
     let req_grants = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/foo", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/foo", &pid)]),
         operations: IdScope::new(vec!["get".into()]),
         peers: None,
         constraints: None,
@@ -407,7 +407,7 @@ async fn delegate_response_includes_parent_chain() {
     let caller = caller_cap_tree_self(&pid, identity_hash);
     let req_grants = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/foo", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/foo", &pid)]),
         operations: IdScope::new(vec!["get".into()]),
         peers: None,
         constraints: None,
@@ -469,7 +469,7 @@ async fn revoke_writes_marker_for_peer_issued_token() {
     let caller = caller_cap_tree_get_all(&pid, identity_hash);
     let req_grants = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/foo", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/foo", &pid)]),
         operations: IdScope::new(vec!["get".into()]),
         peers: None,
         constraints: None,
@@ -586,7 +586,7 @@ async fn request_rejected_when_exceeds_policy_entry() {
 
     let policy_grants = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/*", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/*", &pid)]),
         operations: IdScope::new(vec!["get".into()]),
         peers: None,
         constraints: None,
@@ -603,7 +603,7 @@ async fn request_rejected_when_exceeds_policy_entry() {
 
     let req_grants = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/foo", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/foo", &pid)]),
         operations: IdScope::new(vec!["put".into()]),
         peers: None,
         constraints: None,
@@ -626,7 +626,7 @@ async fn configure_writes_policy_at_peer_path() {
     let peer_hex = "00".to_string() + &"ab".repeat(32);
     let grants = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/*", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/*", &pid)]),
         operations: IdScope::new(vec!["get".into()]),
         peers: None,
         constraints: None,
@@ -659,7 +659,7 @@ async fn configure_accepts_default_peer_pattern() {
     let (handler, _kp, _identity_hash, pid, _store) = make_handler();
     let grants = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/*", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/*", &pid)]),
         operations: IdScope::new(vec!["get".into()]),
         peers: None,
         constraints: None,
@@ -714,7 +714,7 @@ async fn configure_rejects_partial_prefix_pattern() {
     let (handler, _kp, _identity_hash, pid, _store) = make_handler();
     let grants = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/*", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/*", &pid)]),
         operations: IdScope::new(vec!["get".into()]),
         peers: None,
         constraints: None,
@@ -757,7 +757,7 @@ async fn pol_df_1_hex_form_match() {
 
     let policy_grants = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/*", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/*", &pid)]),
         operations: IdScope::new(vec!["get".into()]),
         peers: None,
         constraints: None,
@@ -778,7 +778,7 @@ async fn pol_df_1_hex_form_match() {
     let caller = caller_cap_tree_get_all(&pid, identity_hash);
     let req_grants = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/foo", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/foo", &pid)]),
         operations: IdScope::new(vec!["get".into()]),
         peers: None,
         constraints: None,
@@ -808,7 +808,7 @@ async fn pol_df_2_base58_form_match_and_canonicalize() {
 
     let policy_grants = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/*", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/*", &pid)]),
         operations: IdScope::new(vec!["get".into()]),
         peers: None,
         constraints: None,
@@ -836,7 +836,7 @@ async fn pol_df_2_base58_form_match_and_canonicalize() {
     let caller = caller_cap_tree_get_all(&pid, identity_hash);
     let req_grants = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/foo", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/foo", &pid)]),
         operations: IdScope::new(vec!["get".into()]),
         peers: None,
         constraints: None,
@@ -878,7 +878,7 @@ async fn pol_df_3_hex_wins_over_base58() {
     // tree:put. Then write a restrictive hex-form entry — only tree:get.
     let permissive = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/*", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/*", &pid)]),
         operations: IdScope::new(vec!["get".into(), "put".into()]),
         peers: None,
         constraints: None,
@@ -886,7 +886,7 @@ async fn pol_df_3_hex_wins_over_base58() {
     }];
     let restrictive = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/*", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/*", &pid)]),
         operations: IdScope::new(vec!["get".into()]),
         peers: None,
         constraints: None,
@@ -917,7 +917,7 @@ async fn pol_df_3_hex_wins_over_base58() {
     let caller = caller_cap_tree_get_all(&pid, identity_hash);
     let req_grants = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/foo", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/foo", &pid)]),
         operations: IdScope::new(vec!["put".into()]),
         peers: None,
         constraints: None,
@@ -948,7 +948,7 @@ async fn pol_df_5_default_applies_when_no_specific_entry() {
     // Only a `default` entry — get-only.
     let default_grants = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/*", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/*", &pid)]),
         operations: IdScope::new(vec!["get".into()]),
         peers: None,
         constraints: None,
@@ -966,7 +966,7 @@ async fn pol_df_5_default_applies_when_no_specific_entry() {
     let caller = caller_cap_tree_get_all(&pid, identity_hash);
     let req_grants = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/foo", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/foo", &pid)]),
         operations: IdScope::new(vec!["get".into()]),
         peers: None,
         constraints: None,
@@ -1111,7 +1111,7 @@ async fn request_mint_cannot_outlive_the_caller_capability() {
 
     let req_grants = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/foo", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/foo", &pid)]),
         operations: IdScope::new(vec!["get".into()]),
         peers: None,
         constraints: None,
@@ -1146,7 +1146,7 @@ async fn request_mint_is_bounded_by_the_policy_entrys_ttl() {
 
     let policy_grants = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/*", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/*", &pid)]),
         operations: IdScope::new(vec!["get".into(), "put".into()]),
         peers: None,
         constraints: None,
@@ -1164,7 +1164,7 @@ async fn request_mint_is_bounded_by_the_policy_entrys_ttl() {
 
     let req_grants = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/foo", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/foo", &pid)]),
         operations: IdScope::new(vec!["get".into()]),
         peers: None,
         constraints: None,
@@ -1198,7 +1198,7 @@ async fn request_mint_with_no_ceiling_anywhere_has_no_expiry() {
     let caller = caller_cap_tree_get_all(&pid, identity_hash); // expires_at: None
     let req_grants = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/foo", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/foo", &pid)]),
         operations: IdScope::new(vec!["get".into()]),
         peers: None,
         constraints: None,
@@ -1284,7 +1284,7 @@ async fn an_empty_policy_entry_is_accepted_and_withdraws_future_mints() {
     // fallback the empty exact entry must suppress rather than fall through to.
     let wide = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/*", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/*", &pid)]),
         operations: IdScope::new(vec!["get".into(), "put".into()]),
         peers: None,
         constraints: None,
@@ -1318,7 +1318,7 @@ async fn an_empty_policy_entry_is_accepted_and_withdraws_future_mints() {
 
     let req_grants = vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/foo", &pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/foo", &pid)]),
         operations: IdScope::new(vec!["get".into()]),
         peers: None,
         constraints: None,
@@ -1363,7 +1363,7 @@ async fn an_empty_policy_entry_is_accepted_and_withdraws_future_mints() {
 fn request_grants(pid: &str) -> Vec<GrantEntry> {
     vec![GrantEntry {
         handlers: PathScope::new(vec!["system/tree".into()]),
-        resources: PathScope::new(vec![canonicalize("data/foo", pid).unwrap()]),
+        resources: PathScope::new(vec![canonicalize("data/foo", pid)]),
         operations: IdScope::new(vec!["get".into()]),
         peers: None,
         constraints: None,
@@ -1518,4 +1518,192 @@ async fn a_ttl_ms_that_does_not_fit_u64_declares_no_bound() {
         None,
         "an unrepresentable ttl_ms declares no bound; it MUST NOT truncate into a short one"
     );
+}
+
+/// ⛔ **`CORE-EXCLUDE-UNMATCHABLE-1`'s second arm (§5.4, §6.2 — 0.8.2.21):
+/// minting or delegating a capability with an unmatchable scope pattern MUST be
+/// refused, `400 invalid_path`.**
+///
+/// This is the authoring half of the fail-open, and the reason the ruling made
+/// it a MUST rather than a MAY is here rather than at the evaluation site: an
+/// unmatchable `exclude` is fail-OPEN, so a peer that honours such a capability
+/// and a peer that refuses it reach **different authorization decisions on the
+/// same capability bytes**. It is also the only moment the **granter** — the
+/// party a silently-wider grant harms — is still present to be told.
+///
+/// The probe is the plausible spelling, not a contrived one: `*/secret` for
+/// *not `secret`, in any peer's namespace*, where the intended form is
+/// `/*/secret`.
+#[tokio::test]
+async fn minting_a_capability_with_an_unmatchable_scope_pattern_is_400_invalid_path() {
+    let (handler, _kp, identity_hash, pid, _store) = make_handler();
+
+    // Every position the sweep covers: both path scopes, both arrays. The
+    // `include` rows are fail-CLOSED on their own (they grant nothing) and are
+    // refused anyway, because the ruling is about the capability being invalid,
+    // not about which direction this particular pattern happens to fail in.
+    let unmatchable: Vec<(&str, GrantEntry)> = vec![
+        (
+            "resources.exclude — the fail-OPEN direction, and the worked case",
+            GrantEntry {
+                handlers: PathScope::new(vec!["system/tree".into()]),
+                resources: PathScope::with_exclude(
+                    vec![canonicalize("data/*", &pid)],
+                    vec!["*/secret".into()],
+                ),
+                operations: IdScope::new(vec!["get".into()]),
+                peers: None,
+                constraints: None,
+                allowances: None,
+            },
+        ),
+        (
+            "resources.include",
+            GrantEntry {
+                handlers: PathScope::new(vec!["system/tree".into()]),
+                resources: PathScope::new(vec!["../escape/*".into()]),
+                operations: IdScope::new(vec!["get".into()]),
+                peers: None,
+                constraints: None,
+                allowances: None,
+            },
+        ),
+        (
+            "handlers.exclude",
+            GrantEntry {
+                handlers: PathScope::with_exclude(
+                    vec!["system/tree".into()],
+                    vec!["*/sneaky".into()],
+                ),
+                resources: PathScope::new(vec![canonicalize("data/*", &pid)]),
+                operations: IdScope::new(vec!["get".into()]),
+                peers: None,
+                constraints: None,
+                allowances: None,
+            },
+        ),
+    ];
+
+    for (what, grant) in unmatchable {
+        let caller = caller_cap_tree_get_all(&pid, identity_hash);
+        let ctx = make_ctx(
+            "request",
+            request_params(&[grant]),
+            Some(caller),
+            caller_author_hash(),
+            None,
+        );
+        let res = handler.handle(&ctx).await.unwrap();
+        assert_eq!(res.status, 400, "{what}: must be refused at the mint");
+        let (code, _) =
+            entity_handler::decode_error_entity(&res.result).expect("a system/protocol/error body");
+        assert_eq!(
+            code.as_deref(),
+            Some("invalid_path"),
+            "{what}: read the decoded `code` key, never a substring of the body"
+        );
+    }
+
+    // ⚠ CONTROL, and it is the row that makes the three above mean anything: a
+    // WELL-FORMED exclude mints. Without it, "the handler refuses every
+    // capability request" passes all three — and 403 and 400 are one word to a
+    // reader and two different facts to a check, so this also pins that the
+    // refusal above is not the ordinary attenuation denial.
+    let caller = caller_cap_tree_get_all(&pid, identity_hash);
+    let ok = GrantEntry {
+        handlers: PathScope::new(vec!["system/tree".into()]),
+        resources: PathScope::with_exclude(
+            vec![canonicalize("data/*", &pid)],
+            vec![canonicalize("data/secret", &pid)],
+        ),
+        operations: IdScope::new(vec!["get".into()]),
+        peers: None,
+        constraints: None,
+        allowances: None,
+    };
+    let ctx = make_ctx(
+        "request",
+        request_params(&[ok]),
+        Some(caller),
+        caller_author_hash(),
+        None,
+    );
+    let res = handler.handle(&ctx).await.unwrap();
+    assert_eq!(
+        res.status, STATUS_OK,
+        "a well-formed exclude still mints — the refusals above are not \
+         `request` refusing everything"
+    );
+}
+
+/// The same refusal at `delegate`, which is the surface where the widening
+/// compounds: `is_attenuated` reads a child `exclude` as a narrowing, so an
+/// unmatchable one passes the subset check as though it narrowed and then
+/// carves out nothing at use.
+#[tokio::test]
+async fn delegating_a_capability_with_an_unmatchable_scope_pattern_is_400_invalid_path() {
+    let (handler, _kp, identity_hash, pid, store) = make_handler();
+    let parent_token = CapabilityToken {
+        grants: vec![GrantEntry {
+            handlers: PathScope::new(vec!["system/tree".into()]),
+            resources: PathScope::new(vec![canonicalize("data/*", &pid)]),
+            operations: IdScope::new(vec!["get".into()]),
+            peers: None,
+            constraints: None,
+            allowances: None,
+        }],
+        granter: Granter::single(identity_hash),
+        grantee: identity_hash,
+        parent: None,
+        created_at: 1,
+        expires_at: None,
+        not_before: None,
+        delegation_caveats: None,
+    };
+    let parent_hash = store.put(parent_token.to_entity().unwrap()).unwrap();
+
+    let child = vec![GrantEntry {
+        handlers: PathScope::new(vec!["system/tree".into()]),
+        resources: PathScope::with_exclude(
+            vec![canonicalize("data/*", &pid)],
+            vec!["*/secret".into()],
+        ),
+        operations: IdScope::new(vec!["get".into()]),
+        peers: None,
+        constraints: None,
+        allowances: None,
+    }];
+    let ctx = make_ctx(
+        "delegate",
+        delegate_params(parent_hash, &child),
+        None,
+        identity_hash,
+        None,
+    );
+    let res = handler.handle(&ctx).await.unwrap();
+    assert_eq!(res.status, 400);
+    let (code, _) = entity_handler::decode_error_entity(&res.result).unwrap();
+    assert_eq!(code.as_deref(), Some("invalid_path"));
+
+    // CONTROL: the same delegation with a well-formed exclude succeeds.
+    let child = vec![GrantEntry {
+        handlers: PathScope::new(vec!["system/tree".into()]),
+        resources: PathScope::with_exclude(
+            vec![canonicalize("data/*", &pid)],
+            vec![canonicalize("data/secret", &pid)],
+        ),
+        operations: IdScope::new(vec!["get".into()]),
+        peers: None,
+        constraints: None,
+        allowances: None,
+    }];
+    let ctx = make_ctx(
+        "delegate",
+        delegate_params(parent_hash, &child),
+        None,
+        identity_hash,
+        None,
+    );
+    let res = handler.handle(&ctx).await.unwrap();
+    assert_eq!(res.status, STATUS_OK);
 }

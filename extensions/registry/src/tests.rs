@@ -25,7 +25,13 @@ fn transport_ref(endpoint: &str) -> Hash {
     Hash::compute("system/peer/transport/tcp", endpoint.as_bytes())
 }
 
-const PEER: &str = "z6MkTestPeerIdForRegistry";
+/// The registry handler's own peer id. MUST be a real 46-char Base58 string:
+/// since 0.8.2.20 `check_resource_scope` consumes `validate_absolute_path`'s
+/// verdict on every concrete target (§5.4 R11/G6), so a readable placeholder
+/// makes `/{PEER}/system/registry/...` a malformed path and every
+/// capability-gated row here 403s for the wrong reason. (`I` is not in the
+/// Base58 alphabet, hence `Peerid` rather than `PeerId`.)
+const PEER: &str = "z6MkTestPeeridForRegistry123456789ABCDEFGHJKLM";
 
 fn stores() -> (Arc<dyn ContentStore>, Arc<dyn LocationIndex>) {
     (

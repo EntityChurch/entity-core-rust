@@ -87,10 +87,27 @@ impl QuorumHandler {
         format!("/{}/{}", self.local_peer_id, bare)
     }
 
-    fn resource_path(&self, ctx: &HandlerContext) -> Option<String> {
-        ctx.resource_target
-            .as_ref()
-            .and_then(|rt| rt.targets.first().cloned())
+    /// The single concrete `EXECUTE.resource` target this handler acts on
+    /// (§3.3 + §5.2's subject rule, 0.8.2.20).
+    ///
+    /// ⛔ **This was `targets.first()`.** That is the `F68`/`CP-12a` bypass:
+    /// `check_resource_scope` SKIPS a target the caller's own `exclude` covers
+    /// — correctly, a caller that excludes a target is not asking for it — so
+    /// `targets:[P] exclude:[P]` reaches `ALLOW` with nothing checked, and a
+    /// handler indexing `targets[0]` then acts on `P`. Counting is not the fix
+    /// either: `targets:[P,Q] exclude:[P]` has an effective list of exactly
+    /// one, so an arity check passes while `targets[0]` is still `P`.
+    /// `require_single_resource_path` returns the ELEMENT, so the count and
+    /// the index cannot come from different lists.
+    // A §3.3/§6.3 refusal is a RESPONSE, not a transport error — see
+    // `entity_handler::require_single_resource_path`.
+    #[allow(clippy::result_large_err)]
+    fn resource_path(&self, ctx: &HandlerContext, what: &str) -> Result<String, HandlerResult> {
+        entity_handler::require_single_resource_path(
+            ctx.resource_target.as_ref(),
+            &self.local_peer_id,
+            what,
+        )
     }
 }
 
@@ -179,16 +196,11 @@ impl QuorumHandler {
         let q_hash = entity.content_hash;
         // Path-as-resource MUST per V7 §3.2 (architectural-side; spec
         // EXTENSION-QUORUM v1.1 §6 / SI-7/SI-22).
-        let path = match self.resource_path(ctx) {
-            Some(p) => p,
-            None => {
-                return Ok(error(
-                    STATUS_BAD_REQUEST,
-                    "path_required",
-                    "system/quorum:create requires resource.targets[0]",
-                ))
-            }
-        };
+        let path =
+            match self.resource_path(ctx, "system/quorum:create requires resource.targets[0]") {
+                Ok(p) => p,
+                Err(e) => return Ok(e),
+            };
         if let Err(e) = self.content_store.put(entity) {
             return Ok(error(STATUS_BAD_REQUEST, "store_failed", &e.to_string()));
         }
@@ -260,16 +272,11 @@ impl QuorumHandler {
         };
         let att_hash = att_entity.content_hash;
         // Path-as-resource MUST per spec §6 / SI-7.
-        let path = match self.resource_path(ctx) {
-            Some(p) => p,
-            None => {
-                return Ok(error(
-                    STATUS_BAD_REQUEST,
-                    "path_required",
-                    "system/quorum:update requires resource.targets[0]",
-                ))
-            }
-        };
+        let path =
+            match self.resource_path(ctx, "system/quorum:update requires resource.targets[0]") {
+                Ok(p) => p,
+                Err(e) => return Ok(e),
+            };
         if let Err(e) = self.content_store.put(att_entity) {
             return Ok(error(STATUS_BAD_REQUEST, "store_failed", &e.to_string()));
         }
@@ -356,16 +363,11 @@ impl QuorumHandler {
             Err(e) => return Ok(error(STATUS_BAD_REQUEST, "encode_failed", &e.to_string())),
         };
         let att_hash = att_entity.content_hash;
-        let path = match self.resource_path(ctx) {
-            Some(p) => p,
-            None => {
-                return Ok(error(
-                    STATUS_BAD_REQUEST,
-                    "path_required",
-                    "system/quorum:publish requires resource.targets[0]",
-                ))
-            }
-        };
+        let path =
+            match self.resource_path(ctx, "system/quorum:publish requires resource.targets[0]") {
+                Ok(p) => p,
+                Err(e) => return Ok(e),
+            };
         if let Err(e) = self.content_store.put(att_entity) {
             return Ok(error(STATUS_BAD_REQUEST, "store_failed", &e.to_string()));
         }

@@ -76,6 +76,158 @@ impl TreeHandler {
         }
     }
 
+    /// Handler-level path authorization (§6.3 `check_path_permission`) for the
+    /// path this handler is **about to touch**. `Ok(())` when allowed;
+    /// `Err(403 capability_denied)` when not.
+    ///
+    /// **This is not a secondary check `[MUST]` (§5.2, §6.3, §6.7 — 0.8.2.20.)**
+    /// The *"defense-in-depth when `resource` is present"* characterization was
+    /// withdrawn at seven sites in the corpus, because its premise — that the
+    /// dispatch-level check handles the primary resource check — is false in
+    /// every case where the subject is derived **after** dispatch, and this
+    /// handler is where all four of those cases live:
+    ///
+    /// 1. **`resource` absent.** §3.2 runs no dispatch-level resource check at
+    ///    all, so this is the SOLE resource enforcement. `handle_get` falls back
+    ///    to `pattern + suffix` and `handle_snapshot`/`handle_extract` to
+    ///    `params.prefix` — paths no capability check had ever seen.
+    /// 2. **A path resolved at handler time** — `merge` turning a snapshot into
+    ///    individual writes under `params.target_prefix`.
+    /// 3. **A listing expanded per entry** (`CP-12a`'s wider class): the
+    ///    authorizer evaluated a prefix *string* and the handler enumerates a
+    ///    *set*, so a grant `{include:[app/*], exclude:[app/secret]}` authorizes
+    ///    `get` on `/{p}/app/` — the exclude does not match the prefix string —
+    ///    and the listing then hands back `secret`. See `handle_listing`.
+    /// 4. **`F68`/`CP-12a`** — the dispatch-level check made vacuous by a caller
+    ///    exclude covering the caller's own target.
+    ///
+    /// §6.7 is **act-neutral**: reads or writes. It used to be scoped to writes;
+    /// the measured harm was a `get`, and disclosure is the same defect with the
+    /// same cause and a different verb.
+    ///
+    /// **Two frames (PR-8).** `path` is a request path and canonicalizes against
+    /// the local peer; the cap's `resources` patterns canonicalize against the
+    /// cap's own granter, resolved here from `ctx.included`. §6.3's pseudocode
+    /// passes one peer id and predates PR-8; taking it literally would let a
+    /// foreign-granted bare `*` reach our namespace, and that matters most
+    /// precisely in case 1, where nothing ran the right frame first.
+    ///
+    /// ⚠ **No caller capability means no check, and that is a decision.** A
+    /// `None` `caller_capability` is a dispatch the peer itself originated
+    /// (`DispatchCeiling::PeerRoot`, the SDK entry points) — §6.8's *"peer-level
+    /// writes: the peer is operating as the tree owner"*. It is NOT an absent
+    /// credential on a caller's request: wire dispatch cannot reach a handler
+    /// without a verified capability, and a handler's sub-dispatch inherits its
+    /// caller's. So the `None` arm is the peer-root arm, and the thing that
+    /// makes that safe is that `PeerRoot` is constructed in exactly three places
+    /// (`grep -rn 'DispatchCeiling::PeerRoot'`), each of which says which side of
+    /// the §1.4 provenance test it falls on.
+    // A §3.3/§6.3 refusal is a RESPONSE, not a transport error — see
+    // `entity_handler::require_single_resource_path`.
+    #[allow(clippy::result_large_err)]
+    fn authorize_path(
+        &self,
+        ctx: &HandlerContext,
+        operation: &str,
+        path: &str,
+    ) -> Result<(), HandlerResult> {
+        // ⛔ **Scoped to an EXTERNAL dispatch, and the scope is the
+        // load-bearing decision in this function.** §6.3 authorizes the path
+        // against *"the request's capability"* — the one §5.2's
+        // `check_permission` authorized the dispatch with. In this tree that is
+        // `ctx.caller_capability` for exactly one kind of dispatch: an inbound
+        // wire EXECUTE, where it is the verified caller capability and
+        // `is_external` is set (one construction site,
+        // `connection.rs`'s `dispatch_request`).
+        //
+        // For the other two kinds it is **not** an authorization input, and
+        // treating it as one is a defect in the direction that refuses
+        // legitimate traffic:
+        //
+        // - **In-process sub-dispatch.** `make_execute_fn` propagates
+        //   `caller_capability` *unchanged* down the whole chain — its own
+        //   comment says why: *"so history transitions record the original
+        //   external caller, not the intermediate handler."* It is attribution.
+        //   The authority §5.2 actually checks for a sub-dispatch is the
+        //   dispatching handler's grant (`DispatchCeiling::Handler`), which this
+        //   context does not carry. Measured: `follow(Continuation)`'s standing
+        //   leg arrives at `tree:put` carrying the **inbox deliver token**
+        //   (`handlers:[system/inbox]`, `operations:[receive]`) four hops after
+        //   the delivery that minted it, because that is the token that
+        //   authorized the hop at the top of the chain.
+        // - **Peer-root dispatch.** §6.8: a peer-level write *"bypasses
+        //   capability verification — the peer is operating as the tree
+        //   owner"*, and the capability such a dispatch carries is explicitly
+        //   *"informational, not a security assertion."* `check_permission`'s
+        //   resource dimension already short-circuits on
+        //   `DispatchCeiling::PeerRoot`, so checking here would make the
+        //   handler-level check STRICTER than the dispatch-level one for the
+        //   same dispatch.
+        //
+        // **What this leaves open, stated rather than implied:** a sub-dispatch's
+        // handler-time-derived paths (merge's expansion) are bounded only by the
+        // dispatcher's ceiling at §5.2, and where that dispatch carries no
+        // `resource` they are bounded by nothing. Closing it needs the ceiling
+        // grant in `HandlerContext`, which is a design question about what a
+        // deputy's Level-2 authority *is* — routed, not silently left to the
+        // attribution field. Every instance `F68`/`CP-12a` measured, and every
+        // arm of `CORE-RESOURCE-EFFECTIVE-1`, is an external dispatch.
+        if !ctx.is_external {
+            return Ok(());
+        }
+        let Some(cap) = ctx.caller_capability.as_ref() else {
+            return Ok(());
+        };
+        let granter_peer_id = match entity_capability::resolve_granter_peer_id(
+            &cap.granter,
+            &self.local_peer_id,
+            |h| ctx.included.get(h),
+        ) {
+            Some(g) => g,
+            // Fail-closed (§1.11): a granter we cannot resolve is a frame we
+            // cannot compute, and guessing `local` here is the V1' escalation.
+            None => {
+                return Err(HandlerResult::error(
+                    STATUS_FORBIDDEN,
+                    entity_handler::error_entity(
+                        "capability_denied",
+                        "capability granter is unresolvable — cannot evaluate path scope",
+                    ),
+                ))
+            }
+        };
+        if entity_capability::check_path_permission(
+            operation,
+            path,
+            cap,
+            &ctx.pattern,
+            &self.local_peer_id,
+            &granter_peer_id,
+        ) {
+            return Ok(());
+        }
+        tracing::warn!(
+            request_id = %ctx.request_id,
+            operation = %operation,
+            path = %path,
+            "tree: handler-level path check denied (§6.3)"
+        );
+        Err(HandlerResult::error(
+            STATUS_FORBIDDEN,
+            entity_handler::error_entity(
+                "capability_denied",
+                &format!("insufficient capability for path: {}", path),
+            ),
+        ))
+    }
+
+    /// [`Self::authorize_path`] as a boolean, for the per-entry listing filter
+    /// and the per-path merge loop, where a denial is a *skip* or an abort
+    /// rather than a response.
+    fn path_allowed(&self, ctx: &HandlerContext, operation: &str, path: &str) -> bool {
+        self.authorize_path(ctx, operation, path).is_ok()
+    }
+
     /// Get an entity by path.
     pub fn get(&self, path: &str) -> Option<Entity> {
         let hash = self.location_index.get(path)?;
@@ -116,7 +268,45 @@ impl TreeHandler {
 
     /// Handle a listing request for the given prefix.
     /// Groups entries by immediate child name, producing a single-level listing.
+    /// [`Self::handle_listing`] with §6.3's **per-entry** filter applied.
+    ///
+    /// > *"When the tree handler returns a listing, each entry MUST be
+    /// > individually checked against the request's capability using
+    /// > `check_path_permission`. Entries for which `check_path_permission`
+    /// > returns DENY MUST be omitted. The listing's `count` field MUST reflect
+    /// > the filtered entry count, not the source tree's total count."* (§6.3)
+    ///
+    /// ⛔ **This is the wider class `CP-12a` names and its own fix does not
+    /// reach.** An authorization check evaluates the target it was *given*; a
+    /// listing handler acts on the set that target *derives*. Measured at this
+    /// line: a grant `{include:[app/*], exclude:[app/secret]}` **authorizes**
+    /// `system/tree:get` on `/{p}/app/` — the exclude does not match the prefix
+    /// *string*, so §5.2's concrete arm compares one path and passes — and the
+    /// unfiltered listing then returned `secret` and its hash. The child's own
+    /// path is correctly refused, which is precisely what made the leak
+    /// invisible: the direct read is denied and the enumeration is not.
+    /// `effective_targets` removes nothing here, because the arity is one and
+    /// the caller supplied no exclude at all.
+    ///
+    /// The filter is per **immediate child**, on the child's own absolute path,
+    /// because that is what the listing discloses: a name, and a content hash.
+    fn handle_listing_filtered(
+        &self,
+        ctx: &HandlerContext,
+        prefix: &str,
+    ) -> Result<HandlerResult, HandlerError> {
+        self.listing_inner(prefix, Some(ctx))
+    }
+
     pub fn handle_listing(&self, prefix: &str) -> Result<HandlerResult, HandlerError> {
+        self.listing_inner(prefix, None)
+    }
+
+    fn listing_inner(
+        &self,
+        prefix: &str,
+        ctx: Option<&HandlerContext>,
+    ) -> Result<HandlerResult, HandlerError> {
         let entries = self.location_index.list(prefix);
 
         // Group by immediate child name (matching Go handler.go:192-227)
@@ -170,6 +360,18 @@ impl TreeHandler {
             }
         }
         children.retain(|_name, info| info.hash.is_some() || info.has_children);
+
+        // §6.3's per-entry filter. Applied AFTER the deletion-marker
+        // suppression and BEFORE `count`, so the count is the filtered count as
+        // the MUST requires. `ctx` is `None` only for the direct
+        // `handle_listing` entry point — peer-internal callers and unit tests,
+        // which carry no caller capability and for which `authorize_path` would
+        // be a no-op anyway.
+        if let Some(ctx) = ctx {
+            children.retain(|name, _info| {
+                self.path_allowed(ctx, "get", &format!("{}{}", prefix, name))
+            });
+        }
 
         let count = children.len();
 
@@ -274,6 +476,72 @@ fn map_get_array<'a>(
 /// Validate that a non-empty prefix ends with "/".
 fn validate_prefix(prefix: &str) -> bool {
     prefix.is_empty() || prefix.ends_with('/')
+}
+
+/// An `extract.paths[]` entry is a **relative** path under the request's
+/// `prefix` (EXTENSION-TREE v4.9 §6.1). `Err(message)` is `400 invalid_path`
+/// for the whole request.
+///
+/// The four malformed shapes v4.9 names, and why each is here rather than
+/// somewhere upstream:
+///
+/// - a **control character** — `\x01` is the vector's own probe value
+///   (`CORE-PARAMS-PATH-TOTAL-1`), and §1.4 forbids it in any tree path;
+/// - an **empty segment** (`//`) and the reserved **`./` / `../`** prefixes —
+///   [`EntityUri::validate_path_input`], the same predicate the resource-target
+///   channel gets at admission, applied to the channel that never had one;
+/// - a **leading `/`** — an entry is relative to `prefix`, so an absolute entry
+///   is not "a path somewhere else", it is a caller that has misread the
+///   parameter, and concatenating it would produce `…prefix//peer/x`;
+/// - an **empty** entry, which concatenates to the prefix itself.
+///
+/// Deliberately NOT [`EntityUri::validate_absolute_path`]: an entry is relative
+/// and its first segment is a binding name, not a peer id. The absolute form is
+/// checked where it is built — the per-entry authorization filter below runs on
+/// `prefix + entry`.
+fn validate_extract_subpath(entry: &str) -> Result<(), String> {
+    if entry.is_empty() {
+        return Err("extract paths[] entry is empty".into());
+    }
+    if entry.starts_with('/') {
+        return Err(format!(
+            "extract paths[] entry is relative to `prefix`, not absolute: {:?}",
+            entry
+        ));
+    }
+    if let Some(c) = entry.chars().find(|c| c.is_control()) {
+        return Err(format!(
+            "extract paths[] entry contains a control character (U+{:04X})",
+            c as u32
+        ));
+    }
+    entity_entity::EntityUri::validate_path_input(entry)
+        .map_err(|e| format!("extract paths[] entry is not a valid relative path: {}", e))
+}
+
+/// A tree path is about to be **written** or **read** at the store boundary —
+/// `Err(message)` is `400 invalid_path` (§5.4, 0.8.2.21).
+///
+/// > *"Every path that reaches the location index, the content store, or the
+/// > tree is validated at that boundary — whatever carried it. A resource
+/// > target, a URI suffix, a `params` field, an entry of a caller-supplied
+/// > array, or a path the handler built by concatenation are all the same kind
+/// > of input at the point of use."*
+///
+/// This is the check `merge` never had: its write paths are
+/// `params.target_prefix` concatenated with the source snapshot's binding
+/// names, and **no resource target is read at all**, so nothing upstream —
+/// neither `connection.rs`'s admission nor `check_resource_scope` — has ever
+/// seen them. A control character in `target_prefix` was written into the
+/// location index verbatim.
+fn validate_tree_boundary_path(path: &str) -> Result<(), String> {
+    if let Some(c) = path.chars().find(|c| c.is_control()) {
+        return Err(format!(
+            "path contains a control character (U+{:04X})",
+            c as u32
+        ));
+    }
+    entity_entity::EntityUri::validate_absolute_path(path)
 }
 
 /// Remap a path from source_prefix to target_prefix.
@@ -589,24 +857,45 @@ impl Handler for TreeHandler {
 
 impl TreeHandler {
     fn handle_get(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
-        let target_path = if let Some(ref rt) = ctx.resource_target {
-            if let Some(first) = rt.targets.first() {
-                first.clone()
-            } else if ctx.suffix.is_empty() {
-                ctx.pattern.clone()
-            } else {
-                format!("{}{}", ctx.pattern, ctx.suffix)
-            }
-        } else if ctx.suffix.is_empty() {
-            ctx.pattern.clone()
-        } else {
-            format!("{}{}", ctx.pattern, ctx.suffix)
+        // §5.2's subject rule (0.8.2.20): the subject is `effective_targets[0]`,
+        // never `resource.targets[0]`. An EMPTY effective list — absent
+        // `resource`, or one whose only target the caller excluded — is not an
+        // error for `get`: it falls through to the URI-suffix form, which is a
+        // legitimate listing. That is exactly why §6.3's handler-level check
+        // below is the enforcement rather than a second opinion: on this arm no
+        // dispatch-level resource check ran at all.
+        //
+        // `single_effective_target` and not `require_single_resource_path`,
+        // deliberately: a `tree:get` subject MAY be a prefix (a trailing-slash
+        // listing) so §3.3's "a resource-requiring operation takes a concrete
+        // path" clause does not bind `get`. The arity arm does — two targets is
+        // `ambiguous_resource`, which this function previously answered by
+        // silently using the first.
+        let selected = match entity_handler::single_effective_target(
+            ctx.resource_target.as_ref(),
+            &self.local_peer_id,
+            "system/tree:get",
+        ) {
+            Ok(s) => s,
+            Err(e) => return Ok(e),
         };
+        let target_path = match selected {
+            Some(p) => p,
+            None if ctx.suffix.is_empty() => ctx.pattern.clone(),
+            None => format!("{}{}", ctx.pattern, ctx.suffix),
+        };
+
+        // §6.3 / §6.7 (act-neutral, 0.8.2.20) — authorize the path we are about
+        // to READ. For the suffix form above this is the only resource check
+        // that runs anywhere.
+        if let Err(e) = self.authorize_path(ctx, "get", &target_path) {
+            return Ok(e);
+        }
 
         // Trailing slash or empty path → listing
         if target_path.is_empty() || target_path.ends_with('/') {
             tracing::debug!(path = %target_path, "tree get: listing");
-            return self.handle_listing(&target_path);
+            return self.handle_listing_filtered(ctx, &target_path);
         }
 
         match self.get(&target_path) {
@@ -631,21 +920,22 @@ impl TreeHandler {
     }
 
     fn handle_put(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
-        // Path from resource_target.targets[0]
-        let path = ctx
-            .resource_target
-            .as_ref()
-            .and_then(|rt| rt.targets.first().cloned())
-            .ok_or_else(|| {
-                HandlerError::InvalidParams("resource target path is required".into())
-            })?;
+        // §3.3 + §5.2's subject rule (0.8.2.20). `targets.first()` here was the
+        // WRITE half of `F68`/`CP-12a` and the most expensive instance of it:
+        // `targets:[P] exclude:[P]` reaches `ALLOW` with the resource dimension
+        // having checked nothing, and this function then bound `P`.
+        let path = match entity_handler::require_single_resource_path(
+            ctx.resource_target.as_ref(),
+            &self.local_peer_id,
+            "system/tree:put (the bind path)",
+        ) {
+            Ok(p) => p,
+            Err(e) => return Ok(e),
+        };
 
-        if path.is_empty() {
-            return error_result(
-                STATUS_BAD_REQUEST,
-                "invalid_params",
-                "resource target path is required",
-            );
+        // §6.3 / §6.7 — authorize the path we are about to WRITE.
+        if let Err(e) = self.authorize_path(ctx, "put", &path) {
+            return Ok(e);
         }
 
         // V7 §1.4 / v7.72 §9.5a CORE-TREE-PATH-FLEX-1: reject control bytes in
@@ -927,19 +1217,27 @@ impl TreeHandler {
         // V7 §3.2: prefer resource_target (dispatch-layer auth covers it).
         // Sanctioned fallback to params.prefix carries a handler-side auth
         // obligation — see the explicit check below.
-        let (prefix, from_params) = match ctx
-            .resource_target
-            .as_ref()
-            .and_then(|rt| rt.targets.first().cloned())
-        {
-            Some(p) => (p, false),
-            None => match params.as_ref().and_then(|p| {
-                let map = p.as_map()?;
-                map_get_text(map, "prefix")
-            }) {
-                Some(p) => (p, true),
-                None => (String::new(), false),
-            },
+        // §5.2's subject rule (0.8.2.20) — the effective set. `single_effective_target`
+        // rather than `require_single_resource_path` because a snapshot prefix is
+        // a prefix, and because the empty case has a legitimate `params.prefix`
+        // fallback below.
+        let selected = match entity_handler::single_effective_target(
+            ctx.resource_target.as_ref(),
+            &self.local_peer_id,
+            "system/tree:snapshot",
+        ) {
+            Ok(s) => s,
+            Err(e) => return Ok(e),
+        };
+        let prefix = match selected {
+            Some(p) => p,
+            None => params
+                .as_ref()
+                .and_then(|p| {
+                    let map = p.as_map()?;
+                    map_get_text(map, "prefix")
+                })
+                .unwrap_or_default(),
         };
 
         if !validate_prefix(&prefix) {
@@ -950,32 +1248,20 @@ impl TreeHandler {
             );
         }
 
-        // V7 §3.2 confused-deputy obligation: when the path came from
-        // params (not resource_target), the dispatch-layer capability check
-        // did not see this path. The handler MUST perform its own auth
-        // check, otherwise a caller authorized for one prefix could
-        // snapshot a different one. PROPOSAL-CROSS-IMPL-STANDARDIZATION-
-        // CATCHUP §3.
-        if from_params {
-            if let Some(ref cap) = ctx.caller_capability {
-                if !entity_capability::check_permission(
-                    "snapshot",
-                    &format!("/{}/system/tree", self.local_peer_id),
-                    &self.local_peer_id,
-                    Some(&entity_capability::ResourceTarget {
-                        targets: vec![prefix.clone()],
-                        exclude: vec![],
-                    }),
-                    cap,
-                    &self.local_peer_id,
-                ) {
-                    return error_result(
-                        STATUS_FORBIDDEN,
-                        "access_denied",
-                        "insufficient capability for prefix supplied in params",
-                    );
-                }
-            }
+        // §6.3 / §6.7 — UNCONDITIONALLY, not only on the `params.prefix` arm.
+        //
+        // This check used to be gated on `from_params`, under a comment reading
+        // *"when the path came from params the dispatch-layer capability check
+        // did not see this path"* — true, and an incomplete statement of when
+        // the two layers disagree. `F68`/`CP-12a` is the case where the path
+        // came from `resource_target` and the dispatch-layer check **still** did
+        // not see it, because the caller excluded its own target; 0.8.2.20
+        // withdraws the secondary-check characterization for exactly that
+        // reason. The `from_params` distinction is gone rather than widened:
+        // there is no path into this function on which the handler-level check
+        // is redundant.
+        if let Err(e) = self.authorize_path(ctx, "snapshot", &prefix) {
+            return Ok(e);
         }
 
         // Fast path: EXTENSION-TREE §3.4 — if an incremental trie root is
@@ -1360,6 +1646,74 @@ impl TreeHandler {
             String::new()
         };
 
+        // EXTENSION-TREE §11 + §12.1 — **authorize every path before applying
+        // any write, and fail the whole merge on the first denial.**
+        //
+        // > *"Merge requires `put` authorization on every path it writes. The
+        // > handler MUST verify authorization before applying any writes."*
+        //
+        // This function carried **zero** authorization symbols. It reads no
+        // resource target at all: the write prefix comes from
+        // `params.target_prefix`, so the dispatch-level check never saw a single
+        // one of these paths — §6.3 case 2, *a path resolved at handler time*,
+        // and the most complete form of it in the tree, because one
+        // caller-supplied string expands into N writes. `handle_snapshot` one
+        // function up has carried a documented confused-deputy check for its own
+        // `params` fallback since the proposal that introduced it; the two arms
+        // beside it (`merge`, `extract`) were never swept, which is the
+        // *sibling arms* miss our charter already names. `entity-core-go`
+        // implements all three (`core/tree/operations.go`, per-path inside the
+        // merge loop) and is the reference.
+        //
+        // Checked in a PRE-PASS rather than inside the apply loop, because
+        // §12.1's MUST is atomicity: a denial on binding 40 of 50 must leave
+        // zero writes, not 39. `dry_run` is checked too — a dry run discloses
+        // which paths would conflict, which is the §6.7 read half.
+        let merge_targets: Vec<String> = source_bindings
+            .keys()
+            .map(|rel_path| format!("{}{}", apply_prefix, rel_path))
+            .collect();
+        // ⛔ **Path validation is a property of the BOUNDARY, not of the
+        // channel** (§5.4 — 0.8.2.21). These write paths are built by
+        // concatenation from `params.target_prefix` — a channel no
+        // resource-target pre-validator sees, and `merge` reads no resource
+        // target at all — so this function IS the admission step for them.
+        // Before the authorization pre-pass, because a malformed path is not a
+        // permission question: `403` on garbage tells the caller to go get a
+        // capability for a path that cannot exist.
+        //
+        // In the same pre-pass as the §11/§12.1 authorization sweep, and for
+        // the same reason: a refusal on binding 40 of 50 must leave zero
+        // writes, not 39.
+        //
+        // ⚠ Bare `apply_prefix` — the `namespace_is_peer_id` false arm, which
+        // only the unqualified-pattern unit fixtures take — yields a relative
+        // target that `validate_absolute_path` correctly refuses. The check is
+        // therefore scoped to the qualified case, which is every path a peer
+        // actually serves; see `namespace_is_peer_id`.
+        if namespace_is_peer_id {
+            for target_path in &merge_targets {
+                if let Err(msg) = validate_tree_boundary_path(target_path) {
+                    return error_result(
+                        STATUS_BAD_REQUEST,
+                        "invalid_path",
+                        &format!("merge target path is not a valid tree path: {}", msg),
+                    );
+                }
+            }
+        }
+        for target_path in &merge_targets {
+            if let Err(e) = self.authorize_path(ctx, "put", target_path) {
+                tracing::warn!(
+                    request_id = %ctx.request_id,
+                    path = %target_path,
+                    bindings = merge_targets.len(),
+                    "tree merge: refused before any write (§11 / §12.1 atomic 403)"
+                );
+                return Ok(e);
+            }
+        }
+
         let mut applied: u64 = 0;
         let mut skipped: u64 = 0;
         let mut conflicts: BTreeMap<String, (Hash, Hash, String)> = BTreeMap::new();
@@ -1472,19 +1826,27 @@ impl TreeHandler {
         // fallback comes through *un-qualified* — we absolutize it here so
         // that bare prefixes (e.g. `foo/`) resolve against the LI's absolute
         // bindings.
-        let prefix = ctx
-            .resource_target
-            .as_ref()
-            .and_then(|rt| rt.targets.first().cloned())
-            .or_else(|| {
-                params.as_ref().and_then(|p| {
+        // §5.2's subject rule (0.8.2.20) — the effective set.
+        let selected = match entity_handler::single_effective_target(
+            ctx.resource_target.as_ref(),
+            &self.local_peer_id,
+            "system/tree:extract",
+        ) {
+            Ok(s) => s,
+            Err(e) => return Ok(e),
+        };
+        let prefix = match selected {
+            Some(p) => p,
+            None => params
+                .as_ref()
+                .and_then(|p| {
                     let map = p.as_map()?;
                     map_get_text(map, "prefix").map(|raw| {
                         entity_entity::EntityUri::qualify_path(&raw, &self.local_peer_id)
                     })
                 })
-            })
-            .unwrap_or_default();
+                .unwrap_or_default(),
+        };
 
         if !validate_prefix(&prefix) {
             return error_result(
@@ -1492,6 +1854,15 @@ impl TreeHandler {
                 "invalid_prefix",
                 "non-empty prefix must end with '/'",
             );
+        }
+
+        // §6.3 / §6.7 — `extract` takes `params.prefix` with the same fallback
+        // `handle_snapshot` documents an auth obligation for, and performed
+        // none. It is a READ that returns an envelope of every binding under
+        // the prefix, so §6.7's act-neutral reading (0.8.2.20) is the whole
+        // point: the harm is disclosure.
+        if let Err(e) = self.authorize_path(ctx, "extract", &prefix) {
+            return Ok(e);
         }
 
         // Optional paths filter
@@ -1509,8 +1880,49 @@ impl TreeHandler {
             }
         });
 
-        // Collect bindings
-        let bindings: BTreeMap<String, Hash> = if let Some(ref paths) = paths_filter {
+        // ⛔ **Validate EVERY entry before reading ANY** (EXTENSION-TREE v4.9
+        // §6.1/§6.2, ENTITY-CORE-PROTOCOL §5.4 — 0.8.2.21).
+        //
+        // `paths[]` is a caller-controlled array that reaches a tree-path
+        // boundary through `params` — a channel the resource-target
+        // pre-validator in `connection.rs` never sees. That asymmetry is the
+        // whole of `CORE-PARAMS-PATH-TOTAL-1`: a peer that pre-validates only
+        // the resource target answers `200` (or, in one sibling, crashed the
+        // connection task) where a peer validating at the boundary answers
+        // `400`.
+        //
+        // The disposition is `400 invalid_path` for the WHOLE request, no
+        // partial result — and the deciding argument is the one this function's
+        // own filter already makes. A well-formed path that binds nothing is
+        // *absent* and is silently omitted, because that is what the filter is
+        // FOR. So the question was never reject-vs-omit; it was whether
+        // **malformed** and **absent** get the same answer. They must not: a
+        // caller asking for ten paths and getting seven cannot tell garbage
+        // from a missing binding, and *"fix your path"* is a different
+        // instruction from *"that binding does not exist"*.
+        //
+        // Before reading any, not per-entry inside the loop, so the answer does
+        // not depend on array order — and the sweep is `validate_path_input`
+        // (the reserved dot prefixes, empty segments) plus the control-character
+        // and absolute-path rules that make an entry not a *relative* path.
+        if let Some(ref paths) = paths_filter {
+            for rel_path in paths {
+                if let Err(msg) = validate_extract_subpath(rel_path) {
+                    return error_result(STATUS_BAD_REQUEST, "invalid_path", &msg);
+                }
+            }
+        }
+
+        // Collect bindings.
+        //
+        // §6.3's per-entry rule applies here for the same reason it applies to
+        // a listing: the authorizer evaluated the prefix *string*, and what
+        // leaves this function is the expanded *set* — with the bound entities
+        // themselves in the envelope, so the disclosure is strictly wider than a
+        // listing's name+hash. A per-entry filter rather than a refusal, matching
+        // §6.3's listing MUST and `extensions/query`'s post-filter, which is the
+        // in-tree model for an enumerating consumer.
+        let mut bindings: BTreeMap<String, Hash> = if let Some(ref paths) = paths_filter {
             // Look up specific paths
             let mut map = BTreeMap::new();
             for rel_path in paths {
@@ -1531,6 +1943,9 @@ impl TreeHandler {
                 })
                 .collect()
         };
+        bindings.retain(|rel_path, _| {
+            self.path_allowed(ctx, "extract", &format!("{}{}", prefix, rel_path))
+        });
 
         // Build trie and snapshot entity as root
         let root_hash = trie::build_trie(self.content_store.as_ref(), &bindings)
@@ -1661,6 +2076,19 @@ mod tests {
             .to_string()
     }
 
+    /// Qualify a bare test path to the shape the WIRE produces.
+    ///
+    /// Every test in this module used to bind and address bare paths
+    /// (`docs/readme`). Since 0.8.2.20 the handler draws its subject from
+    /// `effective_targets`, which **canonicalizes** (§5.2) — so a bare target
+    /// arrives as `/{peer}/docs/readme`, which is also the only shape
+    /// `validate_absolute_path` accepts and the only shape `connection.rs`
+    /// ever hands a handler. The bare form was modelling a tree state this
+    /// peer cannot produce; `qp` makes the fixtures match the wire.
+    fn qp(path: &str) -> String {
+        format!("/{}/{}", test_peer_id(), path)
+    }
+
     fn make_tree() -> TreeHandler {
         TreeHandler::new(
             Arc::new(MemoryContentStore::new()),
@@ -1707,7 +2135,11 @@ mod tests {
             caller_capability: None,
             execute,
             params,
-            pattern: "system/tree".to_string(),
+            // The QUALIFIED pattern, as `connection.rs` sets it. The bare form
+            // made `handle_merge`'s `namespace_is_peer_id` test false, so bare
+            // merge prefixes were never qualified and the fixtures were
+            // exercising an unqualified write path production cannot reach.
+            pattern: qp("system/tree"),
             suffix: String::new(),
             resource_target,
             author: None,
@@ -1747,8 +2179,8 @@ mod tests {
     fn test_put_get() {
         let tree = make_tree();
         let entity = make_entity("test/type", "hello");
-        let hash = tree.put("test/path", entity.clone()).unwrap();
-        let got = tree.get("test/path").unwrap();
+        let hash = tree.put(&qp("test/path"), entity.clone()).unwrap();
+        let got = tree.get(&qp("test/path")).unwrap();
         assert_eq!(got.content_hash, entity.content_hash);
         assert_eq!(got.content_hash, hash);
     }
@@ -1756,14 +2188,14 @@ mod tests {
     #[test]
     fn test_get_missing() {
         let tree = make_tree();
-        assert!(tree.get("nonexistent").is_none());
+        assert!(tree.get(&qp("nonexistent")).is_none());
     }
 
     #[test]
     fn test_get_by_hash() {
         let tree = make_tree();
         let entity = make_entity("test/type", "hello");
-        let hash = tree.put("test/path", entity).unwrap();
+        let hash = tree.put(&qp("test/path"), entity).unwrap();
         assert!(tree.get_by_hash(&hash).is_some());
         assert!(tree.get_by_hash(&Hash::zero()).is_none());
     }
@@ -1771,41 +2203,43 @@ mod tests {
     #[test]
     fn test_has() {
         let tree = make_tree();
-        assert!(!tree.has("test/path"));
-        tree.put("test/path", make_entity("test", "data")).unwrap();
-        assert!(tree.has("test/path"));
+        assert!(!tree.has(&qp("test/path")));
+        tree.put(&qp("test/path"), make_entity("test", "data"))
+            .unwrap();
+        assert!(tree.has(&qp("test/path")));
     }
 
     #[test]
     fn test_remove() {
         let tree = make_tree();
         let entity = make_entity("test/type", "hello");
-        tree.put("test/path", entity.clone()).unwrap();
-        let removed = tree.remove("test/path");
+        tree.put(&qp("test/path"), entity.clone()).unwrap();
+        let removed = tree.remove(&qp("test/path"));
         assert!(removed.is_some());
         assert_eq!(removed.unwrap().content_hash, entity.content_hash);
-        assert!(!tree.has("test/path"));
+        assert!(!tree.has(&qp("test/path")));
     }
 
     #[test]
     fn test_remove_missing() {
         let tree = make_tree();
-        assert!(tree.remove("nonexistent").is_none());
+        assert!(tree.remove(&qp("nonexistent")).is_none());
     }
 
     #[test]
     fn test_list() {
         let tree = make_tree();
-        tree.put("system/handler/a", make_entity("test", "a"))
+        tree.put(&qp("system/handler/a"), make_entity("test", "a"))
             .unwrap();
-        tree.put("system/handler/b", make_entity("test", "b"))
+        tree.put(&qp("system/handler/b"), make_entity("test", "b"))
             .unwrap();
-        tree.put("system/tree", make_entity("test", "c")).unwrap();
+        tree.put(&qp("system/tree"), make_entity("test", "c"))
+            .unwrap();
 
-        let entries = tree.list("system/handler/");
+        let entries = tree.list(&qp("system/handler/"));
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].path, "system/handler/a");
-        assert_eq!(entries[1].path, "system/handler/b");
+        assert_eq!(entries[0].path, qp("system/handler/a"));
+        assert_eq!(entries[1].path, qp("system/handler/b"));
     }
 
     #[test]
@@ -1813,9 +2247,9 @@ mod tests {
         let tree = make_tree();
         let e1 = make_entity("test", "first");
         let e2 = make_entity("test", "second");
-        tree.put("path", e1).unwrap();
-        tree.put("path", e2.clone()).unwrap();
-        let got = tree.get("path").unwrap();
+        tree.put(&qp("path"), e1).unwrap();
+        tree.put(&qp("path"), e2.clone()).unwrap();
+        let got = tree.get(&qp("path")).unwrap();
         assert_eq!(got.content_hash, e2.content_hash);
     }
 
@@ -1837,12 +2271,12 @@ mod tests {
     #[test]
     fn test_listing_basic() {
         let tree = make_tree();
-        tree.put("local/files/a.txt", make_entity("test", "a"))
+        tree.put(&qp("local/files/a.txt"), make_entity("test", "a"))
             .unwrap();
-        tree.put("local/files/b.txt", make_entity("test", "b"))
+        tree.put(&qp("local/files/b.txt"), make_entity("test", "b"))
             .unwrap();
 
-        let result = tree.handle_listing("local/files/").unwrap();
+        let result = tree.handle_listing(&qp("local/files/")).unwrap();
         assert_eq!(result.status, 200);
         assert_eq!(result.result.entity_type, entity_types::TYPE_TREE_LISTING);
 
@@ -1855,11 +2289,13 @@ mod tests {
     #[test]
     fn test_listing_groups_children() {
         let tree = make_tree();
-        tree.put("dir/a", make_entity("test", "a")).unwrap();
-        tree.put("dir/sub/b", make_entity("test", "b")).unwrap();
-        tree.put("dir/sub/c", make_entity("test", "c")).unwrap();
+        tree.put(&qp("dir/a"), make_entity("test", "a")).unwrap();
+        tree.put(&qp("dir/sub/b"), make_entity("test", "b"))
+            .unwrap();
+        tree.put(&qp("dir/sub/c"), make_entity("test", "c"))
+            .unwrap();
 
-        let result = tree.handle_listing("dir/").unwrap();
+        let result = tree.handle_listing(&qp("dir/")).unwrap();
         let val = decode_cbor(&result.result.data);
         let map = val.as_map().unwrap();
 
@@ -1882,7 +2318,7 @@ mod tests {
     #[test]
     fn test_listing_empty_prefix() {
         let tree = make_tree();
-        let result = tree.handle_listing("nonexistent/").unwrap();
+        let result = tree.handle_listing(&qp("nonexistent/")).unwrap();
         let val = decode_cbor(&result.result.data);
         let map = val.as_map().unwrap();
         let count = cbor_map_get(map, "count").as_integer().unwrap();
@@ -1897,9 +2333,9 @@ mod tests {
     async fn test_handler_get_entity() {
         let tree = make_tree();
         let entity = make_entity("test/type", "hello");
-        tree.put("docs/readme", entity.clone()).unwrap();
+        tree.put(&qp("docs/readme"), entity.clone()).unwrap();
 
-        let ctx = make_handler_context("get", None, Some(vec!["docs/readme".into()]));
+        let ctx = make_handler_context("get", None, Some(vec![qp("docs/readme")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
         assert_eq!(result.result.content_hash, entity.content_hash);
@@ -1908,7 +2344,7 @@ mod tests {
     #[tokio::test]
     async fn test_handler_get_not_found() {
         let tree = make_tree();
-        let ctx = make_handler_context("get", None, Some(vec!["missing/path".into()]));
+        let ctx = make_handler_context("get", None, Some(vec![qp("missing/path")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_NOT_FOUND);
     }
@@ -1916,8 +2352,8 @@ mod tests {
     #[tokio::test]
     async fn test_handler_get_listing() {
         let tree = make_tree();
-        tree.put("docs/a", make_entity("test", "a")).unwrap();
-        let ctx = make_handler_context("get", None, Some(vec!["docs/".into()]));
+        tree.put(&qp("docs/a"), make_entity("test", "a")).unwrap();
+        let ctx = make_handler_context("get", None, Some(vec![qp("docs/")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
         assert_eq!(result.result.entity_type, entity_types::TYPE_TREE_LISTING);
@@ -1969,7 +2405,7 @@ mod tests {
             ]),
         )]);
 
-        let ctx = make_handler_context("put", Some(params), Some(vec!["docs/readme".into()]));
+        let ctx = make_handler_context("put", Some(params), Some(vec![qp("docs/readme")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
         assert_eq!(
@@ -1978,7 +2414,7 @@ mod tests {
         );
 
         // Verify entity was stored
-        let stored = tree.get("docs/readme").unwrap();
+        let stored = tree.get(&qp("docs/readme")).unwrap();
         assert_eq!(stored.content_hash, inner.content_hash);
 
         // Verify response contains content_hash
@@ -1992,14 +2428,14 @@ mod tests {
     #[tokio::test]
     async fn test_handler_put_remove_binding() {
         let tree = make_tree();
-        tree.put("docs/readme", make_entity("test", "data"))
+        tree.put(&qp("docs/readme"), make_entity("test", "data"))
             .unwrap();
 
         // Put with null entity → remove
         let params =
             entity_ecf::Value::Map(vec![(entity_ecf::text("entity"), entity_ecf::Value::Null)]);
 
-        let ctx = make_handler_context("put", Some(params), Some(vec!["docs/readme".into()]));
+        let ctx = make_handler_context("put", Some(params), Some(vec![qp("docs/readme")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
 
@@ -2008,7 +2444,7 @@ mod tests {
         assert_eq!(cbor_map_get(map, "removed").as_bool(), Some(true));
 
         // Verify binding is gone
-        assert!(!tree.has("docs/readme"));
+        assert!(!tree.has(&qp("docs/readme")));
     }
 
     #[tokio::test]
@@ -2018,17 +2454,36 @@ mod tests {
         let params =
             entity_ecf::Value::Map(vec![(entity_ecf::text("entity"), entity_ecf::Value::Null)]);
 
-        let ctx = make_handler_context("put", Some(params), Some(vec!["missing/path".into()]));
+        let ctx = make_handler_context("put", Some(params), Some(vec![qp("missing/path")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_NOT_FOUND);
     }
 
+    /// §3.3 (0.8.2.20): `put` with no resource is the ABSENT case and answers
+    /// **400 `path_required`** as a value, not a transport-level `Err`. The old
+    /// shape was `Err(HandlerError::InvalidParams)`, which collapses the two
+    /// §3.3 inputs into one generic refusal — the thing §3.3 names
+    /// non-conformant — and gives the caller no code to branch on.
     #[tokio::test]
     async fn test_handler_put_missing_path() {
         let tree = make_tree();
         let ctx = make_handler_context("put", None, None);
-        let result = tree.handle(&ctx).await;
-        assert!(result.is_err()); // InvalidParams
+        let result = tree.handle(&ctx).await.unwrap();
+        assert_eq!(result.status, STATUS_BAD_REQUEST);
+        assert_eq!(error_code(&result), "path_required");
+    }
+
+    /// Decode the `code` field of a `system/protocol/error` result.
+    ///
+    /// Reads the decoded **key**, never a substring of the body: a code is
+    /// `(status, field, spelling)` and a byte scan measures only the spelling.
+    fn error_code(result: &HandlerResult) -> String {
+        let v = decode_cbor(&result.result.data);
+        let map = v.as_map().expect("error body is a map");
+        cbor_map_get(map, "code")
+            .as_text()
+            .unwrap_or_default()
+            .to_string()
     }
 
     // -----------------------------------------------------------------------
@@ -2073,14 +2528,17 @@ mod tests {
     async fn test_handler_put_cas_match_succeeds() {
         let tree = make_tree();
         let e1 = make_entity("test", "v1");
-        let h1 = tree.put("cas/path", e1.clone()).unwrap();
+        let h1 = tree.put(&qp("cas/path"), e1.clone()).unwrap();
 
         let e2 = make_entity("test", "v2");
         let params = put_params_with_expected(Some(&e2), Some(h1));
-        let ctx = make_handler_context("put", Some(params), Some(vec!["cas/path".into()]));
+        let ctx = make_handler_context("put", Some(params), Some(vec![qp("cas/path")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
-        assert_eq!(tree.get("cas/path").unwrap().content_hash, e2.content_hash);
+        assert_eq!(
+            tree.get(&qp("cas/path")).unwrap().content_hash,
+            e2.content_hash
+        );
     }
 
     /// EXTENSION-TREE v4.4 Appendix A — all three `put` rows in one place, so
@@ -2118,7 +2576,7 @@ mod tests {
                 entity_ecf::text("entity"),
                 entity_ecf::text("not a map"),
             )]);
-            let ctx = make_handler_context("put", Some(params), Some(vec!["bad/decode".into()]));
+            let ctx = make_handler_context("put", Some(params), Some(vec![qp("bad/decode")]));
             let result = tree.handle(&ctx).await.unwrap();
             assert_eq!(result.status, STATUS_BAD_REQUEST);
             let val = decode_cbor(&result.result.data);
@@ -2128,7 +2586,7 @@ mod tests {
                 Some("invalid_request"),
                 "a non-decoding entity is the generic structurally-invalid case"
             );
-            assert!(!tree.has("bad/decode"));
+            assert!(!tree.has(&qp("bad/decode")));
         }
 
         // Row 2 — the entity is well-formed and its content hash addresses
@@ -2154,7 +2612,7 @@ mod tests {
                     (entity_ecf::text("type"), entity_ecf::text(&e.entity_type)),
                 ]),
             )]);
-            let ctx = make_handler_context("put", Some(params), Some(vec!["bad/hash".into()]));
+            let ctx = make_handler_context("put", Some(params), Some(vec![qp("bad/hash")]));
             let result = tree.handle(&ctx).await.unwrap();
             assert_eq!(
                 result.status,
@@ -2164,7 +2622,7 @@ mod tests {
             let val = decode_cbor(&result.result.data);
             let map = val.as_map().unwrap();
             assert_eq!(cbor_map_get(map, "code").as_text(), Some("hash_mismatch"));
-            assert!(!tree.has("bad/hash"));
+            assert!(!tree.has(&qp("bad/hash")));
         }
 
         // Row 3 — the CAS race. Same token, different status, different
@@ -2173,10 +2631,11 @@ mod tests {
         // the pair is visible as a pair.
         {
             let tree = make_tree();
-            tree.put("cas/pair", make_entity("test", "v1")).unwrap();
+            tree.put(&qp("cas/pair"), make_entity("test", "v1"))
+                .unwrap();
             let wrong = Hash::compute("test", &entity_ecf::to_ecf(&entity_ecf::text("stale")));
             let params = put_params_with_expected(Some(&make_entity("test", "v2")), Some(wrong));
-            let ctx = make_handler_context("put", Some(params), Some(vec!["cas/pair".into()]));
+            let ctx = make_handler_context("put", Some(params), Some(vec![qp("cas/pair")]));
             let result = tree.handle(&ctx).await.unwrap();
             assert_eq!(result.status, STATUS_CONFLICT);
             let val = decode_cbor(&result.result.data);
@@ -2289,7 +2748,7 @@ mod tests {
         for (label, entity_val, refused) in rows {
             let tree = make_tree();
             let params = entity_ecf::Value::Map(vec![(entity_ecf::text("entity"), entity_val)]);
-            let ctx = make_handler_context("put", Some(params), Some(vec!["p/x".into()]));
+            let ctx = make_handler_context("put", Some(params), Some(vec![qp("p/x")]));
             let result = tree.handle(&ctx).await.unwrap();
             if refused {
                 assert_eq!(
@@ -2302,10 +2761,10 @@ mod tests {
                     Some("invalid_request"),
                     "clause `{label}` is the structural row"
                 );
-                assert!(!tree.has("p/x"), "clause `{label}` stored something");
+                assert!(!tree.has(&qp("p/x")), "clause `{label}` stored something");
             } else {
                 assert_eq!(result.status, STATUS_OK, "row `{label}` must be admitted");
-                assert!(tree.has("p/x"), "row `{label}` must bind");
+                assert!(tree.has(&qp("p/x")), "row `{label}` must bind");
             }
         }
 
@@ -2324,7 +2783,7 @@ mod tests {
                 (entity_ecf::text("type"), entity_ecf::text("test/type")),
             ]),
         )]);
-        let ctx = make_handler_context("put", Some(params), Some(vec!["p/null".into()]));
+        let ctx = make_handler_context("put", Some(params), Some(vec![qp("p/null")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(
             result.status, STATUS_OK,
@@ -2386,7 +2845,7 @@ mod tests {
                     (entity_ecf::text("type"), entity_ecf::text("test/type")),
                 ]),
             )]);
-            let ctx = make_handler_context("put", Some(params), Some(vec!["fmt/x".into()]));
+            let ctx = make_handler_context("put", Some(params), Some(vec![qp("fmt/x")]));
             let result = tree.handle(&ctx).await.unwrap();
             assert_eq!(result.status, STATUS_BAD_REQUEST, "{label}");
             let val = decode_cbor(&result.result.data);
@@ -2396,7 +2855,7 @@ mod tests {
                 "{label}: a well-formed hash we cannot verify is §4.7 row 5, \
                  not the structural row"
             );
-            assert!(!tree.has("fmt/x"));
+            assert!(!tree.has(&qp("fmt/x")));
         }
     }
 
@@ -2437,7 +2896,7 @@ mod tests {
                 (entity_ecf::text("type"), entity_ecf::text("")),
             ]),
         )]);
-        let ctx = make_handler_context("put", Some(params), Some(vec!["both/faults".into()]));
+        let ctx = make_handler_context("put", Some(params), Some(vec![qp("both/faults")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_BAD_REQUEST);
         let val = decode_cbor(&result.result.data);
@@ -2447,7 +2906,7 @@ mod tests {
             "a submission that is both malformed and mis-hashed is the STRUCTURAL row; \
              answering hash_mismatch means the ladder is running backwards"
         );
-        assert!(!tree.has("both/faults"));
+        assert!(!tree.has(&qp("both/faults")));
     }
 
     /// The containment that makes the `put` validate branch's non-mismatch arm
@@ -2477,12 +2936,12 @@ mod tests {
     async fn test_handler_put_cas_mismatch_returns_409() {
         let tree = make_tree();
         let e1 = make_entity("test", "v1");
-        tree.put("cas/path", e1).unwrap();
+        tree.put(&qp("cas/path"), e1).unwrap();
 
         let wrong = Hash::compute("test", &entity_ecf::to_ecf(&entity_ecf::text("wrong")));
         let e2 = make_entity("test", "v2");
         let params = put_params_with_expected(Some(&e2), Some(wrong));
-        let ctx = make_handler_context("put", Some(params), Some(vec!["cas/path".into()]));
+        let ctx = make_handler_context("put", Some(params), Some(vec![qp("cas/path")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_CONFLICT);
         let val = decode_cbor(&result.result.data);
@@ -2496,13 +2955,13 @@ mod tests {
         let expected = Hash::compute("test", &entity_ecf::to_ecf(&entity_ecf::text("x")));
         let e = make_entity("test", "new");
         let params = put_params_with_expected(Some(&e), Some(expected));
-        let ctx = make_handler_context("put", Some(params), Some(vec!["cas/missing".into()]));
+        let ctx = make_handler_context("put", Some(params), Some(vec![qp("cas/missing")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_CONFLICT);
         let val = decode_cbor(&result.result.data);
         let map = val.as_map().unwrap();
         assert_eq!(cbor_map_get(map, "code").as_text(), Some("hash_mismatch"));
-        assert!(!tree.has("cas/missing"));
+        assert!(!tree.has(&qp("cas/missing")));
     }
 
     #[tokio::test]
@@ -2510,42 +2969,45 @@ mod tests {
         // Backward compat: no expected_hash → unconditional put.
         let tree = make_tree();
         let e1 = make_entity("test", "v1");
-        tree.put("cas/path", e1).unwrap();
+        tree.put(&qp("cas/path"), e1).unwrap();
 
         let e2 = make_entity("test", "v2");
         let params = put_params_with_expected(Some(&e2), None);
-        let ctx = make_handler_context("put", Some(params), Some(vec!["cas/path".into()]));
+        let ctx = make_handler_context("put", Some(params), Some(vec![qp("cas/path")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
-        assert_eq!(tree.get("cas/path").unwrap().content_hash, e2.content_hash);
+        assert_eq!(
+            tree.get(&qp("cas/path")).unwrap().content_hash,
+            e2.content_hash
+        );
     }
 
     #[tokio::test]
     async fn test_handler_put_cas_remove_match_succeeds() {
         let tree = make_tree();
         let e1 = make_entity("test", "v1");
-        let h1 = tree.put("cas/path", e1).unwrap();
+        let h1 = tree.put(&qp("cas/path"), e1).unwrap();
 
         let params = put_params_with_expected(None, Some(h1));
-        let ctx = make_handler_context("put", Some(params), Some(vec!["cas/path".into()]));
+        let ctx = make_handler_context("put", Some(params), Some(vec![qp("cas/path")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
-        assert!(!tree.has("cas/path"));
+        assert!(!tree.has(&qp("cas/path")));
     }
 
     #[tokio::test]
     async fn test_handler_put_cas_remove_mismatch_returns_409() {
         let tree = make_tree();
         let e1 = make_entity("test", "v1");
-        tree.put("cas/path", e1).unwrap();
+        tree.put(&qp("cas/path"), e1).unwrap();
 
         let wrong = Hash::compute("test", &entity_ecf::to_ecf(&entity_ecf::text("wrong")));
         let params = put_params_with_expected(None, Some(wrong));
-        let ctx = make_handler_context("put", Some(params), Some(vec!["cas/path".into()]));
+        let ctx = make_handler_context("put", Some(params), Some(vec![qp("cas/path")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_CONFLICT);
         // Binding still present
-        assert!(tree.has("cas/path"));
+        assert!(tree.has(&qp("cas/path")));
     }
 
     #[tokio::test]
@@ -2555,10 +3017,13 @@ mod tests {
         let tree = make_tree();
         let e = make_entity("test", "first");
         let params = put_params_with_expected(Some(&e), Some(Hash::zero()));
-        let ctx = make_handler_context("put", Some(params), Some(vec!["cas/fresh".into()]));
+        let ctx = make_handler_context("put", Some(params), Some(vec![qp("cas/fresh")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
-        assert_eq!(tree.get("cas/fresh").unwrap().content_hash, e.content_hash);
+        assert_eq!(
+            tree.get(&qp("cas/fresh")).unwrap().content_hash,
+            e.content_hash
+        );
     }
 
     #[tokio::test]
@@ -2567,18 +3032,18 @@ mod tests {
         // hash_mismatch (the create precondition is "path is unbound").
         let tree = make_tree();
         let e1 = make_entity("test", "first");
-        let h1 = tree.put("cas/taken", e1.clone()).unwrap();
+        let h1 = tree.put(&qp("cas/taken"), e1.clone()).unwrap();
 
         let e2 = make_entity("test", "second");
         let params = put_params_with_expected(Some(&e2), Some(Hash::zero()));
-        let ctx = make_handler_context("put", Some(params), Some(vec!["cas/taken".into()]));
+        let ctx = make_handler_context("put", Some(params), Some(vec![qp("cas/taken")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_CONFLICT);
         let val = decode_cbor(&result.result.data);
         let map = val.as_map().unwrap();
         assert_eq!(cbor_map_get(map, "code").as_text(), Some("hash_mismatch"));
         // Binding unchanged.
-        assert_eq!(tree.get("cas/taken").unwrap().content_hash, h1);
+        assert_eq!(tree.get(&qp("cas/taken")).unwrap().content_hash, h1);
     }
 
     #[tokio::test]
@@ -2588,10 +3053,10 @@ mod tests {
         // remove".
         let tree = make_tree();
         let params = put_params_with_expected(None, Some(Hash::zero()));
-        let ctx = make_handler_context("put", Some(params), Some(vec!["cas/never".into()]));
+        let ctx = make_handler_context("put", Some(params), Some(vec![qp("cas/never")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
-        assert!(!tree.has("cas/never"));
+        assert!(!tree.has(&qp("cas/never")));
     }
 
     #[tokio::test]
@@ -2600,14 +3065,14 @@ mod tests {
         // → 409 (you expected absent but the path has a binding).
         let tree = make_tree();
         let e1 = make_entity("test", "v1");
-        tree.put("cas/exists", e1).unwrap();
+        tree.put(&qp("cas/exists"), e1).unwrap();
 
         let params = put_params_with_expected(None, Some(Hash::zero()));
-        let ctx = make_handler_context("put", Some(params), Some(vec!["cas/exists".into()]));
+        let ctx = make_handler_context("put", Some(params), Some(vec![qp("cas/exists")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_CONFLICT);
         // Binding still present.
-        assert!(tree.has("cas/exists"));
+        assert!(tree.has(&qp("cas/exists")));
     }
 
     // -----------------------------------------------------------------------
@@ -2644,7 +3109,7 @@ mod tests {
     #[tokio::test]
     async fn test_handler_snapshot_empty_tree() {
         let tree = make_tree();
-        let ctx = make_handler_context("snapshot", None, Some(vec!["docs/".into()]));
+        let ctx = make_handler_context("snapshot", None, Some(vec![qp("docs/")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
         assert_eq!(result.result.entity_type, entity_types::TYPE_TREE_SNAPSHOT);
@@ -2663,11 +3128,12 @@ mod tests {
         let tree = make_tree();
         let e1 = make_entity("test", "alpha");
         let e2 = make_entity("test", "beta");
-        tree.put("docs/a", e1.clone()).unwrap();
-        tree.put("docs/b", e2.clone()).unwrap();
-        tree.put("other/c", make_entity("test", "gamma")).unwrap();
+        tree.put(&qp("docs/a"), e1.clone()).unwrap();
+        tree.put(&qp("docs/b"), e2.clone()).unwrap();
+        tree.put(&qp("other/c"), make_entity("test", "gamma"))
+            .unwrap();
 
-        let ctx = make_handler_context("snapshot", None, Some(vec!["docs/".into()]));
+        let ctx = make_handler_context("snapshot", None, Some(vec![qp("docs/")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
 
@@ -2687,7 +3153,7 @@ mod tests {
     #[tokio::test]
     async fn test_handler_snapshot_invalid_prefix() {
         let tree = make_tree();
-        let ctx = make_handler_context("snapshot", None, Some(vec!["docs".into()]));
+        let ctx = make_handler_context("snapshot", None, Some(vec![qp("docs")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_BAD_REQUEST);
     }
@@ -2765,8 +3231,15 @@ mod tests {
             entity_ecf::text("prefix"),
             entity_ecf::text(&attempted_prefix),
         )]);
-        let mut ctx = make_handler_context("snapshot", Some(params_val), None);
-        ctx.caller_capability = Some(cap);
+        let mut ctx = make_handler_context("snapshot", Some(params_val.clone()), None);
+        ctx.caller_capability = Some(cap.clone());
+        // The fixture now declares the dispatch EXTERNAL, because that is the
+        // only kind for which `caller_capability` is an authorization input
+        // rather than attribution — see `TreeHandler::authorize_path`. It was
+        // implicitly external all along (the scenario is *"a caller authorized
+        // for one prefix"*); nothing said so, and the check it drives used to
+        // run on every dispatch.
+        ctx.is_external = true;
 
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(
@@ -2775,16 +3248,367 @@ mod tests {
         );
     }
 
+    /// The narrowing that landed with §6.3's handler-level check, pinned so it
+    /// is visible rather than rediscovered as a defect.
+    ///
+    /// The same request on an **internal** dispatch is NOT refused. That is a
+    /// reduction against the previous `from_params` check, which ran on every
+    /// dispatch, and it is deliberate: for an in-process dispatch
+    /// `caller_capability` is the *propagated* original caller's token —
+    /// attribution, per `make_execute_fn`'s own comment — not the authority
+    /// §5.2 checked, which is the dispatcher's `DispatchCeiling`. Measured
+    /// consequence of the old reading: `follow(Continuation)`'s standing leg
+    /// reached `tree:put` carrying the inbox deliver token four hops later.
+    ///
+    /// What this row does NOT say is that the internal case is safe. It is
+    /// bounded by the dispatcher's ceiling at §5.2 and, where that dispatch
+    /// carries no `resource`, by nothing — the gap named at `authorize_path`
+    /// and routed. Flip this assertion when the ceiling grant reaches the
+    /// handler context.
+    #[tokio::test]
+    async fn snapshot_params_prefix_is_not_checked_on_an_internal_dispatch() {
+        let tree = make_tree();
+        let peer = test_peer_id();
+        let attempted_prefix = format!("/{}/secret/", peer);
+        let cap = entity_capability::CapabilityToken {
+            grants: vec![entity_capability::GrantEntry {
+                handlers: entity_capability::PathScope::new(vec![format!("/{}/system/tree", peer)]),
+                resources: entity_capability::PathScope::new(vec![format!("/{}/allowed/*", peer)]),
+                operations: entity_capability::IdScope::new(vec!["snapshot".into()]),
+                peers: None,
+                constraints: None,
+                allowances: None,
+            }],
+            granter: entity_capability::Granter::Single(Hash::zero()),
+            grantee: Hash::zero(),
+            parent: None,
+            created_at: 0,
+            expires_at: None,
+            not_before: None,
+            delegation_caveats: None,
+        };
+        let params_val = entity_ecf::Value::Map(vec![(
+            entity_ecf::text("prefix"),
+            entity_ecf::text(&attempted_prefix),
+        )]);
+        let mut ctx = make_handler_context("snapshot", Some(params_val), None);
+        ctx.caller_capability = Some(cap);
+        ctx.is_external = false;
+
+        let result = tree.handle(&ctx).await.unwrap();
+        assert_eq!(result.status, STATUS_OK);
+    }
+
+    // -----------------------------------------------------------------------
+    // §6.3 / §6.7 handler-level path authorization (0.8.2.20)
+    //
+    // `CORE-RESOURCE-EFFECTIVE-1`'s six arms are driven CROSS-IMPL against a
+    // live peer by core-go's `resource_effective` oracle (6P/0F, mutation
+    // M3-verified: disabling both the boundary narrowing and the handler
+    // selection reddens `case_d_witness` 5P/1F). The rows below are the ones
+    // that oracle does NOT reach — the wider class `CP-12a` names and its own
+    // fix does not touch, where the authorizer evaluated a path STRING and the
+    // handler acts on the SET that string derives.
+    // -----------------------------------------------------------------------
+
+    /// A capability granting `app/*` with `app/secret` excluded, for `tree:get`.
+    fn prefix_cap_excluding_secret(peer: &str) -> entity_capability::CapabilityToken {
+        entity_capability::CapabilityToken {
+            grants: vec![entity_capability::GrantEntry {
+                handlers: entity_capability::PathScope::new(vec![format!("/{}/system/tree", peer)]),
+                resources: entity_capability::PathScope::with_exclude(
+                    vec![format!("/{}/app/*", peer)],
+                    vec![format!("/{}/app/secret", peer)],
+                ),
+                operations: entity_capability::IdScope::new(vec![
+                    "get".into(),
+                    "put".into(),
+                    "extract".into(),
+                ]),
+                peers: None,
+                constraints: None,
+                allowances: None,
+            }],
+            granter: entity_capability::Granter::Single(Hash::zero()),
+            grantee: Hash::zero(),
+            parent: None,
+            created_at: 0,
+            expires_at: None,
+            not_before: None,
+            delegation_caveats: None,
+        }
+    }
+
+    /// The local peer's own `system/peer` identity entity and its hash.
+    ///
+    /// Needed because `authorize_path` resolves the cap's PR-8 granter frame
+    /// from `ctx.included` and **fails closed** when it cannot — and a fixture
+    /// whose granter is `Hash::zero()` with an empty `included` map is exactly
+    /// that case. On the wire this never arises: §5.2's `check_permission` has
+    /// already resolved the same granter out of `envelope.included` and refused
+    /// the dispatch if it could not, so an unresolvable granter cannot reach a
+    /// handler. The fixture has to carry what the wire carries.
+    fn test_peer_entity() -> (Hash, Entity) {
+        let kp = entity_crypto::Keypair::from_seed([42u8; 32]);
+        let ent = entity_crypto::peer_entity_from_components(&kp.public_key_bytes())
+            .expect("peer entity");
+        (ent.content_hash, ent)
+    }
+
+    fn external_ctx(
+        operation: &str,
+        params: Option<entity_ecf::Value>,
+        targets: Option<Vec<String>>,
+        cap: entity_capability::CapabilityToken,
+    ) -> HandlerContext {
+        let mut ctx = make_handler_context(operation, params, targets);
+        let (granter_hash, granter_entity) = test_peer_entity();
+        let mut cap = cap;
+        cap.granter = entity_capability::Granter::Single(granter_hash);
+        ctx.included.insert(granter_hash, granter_entity);
+        ctx.caller_capability = Some(cap);
+        // `authorize_path` only treats `caller_capability` as an authorization
+        // input on an EXTERNAL dispatch — see its doc comment. Every row here is
+        // a wire caller, which is what `CP-12a` measured.
+        ctx.is_external = true;
+        ctx
+    }
+
+    /// ⛔ **`CP-12a`'s wider class, measured at this line and fixed here.**
+    ///
+    /// The grant authorizes `app/*` and excludes `app/secret`. `tree:get` on the
+    /// PARENT PREFIX `/{p}/app/` is authorized by §5.2 — the exclude does not
+    /// match the prefix *string*, so the concrete arm compares one path and
+    /// passes — and the unfiltered listing then returned `secret` AND ITS
+    /// CONTENT HASH. `effective_targets` removes nothing: the arity is one and
+    /// the caller supplied no exclude at all, so `CP-12a`'s own fix does not
+    /// reach this.
+    ///
+    /// The NEGATIVE CONTROL is the non-obvious half and it is why the leak read
+    /// as a working guard: the child's own path is still refused. A reader
+    /// checking `get /{p}/app/secret` sees a correct 403 and concludes the
+    /// dimension binds.
+    #[tokio::test]
+    async fn a_listing_omits_a_child_the_callers_grant_excludes() {
+        let tree = make_tree();
+        let peer = test_peer_id();
+        tree.put(&qp("app/public"), make_entity("t", "public"))
+            .unwrap();
+        tree.put(&qp("app/secret"), make_entity("t", "secret"))
+            .unwrap();
+        let cap = prefix_cap_excluding_secret(&peer);
+
+        let ctx = external_ctx("get", None, Some(vec![qp("app/")]), cap.clone());
+        let result = tree.handle(&ctx).await.unwrap();
+        assert_eq!(
+            result.status, STATUS_OK,
+            "the prefix read itself is authorized"
+        );
+
+        let val = decode_cbor(&result.result.data);
+        let map = val.as_map().unwrap();
+        let entries = cbor_map_get(map, "entries").as_map().unwrap();
+        let names: Vec<&str> = entries.iter().filter_map(|(k, _)| k.as_text()).collect();
+        assert!(names.contains(&"public"), "the in-grant child is listed");
+        assert!(
+            !names.contains(&"secret"),
+            "§6.3: an entry whose path the caller's grant excludes MUST be omitted \
+             — it was returned with its content hash"
+        );
+        // §6.3: "`count` MUST reflect the filtered entry count."
+        let count = cbor_map_get(map, "count").as_integer().unwrap();
+        assert_eq!(
+            i128::from(count),
+            1,
+            "count is the FILTERED count, not the source total"
+        );
+
+        // NEGATIVE CONTROL — the direct read of the same child is refused, which
+        // is what made the enumeration leak invisible from either side.
+        let direct = external_ctx("get", None, Some(vec![qp("app/secret")]), cap.clone());
+        assert_eq!(
+            tree.handle(&direct).await.unwrap().status,
+            STATUS_FORBIDDEN,
+            "the child's OWN path must still be refused — this row passing is \
+             exactly what let the listing leak read as a working guard"
+        );
+        // CONTROL — an in-grant direct read still works, so the 403 above is
+        // attributable to the exclude and not to a deny-everything peer.
+        let allowed = external_ctx("get", None, Some(vec![qp("app/public")]), cap);
+        assert_eq!(tree.handle(&allowed).await.unwrap().status, STATUS_OK);
+    }
+
+    /// §6.7 is ACT-NEUTRAL (0.8.2.20): `extract` is a read that returns every
+    /// binding under a prefix *with the entities themselves*, so it is a strictly
+    /// wider disclosure than a listing's name+hash. Same per-entry filter.
+    #[tokio::test]
+    async fn an_extract_omits_a_binding_the_callers_grant_excludes() {
+        let tree = make_tree();
+        let peer = test_peer_id();
+        tree.put(&qp("app/public"), make_entity("t", "public"))
+            .unwrap();
+        tree.put(&qp("app/secret"), make_entity("t", "secret"))
+            .unwrap();
+        let cap = prefix_cap_excluding_secret(&peer);
+
+        let ctx = external_ctx("extract", None, Some(vec![qp("app/")]), cap);
+        let result = tree.handle(&ctx).await.unwrap();
+        assert_eq!(result.status, STATUS_OK);
+
+        // The excluded entity's bytes must not appear anywhere in the envelope.
+        let secret_hash = make_entity("t", "secret").content_hash;
+        let public_hash = make_entity("t", "public").content_hash;
+        let body = &result.result.data;
+        assert!(
+            !contains_subslice(body, &secret_hash.to_bytes()),
+            "§6.3/§6.7: extract disclosed the excluded binding's entity"
+        );
+        assert!(
+            contains_subslice(body, &public_hash.to_bytes()),
+            "CONTROL: the in-grant binding IS in the envelope — without this the \
+             row above passes against an extract that returns nothing"
+        );
+    }
+
+    fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack.windows(needle.len()).any(|w| w == needle)
+    }
+
+    /// `EXTENSION-TREE` §11 + §12.1: *"Merge requires `put` authorization on
+    /// every path it writes. The handler MUST verify authorization before
+    /// applying any writes."* — and §12.1 makes the failure ATOMIC.
+    ///
+    /// `handle_merge` carried zero authorization symbols: it reads no resource
+    /// target at all, its write prefix comes from `params.target_prefix`, so the
+    /// dispatch-level check never saw a single one of these paths.
+    #[tokio::test]
+    async fn a_merge_touching_one_forbidden_path_writes_nothing_at_all() {
+        let tree = make_tree();
+        let peer = test_peer_id();
+        // Source: two bindings, which will land at app/public and app/secret.
+        tree.put(&qp("src/public"), make_entity("t", "p")).unwrap();
+        tree.put(&qp("src/secret"), make_entity("t", "s")).unwrap();
+        let snap_ctx = make_handler_context("snapshot", None, Some(vec![qp("src/")]));
+        let snap = tree.handle(&snap_ctx).await.unwrap();
+        let snap_hash = tree.content_store.put(snap.result).unwrap();
+
+        let params = entity_ecf::Value::Map(vec![
+            (
+                entity_ecf::text("source"),
+                entity_ecf::Value::Bytes(snap_hash.to_bytes().to_vec()),
+            ),
+            (entity_ecf::text("source_prefix"), entity_ecf::text("src/")),
+            (entity_ecf::text("target_prefix"), entity_ecf::text("app/")),
+        ]);
+        let ctx = external_ctx(
+            "merge",
+            Some(params),
+            None,
+            prefix_cap_excluding_secret(&peer),
+        );
+        let result = tree.handle(&ctx).await.unwrap();
+        assert_eq!(
+            result.status, STATUS_FORBIDDEN,
+            "§11: merge MUST verify authorization before applying any writes"
+        );
+        // §12.1 ATOMIC — the AUTHORIZED sibling must not have landed either.
+        // This is the assertion a per-path check inside the apply loop fails:
+        // it would write `app/public`, then refuse at `app/secret`, and report a
+        // 403 over a half-applied tree.
+        assert!(
+            !tree.has(&qp("app/public")),
+            "§12.1: a refused merge is atomic — the in-grant sibling must not be written"
+        );
+        assert!(!tree.has(&qp("app/secret")));
+    }
+
+    /// CONTROL for the row above: the same merge with every target in grant
+    /// applies. Without this, refusing every merge scores identically.
+    #[tokio::test]
+    async fn a_fully_in_grant_merge_still_applies() {
+        let tree = make_tree();
+        let peer = test_peer_id();
+        tree.put(&qp("src/public"), make_entity("t", "p")).unwrap();
+        let snap_ctx = make_handler_context("snapshot", None, Some(vec![qp("src/")]));
+        let snap = tree.handle(&snap_ctx).await.unwrap();
+        let snap_hash = tree.content_store.put(snap.result).unwrap();
+
+        let params = entity_ecf::Value::Map(vec![
+            (
+                entity_ecf::text("source"),
+                entity_ecf::Value::Bytes(snap_hash.to_bytes().to_vec()),
+            ),
+            (entity_ecf::text("source_prefix"), entity_ecf::text("src/")),
+            (entity_ecf::text("target_prefix"), entity_ecf::text("app/")),
+        ]);
+        let ctx = external_ctx(
+            "merge",
+            Some(params),
+            None,
+            prefix_cap_excluding_secret(&peer),
+        );
+        let result = tree.handle(&ctx).await.unwrap();
+        assert_eq!(result.status, STATUS_OK);
+        assert!(tree.has(&qp("app/public")));
+    }
+
+    /// §5.2's subject rule at the `put` half — the WRITE form of `F68`/`CP-12a`,
+    /// and the most expensive instance of it.
+    ///
+    /// `targets:[P] exclude:[P]` makes the dispatch-level resource check vacuous
+    /// (it skips the target, correctly — a caller that excludes a target is not
+    /// asking for it), and `handle_put` used to bind `targets[0]` anyway. The
+    /// effective list is empty, which §3.3 says IS the absent case.
+    #[tokio::test]
+    async fn a_self_excluded_put_target_is_the_absent_case_and_binds_nothing() {
+        let tree = make_tree();
+        let peer = test_peer_id();
+        let body = make_entity("t", "payload");
+        let params = put_params_with_expected(Some(&body), None);
+        let mut ctx = external_ctx(
+            "put",
+            Some(params),
+            Some(vec![qp("app/secret")]),
+            prefix_cap_excluding_secret(&peer),
+        );
+        // The boundary narrowing is what a wire request gets; here the handler's
+        // own `effective_targets` call is the one under test, so the raw target
+        // plus its self-exclusion is passed through deliberately.
+        if let Some(rt) = ctx.resource_target.as_mut() {
+            rt.exclude = vec![qp("app/secret")];
+        }
+        let result = tree.handle(&ctx).await.unwrap();
+        assert_eq!(result.status, STATUS_BAD_REQUEST);
+        assert_eq!(error_code(&result), "path_required");
+        assert!(
+            !tree.has(&qp("app/secret")),
+            "nothing may be bound at a path the authorizer never evaluated"
+        );
+    }
+
+    /// §3.3's arity arm on `get`, which this handler answered by silently using
+    /// the first of two targets.
+    #[tokio::test]
+    async fn two_effective_get_targets_are_ambiguous_resource() {
+        let tree = make_tree();
+        tree.put(&qp("app/a"), make_entity("t", "a")).unwrap();
+        tree.put(&qp("app/b"), make_entity("t", "b")).unwrap();
+        let ctx = make_handler_context("get", None, Some(vec![qp("app/a"), qp("app/b")]));
+        let result = tree.handle(&ctx).await.unwrap();
+        assert_eq!(result.status, STATUS_BAD_REQUEST);
+        assert_eq!(error_code(&result), "ambiguous_resource");
+    }
+
     #[tokio::test]
     async fn test_handler_snapshot_determinism() {
         let tree = make_tree();
-        tree.put("data/x", make_entity("test", "x")).unwrap();
-        tree.put("data/y", make_entity("test", "y")).unwrap();
+        tree.put(&qp("data/x"), make_entity("test", "x")).unwrap();
+        tree.put(&qp("data/y"), make_entity("test", "y")).unwrap();
 
-        let ctx1 = make_handler_context("snapshot", None, Some(vec!["data/".into()]));
+        let ctx1 = make_handler_context("snapshot", None, Some(vec![qp("data/")]));
         let r1 = tree.handle(&ctx1).await.unwrap();
 
-        let ctx2 = make_handler_context("snapshot", None, Some(vec!["data/".into()]));
+        let ctx2 = make_handler_context("snapshot", None, Some(vec![qp("data/")]));
         let r2 = tree.handle(&ctx2).await.unwrap();
 
         assert_eq!(r1.result.content_hash, r2.result.content_hash);
@@ -2793,8 +3617,8 @@ mod tests {
     #[tokio::test]
     async fn test_handler_snapshot_full_tree() {
         let tree = make_tree();
-        tree.put("a", make_entity("test", "a")).unwrap();
-        tree.put("b", make_entity("test", "b")).unwrap();
+        tree.put(&qp("a"), make_entity("test", "a")).unwrap();
+        tree.put(&qp("b"), make_entity("test", "b")).unwrap();
 
         // Empty prefix = full tree
         let params =
@@ -2821,21 +3645,21 @@ mod tests {
         let tree = make_tree();
 
         // Create base snapshot: a, b, c
-        tree.put("data/a", make_entity("test", "a1")).unwrap();
-        tree.put("data/b", make_entity("test", "b1")).unwrap();
-        tree.put("data/c", make_entity("test", "c1")).unwrap();
+        tree.put(&qp("data/a"), make_entity("test", "a1")).unwrap();
+        tree.put(&qp("data/b"), make_entity("test", "b1")).unwrap();
+        tree.put(&qp("data/c"), make_entity("test", "c1")).unwrap();
 
-        let snap1_ctx = make_handler_context("snapshot", None, Some(vec!["data/".into()]));
+        let snap1_ctx = make_handler_context("snapshot", None, Some(vec![qp("data/")]));
         let snap1 = tree.handle(&snap1_ctx).await.unwrap();
         // Store snapshot in content store
         let snap1_hash = tree.content_store.put(snap1.result.clone()).unwrap();
 
         // Modify tree: remove b, change c, add d
-        tree.remove("data/b");
-        tree.put("data/c", make_entity("test", "c2")).unwrap();
-        tree.put("data/d", make_entity("test", "d1")).unwrap();
+        tree.remove(&qp("data/b"));
+        tree.put(&qp("data/c"), make_entity("test", "c2")).unwrap();
+        tree.put(&qp("data/d"), make_entity("test", "d1")).unwrap();
 
-        let snap2_ctx = make_handler_context("snapshot", None, Some(vec!["data/".into()]));
+        let snap2_ctx = make_handler_context("snapshot", None, Some(vec![qp("data/")]));
         let snap2 = tree.handle(&snap2_ctx).await.unwrap();
         let snap2_hash = tree.content_store.put(snap2.result.clone()).unwrap();
 
@@ -2903,10 +3727,10 @@ mod tests {
         let tree = make_tree();
 
         // Create source snapshot with entries
-        tree.put("src/a", make_entity("test", "a")).unwrap();
-        tree.put("src/b", make_entity("test", "b")).unwrap();
+        tree.put(&qp("src/a"), make_entity("test", "a")).unwrap();
+        tree.put(&qp("src/b"), make_entity("test", "b")).unwrap();
 
-        let snap_ctx = make_handler_context("snapshot", None, Some(vec!["src/".into()]));
+        let snap_ctx = make_handler_context("snapshot", None, Some(vec![qp("src/")]));
         let snap = tree.handle(&snap_ctx).await.unwrap();
         let snap_hash = tree.content_store.put(snap.result).unwrap();
 
@@ -2934,8 +3758,8 @@ mod tests {
         assert_eq!(i128::from(skipped), 0);
 
         // Verify paths were written
-        assert!(tree.has("dest/a"));
-        assert!(tree.has("dest/b"));
+        assert!(tree.has(&qp("dest/a")));
+        assert!(tree.has(&qp("dest/b")));
     }
 
     #[tokio::test]
@@ -2943,11 +3767,13 @@ mod tests {
         let tree = make_tree();
 
         // Pre-existing entry
-        tree.put("data/x", make_entity("test", "existing")).unwrap();
+        tree.put(&qp("data/x"), make_entity("test", "existing"))
+            .unwrap();
 
         // Source snapshot with conflicting entry
-        tree.put("snap/x", make_entity("test", "incoming")).unwrap();
-        let snap_ctx = make_handler_context("snapshot", None, Some(vec!["snap/".into()]));
+        tree.put(&qp("snap/x"), make_entity("test", "incoming"))
+            .unwrap();
+        let snap_ctx = make_handler_context("snapshot", None, Some(vec![qp("snap/")]));
         let snap = tree.handle(&snap_ctx).await.unwrap();
         let snap_hash = tree.content_store.put(snap.result).unwrap();
 
@@ -2975,7 +3801,7 @@ mod tests {
         assert_eq!(conflicts.len(), 1);
 
         // Existing value should not be overwritten
-        let existing = tree.get("data/x").unwrap();
+        let existing = tree.get(&qp("data/x")).unwrap();
         assert_eq!(existing, make_entity("test", "existing"));
     }
 
@@ -2984,10 +3810,10 @@ mod tests {
         let tree = make_tree();
         let existing = make_entity("test", "existing");
         let incoming = make_entity("test", "incoming");
-        tree.put("data/x", existing).unwrap();
+        tree.put(&qp("data/x"), existing).unwrap();
 
-        tree.put("snap/x", incoming.clone()).unwrap();
-        let snap_ctx = make_handler_context("snapshot", None, Some(vec!["snap/".into()]));
+        tree.put(&qp("snap/x"), incoming.clone()).unwrap();
+        let snap_ctx = make_handler_context("snapshot", None, Some(vec![qp("snap/")]));
         let snap = tree.handle(&snap_ctx).await.unwrap();
         let snap_hash = tree.content_store.put(snap.result).unwrap();
 
@@ -3015,12 +3841,13 @@ mod tests {
         assert_eq!(i128::from(applied), 1);
 
         // Source should win
-        let stored = tree.get("data/x").unwrap();
+        let stored = tree.get(&qp("data/x")).unwrap();
         assert_eq!(stored.content_hash, incoming.content_hash);
 
         let conflicts = cbor_map_get(map, "conflicts").as_map().unwrap();
         assert_eq!(conflicts.len(), 1);
-        let conflict = cbor_map_get(conflicts, "data/x").as_map().unwrap();
+        // The conflict key is the qualified target path, as the merge writes it.
+        let conflict = cbor_map_get(conflicts, &qp("data/x")).as_map().unwrap();
         let resolution = cbor_map_get(conflict, "resolution").as_text().unwrap();
         assert_eq!(resolution, "used-incoming");
     }
@@ -3029,10 +3856,11 @@ mod tests {
     async fn test_handler_merge_target_wins() {
         let tree = make_tree();
         let existing = make_entity("test", "existing");
-        tree.put("data/x", existing.clone()).unwrap();
+        tree.put(&qp("data/x"), existing.clone()).unwrap();
 
-        tree.put("snap/x", make_entity("test", "incoming")).unwrap();
-        let snap_ctx = make_handler_context("snapshot", None, Some(vec!["snap/".into()]));
+        tree.put(&qp("snap/x"), make_entity("test", "incoming"))
+            .unwrap();
+        let snap_ctx = make_handler_context("snapshot", None, Some(vec![qp("snap/")]));
         let snap = tree.handle(&snap_ctx).await.unwrap();
         let snap_hash = tree.content_store.put(snap.result).unwrap();
 
@@ -3059,7 +3887,7 @@ mod tests {
         assert_eq!(i128::from(skipped), 1);
 
         // Existing should remain
-        let stored = tree.get("data/x").unwrap();
+        let stored = tree.get(&qp("data/x")).unwrap();
         assert_eq!(stored.content_hash, existing.content_hash);
     }
 
@@ -3067,8 +3895,8 @@ mod tests {
     async fn test_handler_merge_dry_run() {
         let tree = make_tree();
 
-        tree.put("src/a", make_entity("test", "a")).unwrap();
-        let snap_ctx = make_handler_context("snapshot", None, Some(vec!["src/".into()]));
+        tree.put(&qp("src/a"), make_entity("test", "a")).unwrap();
+        let snap_ctx = make_handler_context("snapshot", None, Some(vec![qp("src/")]));
         let snap = tree.handle(&snap_ctx).await.unwrap();
         let snap_hash = tree.content_store.put(snap.result).unwrap();
 
@@ -3093,7 +3921,7 @@ mod tests {
         assert_eq!(i128::from(applied), 1);
 
         // But no actual write
-        assert!(!tree.has("dest/a"));
+        assert!(!tree.has(&qp("dest/a")));
     }
 
     // -----------------------------------------------------------------------
@@ -3105,10 +3933,10 @@ mod tests {
         let tree = make_tree();
         let e1 = make_entity("test", "alpha");
         let e2 = make_entity("test", "beta");
-        tree.put("data/a", e1).unwrap();
-        tree.put("data/b", e2).unwrap();
+        tree.put(&qp("data/a"), e1).unwrap();
+        tree.put(&qp("data/b"), e2).unwrap();
 
-        let ctx = make_handler_context("extract", None, Some(vec!["data/".into()]));
+        let ctx = make_handler_context("extract", None, Some(vec![qp("data/")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
         assert_eq!(result.result.entity_type, entity_types::TYPE_ENVELOPE);
@@ -3135,16 +3963,19 @@ mod tests {
     #[tokio::test]
     async fn test_handler_extract_with_paths_filter() {
         let tree = make_tree();
-        tree.put("data/a", make_entity("test", "alpha")).unwrap();
-        tree.put("data/b", make_entity("test", "beta")).unwrap();
-        tree.put("data/c", make_entity("test", "gamma")).unwrap();
+        tree.put(&qp("data/a"), make_entity("test", "alpha"))
+            .unwrap();
+        tree.put(&qp("data/b"), make_entity("test", "beta"))
+            .unwrap();
+        tree.put(&qp("data/c"), make_entity("test", "gamma"))
+            .unwrap();
 
         let params = entity_ecf::Value::Map(vec![(
             entity_ecf::text("paths"),
             entity_ecf::array(vec![entity_ecf::text("a"), entity_ecf::text("c")]),
         )]);
 
-        let ctx = make_handler_context("extract", Some(params), Some(vec!["data/".into()]));
+        let ctx = make_handler_context("extract", Some(params), Some(vec![qp("data/")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
 
@@ -3164,10 +3995,160 @@ mod tests {
         assert_eq!(bindings.len(), 2);
     }
 
+    /// ⛔ **`CORE-PARAMS-PATH-TOTAL-1` (§5.4 — 0.8.2.21) and EXTENSION-TREE v4.9
+    /// §6.1 in one row: a malformed `paths[]` entry is `400 invalid_path` for
+    /// the whole request, and an ABSENT well-formed one is silently omitted.**
+    ///
+    /// The two are different inputs with different remedies and collapsing them
+    /// is the defect: a caller asking for ten paths and getting seven cannot
+    /// tell garbage from a missing binding. *"Fix your path"* is a different
+    /// instruction from *"that binding does not exist"*, and the code is what
+    /// selects the remedy.
+    ///
+    /// **This cannot be a false pass** — that is the vector's own claim and it
+    /// is why the absent row below is mandatory. `paths[]` reaches a tree-path
+    /// boundary through `params`, a channel `connection.rs`'s resource-target
+    /// pre-validator never sees, so a peer that validates only the resource
+    /// target answers `200` with a short result (ours did) or crashes the
+    /// connection task (one sibling's did). Only a peer validating at the
+    /// boundary answers `400`.
+    ///
+    /// Mutation-verified: deleting the `validate_extract_subpath` pre-pass in
+    /// `handle_extract` reddens every malformed row here and leaves the two
+    /// well-formed rows green.
+    #[tokio::test]
+    async fn a_malformed_extract_subpath_is_400_and_an_absent_one_is_omitted() {
+        let tree = make_tree();
+        tree.put(&qp("data/a"), make_entity("test", "alpha"))
+            .unwrap();
+
+        let drive = |paths: Vec<&str>| {
+            let params = entity_ecf::Value::Map(vec![(
+                entity_ecf::text("paths"),
+                entity_ecf::array(paths.iter().map(|p| entity_ecf::text(*p)).collect()),
+            )]);
+            make_handler_context("extract", Some(params), Some(vec![qp("data/")]))
+        };
+
+        // The vector's own probe value, and the other three shapes v4.9 names.
+        for bad in ["\u{1}x", "a//b", "./a", "../a", "/a", ""] {
+            let result = tree.handle(&drive(vec![bad])).await.unwrap();
+            assert_eq!(
+                result.status, STATUS_BAD_REQUEST,
+                "a malformed paths[] entry {bad:?} is 400, not a short 200"
+            );
+            let (code, _) = entity_handler::decode_error_entity(&result.result)
+                .expect("400 carries a system/protocol/error");
+            assert_eq!(
+                code.as_deref(),
+                Some("invalid_path"),
+                "the code is what selects the remedy — read the decoded `code` \
+                 key, never a substring of the body"
+            );
+        }
+
+        // BEFORE reading any: one good entry beside one malformed entry is
+        // still 400 for the whole request, and the answer does not depend on
+        // array order.
+        for pair in [vec!["a", "\u{1}x"], vec!["\u{1}x", "a"]] {
+            let result = tree.handle(&drive(pair.clone())).await.unwrap();
+            assert_eq!(
+                result.status, STATUS_BAD_REQUEST,
+                "no partial result, in either array order: {pair:?}"
+            );
+        }
+
+        // CONTROL 1 — a well-formed entry that BINDS NOTHING is absent, and
+        // absent is silently omitted. This is what the filter is FOR, and
+        // without this row the rows above are satisfied by a handler that
+        // refuses every `paths` filter.
+        let result = tree.handle(&drive(vec!["a", "nonexistent"])).await.unwrap();
+        assert_eq!(
+            result.status, STATUS_OK,
+            "a well-formed path that binds nothing is ABSENT, not malformed"
+        );
+
+        // CONTROL 2 — the ordinary filtered extract still works.
+        let result = tree.handle(&drive(vec!["a"])).await.unwrap();
+        assert_eq!(result.status, STATUS_OK);
+    }
+
+    /// ⛔ **The other half of `CORE-PARAMS-PATH-TOTAL-1`: `:merge`'s
+    /// `target_prefix`, which is the sharper one, because `merge` reads NO
+    /// resource target at all.**
+    ///
+    /// Nothing upstream has ever seen these paths — not `connection.rs`'s
+    /// admission, not `check_resource_scope` — so a control character in
+    /// `target_prefix` was concatenated with every binding name in the source
+    /// snapshot and written into the location index verbatim. The boundary is
+    /// where it has to be caught, *"whatever carried it"*.
+    ///
+    /// Before the §11/§12.1 authorization pre-pass, deliberately: `403` on a
+    /// path that cannot exist tells the caller to go get a capability for it.
+    #[tokio::test]
+    async fn a_malformed_merge_target_prefix_is_400_and_writes_nothing() {
+        let source = make_tree();
+        source
+            .put(&qp("src/a"), make_entity("test", "alpha"))
+            .unwrap();
+        let snap = source
+            .handle(&make_handler_context(
+                "snapshot",
+                None,
+                Some(vec![qp("src/")]),
+            ))
+            .await
+            .unwrap();
+        let snapshot_hash = source.content_store.put(snap.result).unwrap();
+
+        let drive = |target_prefix: &str| {
+            entity_ecf::Value::Map(vec![
+                (
+                    entity_ecf::text("source"),
+                    entity_ecf::Value::Bytes(snapshot_hash.to_bytes().to_vec()),
+                ),
+                (
+                    entity_ecf::text("target_prefix"),
+                    entity_ecf::text(target_prefix),
+                ),
+            ])
+        };
+
+        let result = source
+            .handle(&make_handler_context(
+                "merge",
+                Some(drive("\u{1}evil/")),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(result.status, STATUS_BAD_REQUEST);
+        let (code, _) = entity_handler::decode_error_entity(&result.result).unwrap();
+        assert_eq!(code.as_deref(), Some("invalid_path"));
+        assert!(
+            source
+                .location_index
+                .list(&format!("/{}/", test_peer_id()))
+                .iter()
+                .all(|e| !e.path.contains('\u{1}')),
+            "§12.1 is atomic: a refused merge leaves ZERO writes, not some"
+        );
+
+        // CONTROL — the same merge at a well-formed target prefix applies.
+        let result = source
+            .handle(&make_handler_context("merge", Some(drive("dest/")), None))
+            .await
+            .unwrap();
+        assert_eq!(
+            result.status, STATUS_OK,
+            "without this row the refusal above is a handler that refuses every merge"
+        );
+    }
+
     #[tokio::test]
     async fn test_handler_extract_invalid_prefix() {
         let tree = make_tree();
-        let ctx = make_handler_context("extract", None, Some(vec!["data".into()]));
+        let ctx = make_handler_context("extract", None, Some(vec![qp("data")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_BAD_REQUEST);
     }
@@ -3181,24 +4162,24 @@ mod tests {
         let tree = make_tree();
 
         // Set up initial data
-        tree.put("app/config", make_entity("test", "config-v1"))
+        tree.put(&qp("app/config"), make_entity("test", "config-v1"))
             .unwrap();
-        tree.put("app/data", make_entity("test", "data-v1"))
+        tree.put(&qp("app/data"), make_entity("test", "data-v1"))
             .unwrap();
 
         // Snapshot before
-        let snap1_ctx = make_handler_context("snapshot", None, Some(vec!["app/".into()]));
+        let snap1_ctx = make_handler_context("snapshot", None, Some(vec![qp("app/")]));
         let snap1 = tree.handle(&snap1_ctx).await.unwrap();
         let snap1_hash = tree.content_store.put(snap1.result).unwrap();
 
         // Modify
-        tree.put("app/data", make_entity("test", "data-v2"))
+        tree.put(&qp("app/data"), make_entity("test", "data-v2"))
             .unwrap();
-        tree.put("app/new", make_entity("test", "new-entry"))
+        tree.put(&qp("app/new"), make_entity("test", "new-entry"))
             .unwrap();
 
         // Snapshot after
-        let snap2_ctx = make_handler_context("snapshot", None, Some(vec!["app/".into()]));
+        let snap2_ctx = make_handler_context("snapshot", None, Some(vec![qp("app/")]));
         let snap2 = tree.handle(&snap2_ctx).await.unwrap();
         let snap2_hash = tree.content_store.put(snap2.result).unwrap();
 
@@ -3227,7 +4208,7 @@ mod tests {
         assert_eq!(i128::from(unchanged), 1);
 
         // Extract subtree
-        let extract_ctx = make_handler_context("extract", None, Some(vec!["app/".into()]));
+        let extract_ctx = make_handler_context("extract", None, Some(vec![qp("app/")]));
         let extract = tree.handle(&extract_ctx).await.unwrap();
         assert_eq!(extract.status, STATUS_OK);
         assert_eq!(extract.result.entity_type, entity_types::TYPE_ENVELOPE);
@@ -3274,11 +4255,11 @@ mod tests {
                 ),
             ]),
         )]);
-        let ctx = make_handler_context("put", Some(params), Some(vec!["foreign/fmt".into()]));
+        let ctx = make_handler_context("put", Some(params), Some(vec![qp("foreign/fmt")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(result.status, STATUS_OK);
 
-        let got = tree.get("foreign/fmt").expect("bound");
+        let got = tree.get(&qp("foreign/fmt")).expect("bound");
         assert_eq!(
             got.content_hash, foreign.content_hash,
             "the peer re-derived a reference it did not author"
@@ -3327,7 +4308,7 @@ mod tests {
                 (entity_ecf::text("type"), entity_ecf::text("test/type")),
             ]),
         )]);
-        let ctx = make_handler_context("put", Some(params), Some(vec!["local/fmt".into()]));
+        let ctx = make_handler_context("put", Some(params), Some(vec![qp("local/fmt")]));
         let result = tree.handle(&ctx).await.unwrap();
         assert_eq!(
             result.status, STATUS_BAD_REQUEST,
@@ -3343,7 +4324,7 @@ mod tests {
         // nothing was stored and nothing was bound, so no address the
         // submitter did not choose came into existence.
         assert!(
-            !tree.has("local/fmt"),
+            !tree.has(&qp("local/fmt")),
             "the peer authored a hash the submitter did not provide"
         );
     }
@@ -3389,7 +4370,7 @@ mod tests {
                     (entity_ecf::text("type"), entity_ecf::text("test/type")),
                 ]),
             )]);
-            let ctx = make_handler_context("put", Some(params), Some(vec!["bad/ch".into()]));
+            let ctx = make_handler_context("put", Some(params), Some(vec![qp("bad/ch")]));
             let result = tree.handle(&ctx).await.unwrap();
             assert_eq!(
                 result.status, STATUS_BAD_REQUEST,
@@ -3401,7 +4382,10 @@ mod tests {
                 Some("invalid_request"),
                 "content_hash as {label} is the structural row"
             );
-            assert!(!tree.has("bad/ch"), "nothing may be stored for {label}");
+            assert!(
+                !tree.has(&qp("bad/ch")),
+                "nothing may be stored for {label}"
+            );
         }
     }
 
@@ -3433,12 +4417,15 @@ mod tests {
                 (entity_ecf::text("type"), entity_ecf::text("test/type")),
             ]),
         )]);
-        let ctx = make_handler_context("put", Some(params), Some(vec!["forged/fmt".into()]));
+        let ctx = make_handler_context("put", Some(params), Some(vec![qp("forged/fmt")]));
         let result = tree.handle(&ctx).await;
         assert!(
             result.is_err() || result.as_ref().unwrap().status >= 400,
             "a content_hash that does not match the bytes must be refused"
         );
-        assert!(tree.get("forged/fmt").is_none(), "nothing may be bound");
+        assert!(
+            tree.get(&qp("forged/fmt")).is_none(),
+            "nothing may be bound"
+        );
     }
 }

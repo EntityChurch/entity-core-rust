@@ -307,11 +307,17 @@ pub(crate) fn forbidden(code: &str, message: &str) -> HandlerResult {
 // result_large_err: the Err IS the ready-to-return HandlerResult (an
 // Entity-carrying 4xx) — boxing it would churn every `?` call site.
 #[allow(clippy::result_large_err)]
-pub(crate) fn resource_bare_path(ctx: &HandlerContext) -> Result<String, HandlerResult> {
-    let target = ctx
-        .resource_target
-        .as_ref()
-        .and_then(|rt| rt.targets.first().cloned())
-        .ok_or_else(|| bad_request("invalid_resource", "missing resource target"))?;
+pub(crate) fn resource_bare_path(
+    ctx: &HandlerContext,
+    local_peer_id: &str,
+) -> Result<String, HandlerResult> {
+    // §3.3 + §5.2's subject rule (0.8.2.20). `targets.first()` was the
+    // `F68`/`CP-12a` bypass at this handler: a caller-excluded target is
+    // skipped by `check_resource_scope` and then read here.
+    let target = entity_handler::require_single_resource_path(
+        ctx.resource_target.as_ref(),
+        local_peer_id,
+        "system/local-files (the file path)",
+    )?;
     Ok(EntityUri::strip_peer_prefix(&target).to_string())
 }

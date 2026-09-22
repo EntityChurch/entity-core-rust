@@ -35,7 +35,7 @@ const STREAMING_THRESHOLD: u64 = 64 * 1024 * 1024;
 // ---------------------------------------------------------------------------
 
 pub(crate) async fn handle_read(h: &LocalFilesHandler, ctx: &HandlerContext) -> HandlerResult {
-    let tree_path = match resource_bare_path(ctx) {
+    let tree_path = match resource_bare_path(ctx, &h.local_peer_id) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -167,7 +167,7 @@ pub(crate) async fn handle_read(h: &LocalFilesHandler, ctx: &HandlerContext) -> 
 // ---------------------------------------------------------------------------
 
 pub(crate) async fn handle_write(h: &LocalFilesHandler, ctx: &HandlerContext) -> HandlerResult {
-    let tree_path = match resource_bare_path(ctx) {
+    let tree_path = match resource_bare_path(ctx, &h.local_peer_id) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -352,7 +352,7 @@ pub(crate) async fn handle_write(h: &LocalFilesHandler, ctx: &HandlerContext) ->
 // ---------------------------------------------------------------------------
 
 pub(crate) async fn handle_list(h: &LocalFilesHandler, ctx: &HandlerContext) -> HandlerResult {
-    let mut tree_path = match resource_bare_path(ctx) {
+    let mut tree_path = match resource_bare_path(ctx, &h.local_peer_id) {
         Ok(p) => p,
         Err(r) => return r,
     };
@@ -457,7 +457,7 @@ pub(crate) async fn handle_list(h: &LocalFilesHandler, ctx: &HandlerContext) -> 
 // ---------------------------------------------------------------------------
 
 pub(crate) fn handle_delete(h: &LocalFilesHandler, ctx: &HandlerContext) -> HandlerResult {
-    let tree_path = match resource_bare_path(ctx) {
+    let tree_path = match resource_bare_path(ctx, &h.local_peer_id) {
         Ok(p) => p,
         Err(r) => return r,
     };

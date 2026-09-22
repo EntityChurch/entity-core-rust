@@ -329,11 +329,10 @@ impl ScopePredicate for CapTokenScope {
                 continue;
             }
             for pat in &grant.resources.include {
-                // A malformed pattern can't project to a namespace — skip it.
-                let canon = match entity_capability::canonicalize(pat, local_pid.as_str()) {
-                    Some(c) => c,
-                    None => continue,
-                };
+                // A malformed pattern can't project to a namespace — it
+                // canonicalizes to NEVER_MATCH (§5.4), which has no `/*`
+                // suffix and so falls out at the `strip_suffix` below.
+                let canon = entity_capability::canonicalize(pat, local_pid.as_str());
                 // Derive the namespace prefix from a `prefix/*`
                 // pattern; exact patterns aren't a content-namespace.
                 let ns_prefix = match canon.strip_suffix("/*") {
@@ -390,11 +389,13 @@ impl ScopePredicate for CapTokenScope {
                 continue;
             }
             for pat in &grant.resources.include {
-                // A malformed pattern can't extend reachability — skip it.
-                let canon = match entity_capability::canonicalize(pat, local_pid.as_str()) {
-                    Some(c) => c,
-                    None => continue,
-                };
+                // A malformed pattern can't extend reachability: NEVER_MATCH
+                // (§5.4) is a single segment that is nobody's ancestor, so the
+                // two prefix tests below both fail on it.
+                let canon = entity_capability::canonicalize(pat, local_pid.as_str());
+                if canon == entity_capability::NEVER_MATCH {
+                    continue;
+                }
                 let inc_prefix = canon.strip_suffix("/*").unwrap_or(&canon).to_string();
                 if absolute_path == "/" && !inc_prefix.is_empty() {
                     return Ok(true);

@@ -729,7 +729,7 @@ mod tests {
     use entity_store::{EmitContext, MemoryContentStore, MemoryLocationIndex};
 
     fn test_peer_id() -> String {
-        "TestPeerABCDEFGH1234567890abcdefghijklmnop123".to_string()
+        "TestPeerABCDEFGH123456789ABCDEFGHJKLMNPQRSTUVW".to_string()
     }
 
     fn make_stores() -> (Arc<MemoryContentStore>, Arc<MemoryLocationIndex>) {

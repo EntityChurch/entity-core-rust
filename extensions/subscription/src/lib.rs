@@ -234,15 +234,26 @@ impl SubscriptionHandler {
         };
 
         // Extract pattern from resource target
-        let pattern = match ctx.resource_target.as_ref().and_then(|r| r.targets.first()) {
-            Some(p) if !p.is_empty() => p.clone(),
-            _ => {
+        // §5.2's subject rule (0.8.2.20) — the effective set, not
+        // `targets.first()`. Deliberately `single_effective_target` and NOT
+        // `require_single_resource_path`: a subscription's subject IS a
+        // pattern by design (§3 pattern subscriptions), so §3.3's
+        // `malformed_resource` arm — "a resource-REQUIRING operation takes a
+        // concrete path" — does not bind here. The arity arms do.
+        let pattern = match entity_handler::single_effective_target(
+            ctx.resource_target.as_ref(),
+            &self.local_peer_id,
+            "system/subscription:subscribe (the subscription pattern)",
+        ) {
+            Ok(Some(p)) => p,
+            Ok(None) => {
                 return Ok(error_result(
                     STATUS_BAD_REQUEST,
-                    "invalid_params",
-                    "resource target pattern required",
+                    "path_required",
+                    "system/subscription:subscribe requires a resource target (the subscription pattern)",
                 ));
             }
+            Err(e) => return Ok(e),
         };
 
         // GUIDE-CAPABILITIES §10 (v1.2.1 Ruling 1) — operator-class gate for

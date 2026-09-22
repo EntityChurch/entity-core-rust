@@ -41,7 +41,7 @@ impl IdentityHandler {
 
         // Resource MUST be system/identity/peer-config (§6).
         let expected = self.qualify(PATH_PEER_CONFIG);
-        if let Err(e) = require_resource(ctx, &expected) {
+        if let Err(e) = require_resource(ctx, &self.local_peer_id, &expected) {
             return Ok(e);
         }
 

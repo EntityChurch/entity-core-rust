@@ -1656,21 +1656,38 @@ fn mint_owner_self_cap(
     // bare `*`, which `canonicalize` resolves to `/{me}/*` — own-namespace only.
     let mut grants = entity_capability::wildcard_handler_grant();
 
-    // Owner-of-the-store READ authority across namespaces. A peer's store can
+    // Owner-of-the-store authority across namespaces. A peer's store can
     // legitimately hold OTHER peers' subtrees at their natural universal paths
     // (V7 §1.4 Category A — e.g. a cached foreign content site at
-    // `/{them}/sites/...`). The wildcard grant above does NOT cover those (its
-    // `*` → `/{me}/*`), so a peer's own `system/query find` / dispatched `get`
-    // over its store is filtered to its own namespace and cannot see the
-    // content it cached. The owner of a store may read everything IN it, so
-    // grant cross-namespace READ via the explicit `/*/*` peer-wildcard form —
-    // the same shape `debug_open_grants` uses for this exact reason
-    // (`core/capability/src/lib.rs:153`), and deliberately NOT the bare `*` the
+    // `/{them}/sites/...`, or a `follow` mirror at `/{them}/app/...`). The
+    // wildcard grant above does NOT cover those (its `*` → `/{me}/*`), so a
+    // peer's own `system/query find` / dispatched `get` over its store is
+    // filtered to its own namespace and cannot see the content it cached. The
+    // owner of a store may reach everything IN it, so grant cross-namespace
+    // access via the explicit `/*/*` peer-wildcard form — the same shape
+    // `debug_open_grants` uses for this exact reason
+    // (`core/capability/src/lib.rs`), and deliberately NOT the bare `*` the
     // `test_resource_wildcard_local_vs_cross_namespace` pin reserves for
-    // own-namespace. Reads only (get/find/count): cross-namespace WRITES go
-    // through local dispatch, which is not capability-gated, so no write grant
-    // is needed. This is what lets `content_site::list_all_sites` enumerate
-    // owned + cached site manifests in one type query.
+    // own-namespace.
+    //
+    // ⛔ **This grant was READ-ONLY (`get`/`find`/`count`) on the stated ground
+    // that *"cross-namespace WRITES go through local dispatch, which is not
+    // capability-gated, so no write grant is needed."* That clause was true and
+    // is now false**, and it is the third instance of a rule this repo already
+    // carries: *a check added to a path that ran none starts READING fields
+    // that were written when nothing read them.* 0.8.2.20 makes §6.3's
+    // handler-level path check not-secondary, so `system/tree` now authorizes
+    // the path it is about to touch against the capability the dispatch
+    // presents — and `follow(Continuation)`'s STANDING leg presents exactly
+    // this cap (as the continuation's `dispatch_capability`) while merging into
+    // `/{them}/...`. Read-only here meant the standing mirror 403'd at
+    // `tree:merge` with the bootstrap still working, because the bootstrap is a
+    // `DispatchCeiling::PeerRoot` dispatch and the standing leg is not.
+    //
+    // The write half is the tree ops an owner's own engines dispatch across
+    // namespaces, enumerated rather than `*` so a future op does not inherit
+    // cross-namespace write authority by default. `system/query` stays
+    // read-only — it has no write surface.
     grants.push(entity_capability::GrantEntry {
         handlers: entity_capability::PathScope::new(vec![
             "system/tree".into(),
@@ -1681,6 +1698,12 @@ fn mint_owner_self_cap(
             "get".into(),
             "find".into(),
             "count".into(),
+            // Write/derive ops the store owner performs on Category A paths.
+            "put".into(),
+            "merge".into(),
+            "extract".into(),
+            "snapshot".into(),
+            "diff".into(),
         ]),
         peers: Some(entity_capability::IdScope::all()),
         constraints: None,

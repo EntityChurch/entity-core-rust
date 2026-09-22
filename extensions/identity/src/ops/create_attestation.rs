@@ -186,7 +186,12 @@ impl IdentityHandler {
         };
 
         // Resolve storage path.
-        let provided_path = self.resource_path(ctx);
+        let provided_path = match self
+            .optional_resource_path(ctx, "create_attestation (the attestation's storage path)")
+        {
+            Ok(p) => p,
+            Err(e) => return Ok(e),
+        };
         let computed_path =
             self.compute_storage_path(&att, &kind, mode_str.as_deref(), contact_id.as_ref())?;
 

@@ -603,8 +603,9 @@ gates by making the TCP path compile on wasm32.
   from the only real instance. Teeth:
   `ingest_rejects_an_undecodable_entity_with_the_defined_400_default`, mutation-verified RED.
 - **A comment explaining why a surface is UNTESTED is a standing instruction not to try, and it
-  never expires on its own — re-price it before you believe it.** *(Candidate: bit us once,
-  2026-09-04, `e86f783`; found only because a sibling's packet hedged.)* `handle_pull`'s three
+  never expires on its own — re-price it before you believe it.** *(**Ratified 2026-09-11**: bit
+  us twice, and the second time the comment was in a CONFORMANCE CHECK rather than in our own
+  test tree — see the end of this entry.)* `handle_pull`'s three
   test rows sat under *"End-to-end behavior requires a wire-connected remote peer and is exercised
   by the cross-impl probe."* True when written. The consequence is that every row drove a
   **precondition** failure — missing `remote`, absent `execute_fn` — and the entire path *past* the
@@ -625,6 +626,27 @@ gates by making the TCP path compile on wasm32.
   is untested and the comment should say that instead. Same rule as *"a declared exclusion whose
   ground is 'nothing installs it' is a gap wearing an exemption"*, applied to a deferral rather
   than an exclusion.
+  **Second bite, and it ratifies the entry by moving it out of our own tree: the deferral was in
+  a CONFORMANCE CHECK, so the surface it left untested is the whole cohort's — and the check
+  carries the vector's `[MUST]` while measuring something else.** `CORE-TREE-LISTING-1` is §6.3's
+  cap-coverage listing filter (*"entries for which `check_path_permission` returns DENY MUST be
+  omitted… `count` MUST reflect the filtered count"*), in the `--profile core` set. core-go's
+  `core_tree_listing_1` seeds two paths **with the connection's broad cap**, lists, and asserts
+  **both appear** — a positive-presence assertion, so **a peer that filters nothing passes by
+  construction**. Its comment declares the narrower scope honestly and names the substitute:
+  *"a full cap-coverage filter test requires a narrowed delegated cap, which the broader security
+  category exercises."* Grepped the harness: **no check anywhere asserts a listing entry is
+  omitted.** The substitute does not exist, and the sibling whose tree it scores has no per-entry
+  filter at all (`handleListing`'s signature takes no capability).
+  **The half that is about us: the row was green against US too, and our filter is real.** A PASS
+  there was never evidence of `handle_listing_filtered`; it was a return-shape check wearing a
+  security vector's name, and we had cited it. **So the deferral rule binds a category name as
+  well as a comment: before citing a vector ID as covering what its §9 row says it covers, read
+  the check's ASSERTIONS** — `grep -n 'r.Run("<check_name>"' -A 40` in the sibling harness — and
+  ask whether any arm could fail against a peer that does nothing. A vector whose every assertion
+  is positive-presence cannot witness an omission MUST. This is the *"a green category is not
+  evidence about a surface the category does not check"* entry one level finer: there the check
+  was absent, here it is present, correctly named, and measuring a different property.
 - **A precondition guard on a TEST FIXTURE can make the behaviour under test unreachable — and
   it reads as strictness, not as a hole.** *(Candidate: bit us once, 2026-09-09, found by a
   sibling's check scoring us FAIL for a reason unrelated to what it measures.)* 0.8.2.17's §9.1
@@ -839,6 +861,182 @@ gates by making the TCP path compile on wasm32.
   (`grep -rn '<id>' ../entity-system-architecture/docs/{DESIGN-REGISTER,COHORT-OPEN-ITEMS}.md`) and
   check the finding under it is the one in front of you. A finding that arrives with a section
   reference and no number **has** no number — cite the section.
+
+- **A CROSS-IMPL oracle scores the UNION of your layers — when a rule can be satisfied at two
+  sites, a green row says nothing about which one earned it, and the redundant one is an
+  unmeasured claim.** *(Candidate: bit us once, 2026-09-11, caught by running the mutation the
+  report would otherwise have asserted.)* `0.8.2.20`'s subject rule can be discharged at the
+  dispatch **boundary** (narrow `resource.targets` to `effective_targets` once, so no handler can
+  see a skipped target) or at **each handler** (`require_single_resource_path`), and the spec says
+  so outright: *"this document does not mandate two sites."* We shipped both. core-go's
+  `resource_effective` oracle then scored `6P/0F` — and **restoring the exact bypass arch flags in
+  ⛔ capitals, `targets.first()` inside `handle_get`, still scored `6P/0F`**, because by then
+  `rt.targets` *is* the effective list. Only disabling BOTH reddened `case_d_witness` (`5P/1F`);
+  restoring the handler half alone with the boundary off scored `6P/0F` again. Three runs, and the
+  one-line report *"the oracle confirms the selection"* would have been false about which code it
+  confirmed.
+  **Enforcement.** When a rule is satisfiable at two sites, run the mutation **per site**, not per
+  behaviour — and if a site's mutation cannot be reddened by any cross-impl row, it owes an in-tree
+  test that observes it *directly*. For the boundary that meant a probe handler which reads
+  `targets[0]` **on purpose** (`the_dispatch_boundary_hands_the_handler_only_the_effective_targets`,
+  `core/peer`): every conformant consumer draws from `effective_targets` and is therefore blind to
+  whether the narrowing happened, so the only observer is a deliberately non-conformant one. Report
+  the per-site result, never the category total — *"6/6 and here is which layer each row is
+  attributable to"* is a different and more useful sentence than *"6/6."*
+
+- **A pair of helpers implementing one §1.4 rule will drift in their DISPOSITION, and the one that
+  panics is reachable from the wire.** *(**Ratified 2026-09-11**: bit us twice in one day, the
+  second time in a helper nobody had looked at — see the end of this entry.)* §5.4's three reserved path shapes (`./`, `../`, `*/`) are handled
+  by two functions in this tree: `entity_capability::canonicalize` returned `None`, and
+  `entity_entity::EntityUri::qualify_path` **`assert!`ed**. The dispatch sites run
+  `validate_path_input` before `qualify_path` — which rejects `./` and `../` and **not `*/`** — so
+  an inbound EXECUTE carrying `resource: {targets: ["*/anything"]}` reached the `assert!` and
+  unwound the connection task, *before* `check_permission`. A `#[should_panic]` test sat over it,
+  which is what made it read as intentional.
+  **Three transferable parts.** (a) Same family as the `is_connect_path` bite — two path helpers,
+  one rule, and a decision made with the wrong one — with a panic at the end instead of a wrong
+  route. Grep: for any rule about a path SHAPE, enumerate the functions that implement it
+  (`grep -rn 'starts_with("\*/")\|starts_with("\./")'`) and check they agree on the *disposition*,
+  not just on the set. (b) **A guard that is a superset in one place and a subset in another is the
+  defect**, and the tell is a pre-validator and a validator listing different shapes. (c)
+  `#[should_panic]` on a function reachable from caller-controlled input is a finding on sight: the
+  attribute converts a crash into an assertion and nothing re-asks whether the caller can reach it.
+  **Enforcement:** `grep -rn 'should_panic' --include=*.rs` and, for each, answer *can a wire
+  caller construct this input?* Teeth: `a_reserved_resource_target_is_answered_not_a_panic`
+  (`core/peer`) drives all four shapes over the real wire and asserts a 4xx **answer**, with a live
+  control after them proving the connection survived — mutation-verified by restoring the asserts,
+  which reproduces the panic as a 30s request timeout rather than as a visible crash, which is the
+  other half of why it went unnoticed.
+  **Second bite, same day, and it is what ratifies (c): the `should_panic` grep this entry
+  PRESCRIBED had two hits and only one of them got asked the question.** `EntityUri::clean_path`
+  asserted on a leading `./` or `../` under `test_clean_path_rejects_dot_slash`, and the answer to
+  *"can a wire caller construct this input?"* was *"not through `qualify_path`"* — true, because
+  `qualify_path` answers the reserved prefixes with `NEVER_MATCH` before calling it. **That is the
+  same sentence that was true about the other one until a `params` channel appeared**, and
+  `clean_path` is `pub`, recurses through its own `entity://` arm (`clean_path("entity://./x")`
+  panicked while `qualify_path("entity://./x")` did not), and sits on the store side of the tree.
+  `0.8.2.21` then ruled the general form: *"a boundary MUST NOT assert on a malformed path"* — a
+  property, not an enumeration of reachable call sites. **So the rule loses its reachability
+  clause: a path helper that asserts is a defect whether or not you can currently reach it, and
+  the disposition belongs at the boundary with a caller to answer** (`validate_path_input` → `400`,
+  `canonicalize` → `NEVER_MATCH`). Sweeping for the property rather than for reachability also
+  found `SqliteLocationIndex::set`'s `.expect("sqlite location set failed")` — a locked-database
+  error as a panic in the dispatch task, which no `should_panic` grep would ever have surfaced.
+  Teeth: `clean_path_is_total_on_the_reserved_prefixes` (mutation-verified by restoring the
+  assert) and `a_malformed_storage_key_is_refused_and_never_panics` (`core/store`), whose rows are
+  written as `remove`/`list`/`get` calls precisely because each would *unwind* rather than fail if
+  the boundary asserted.
+
+- **An enumeration inside a ruling is a hypothesis about YOUR tree — recount it, and recount the
+  sites the ruling exempted BY ARGUMENT hardest of all.** *(Candidate: bit us once, 2026-09-11,
+  in both directions within one revision.)* `0.8.2.21` fixes a fail-open and says *"measured here
+  it is THREE sites."* Against our tree it was **four**, and the two misses have opposite causes
+  that are each worth recognizing:
+  - **A site the ruling EXEMPTED with a reason that does not hold.** The third site — the pattern
+    arm of `check_resource_scope` — is described as *"fail-closed **BY ACCIDENT**, the test is
+    negated for an unrelated reason"*, and therefore gets no fix. The negated test is never
+    reached: `patterns_overlap(ct, NEVER_MATCH)` is `false` for every real pattern target
+    (`strip_wildcard` leaves the path-shaped sentinel intact and neither string prefixes the
+    other), so the loop `continue`s and the unmatchable exclude is skipped exactly as it was in
+    the arm that *did* get fixed. **"Fail-closed by accident" is a claim about control flow, and
+    control flow is measurable** — build the exempted version and run the mutation. Ours printed
+    *"spec-literal this ALLOWS"*.
+  - **A site the ruling could not see, because the spec FACTORS where we INLINE.** §6.3's
+    pseudocode delegates its resource dimension to `matches_scope`, so in the spec it inherits the
+    site-1 fix for free and never appears in any count. Our `check_path_permission` open-coded the
+    same predicate as `is_covered_by(include) && !is_covered_by(exclude)` — `matches_scope`'s body
+    minus the new arm — so the hole survived there after all three named sites were closed. It is
+    also the worst place for it: §6.3 is **sole** resource enforcement when `resource` is absent.
+  **Enforcement.** (a) For any ruling that fixes a predicate, grep your tree for **re-implementations
+  of that predicate**, not for its name — the tell is a call to a *containment* helper
+  (`is_covered_by(`, `matches_pattern(` over an include/exclude pair) on a path that is
+  *implementing a scope* rather than *asking a containment question*. Fix it by **calling the one
+  function**, never by adding a copy of the arm; a rule with N implementations has N-1 places to
+  drift back. (b) Any site a ruling declines to fix **with an argument** owes you the mutation that
+  tests the argument, and the finding goes back upstream with the measurement rather than as a
+  reading. Ours is `an_unmatchable_exclude_excludes_everything_at_every_site`, which carries the
+  premise (`!patterns_overlap(...)`) and the consequence as two assertions so the next reader does
+  not have to re-derive why the arm is there.
+
+- **A ruling that adds a CLASSIFICATION TABLE can contradict an unchanged MUST in the same
+  document, and the fold diff is exactly the wrong place to look for it.** *(Candidate: bit us
+  once, 2026-09-11, caught before implementing.)* `0.8.2.21`'s §6.8 answers *"which authority does
+  the handler-level check run against?"* with a three-row table, and classes *"a listing entry"*
+  and *"a merge expansion"* as handler-derived → **the executing handler's own grant**. §6.3's
+  *"Listing filter"* MUST answers the same question for the same subject and says **the request's
+  capability** — and it is untouched by the fold, so `git show <fold> -- specs/` (this file's own
+  prescribed enforcement for a version bump) shows it to nobody. Implementing the table would
+  filter a listing against the §6.9 default self-grant's `/*/*` and hand back exactly the entries
+  `F71`/`CP-12a` closed. Same for merge: its expansion derives from `params.target_prefix`, a
+  caller-supplied `params` path, which is **row 1 of the same table** and which §6.7 forbids the
+  handler to answer with its own grant.
+  **The transferable part is that a new table is a RESTATEMENT**, and this file already records
+  what restatements do (`L23`: a rule promoted at one site and not swept at its restatements). A
+  table is the most convincing possible restatement because it reads as the complete answer.
+  **Enforcement:** when a ruling introduces a table, a list, or any enumeration that *classifies*,
+  grep the spec for every **other** sentence that answers the same question for the same subject
+  (here: `grep -n "check_path_permission" specs/ENTITY-CORE-PROTOCOL.md` — twelve hits, one of
+  them the contradiction) and reconcile them before writing code. Where they disagree, **hold the
+  narrower one, say so at the `fn` with both citations, and route** — do not pick. The cost of
+  picking wrong here is silently re-opening a closed disclosure, which no oracle can see because
+  both readings produce a well-formed response.
+
+- **A spec rule that relocates an authorization check makes you read a field that was ATTRIBUTION
+  until that moment — and the propagated caller capability is the one with a comment saying so.**
+  *(Ratified 2026-09-11: this is the third instance of *"a check added to a path that ran none
+  starts READING fields that were written when nothing read them"*, and the first where the field's
+  own doc comment told us it was not an authorization input.)* §6.3's handler-level path check is
+  *"not a secondary check"* at `0.8.2.20`, so `core/tree` now authorizes the path it is about to
+  touch against *"the request's capability."* Implemented as `ctx.caller_capability`, it refused
+  `follow(Continuation)`'s standing mirror — and the capability arriving at `tree:put` was the
+  **inbox deliver token** (`handlers:[system/inbox]`, `operations:[receive]`), four hops after the
+  delivery that minted it. `make_execute_fn` says why in as many words: *"caller_capability
+  propagates unchanged through sub-dispatch chains so history transitions record the original
+  external caller."* It is the chain initiator, for attribution. The authority §5.2 actually checks
+  for a sub-dispatch is the dispatching handler's `DispatchCeiling`, which the handler context does
+  not carry.
+  **So the scope of a relocated check is a question about which dispatch KIND the field means
+  something for, and there are three**: inbound wire (`is_external` — the field is the verified
+  caller capability, and this is the only kind where it authorizes), in-process sub-dispatch
+  (attribution), and peer-root (§6.8: *"bypasses capability verification — the peer is operating as
+  the tree owner"*, and the capability is *"informational, not a security assertion"*). Treating
+  peer-root as checkable makes the handler-level check **stricter than the dispatch-level one for
+  the same dispatch**, because `check_permission`'s resource dimension already short-circuits on
+  `DispatchCeiling::PeerRoot`.
+  **Enforcement:** before reading any context field as an authorization input, grep for the site
+  that WRITES it and read that comment (`grep -rn '<field>' core/peer/src/connection.rs`); if the
+  producer's own words are *propagates unchanged*, *for attribution*, *informational*, or *records
+  the original*, it is not an authorization input and the check needs a different source or a
+  narrower scope. Say the scope at the `fn` with the measurement attached
+  (`TreeHandler::authorize_path`), and **pin the narrowing you caused** — gating on `is_external`
+  removed a check that previously ran on every dispatch, so
+  `snapshot_params_prefix_is_not_checked_on_an_internal_dispatch` asserts the reduction rather than
+  leaving it to be rediscovered as a defect.
+  **And the open half, stated because an unstated gap is an exemption:** a deputy's Level-2
+  authority has no source in this tree. Routed, not papered over with the attribution field.
+
+- **When a validator's verdict starts being consumed, the first thing it refuses is your own test
+  fixtures — and a readable placeholder peer id is a malformed path.** *(Candidate: bit us once,
+  2026-09-11; 20+ rows across five crates, and every one of them was the check working.)* §5.4's
+  G6 makes `check_resource_scope` consume `validate_absolute_path`'s verdict on every concrete
+  target. `validate_absolute_path` requires the first segment to be a **real** peer id — ≥ 46
+  characters, Base58 alphabet — so `/some-other-peer/...`, `/z6MkTestPeerIdForRegistry/...` and
+  `testpeer123456789012345678901234567890123456` (44 chars, and containing `0`, which is not in
+  Base58 at all) all became denials. Four fixtures were one character short; three contained
+  non-Base58 letters (`0`, `O`, `I`, `l`) and had *never* been valid.
+  **The useful half is what the churn revealed, not the churn.** `core/tree`'s entire unit suite
+  bound and addressed **bare** paths (`docs/readme`) while `effective_targets` canonicalizes — so
+  the fixtures were exercising a tree state this peer cannot produce, and `handle_merge`'s
+  `namespace_is_peer_id` test was false throughout, meaning every merge fixture took an
+  unqualified write path production never reaches. A `qp()` helper and a qualified `ctx.pattern`
+  fixed both.
+  **Enforcement:** when a change starts consuming a structural validator's verdict, expect the
+  fixtures to fail first and **read each failure before fixing it** — ours were three different
+  facts (a short id, a non-Base58 id, and a whole suite on the wrong path shape) wearing one error.
+  A fixture peer id is checkable in one line:
+  `python3 -c "print(len(s)>=46 and all(c in '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz' for c in s))"`.
+  And prefer deriving one (`Keypair::from_seed(...).peer_id()`) to writing one, which is what the
+  surviving fixtures now do.
 
 - **An operation added to a `Handler` has two registration sites, and the second one is in
   another crate.** `impl Handler::operations()` makes it answerable; `bootstrap_handler(...)` in

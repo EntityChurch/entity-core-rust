@@ -87,10 +87,44 @@ impl IdentityHandler {
         format!("/{}/{}", self.local_peer_id, bare)
     }
 
-    pub(crate) fn resource_path(&self, ctx: &HandlerContext) -> Option<String> {
-        ctx.resource_target
-            .as_ref()
-            .and_then(|rt| rt.targets.first().cloned())
+    /// The single concrete `EXECUTE.resource` target this handler acts on
+    /// (§3.3 + §5.2's subject rule, 0.8.2.20).
+    ///
+    /// ⛔ **This was `targets.first()`.** That is the `F68`/`CP-12a` bypass:
+    /// `check_resource_scope` SKIPS a target the caller's own `exclude` covers
+    /// — correctly, a caller that excludes a target is not asking for it — so
+    /// `targets:[P] exclude:[P]` reaches `ALLOW` with nothing checked, and a
+    /// handler indexing `targets[0]` then acts on `P`. Counting is not the fix
+    /// either: `targets:[P,Q] exclude:[P]` has an effective list of exactly
+    /// one, so an arity check passes while `targets[0]` is still `P`.
+    /// `require_single_resource_path` returns the ELEMENT, so the count and
+    /// the index cannot come from different lists.
+    pub(crate) fn resource_path(
+        &self,
+        ctx: &HandlerContext,
+        what: &str,
+    ) -> Result<String, HandlerResult> {
+        entity_handler::require_single_resource_path(
+            ctx.resource_target.as_ref(),
+            &self.local_peer_id,
+            what,
+        )
+    }
+
+    /// Same derivation, for the three identity ops whose `resource` is
+    /// **optional** (`process_attestation`, `create_attestation` in embedded
+    /// mode). Absent stays absent; present is still `effective[0]` and still
+    /// refuses more than one or a lone pattern.
+    pub(crate) fn optional_resource_path(
+        &self,
+        ctx: &HandlerContext,
+        what: &str,
+    ) -> Result<Option<String>, HandlerResult> {
+        entity_handler::optional_single_resource_path(
+            ctx.resource_target.as_ref(),
+            &self.local_peer_id,
+            what,
+        )
     }
 }
 
@@ -638,12 +672,42 @@ pub(crate) fn configure_result(peer_config_path: &str, issued: &[Hash]) -> Handl
     }
 }
 
-pub(crate) fn require_resource(ctx: &HandlerContext, expected: &str) -> Result<(), HandlerResult> {
-    let path = ctx
-        .resource_target
-        .as_ref()
-        .and_then(|rt| rt.targets.first().cloned());
-    match path {
+/// §3.2 path-as-resource, for the ops whose resource target is a FIXED path the
+/// handler computes itself: the caller must name exactly that path.
+///
+/// The subject is drawn from `effective_targets` (§5.2, 0.8.2.20) rather than
+/// `targets.first()`, so `targets:[expected] exclude:[expected]` is the absent
+/// case (`path_required`) and not a match — which is the `F68`/`CP-12a` shape:
+/// the dispatch check skipped the target, and an equality against
+/// `targets[0]` would have said yes.
+pub(crate) fn require_resource(
+    ctx: &HandlerContext,
+    local_peer_id: &str,
+    expected: &str,
+) -> Result<(), HandlerResult> {
+    // `effective_targets` returns the RAW survivor (§5.2, 0.8.2.21) — the
+    // target as the caller spelled it. `expected` is a canonical path computed
+    // by this peer, so the comparison below canonicalizes the survivor first;
+    // without it a peer-relative target that names exactly the right path reads
+    // as a `resource_target_mismatch`. The arity above is unaffected: the skip
+    // inside `effective_targets` is decided canonically either way.
+    let effective: Vec<String> =
+        entity_capability::effective_targets(ctx.resource_target.as_ref(), local_peer_id)
+            .iter()
+            .map(|t| entity_capability::canonicalize(t, local_peer_id))
+            .collect();
+    if effective.len() > 1 {
+        return Err(error(
+            STATUS_BAD_REQUEST,
+            "ambiguous_resource",
+            &format!(
+                "expected exactly one resource target ({}), got {}",
+                expected,
+                effective.len()
+            ),
+        ));
+    }
+    match effective.into_iter().next() {
         Some(p) if p == expected => Ok(()),
         Some(p) => Err(error(
             STATUS_BAD_REQUEST,

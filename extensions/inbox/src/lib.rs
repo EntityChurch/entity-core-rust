@@ -18,8 +18,8 @@ fn spawn_task<F: std::future::Future<Output = ()> + 'static>(f: F) {
     wasm_bindgen_futures::spawn_local(f);
 }
 use entity_handler::{
-    ExecuteOptions, Handler, HandlerContext, HandlerError, HandlerResult, STATUS_BAD_REQUEST,
-    STATUS_NOT_SUPPORTED, STATUS_OK,
+    ExecuteOptions, Handler, HandlerContext, HandlerError, HandlerResult, STATUS_NOT_SUPPORTED,
+    STATUS_OK,
 };
 use entity_store::{ContentStore, LocationIndex};
 
@@ -28,6 +28,8 @@ pub struct InboxHandler {
     content_store: Arc<dyn ContentStore>,
     location_index: Arc<dyn LocationIndex>,
     qualified_pattern: String,
+    /// Needed by the §3.3/§5.2 subject derivation.
+    local_peer_id: String,
 }
 
 impl InboxHandler {
@@ -41,6 +43,7 @@ impl InboxHandler {
             content_store,
             location_index,
             qualified_pattern,
+            local_peer_id,
         }
     }
 }
@@ -77,14 +80,19 @@ impl Handler for InboxHandler {
 impl InboxHandler {
     async fn handle_receive(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
         // Extract path from resource target
-        let path = match ctx.resource_target.as_ref().and_then(|r| r.targets.first()) {
-            Some(p) if !p.is_empty() => p.clone(),
-            _ => {
-                tracing::debug!(request_id = %ctx.request_id, "inbox receive: missing resource target path");
-                return Ok(HandlerResult::error(
-                    STATUS_BAD_REQUEST,
-                    make_error_entity("invalid_params", "resource target path required"),
-                ));
+        // §3.3 + §5.2's subject rule (0.8.2.20). `targets.first()` is the
+        // `F68`/`CP-12a` bypass: the authorizer SKIPS a caller-excluded target,
+        // so `targets:[P] exclude:[P]` reaches ALLOW with nothing checked and a
+        // handler indexing `targets[0]` then delivers to P.
+        let path = match entity_handler::require_single_resource_path(
+            ctx.resource_target.as_ref(),
+            &self.local_peer_id,
+            "system/inbox:receive (the delivery path)",
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!(request_id = %ctx.request_id, "inbox receive: resource target refused");
+                return Ok(e);
             }
         };
 
@@ -421,7 +429,7 @@ mod tests {
             caller_capability: None,
             execute,
             params,
-            pattern: "system/inbox".to_string(),
+            pattern: format!("/{}/system/inbox", test_peer_id()),
             suffix: String::new(),
             resource_target,
             author: None,
@@ -456,9 +464,16 @@ mod tests {
         assert_eq!(result.result.entity_type, "system/inbox/receive-result");
 
         // Verify the message was stored
-        let entries = inbox.location_index.list("user/messages/");
+        // The handler's subject is `effective_targets[0]`, which canonicalizes
+        // (§5.2) — so a bare fixture target lands at `/{peer}/user/messages`,
+        // which is also the only shape the wire produces.
+        let entries = inbox
+            .location_index
+            .list(&format!("/{}/user/messages/", test_peer_id()));
         assert_eq!(entries.len(), 1);
-        assert!(entries[0].path.starts_with("user/messages/"));
+        assert!(entries[0]
+            .path
+            .starts_with(&format!("/{}/user/messages/", test_peer_id())));
     }
 
     #[tokio::test]
@@ -466,7 +481,7 @@ mod tests {
         let inbox = make_inbox();
         let ctx = make_ctx(&inbox, "receive", "");
         let result = inbox.handle(&ctx).await.unwrap();
-        assert_eq!(result.status, STATUS_BAD_REQUEST);
+        assert_eq!(result.status, entity_handler::STATUS_BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -516,7 +531,9 @@ mod tests {
         ctx2.request_id = "req-2".to_string();
         inbox.handle(&ctx2).await.unwrap();
 
-        let entries = inbox.location_index.list("inbox/multi/");
+        let entries = inbox
+            .location_index
+            .list(&format!("/{}/inbox/multi/", test_peer_id()));
         assert_eq!(entries.len(), 2);
     }
 

@@ -19,7 +19,7 @@ use crate::builtins::{BUILTIN_ASSOC, BUILTIN_CONCAT, BUILTIN_GROUP_BY, BUILTIN_R
 use crate::eval::{evaluate, EvalContext};
 use crate::types::*;
 
-const TEST_PID: &str = "testpeer123456789012345678901234567890123456";
+const TEST_PID: &str = "testpeer123456789ABCDEFGHJKLMNPQRSTUVWXYZabcde";
 
 // ---------------------------------------------------------------------------
 // Fixture builders

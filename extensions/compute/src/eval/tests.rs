@@ -2,7 +2,7 @@ use super::*;
 use entity_ecf::ValueExt;
 use entity_store::{ContentStore, LocationIndex, MemoryContentStore, MemoryLocationIndex};
 
-const TEST_PID: &str = "testpeer123456789012345678901234567890123456";
+const TEST_PID: &str = "testpeer123456789ABCDEFGHJKLMNPQRSTUVWXYZabcde";
 
 /// Type alias for the dispatch closure used in handler-mode apply tests.
 /// Matches `eval::DispatchExecuteFn<'static>` shape — kept local to avoid
@@ -303,7 +303,7 @@ fn test_lookup_scope_not_found() {
 fn test_lookup_tree_entity() {
     let cs = MemoryContentStore::new();
     let li = MemoryLocationIndex::new();
-    let pid = "testpeer123456789012345678901234567890123456";
+    let pid = "testpeer123456789ABCDEFGHJKLMNPQRSTUVWXYZabcde";
 
     let stored = Entity::new(
         "app/data",
@@ -332,7 +332,7 @@ fn test_lookup_tree_entity() {
 fn test_lookup_tree_expression() {
     let cs = MemoryContentStore::new();
     let li = MemoryLocationIndex::new();
-    let pid = "testpeer123456789012345678901234567890123456";
+    let pid = "testpeer123456789ABCDEFGHJKLMNPQRSTUVWXYZabcde";
 
     let stored = make_literal_int(42);
     let hash = cs.put(stored.clone()).unwrap();

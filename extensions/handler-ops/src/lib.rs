@@ -80,40 +80,22 @@ impl HandlersHandler {
         // Path-as-resource (PROPOSAL-PATH-AS-RESOURCE-HYGIENE §3.4, P-V7-1):
         // resource = `system/handler/{pattern}`. Pattern is derived from the
         // resource path; manifest.pattern (if present) MUST agree.
-        let qualified_resource =
-            match ctx.resource_target.as_ref() {
-                Some(rt) if rt.targets.len() == 1 && rt.exclude.is_empty() => rt.targets[0].clone(),
-                // §3.3 (0.8.2.18): ABSENT is `path_required`, MORE THAN ONE is
-                // `ambiguous_resource` — two inputs, two remedies, and collapsing
-                // them is non-conformant on the absent case. A non-empty `exclude`
-                // stays on the ambiguous arm: §3.3 names two inputs and an
-                // exclusion set is neither.
-                None => {
-                    return Ok(HandlerResult::error(
-                        STATUS_BAD_REQUEST,
-                        error_entity(
-                            "path_required",
-                            "register requires a resource target (system/handler/{pattern})",
-                        ),
-                    ))
-                }
-                Some(rt) if rt.targets.is_empty() => {
-                    return Ok(HandlerResult::error(
-                        STATUS_BAD_REQUEST,
-                        error_entity(
-                            "path_required",
-                            "register requires a resource target (system/handler/{pattern})",
-                        ),
-                    ))
-                }
-                _ => return Ok(HandlerResult::error(
-                    STATUS_BAD_REQUEST,
-                    error_entity(
-                        "ambiguous_resource",
-                        "register requires exactly one resource target (system/handler/{pattern})",
-                    ),
-                )),
-            };
+        // §6.13 + §3.3 + §5.2's subject rule (0.8.2.20). Both arms were
+        // already the right way round here — absent → `path_required`, more
+        // than one → `ambiguous_resource`, NOT inverted — which is what arch
+        // asked every seat to check separately, because three of keystone's
+        // five generator backends emit the `>1` code for the `=0` condition
+        // and two of those *have* the count. What this call adds is the
+        // EFFECTIVE set (a self-excluded lone target is the absent case) and
+        // the `malformed_resource` arm for a lone pattern target.
+        let qualified_resource = match entity_handler::require_single_resource_path(
+            ctx.resource_target.as_ref(),
+            &self.local_peer_id,
+            "register (system/handler/{pattern})",
+        ) {
+            Ok(p) => p,
+            Err(e) => return Ok(e),
+        };
         let pattern = match parse_handler_resource_pattern(&qualified_resource) {
             Some(p) => p,
             None => {
@@ -438,38 +420,14 @@ impl HandlersHandler {
         // `system/handler/unregister-request` wrapper is eliminated; params
         // is the empty-params shape (`primitive/any` with `a0` data) and is
         // ignored here.
-        let qualified_resource = match ctx.resource_target.as_ref() {
-            Some(rt) if rt.targets.len() == 1 && rt.exclude.is_empty() => rt.targets[0].clone(),
-            // §3.3 (0.8.2.18): ABSENT is `path_required`, MORE THAN ONE is
-            // `ambiguous_resource` — two inputs, two remedies, and collapsing
-            // them is non-conformant on the absent case. A non-empty `exclude`
-            // stays on the ambiguous arm: §3.3 names two inputs and an
-            // exclusion set is neither.
-            None => {
-                return Ok(HandlerResult::error(
-                    STATUS_BAD_REQUEST,
-                    error_entity(
-                        "path_required",
-                        "unregister requires a resource target (system/handler/{pattern})",
-                    ),
-                ))
-            }
-            Some(rt) if rt.targets.is_empty() => {
-                return Ok(HandlerResult::error(
-                    STATUS_BAD_REQUEST,
-                    error_entity(
-                        "path_required",
-                        "unregister requires a resource target (system/handler/{pattern})",
-                    ),
-                ))
-            }
-            _ => return Ok(HandlerResult::error(
-                STATUS_BAD_REQUEST,
-                error_entity(
-                    "ambiguous_resource",
-                    "unregister requires exactly one resource target (system/handler/{pattern})",
-                ),
-            )),
+        // §6.13 + §3.3 + §5.2's subject rule (0.8.2.20) — see `handle_register`.
+        let qualified_resource = match entity_handler::require_single_resource_path(
+            ctx.resource_target.as_ref(),
+            &self.local_peer_id,
+            "unregister (system/handler/{pattern})",
+        ) {
+            Ok(p) => p,
+            Err(e) => return Ok(e),
         };
         let pattern = match parse_handler_resource_pattern(&qualified_resource) {
             Some(p) => p,
@@ -726,7 +684,7 @@ mod tests {
     use entity_store::{MemoryContentStore, MemoryLocationIndex};
     use std::collections::HashMap;
 
-    const TEST_PID: &str = "testpeer123456789012345678901234567890123456";
+    const TEST_PID: &str = "testpeer123456789ABCDEFGHJKLMNPQRSTUVWXYZabcde";
 
     fn test_handler() -> HandlersHandler {
         HandlersHandler::new(
@@ -889,6 +847,33 @@ mod tests {
                     }),
                     "ambiguous_resource",
                 ),
+                // --- 0.8.2.20: the arity answers from the EFFECTIVE list ---
+                // One target the caller excluded IS the absent case. This row is
+                // the §6.13 half of `F68`/`CP-12a`: the dispatch-level check
+                // SKIPS a self-excluded target, so `register` used to install a
+                // handler at a path no authorization covered.
+                (
+                    "self-excluded lone target",
+                    Some(entity_capability::ResourceTarget {
+                        targets: vec![one.clone()],
+                        exclude: vec![one.clone()],
+                    }),
+                    "path_required",
+                ),
+                // Two targets, one excluded → effective arity ONE, so this must
+                // NOT be `ambiguous_resource`. It is the row that separates
+                // *reduce* from *reject*, and it is what the seven
+                // `rt.exclude.is_empty()` guards in this tree all failed: they
+                // answered `ambiguous_resource` to any request carrying an
+                // exclusion. It proceeds, so it is driven below rather than here.
+                (
+                    "lone PATTERN target",
+                    Some(entity_capability::ResourceTarget {
+                        targets: vec![format!("/{}/system/handler/app/*", TEST_PID)],
+                        exclude: vec![],
+                    }),
+                    "malformed_resource",
+                ),
             ];
             for (label, rt, want) in cases {
                 let params = build_register_request("app/echo", true, None);
@@ -902,6 +887,50 @@ mod tests {
                 assert_eq!(got, want, "{op} / {label}");
             }
         }
+    }
+
+    /// The row that separates **reduce** from **reject** (0.8.2.20), and the one
+    /// every `rt.exclude.is_empty()` guard in this tree got wrong in the strict
+    /// direction: `targets:[P,Q] exclude:[P]` has an effective list of exactly
+    /// one and MUST **proceed on Q**, not answer `ambiguous_resource`.
+    ///
+    /// Driven separately from the table above because its outcome is a success,
+    /// and asserted on a WITNESS — the registered pattern — rather than on the
+    /// status, because `register` answers 200 whichever of the two targets was
+    /// selected. Status alone cannot tell `effective[0]` from `targets[0]` here;
+    /// that is `GUIDE-CONFORMANCE` §2.4c's rule and the reason core-go's
+    /// `resource_effective` case-D arm scores on the returned entity type.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mixed_target_with_a_self_exclusion_registers_the_survivor() {
+        let handler = test_handler();
+        let excluded = format!("/{}/system/handler/app/excluded", TEST_PID);
+        let survivor = format!("/{}/system/handler/app/echo", TEST_PID);
+
+        let params = build_register_request("app/echo", true, None);
+        let mut ctx = ctx_with_params(params, "register", "app/echo");
+        ctx.resource_target = Some(entity_capability::ResourceTarget {
+            targets: vec![excluded.clone(), survivor.clone()],
+            exclude: vec![excluded.clone()],
+        });
+        let r = handler.handle(&ctx).await.unwrap();
+        assert_eq!(
+            r.status, 200,
+            "effective arity is one — an exclusion is applied, not rejected"
+        );
+        let v: ciborium::Value = ciborium::from_reader(r.result.data.as_slice()).unwrap();
+        let got = v
+            .as_map()
+            .and_then(|m| {
+                m.iter()
+                    .find(|(k, _)| k.as_text() == Some("pattern"))
+                    .and_then(|(_, x)| x.as_text())
+            })
+            .unwrap_or_default()
+            .to_string();
+        assert_eq!(
+            got, "app/echo",
+            "the subject is effective[0] — `targets[0]` is the EXCLUDED path, and              a handler that counts the effective list and then indexes targets[0]              installs at a path nothing authorized while still answering 200"
+        );
     }
 
     // **Mutation 1** — collapse the two new `path_required` arms back into the

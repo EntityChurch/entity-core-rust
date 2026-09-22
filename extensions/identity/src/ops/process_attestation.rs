@@ -36,7 +36,12 @@ impl IdentityHandler {
         // Resource target (when supplied) is the attestation's stored path
         // — used for fail-closed unbind. Optional in v3.3 to keep
         // explicit-call path callable without staging a binding first.
-        let bound_path = self.resource_path(ctx);
+        let bound_path = match self
+            .optional_resource_path(ctx, "process_attestation (the attestation's stored path)")
+        {
+            Ok(p) => p,
+            Err(e) => return Ok(e),
+        };
         let att = match self.attestation_index.get(&attestation_hash) {
             Some(a) => a,
             None => return Ok(error(STATUS_NOT_FOUND, "attestation_not_indexed", "")),

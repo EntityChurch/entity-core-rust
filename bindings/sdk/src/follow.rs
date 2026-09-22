@@ -706,7 +706,7 @@ mod tests {
         let pid = ctx.peer_id().to_string();
         let r = ctx
             .follow(
-                "2KsomeUnconnectedRemotePeerXXXXXXXXXXXXXXXXXX".to_string(),
+                "2KsomeUnconnectedRemotePeer123456789ABCDEFGHJK".to_string(),
                 format!("/{pid}/app/x/"),
                 FollowOptions::continuation(),
             )

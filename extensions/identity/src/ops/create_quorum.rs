@@ -42,15 +42,12 @@ impl IdentityHandler {
         // code comment citing a spec passage is a claim with an expiry date, and
         // the passage this one cited no longer exists. Recorded closed in
         // `docs/SPEC-AMBIGUITIES.md`.
-        let resource_path = match self.resource_path(ctx) {
-            Some(p) => p,
-            None => {
-                return Ok(error(
-                    STATUS_BAD_REQUEST,
-                    "path_required",
-                    "system/identity:create_quorum requires a resource target per V7 §3.2",
-                ))
-            }
+        let resource_path = match self.resource_path(
+            ctx,
+            "system/identity:create_quorum (the quorum storage path)",
+        ) {
+            Ok(p) => p,
+            Err(e) => return Ok(e),
         };
         let map = match decode_map(&ctx.params.data) {
             Ok(m) => m,

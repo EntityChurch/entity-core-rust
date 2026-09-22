@@ -1107,7 +1107,7 @@ mod tests {
     use entity_store::{ContentStore, LocationIndex, MemoryContentStore, MemoryLocationIndex};
     use std::collections::HashMap;
 
-    const TEST_PID: &str = "testpeer123456789012345678901234567890123456";
+    const TEST_PID: &str = "testpeer123456789ABCDEFGHJKLMNPQRSTUVWXYZabcde";
 
     fn make_literal_int(n: i64) -> Entity {
         let data = entity_ecf::cbor_map! {

@@ -94,25 +94,27 @@ impl RoleHandler {
     /// (§3.2 path-as-resource), or the refusal that names **which** wrong shape
     /// arrived.
     ///
-    /// `ENTITY-CORE-PROTOCOL` §3.3 (`0.8.2.18`): *"An operation that requires a
-    /// resource answers ABSENT with `path_required` and MORE THAN ONE with
-    /// `ambiguous_resource`"* — two different inputs with two different
-    /// remedies, and *"a handler specification that collapses them into one code
-    /// is non-conformant on the absent case."* `EXTENSION-ROLE` §4.3 v2.2 swept
-    /// `assign`'s pseudocode to match; the rule is general, so it binds every op
-    /// here that derives its path from `resource.targets[0]`, which is all six.
+    /// One line, because the arity rule and the SELECTION are one function
+    /// now — `entity_handler::require_single_resource_path` (§3.3 + §5.2's
+    /// subject rule, `0.8.2.20`). Three things this handler used to get wrong
+    /// and no longer can:
     ///
-    /// **This replaces a guard that was wrong in BOTH directions**, not one that
-    /// merely used a coarse code. `resource_path` returned
-    /// `targets.first().cloned()`, so `None` — and therefore the
-    /// `ambiguous_resource` every call site raised — meant *absent*, exactly
-    /// inverting the row; and **more than one target was silently accepted**,
-    /// the first one used, so the code named `ambiguous_resource` was the one
-    /// input this handler could never answer with it.
+    /// - `resource_path` returned `targets.first().cloned()`, so `None` — and
+    ///   therefore the `ambiguous_resource` every call site raised — meant
+    ///   *absent*, inverting §3.3's row; and **more than one target was
+    ///   silently accepted**, the first one used, so the code named
+    ///   `ambiguous_resource` was the one input this handler could never
+    ///   answer with it. (Fixed at `0.8.2.18`.)
+    /// - The replacement then required `rt.exclude.is_empty()`, on the reading
+    ///   that *"§3.3 names two inputs and an exclusion set is neither, so
+    ///   picking a third code would be inventing vocabulary."* **That is the
+    ///   reading `0.8.2.20` withdraws.** The exclusion is *applied*, and then
+    ///   the result is counted: `targets:[P,Q] exclude:[P]` proceeds on `Q`,
+    ///   and `targets:[P] exclude:[P]` is the ABSENT case (`path_required`).
+    ///   Six ops here refused both.
+    /// - A lone **pattern** target is now `malformed_resource`, which this
+    ///   handler had no arm for at all.
     ///
-    /// A non-empty `exclude` is deliberately left on the `ambiguous_resource`
-    /// arm: §3.3 names two inputs and an exclusion set is neither, so picking a
-    /// third code would be inventing vocabulary. Noted rather than overlooked.
     /// The `Err` is boxed because `HandlerResult` is 176 bytes and
     /// `clippy::result_large_err` is `-D warnings` here — the call sites
     /// unbox with `*e`.
@@ -121,36 +123,12 @@ impl RoleHandler {
         ctx: &HandlerContext,
         what: &str,
     ) -> Result<String, Box<HandlerResult>> {
-        match ctx.resource_target.as_ref() {
-            None => Err(Box::new(error(
-                STATUS_BAD_REQUEST,
-                "path_required",
-                &format!(
-                    "{} requires a resource target ({})",
-                    ctx.operation.as_str(),
-                    what
-                ),
-            ))),
-            Some(rt) if rt.targets.is_empty() => Err(Box::new(error(
-                STATUS_BAD_REQUEST,
-                "path_required",
-                &format!(
-                    "{} requires a resource target ({})",
-                    ctx.operation.as_str(),
-                    what
-                ),
-            ))),
-            Some(rt) if rt.targets.len() == 1 && rt.exclude.is_empty() => Ok(rt.targets[0].clone()),
-            Some(_) => Err(Box::new(error(
-                STATUS_BAD_REQUEST,
-                "ambiguous_resource",
-                &format!(
-                    "{} requires exactly one resource target ({})",
-                    ctx.operation.as_str(),
-                    what
-                ),
-            ))),
-        }
+        entity_handler::require_single_resource_path(
+            ctx.resource_target.as_ref(),
+            &self.local_peer_id,
+            &format!("{} ({})", ctx.operation.as_str(), what),
+        )
+        .map_err(Box::new)
     }
 }
 

@@ -969,8 +969,59 @@ pub enum CasError {
 ///
 /// Maps string paths to content hashes. Implementations must be
 /// safe for concurrent access.
+/// Whether `path` may be used as a **storage key** (§5.4 — 0.8.2.21).
+///
+/// > *"Path validation is a property of the BOUNDARY, not of the channel. Every
+/// > path that reaches the location index, the content store, or the tree is
+/// > validated at that boundary — whatever carried it… A path that
+/// > canonicalizes to `NEVER_MATCH` MUST NOT be stored, used as a storage key,
+/// > or resolved against the tree."*
+///
+/// **This is the second of two independent layers and neither substitutes for
+/// the other** (EXTENSION-TREE v4.9 states it in those words). The handler's
+/// `400 invalid_path` is what the *caller* is told; this is what makes the
+/// operation safe if some future call site forgets to tell them — which is not
+/// hypothetical, because the channel that produced the sibling's remote DoS
+/// (`params`) had no admission step at all and the one before it (`resource`)
+/// did.
+///
+/// ⚠ **Structural rules only, and the omission is deliberate and scoped.** This
+/// rejects the shapes §1.4 forbids at *every* layer: control characters, empty
+/// segments, the reserved dot tokens as whole segments, and the `NEVER_MATCH`
+/// sentinel itself. It does **not** apply `validate_absolute_path`'s
+/// first-segment-is-a-peer-id clause, because that clause's own doc comment
+/// scopes it to *"the protocol boundary on tree paths"* — this index is also the
+/// toolkit-deployment substrate (`ARCHITECTURE.md`'s data-toolkit role), where
+/// keys are legitimately not peer-qualified. Enforcing the peer-id rule here
+/// would refuse writes no protocol surface can produce and no spec sentence
+/// forbids. Stated rather than left as a silent narrowing.
+///
+/// **Two call sites, not four.** `OpfsLocationIndex` and `IdbLocationIndex`
+/// both delegate their `set` to an inner `MemoryLocationIndex`, so guarding
+/// `Memory` covers three backends; `Sqlite` holds its own map and is the
+/// second. A new backend that does not delegate owes this call — the
+/// enumeration is `grep -rn 'impl LocationIndex for'`, and
+/// `every_backend_refuses_a_malformed_storage_key` is where it is checked.
+pub fn path_is_storable(path: &str) -> bool {
+    if path.is_empty() || path == entity_entity::NEVER_MATCH {
+        return false;
+    }
+    if path.contains("//") || path.chars().any(|c| c.is_control()) {
+        return false;
+    }
+    !path
+        .split('/')
+        .any(|segment| segment == "." || segment == "..")
+}
+
 pub trait LocationIndex: Send + Sync {
     /// Set a path to point to a hash.
+    ///
+    /// **A write at a path [`path_is_storable`] refuses is dropped, not
+    /// panicked on** (§5.4 — 0.8.2.21). `set` has no error channel, so the
+    /// refusal is a no-op plus a `warn`: the caller-facing diagnostic is the
+    /// handler's `400 invalid_path`, and this layer exists so that a call site
+    /// which never produced one cannot corrupt the key space.
     fn set(&self, path: &str, hash: Hash);
 
     /// Get the hash at a path.
@@ -1191,6 +1242,15 @@ impl MemoryLocationIndex {
 
 impl LocationIndex for MemoryLocationIndex {
     fn set(&self, path: &str, hash: Hash) {
+        // §5.4 (0.8.2.21) — the boundary guard. Covers Opfs and Idb too: both
+        // delegate here. See `path_is_storable`.
+        if !path_is_storable(path) {
+            tracing::warn!(
+                path = %path.escape_debug(),
+                "location index: refused a write at a malformed path (§5.4)"
+            );
+            return;
+        }
         self.paths.write().unwrap().insert(path.to_string(), hash);
     }
 
@@ -1787,5 +1847,70 @@ mod tests {
 
         // Broadcast should NOT fire due to hook halt
         assert!(events.lock().unwrap().is_empty());
+    }
+
+    /// ⛔ **The boundary half of `CORE-PARAMS-PATH-TOTAL-1` (§5.4 — 0.8.2.21),
+    /// and the half the conformance vector cannot see.**
+    ///
+    /// The vector drives a handler and reads a status; this is the layer under
+    /// it. EXTENSION-TREE v4.9 states the two as independent in as many words:
+    /// *"The 400 is what the caller is told; the total boundary is what makes
+    /// the operation safe if some future call site forgets to tell them.
+    /// Neither substitutes for the other."*
+    ///
+    /// **Total is the load-bearing word and it is asserted twice here.** A
+    /// malformed key must not be STORED — and the store must not PANIC deciding
+    /// that, which is the shape that was a remote DoS in a sibling: any
+    /// authenticated peer holding an ordinary grant could crash the connection
+    /// task. Every row below would be an unwind rather than a failure if the
+    /// boundary asserted.
+    #[test]
+    fn a_malformed_storage_key_is_refused_and_never_panics() {
+        let li = MemoryLocationIndex::new();
+        let h = Hash::compute("test", b"x");
+        let pid = "z6MkTestPeer1111111111111111111111111111111111";
+
+        let malformed = [
+            format!("/{pid}/\u{1}evil"), // the vector's own probe value
+            format!("/{pid}/a//b"),      // empty segment
+            format!("/{pid}/a/../etc"),  // reserved dot token as a segment
+            format!("/{pid}/a/./b"),
+            entity_entity::NEVER_MATCH.to_string(),
+            String::new(),
+        ];
+        for path in &malformed {
+            li.set(path, h);
+            assert!(
+                li.get(path).is_none(),
+                "a malformed key is never stored: {:?}",
+                path
+            );
+            assert!(!li.has(path));
+            // A read at an invalid path is ABSENT, and remove/list are total too
+            // — these are the calls that unwound in the sibling's DoS.
+            assert!(li.remove(path).is_none());
+            assert!(li.list(path).is_empty());
+        }
+
+        // CONTROL — a well-formed key round-trips. Without it every assertion
+        // above is satisfied by an index that stores nothing, which is exactly
+        // what a too-strict guard looks like from outside.
+        let good = format!("/{pid}/app/data");
+        li.set(&good, h);
+        assert_eq!(li.get(&good), Some(h));
+
+        // CONTROL 2 — a dot-PREFIXED segment is not a dot TOKEN. `.hidden` and
+        // `..config` are ordinary names and must still store; the rule is about
+        // whole segments.
+        for ok in [format!("/{pid}/.hidden/x"), format!("/{pid}/..config")] {
+            li.set(&ok, h);
+            assert_eq!(li.get(&ok), Some(h), "{ok} is a name, not a dot token");
+        }
+
+        // CONTROL 3 — the deliberate NON-application of the peer-id clause. A
+        // bare toolkit key stores; see `path_is_storable`'s doc comment for why
+        // that is scoped rather than overlooked.
+        li.set("docs/readme", h);
+        assert_eq!(li.get("docs/readme"), Some(h));
     }
 }

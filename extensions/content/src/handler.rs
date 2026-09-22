@@ -53,6 +53,9 @@ pub const DEFAULT_GET_FRAME_BUDGET: u64 = (16 * 1024 * 1024) - (64 * 1024);
 /// The optional `system/content` handler (§6).
 pub struct SystemContentHandler {
     qualified_pattern: String,
+    /// Needed by the §3.3/§5.2 subject derivation — `effective_targets`
+    /// canonicalizes against the local peer.
+    local_peer_id: String,
     content_store: Arc<dyn ContentStore>,
     /// LocationIndex for writing the §6.4.2 Hash Tree Presence
     /// binding at ingest time. Optional **only** so call sites that
@@ -95,6 +98,7 @@ impl SystemContentHandler {
     pub fn new(local_peer_id: &str, content_store: Arc<dyn ContentStore>) -> Self {
         Self {
             qualified_pattern: format!("/{}/system/content", local_peer_id),
+            local_peer_id: local_peer_id.to_string(),
             content_store,
             location_index: None,
             get_frame_budget: DEFAULT_GET_FRAME_BUDGET,
@@ -131,10 +135,16 @@ impl SystemContentHandler {
     }
 
     async fn handle_get(&self, ctx: &HandlerContext) -> HandlerResult {
-        if !has_resource(ctx) {
-            return path_required(
-                "system/content:get requires a resource field naming the namespace path",
-            );
+        // §6.2 path_required + §3.3's other two arms + §5.2's subject rule
+        // (0.8.2.20). The presence gate this replaces had no arity check at
+        // all, so `targets:[A,B]` silently used the first and a lone pattern
+        // target was accepted as a namespace.
+        if let Err(e) = entity_handler::require_single_resource_path(
+            ctx.resource_target.as_ref(),
+            &self.local_peer_id,
+            "system/content:get (the namespace path)",
+        ) {
+            return e;
         }
         let params: Value = match ciborium::from_reader(ctx.params.data.as_slice()) {
             Ok(v) => v,
@@ -269,11 +279,17 @@ impl SystemContentHandler {
     }
 
     fn handle_ingest(&self, ctx: &HandlerContext) -> HandlerResult {
-        if !has_resource(ctx) {
-            return path_required(
-                "system/content:ingest requires a resource field naming the namespace path",
-            );
-        }
+        // §6.3 path_required + §3.3's other two arms + §5.2's subject rule
+        // (0.8.2.20) — see `handle_get`. The selected path is the namespace the
+        // §6.4.2 bindings are written under, resolved once here and used below.
+        let namespace_uri = match entity_handler::require_single_resource_path(
+            ctx.resource_target.as_ref(),
+            &self.local_peer_id,
+            "system/content:ingest (the namespace path)",
+        ) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
         let params: Value = match ciborium::from_reader(ctx.params.data.as_slice()) {
             Ok(v) => v,
             Err(e) => return bad_request("invalid_params", &format!("cbor: {}", e)),
@@ -307,13 +323,10 @@ impl SystemContentHandler {
         // namespace — leaving suffix empty and binding under the
         // wrong path. Resource-driven is the wire-correct read.
         //
-        // (We've already gated entry with `has_resource(ctx)` above,
-        // so unwrapping the first target is safe.)
-        let namespace_uri = ctx
-            .resource_target
-            .as_ref()
-            .and_then(|rt| rt.targets.first().cloned())
-            .expect("has_resource gate guarantees targets[0]");
+        // The namespace is `effective_targets(...)[0]`, resolved at the top of
+        // this function by `require_single_resource_path` — never
+        // `targets.first()`, which is the target the authorizer may have
+        // skipped (§5.2's subject rule).
 
         if env_present {
             self.ingest_envelope(envelope.unwrap(), &namespace_uri)
@@ -569,20 +582,9 @@ fn decode_core_entity(value: &Value) -> Result<Entity, String> {
     Entity::new(&etype, data_bytes).map_err(|e| e.to_string())
 }
 
-fn has_resource(ctx: &HandlerContext) -> bool {
-    ctx.resource_target
-        .as_ref()
-        .map(|rt| !rt.targets.is_empty())
-        .unwrap_or(false)
-}
-
 // ---------------------------------------------------------------------------
 // Result helpers
 // ---------------------------------------------------------------------------
-
-fn path_required(message: &str) -> HandlerResult {
-    bad_request("path_required", message)
-}
 
 /// §3.3's 501 row (0.8.2.7): a handler IS registered at the path and does not
 /// implement the named operation. The default `code` is mandatory for the

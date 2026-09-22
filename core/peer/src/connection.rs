@@ -2054,6 +2054,29 @@ pub(crate) async fn dispatch_request(
                 qualified_targets.push(qualified);
             }
             rt.targets = qualified_targets;
+            // §5.2 subject rule (0.8.2.20): narrow `targets` to the EFFECTIVE
+            // set here, at the one boundary every inbound EXECUTE crosses, so
+            // no handler downstream can be handed a target the authorizer
+            // skipped. `effective_targets` is the same function
+            // `check_resource_scope` iterates and the same one
+            // `require_single_resource_path` calls — applying it twice is a
+            // no-op (it is idempotent), and applying it HERE is what makes the
+            // rule structural instead of an obligation re-discharged at ~20
+            // handlers with no gate. `exclude` is deliberately KEPT: §5.2's
+            // pattern arm reads the caller's exclude to decide whether a
+            // wildcard target may overlap a grant exclude, so dropping it here
+            // would silently delete that check — the shape core-go hit from
+            // the other direction when its normalizer rebuilt the struct
+            // without the field.
+            //
+            // 0.8.2.21 made `effective_targets` return the RAW survivor rather
+            // than the canonical one. That is a no-op **at this boundary and
+            // only here**, because the loop above already replaced every entry
+            // with `qualify_path`'s output — so "raw" and "canonical" are the
+            // same string by the time this line runs. The handler still sees
+            // absolute targets; what changed is that the narrowing no longer
+            // *performs* the qualification, it inherits it.
+            rt.targets = entity_capability::effective_targets(Some(&rt), pid.as_str());
             Some(rt)
         }
         None => None,
@@ -4285,6 +4308,14 @@ pub fn make_execute_fn(
                             qualified.push(q);
                         }
                         rt.targets = qualified;
+                        // §5.2 subject rule (0.8.2.20) — same narrowing as the
+                        // wire path above. It runs on the sub-dispatch seam
+                        // too because the effective set is a property of the
+                        // REQUEST, not of whether a capability was checked: a
+                        // reduction that lived only in the authorizer would
+                        // give the same request a different arity answer
+                        // depending on whether one was presented.
+                        rt.targets = entity_capability::effective_targets(Some(&rt), pid.as_str());
                         Some(rt)
                     }
                     None => None,

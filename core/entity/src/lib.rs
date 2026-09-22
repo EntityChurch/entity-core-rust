@@ -54,6 +54,18 @@ pub fn canonical_deletion_marker_hash() -> Hash {
 /// URI scheme for entity references.
 pub const URI_SCHEME: &str = "entity://";
 
+/// The unmatchable canonical value (§5.4, 0.8.2.20). See
+/// `entity_capability::NEVER_MATCH`, which re-exports this constant — the
+/// definition lives here because `core/entity` sits above `core/capability` in
+/// the crate DAG and both `qualify_path` and `canonicalize` must return the
+/// *same* string for the matcher rule to hold across them.
+///
+/// A single-segment absolute path whose first segment cannot be a `peer_id`
+/// ([`EntityUri::is_peer_id`] requires >= 46 Base58 characters and `-` is
+/// outside the Base58 alphabet), so it is unreachable as a canonical path by
+/// construction rather than by prohibition. Star-free, plain ASCII, greppable.
+pub const NEVER_MATCH: &str = "/never-match";
+
 /// An entity: the fundamental unit of content-addressed data.
 ///
 /// Contains a type string, raw CBOR data bytes, and its content hash.
@@ -393,22 +405,33 @@ impl EntityUri {
     /// - `system/tree` (peer-relative) → `/{local_peer_id}/system/tree`
     /// - `*` (bare wildcard) → `/{local_peer_id}/*`
     ///
-    /// Rejects reserved prefixes (`./`, `../`) and ambiguous `*/rest`.
+    /// **Total** (§5.4, 0.8.2.20). The three reserved shapes — `./…`, `../…`
+    /// and the ambiguous bare `*/…` — yield [`NEVER_MATCH`], which
+    /// [`Self::validate_absolute_path`] then refuses, so the dispatch sites'
+    /// existing post-qualify check answers the caller `400 invalid_path`
+    /// (§6.5 admission, `CORE-TREE-PATH-FLEX-1`).
+    ///
+    /// ⛔ These three shapes were `assert!`s, and `validate_path_input` — the
+    /// pre-qualify guard both dispatch sites run — rejects `./` and `../` but
+    /// **not** `*/`. So an inbound EXECUTE carrying
+    /// `resource: {targets: ["*/anything"]}` reached this function and
+    /// **panicked**, killing the connection task, from any authenticated peer
+    /// and *before* `check_permission` ran. A path helper that panics on
+    /// caller-controlled input is a defect whichever answer is correct; the
+    /// answer here is the one §5.4 already gives its sibling `canonicalize`.
     pub fn qualify_path(path: &str, local_peer_id: &str) -> String {
         // Strip entity:// scheme → produce absolute path
         if let Some(rest) = path.strip_prefix(URI_SCHEME) {
             return Self::clean_path(&format!("/{}", rest));
         }
-        // Reject reserved directory-relative paths
-        assert!(
-            !path.starts_with("./") && !path.starts_with("../"),
-            "reserved: directory-relative paths (./ and ../) are not yet supported"
-        );
-        // Reject ambiguous bare */rest — must use /*/rest
-        assert!(
-            !path.starts_with("*/"),
-            "ambiguous: use /*/rest for peer wildcard patterns"
-        );
+        // Reserved directory-relative paths (§1.4).
+        if path.starts_with("./") || path.starts_with("../") {
+            return NEVER_MATCH.to_string();
+        }
+        // Ambiguous bare */rest — must use /*/rest.
+        if path.starts_with("*/") {
+            return NEVER_MATCH.to_string();
+        }
         // Already absolute → pass through
         if path.starts_with('/') {
             return Self::clean_path(path);
@@ -539,17 +562,30 @@ impl EntityUri {
     /// `tree.snapshot`, `tree.extract`, `tree.merge`). Callers that want a
     /// canonical binding path should strip trailing slashes themselves.
     ///
-    /// Rejects reserved directory-relative prefixes (`./`, `../`).
+    /// **Total.** Cleans whatever it is given and never panics (§5.4,
+    /// 0.8.2.21: *"path validation is a property of the BOUNDARY, not of the
+    /// channel… a boundary MUST NOT assert on a malformed path"*).
+    ///
+    /// ⛔ **This function used to `assert!` on a leading `./` or `../`, under a
+    /// `#[should_panic]` test that made the crash read as intentional.** It is
+    /// the same shape as `qualify_path`'s `*/` assert, which was wire-reachable
+    /// and shipped; this one was not reachable through `qualify_path` (the
+    /// reserved prefixes are answered with `NEVER_MATCH` before this is called)
+    /// but it is a `pub` path helper on the store side of the tree, and *"not
+    /// reachable today"* is the sentence that was true about the other one
+    /// until a params channel appeared. The **disposition** for a reserved
+    /// prefix lives at the boundary that has a caller to answer —
+    /// [`Self::validate_path_input`] (`400 invalid_path`) and
+    /// `entity_capability::canonicalize` ([`NEVER_MATCH`]) — not here.
+    ///
+    /// Cleaning is not canonicalization: this collapses `//` and preserves
+    /// leading/trailing `/`. It does not resolve `.` or `..` segments and never
+    /// did — [`is_safe_path_segment`] is the defense for an interpolated value.
     pub fn clean_path(input: &str) -> String {
         // Handle entity:// scheme — clean only the path portion
         if let Some(rest) = input.strip_prefix(URI_SCHEME) {
             return format!("{}{}", URI_SCHEME, Self::clean_path(rest));
         }
-        // Reject reserved directory-relative prefixes
-        assert!(
-            !input.starts_with("./") && !input.starts_with("../"),
-            "reserved: directory-relative paths (./ and ../) are not yet supported"
-        );
         if input.is_empty() {
             return String::new();
         }
@@ -1020,25 +1056,46 @@ mod tests {
         );
     }
 
+    /// `qualify_path` is TOTAL (§5.4, 0.8.2.20): the three reserved shapes
+    /// yield `NEVER_MATCH`, and `validate_absolute_path` then refuses it, so the
+    /// dispatch sites' existing post-qualify check answers the caller
+    /// `400 invalid_path`.
+    ///
+    /// ⛔ **These three rows asserted `#[should_panic]`, and the `*/` one was
+    /// reachable from the wire.** `validate_path_input` — the pre-qualify guard
+    /// both dispatch sites in `connection.rs` run — rejects `./` and `../` and
+    /// does **not** reject `*/`, so an inbound EXECUTE carrying
+    /// `resource: {targets: ["*/anything"]}` reached `qualify_path` and
+    /// panicked, from any authenticated peer and *before* `check_permission`.
+    /// The `should_panic` attribute is what made that read as intentional.
     #[test]
-    #[should_panic(expected = "ambiguous")]
-    fn test_qualify_path_rejects_bare_star_slash() {
+    fn qualify_path_is_total_over_the_three_reserved_shapes() {
         let pid = entity_crypto::Keypair::from_seed([42u8; 32]).peer_id();
-        EntityUri::qualify_path("*/system/tree", pid.as_str());
+        for reserved in ["*/system/tree", "./relative", "../parent"] {
+            let got = EntityUri::qualify_path(reserved, pid.as_str());
+            assert_eq!(
+                got, NEVER_MATCH,
+                "{reserved} must canonicalize to NEVER_MATCH"
+            );
+            // The sentinel's own contract: it is refused by the post-qualify
+            // validator, which is where the diagnostic the matcher cannot raise
+            // is delivered to the caller.
+            assert!(
+                EntityUri::validate_absolute_path(&got).is_err(),
+                "NEVER_MATCH must fail validate_absolute_path"
+            );
+        }
     }
 
+    /// CONTROL for the row above: an ordinary peer-relative path is still
+    /// qualified and still validates. Without this, replacing the whole function
+    /// body with `NEVER_MATCH` would pass.
     #[test]
-    #[should_panic(expected = "reserved")]
-    fn test_qualify_path_rejects_dot_slash() {
+    fn qualify_path_still_qualifies_an_ordinary_relative_path() {
         let pid = entity_crypto::Keypair::from_seed([42u8; 32]).peer_id();
-        EntityUri::qualify_path("./relative", pid.as_str());
-    }
-
-    #[test]
-    #[should_panic(expected = "reserved")]
-    fn test_qualify_path_rejects_dotdot_slash() {
-        let pid = entity_crypto::Keypair::from_seed([42u8; 32]).peer_id();
-        EntityUri::qualify_path("../parent", pid.as_str());
+        let got = EntityUri::qualify_path("system/tree", pid.as_str());
+        assert_eq!(got, format!("/{}/system/tree", pid.as_str()));
+        assert!(EntityUri::validate_absolute_path(&got).is_ok());
     }
 
     // --- strip_peer_prefix tests ---
@@ -1104,10 +1161,36 @@ mod tests {
         assert_eq!(EntityUri::clean_path("system/tree"), "system/tree");
     }
 
+    /// ⛔ **This row asserted `#[should_panic(expected = "reserved")]`, and the
+    /// attribute is what kept anybody from re-asking whether a caller could
+    /// reach it** — the identical construction that hid the wire-reachable
+    /// `qualify_path` panic one revision ago. §5.4 (0.8.2.21) states the rule
+    /// as a property of the boundary: a path helper MUST NOT assert on a
+    /// malformed path. The refusal moved to the boundaries that have a caller
+    /// to answer; `clean_path` is total.
+    ///
+    /// Both reserved prefixes and the `entity://`-wrapped forms, because
+    /// `clean_path` recurses through the scheme arm and the recursion is where
+    /// the old assert was actually reachable: `clean_path("entity://./x")`
+    /// panicked while `qualify_path("entity://./x")` did not.
     #[test]
-    #[should_panic(expected = "reserved")]
-    fn test_clean_path_rejects_dot_slash() {
-        EntityUri::clean_path("./relative");
+    fn clean_path_is_total_on_the_reserved_prefixes() {
+        for input in ["./relative", "../escape", ".", "..", "./"] {
+            let cleaned = EntityUri::clean_path(input);
+            assert_eq!(
+                cleaned, input,
+                "cleaning collapses slashes only; it does not resolve dot tokens"
+            );
+        }
+        assert_eq!(
+            EntityUri::clean_path("entity://./x"),
+            "entity://./x",
+            "the scheme arm recurses — it is where the assert was reachable"
+        );
+        // The disposition lives at the boundaries, and it is unchanged.
+        assert!(EntityUri::validate_path_input("./relative").is_err());
+        assert_eq!(EntityUri::qualify_path("./relative", "peer"), NEVER_MATCH);
+        assert_eq!(EntityUri::qualify_path("../escape", "peer"), NEVER_MATCH);
     }
 
     #[test]

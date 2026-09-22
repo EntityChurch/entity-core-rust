@@ -571,15 +571,17 @@ impl Handler for ContinuationHandler {
 
 impl ContinuationHandler {
     async fn handle_advance(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
-        let path = match ctx.resource_target.as_ref().and_then(|r| r.targets.first()) {
-            Some(p) if !p.is_empty() => p.clone(),
-            _ => {
-                tracing::debug!(request_id = %ctx.request_id, "continuation advance: missing resource target");
-                return Ok(error_result(
-                    STATUS_BAD_REQUEST,
-                    "invalid_params",
-                    "resource target path required",
-                ));
+        // §3.3 + §5.2's subject rule (0.8.2.20) — the effective set, never
+        // `targets.first()` (`F68`/`CP-12a`).
+        let path = match entity_handler::require_single_resource_path(
+            ctx.resource_target.as_ref(),
+            &self.local_peer_id,
+            "system/continuation:advance (the continuation path)",
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::debug!(request_id = %ctx.request_id, "continuation advance: resource target refused");
+                return Ok(e);
             }
         };
 
@@ -1922,34 +1924,17 @@ impl ContinuationHandler {
         // eliminated. Caller passes a continuation entity directly as params;
         // the install path is carried in resource. Forward-vs-join is
         // discriminated by `params.type`.
-        let qualified_path = match ctx.resource_target.as_ref() {
-            Some(rt) if rt.targets.len() == 1 && rt.exclude.is_empty() => rt.targets[0].clone(),
-            // §3.3 (0.8.2.18): ABSENT is `path_required`, MORE THAN ONE is
-            // `ambiguous_resource` — two inputs, two remedies, and collapsing
-            // them is non-conformant on the absent case. A non-empty `exclude`
-            // stays on the ambiguous arm: §3.3 names two inputs and an
-            // exclusion set is neither.
-            None => {
-                return Ok(error_result(
-                    STATUS_BAD_REQUEST,
-                    "path_required",
-                    "install requires a resource target (the suspended continuation path)",
-                ));
-            }
-            Some(rt) if rt.targets.is_empty() => {
-                return Ok(error_result(
-                    STATUS_BAD_REQUEST,
-                    "path_required",
-                    "install requires a resource target (the suspended continuation path)",
-                ));
-            }
-            _ => {
-                return Ok(error_result(
-                    STATUS_BAD_REQUEST,
-                    "ambiguous_resource",
-                    "install requires exactly one resource target (the suspended continuation path)",
-                ));
-            }
+        // §3.3 + §5.2's subject rule (0.8.2.20): one function answers the arity
+        // and returns the element. Replaces a block that required
+        // `rt.exclude.is_empty()` — so it refused every request carrying an
+        // exclusion — and had no `malformed_resource` arm.
+        let qualified_path = match entity_handler::require_single_resource_path(
+            ctx.resource_target.as_ref(),
+            &self.local_peer_id,
+            "install (the suspended continuation path)",
+        ) {
+            Ok(p) => p,
+            Err(e) => return Ok(e),
         };
 
         // Discriminate by entity type. Both forward and join are accepted by
@@ -2217,15 +2202,14 @@ impl ContinuationHandler {
 
 impl ContinuationHandler {
     async fn handle_resume(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
-        let path = match ctx.resource_target.as_ref().and_then(|r| r.targets.first()) {
-            Some(p) if !p.is_empty() => p.clone(),
-            _ => {
-                return Ok(error_result(
-                    STATUS_BAD_REQUEST,
-                    "invalid_params",
-                    "resource target path required",
-                ));
-            }
+        // §3.3 + §5.2's subject rule (0.8.2.20) — see `handle_advance`.
+        let path = match entity_handler::require_single_resource_path(
+            ctx.resource_target.as_ref(),
+            &self.local_peer_id,
+            "system/continuation:resume (the continuation path)",
+        ) {
+            Ok(p) => p,
+            Err(e) => return Ok(e),
         };
 
         let execute_fn = ctx
@@ -2300,15 +2284,14 @@ impl ContinuationHandler {
 
 impl ContinuationHandler {
     async fn handle_abandon(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
-        let path = match ctx.resource_target.as_ref().and_then(|r| r.targets.first()) {
-            Some(p) if !p.is_empty() => p.clone(),
-            _ => {
-                return Ok(error_result(
-                    STATUS_BAD_REQUEST,
-                    "invalid_params",
-                    "resource target path required",
-                ));
-            }
+        // §3.3 + §5.2's subject rule (0.8.2.20) — see `handle_advance`.
+        let path = match entity_handler::require_single_resource_path(
+            ctx.resource_target.as_ref(),
+            &self.local_peer_id,
+            "system/continuation:abandon (the continuation path)",
+        ) {
+            Ok(p) => p,
+            Err(e) => return Ok(e),
         };
 
         // Read suspended entity at path
@@ -4110,7 +4093,7 @@ mod tests {
             pattern: format!("/{}/system/continuation", test_peer_id()),
             suffix: String::new(),
             resource_target: Some(entity_capability::ResourceTarget {
-                targets: vec!["cont/test".to_string()],
+                targets: vec![format!("/{}/cont/missing", test_peer_id())],
                 exclude: vec![],
             }),
             author: None,
@@ -4141,7 +4124,10 @@ mod tests {
         ]));
         let suspended = Entity::new("system/continuation/suspended", suspended_data).unwrap();
         let hash = h.content_store.put(suspended).unwrap();
-        h.location_index.set("cont/test", hash);
+        // Qualified: the handler's subject is `effective_targets[0]`, which
+        // canonicalizes (§5.2), and that is the only shape the wire produces.
+        let cont_path = format!("/{}/cont/test", test_peer_id());
+        h.location_index.set(&cont_path, hash);
 
         let ctx = HandlerContext {
             handler_grant: None,

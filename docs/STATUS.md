@@ -1,6 +1,6 @@
 # entity-core-rust — status
 
-_Updated: 2026-09-01 · public: v0.8.0 (master)_
+_Updated: 2026-09-11 · public: v0.8.0 (master)_
 
 > **A note on the citations below.** Entries name the handoff, routing note or
 > validation report that produced them — files under `docs/status/` and
@@ -41,6 +41,65 @@ and tree semantics are interop-validated against the Go and Python peers, not
 just self-tested.
 
 ## Where we left off
+
+_2026-09-11 (c) — **`0.8.2.21` absorbed. The exclude fail-open had four sites here, not the three
+the ruling counts, and the third one is not fail-closed by accident.**_
+
+No routing came to this seat — the packet went to `entity-core-go`, keystone and formalization,
+with §6 relaying three lines to us. We took the packet's own header at its word (*"a per-seat
+section is the delta from that seat's last reported state; the RULING is the obligation"*) and
+recomputed the whole revision against our tree. All three findings below came out of that, and
+none of them is in §6.
+
+**`H1` — the fail-open, which was our filing, upheld, with our option (c) promoted from
+*permitted* to *required*.** An unmatchable `exclude` carves out nothing, so a grant is silently
+wider than its author wrote with no error anywhere. Closed in both directions: an unmatchable
+exclude now **denies** at evaluation, and a capability carrying an unmatchable scope pattern is
+refused at mint, at delegate (`400 invalid_path`) and at §5.5 chain verification (403). Two
+layers, neither substituting for the other.
+
+**It is four evaluation sites here, and the two the ruling missed have opposite causes.** The
+**pattern** arm of `check_resource_scope` is exempted by the fold as *"fail-closed BY ACCIDENT via
+a negated test"* — and the negated test is never reached, because `patterns_overlap` against the
+path-shaped sentinel is `false` and the loop `continue`s first. Measured: built spec-literally, it
+**allows**. The fourth site, `check_path_permission`, was **ours** — the spec delegates that
+dimension to `matches_scope` and so inherits the fix for free, while we had open-coded it as
+`is_covered_by(include) && !is_covered_by(exclude)`, which is `matches_scope`'s body minus the new
+arm. That is the site where it costs most: §6.3 is *sole* resource enforcement when `resource` is
+absent.
+
+**`H3` + `EXTENSION-TREE` v4.9 — path validation is a property of the boundary, not the channel.**
+Both layers, which v4.9 states as independent. `extract.paths[]` is validated **every entry before
+reading any** → `400 invalid_path` for the whole request, while a well-formed entry that binds
+nothing stays silently omitted; `merge`'s `target_prefix` likewise, and merge reads *no resource
+target at all*, so nothing upstream had ever seen those paths. On the store side,
+`path_is_storable` at the two `LocationIndex` write sites. Two boundary panics went with it:
+`clean_path`'s assert — sitting under a `#[should_panic]`, the same construction that hid the
+wire-reachable `qualify_path` panic one revision ago — and `SqliteLocationIndex::set`'s `.expect`
+on a database error, which was a panic in the dispatch task.
+
+**`H4` — our ask, ruled, and two rows of the new table are deliberately not applied.** §6.3's
+parameter is now `authority` with §6.8's who-named-the-path table at the `fn`. But that table
+classes *"a listing entry"* and *"a merge expansion"* as handler-derived → the handler's own
+grant, while §6.3's Listing-filter MUST — **unchanged in the same revision** — says each entry is
+checked against the *request's* capability. Applying the table would filter a listing against the
+`/*/*` default self-grant and hand back exactly the entries `F71`/`CP-12a` closed. Held §6.3,
+written the conflict at the code, routed.
+
+**Evidence.** Twelve mutations run, each reddening its own row with the neighbours green, and
+every `H1` row paired with **both** controls `CORE-EXCLUDE-UNMATCHABLE-1` demands — a well-formed
+exclude that still denies *and* one that still allows, because every row in this family is a
+denial and a peer that denies everything would pass all of them. Gate: `make test` 2728/0F across
+129 suites, `lint`, `godot` 261/0F, `wasm`, `features`. Cross-impl at this tree with the peer
+rebuilt (`dirty=true`): `validate-complete.sh rust` — passes 0/0b/1/1b/2/3/4 all exit 0. ⚠ Neither
+new vector is in `entity-core-go`'s check set yet (grepped, zero hits), so that green is a
+regression check and says **nothing** about the two things this revision is for; keystone owns the
+wire arm.
+
+---
+
+### Earlier
+
 
 _2026-09-01 (b) — **§4.7's last two connect-error rows are closed, and building them found two
 defects no conformance probe would have reached.**_

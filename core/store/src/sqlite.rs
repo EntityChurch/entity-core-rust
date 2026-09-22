@@ -168,13 +168,31 @@ pub struct SqliteLocationIndex {
 
 impl LocationIndex for SqliteLocationIndex {
     fn set(&self, path: &str, hash: Hash) {
+        // §5.4 (0.8.2.21) — the boundary guard. The second of the two call
+        // sites; the other is `MemoryLocationIndex`, which Opfs and Idb
+        // delegate to. See `crate::path_is_storable`.
+        if !crate::path_is_storable(path) {
+            tracing::warn!(
+                path = %path.escape_debug(),
+                "sqlite location index: refused a write at a malformed path (§5.4)"
+            );
+            return;
+        }
         let hash_bytes = hash.to_bytes();
         let conn = self.conn.lock().unwrap();
-        conn.execute(
+        // ⛔ Was `.expect("sqlite location set failed")`. A store boundary MUST
+        // NOT assert (§5.4, 0.8.2.21): this is on the tree-write path that every
+        // inbound EXECUTE can reach, so a disk-full or locked-database error was
+        // a panic in the dispatch task. `set` has no error channel — the same
+        // shape `OpfsLocationIndex` already answers with
+        // `log_swallowed_journal_failure`, and this follows that precedent
+        // rather than inventing a second one.
+        if let Err(e) = conn.execute(
             "INSERT OR REPLACE INTO locations (path, hash) VALUES (?1, ?2)",
             params![path, hash_bytes.as_slice()],
-        )
-        .expect("sqlite location set failed");
+        ) {
+            tracing::error!(path = %path.escape_debug(), error = %e, "sqlite location set failed");
+        }
     }
 
     fn get(&self, path: &str) -> Option<Hash> {

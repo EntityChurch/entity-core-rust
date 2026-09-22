@@ -496,28 +496,60 @@ pub struct DelegationCaveats {
 // Pattern matching (§5.4)
 // ---------------------------------------------------------------------------
 
-/// Canonicalize a path or pattern to absolute form.
+/// The unmatchable canonical value (§5.4, 0.8.2.20).
 ///
-/// Returns `None` for malformed patterns, which callers MUST treat as a
-/// deny (V7 §1.11 fail-closed). A malformed pattern presented in a
-/// capability must yield a clean DENY response, never a panic or dropped
-/// connection.
+/// A single-segment absolute path whose first segment cannot be a `peer_id`
+/// — [`entity_entity::EntityUri::is_peer_id`] requires ≥ 46 Base58 characters
+/// and `-` is outside the Base58 alphabet — so it is unreachable as a real
+/// canonical path *by construction*, not by a prohibition somebody has to
+/// remember. Star-free, plain ASCII, greppable.
+///
+/// **Why a sentinel and not `Option`.** Until 0.8.2.20 this module's
+/// `canonicalize` returned `Option<String>` and every caller was obliged to
+/// read `None` as deny. That is a stronger contract in Rust — the compiler
+/// asks the question — and it was the right shape for as long as the rule was
+/// *"a malformed pattern denies."* It is the wrong shape for
+/// [`effective_targets`], whose defined behaviour is that a malformed target
+/// **stays in the effective list** so the arity rule counts it and
+/// `validate_absolute_path` refuses it (§5.2). `None` cannot be put in that
+/// list; a value that matches nothing can. The sentinel is also the cohort's
+/// wire-visible vocabulary, which an `Option` is not.
+pub use entity_entity::NEVER_MATCH;
+
+/// Canonicalize a path or pattern to absolute form. **Total** (§5.4,
+/// 0.8.2.20): the return domain is *a canonical path or [`NEVER_MATCH`]*, and
+/// there is no error channel.
+///
+/// It became total because every normative call site is a **matcher**, which
+/// has nowhere to put an error — `matches_scope` ends in a `matches_pattern`
+/// over two canonicalized operands, `is_covered_by` canonicalizes inside a
+/// matcher argument. A declared failure mode that every caller structurally
+/// discards is not a contract (R11). The diagnostic lives at admission (§6.5),
+/// which has a caller to answer; see `connection.rs`'s `invalid_path` refusal.
 ///
 /// Rules:
 /// - `"entity://{peer}/{path}"` → `"/{peer}/{path}"` (address, not scheme)
 /// - `starts_with("/")` → pass through (already absolute)
 /// - `"*"` → `"/{local_peer_id}/*"` (peer-relative wildcard)
-/// - `"./..."` / `"../..."` → `None` (reserved)
-/// - `"*/..."` → `None` (ambiguous — use `/*/...`)
+/// - `"./..."` / `"../..."` → [`NEVER_MATCH`] (reserved, §1.4)
+/// - `"*/..."` → [`NEVER_MATCH`] (ambiguous — use `/*/...`)
 /// - bare path → `"/{local_peer_id}/{path}"`
-pub fn canonicalize(path: &str, local_peer_id: &str) -> Option<String> {
-    // Reject reserved directory-relative prefixes
+///
+/// The three consumers of [`NEVER_MATCH`] are ruled by §5.4 and all three are
+/// implemented here or next door: [`matches_pattern`] returns `false` for
+/// either operand; [`entity_entity::EntityUri::validate_absolute_path`] errors
+/// on it (its first segment is not a `peer_id`); and `core/store` refuses to
+/// store or resolve it.
+pub fn canonicalize(path: &str, local_peer_id: &str) -> String {
+    // Reserved directory-relative prefixes (§1.4).
     if path.starts_with("./") || path.starts_with("../") {
-        return None;
+        return NEVER_MATCH.to_string();
     }
-    // Reject ambiguous bare */rest — must use /*/rest
+    // Ambiguous bare */rest — must use /*/rest. Matches nothing rather than
+    // erroring (R11): a `*/`-leading pattern in a grant is admitted and
+    // covers no path.
     if path.starts_with("*/") {
-        return None;
+        return NEVER_MATCH.to_string();
     }
     // Full entity URI → absolute path (arch ruling 24: `entity://{p}/x` and
     // `/{p}/x` are the same address, and canonicalization is where they
@@ -535,24 +567,24 @@ pub fn canonicalize(path: &str, local_peer_id: &str) -> Option<String> {
     if path.starts_with("entity://") {
         if let Ok(uri) = entity_entity::EntityUri::parse(path) {
             if !uri.peer_id.is_empty() {
-                return Some(if uri.path.is_empty() {
+                return if uri.path.is_empty() {
                     format!("/{}", uri.peer_id)
                 } else {
                     format!("/{}/{}", uri.peer_id, uri.path)
-                });
+                };
             }
         }
     }
     // Already absolute — pass through
     if path.starts_with('/') {
-        return Some(path.to_string());
+        return path.to_string();
     }
     // Bare wildcard → local peer all paths
     if path == "*" {
-        return Some(format!("/{}/*", local_peer_id));
+        return format!("/{}/*", local_peer_id);
     }
     // Bare path — prepend / + local peer
-    Some(format!("/{}/{}", local_peer_id, path))
+    format!("/{}/{}", local_peer_id, path)
 }
 
 /// Check if a concrete path matches a pattern (§5.4).
@@ -565,6 +597,15 @@ pub fn canonicalize(path: &str, local_peer_id: &str) -> Option<String> {
 /// - `/*/rest` — peer wildcard (any peer, match rest)
 /// - anything else — exact match
 pub fn matches_pattern(path: &str, pattern: &str) -> bool {
+    // §5.4 (0.8.2.20): NEVER_MATCH never matches, in EITHER operand. This arm
+    // is deliberately FIRST and is a *matcher rule*, not a property of the
+    // string — the `pattern == "*"` arm immediately below returns true for any
+    // path, so safety here MUST NOT rest on the sentinel merely looking
+    // unmatchable. Reorder these two and a bare-`*` grant covers every
+    // malformed target in the tree.
+    if path == NEVER_MATCH || pattern == NEVER_MATCH {
+        return false;
+    }
     if pattern == "*" {
         return true;
     }
@@ -638,36 +679,110 @@ pub fn matches_scope(
     exclude: &[String],
     local_peer_id: &str,
 ) -> bool {
-    // Fail-closed (§1.11): a malformed value denies rather than panics.
-    let cv = match canonicalize(value, local_peer_id) {
-        Some(v) => v,
-        None => return false,
-    };
+    // A malformed value canonicalizes to NEVER_MATCH, which the include loop
+    // below cannot match (§5.4's matcher rule) — so it falls through to DENY
+    // without needing a guard of its own.
+    let cv = canonicalize(value, local_peer_id);
 
     // A malformed include can never grant — it simply doesn't match.
-    let matched = include.iter().any(|pattern| {
-        canonicalize(pattern, local_peer_id).is_some_and(|cp| matches_pattern(&cv, &cp))
-    });
+    let matched = include
+        .iter()
+        .any(|pattern| matches_pattern(&cv, &canonicalize(pattern, local_peer_id)));
 
     if !matched {
         return false;
     }
 
-    // A malformed exclude fails closed: treat it as if it matched (deny),
-    // never as a silent no-op that would under-exclude.
-    let excluded = exclude.iter().any(|pattern| {
-        canonicalize(pattern, local_peer_id).is_none_or(|cp| matches_pattern(&cv, &cp))
-    });
+    // ⛔ §5.4 (0.8.2.21): AN UNMATCHABLE EXCLUDE EXCLUDES EVERYTHING.
+    //
+    // The sentinel's safety is DIRECTIONAL and 0.8.2.20 argued it from the
+    // include side only. *Matches nothing* is fail-closed in an include (covers
+    // nothing → the grant grants nothing) and fail-OPEN here (carves out
+    // nothing → the grant is silently WIDER than its author wrote, with no
+    // error anywhere, because the sentinel is designed not to raise). A granter
+    // writing `exclude: ["*/secret"]` — a plausible spelling of *not `secret`,
+    // in any peer's namespace*, where the intended form is `/*/secret` — got an
+    // exclusion that excluded nothing.
+    //
+    // This is the disposition this line carried BEFORE 0.8.2.20 reversed it;
+    // the reversal is corrected at the spec's end and the fail-closed reading
+    // is restored. It is stated HERE, at the scope layer, which already knows
+    // which array it is reading — `matches_pattern` stays uniform over its
+    // operands so it remains transcribable into 46 languages.
+    //
+    // `check_resource_scope`'s concrete arm carries the same arm; its pattern
+    // arm is fail-closed already (see there). The caller's OWN exclude in
+    // `effective_targets` deliberately does not: an unmatchable caller exclude
+    // carves out nothing, so MORE of the caller's targets face the grant check
+    // — that direction narrows, and refusing it would reject a request the
+    // caller is entitled to make.
+    for pattern in exclude {
+        let cp = canonicalize(pattern, local_peer_id);
+        if cp == NEVER_MATCH {
+            return false;
+        }
+        if matches_pattern(&cv, &cp) {
+            return false;
+        }
+    }
 
-    !excluded
+    true
+}
+
+/// The first scope pattern in `grants` that canonicalizes to [`NEVER_MATCH`],
+/// if any — §5.4's *"a capability carrying an unmatchable scope pattern is
+/// INVALID"* `[MUST]` (0.8.2.21).
+///
+/// ⛔ **This is the authoring half of the fail-open, and it is a MUST rather
+/// than a MAY for a cross-peer reason.** An unmatchable pattern is fail-closed
+/// in an `include` and fail-OPEN in an `exclude`; the evaluation-side deny
+/// ([`matches_scope`], [`check_resource_scope`]) closes the hole, and this
+/// closes it at the only moment the **granter** — the party a silently-wider
+/// grant harms — is still present to be told. A peer that refuses the
+/// capability and a peer that honours a grant wider than written reach
+/// **different authorization decisions on the same capability bytes**, which is
+/// the class the specification pins rather than leaves open. Two layers,
+/// because a single layer that author input can make vacuous is not a gate.
+///
+/// **Frame-independent, deliberately, and there is no `local_peer_id`
+/// parameter.** [`canonicalize`] yields [`NEVER_MATCH`] for exactly three
+/// reserved prefixes — `./`, `../`, `*/` — all decided *before* any peer-id
+/// qualification, so the granter frame and the verifier frame give the same
+/// answer. Taking a peer id here would invite a call site to pass the wrong one
+/// and read as though the verdict depended on it.
+///
+/// **Path scopes only.** `operations` and `peers` are id-scopes (§5.2): they
+/// match literally with no §5.4 canonicalization, so no id-scope pattern can
+/// be unmatchable and there is nothing here to check. Stated rather than
+/// omitted — an absent check reads the same as an overlooked one.
+///
+/// Call sites: mint (`system/capability:request`), delegation
+/// (`system/capability:delegate`) → `400 invalid_path`; and chain verification
+/// (§5.5), where it is an invalid capability.
+pub fn unmatchable_scope_pattern(grants: &[GrantEntry]) -> Option<String> {
+    // The frame is irrelevant (see the doc comment); this one is named so that
+    // nobody "fixes" it by threading a peer id in and making the verdict look
+    // frame-dependent. `frame_is_irrelevant_to_the_unmatchable_verdict` fails if
+    // that stops being true.
+    const ANY_FRAME: &str = "unused-frame-see-doc-comment";
+    for grant in grants {
+        for scope in [&grant.handlers, &grant.resources] {
+            for pattern in scope.include.iter().chain(scope.exclude.iter()) {
+                if canonicalize(pattern, ANY_FRAME) == NEVER_MATCH {
+                    return Some(pattern.clone());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Check if a path/pattern is covered by a set of patterns.
 fn is_covered_by(path: &str, pattern_set: &[String], local_peer_id: &str) -> bool {
-    // A malformed pattern cannot cover anything (fail-closed).
+    // A malformed pattern canonicalizes to NEVER_MATCH and covers nothing.
     pattern_set
         .iter()
-        .any(|p| canonicalize(p, local_peer_id).is_some_and(|cp| matches_pattern(path, &cp)))
+        .any(|p| matches_pattern(path, &canonicalize(p, local_peer_id)))
 }
 
 /// Check if a string contains a wildcard.
@@ -918,16 +1033,27 @@ pub fn check_resource_scope(
     let grant_include = &grant_resources.include;
     let grant_exclude = &grant_resources.exclude;
 
-    for target in &resource_target.targets {
-        // Fail-closed: a malformed requested target denies the whole check.
-        let ct = match canonicalize(target, local_peer_id) {
-            Some(v) => v,
-            None => return false,
-        };
+    // §5.2 (0.8.2.20): the authorizer iterates the EFFECTIVE set, named rather
+    // than computed inline. The skip loop that used to live here IS
+    // `effective_targets`; the handler calls the same function, which is the
+    // whole point of the extraction (`F68`/`CP-12a` was two layers deriving one
+    // set independently and drifting).
+    for target in effective_targets(Some(resource_target), local_peer_id) {
+        // `effective_targets` returns the RAW survivors (§5.2, 0.8.2.21), so
+        // this scope check canonicalizes for its own matching. Re-canonicalizing
+        // is not a second derivation of the effective SET — the set is already
+        // decided, and decided canonically inside that function; this is the
+        // same total function applied to a member of it.
+        let ct = canonicalize(&target, local_peer_id);
 
-        // Skip targets fully covered by caller's own exclude (request frame)
-        if is_covered_by(&ct, caller_exclude, local_peer_id) {
-            continue;
+        // Validate concrete path targets at the protocol boundary, and CONSUME
+        // the verdict (§5.4, 0.8.2.20 — R11/G6). This call did not exist here
+        // at all, so a target like `/notapeerid/x` was matched against the
+        // grant as an ordinary string and a broad grant (`*`, `/*/*`) covered
+        // it. NEVER_MATCH is refused by this arm too, by construction: its
+        // first segment is not a peer_id.
+        if !is_pattern(&ct) && entity_entity::EntityUri::validate_absolute_path(&ct).is_err() {
+            return false;
         }
 
         // Target must be covered by grant include (granter frame per PR-8)
@@ -936,13 +1062,27 @@ pub fn check_resource_scope(
         }
 
         if is_pattern(&ct) {
-            // Pattern target: grant excludes must be covered by caller excludes
+            // Pattern target: grant excludes must be covered by caller excludes.
+            //
+            // ⛔ **This arm carries the NEVER_MATCH deny too, and that is a
+            // DEPARTURE from 0.8.2.21's pseudocode — routed, with the
+            // measurement.** The fold's own ledger calls this arm *"fail-closed
+            // BY ACCIDENT, the test is negated for an unrelated reason"* and so
+            // adds the arm only to the concrete branch. The accident does not
+            // hold: `is_covered_by`'s negated test is never REACHED, because
+            // `patterns_overlap(ct, "/never-match")` is false for every real
+            // pattern target — `strip_wildcard` leaves the sentinel intact and
+            // neither string is a prefix of the other — so the loop `continue`s
+            // and the unmatchable grant exclude is skipped exactly as it was in
+            // the concrete arm. Measured, not reasoned:
+            // `the_pattern_arm_is_not_fail_closed_by_accident` fails against a
+            // build of this function without this `if`. Spec-literal here is
+            // fail-OPEN on the third of the three sites 0.8.2.21 enumerates.
             for ge in grant_exclude {
-                // A malformed grant exclude can't be reasoned about → deny.
-                let cge = match canonicalize(ge, granter_peer_id) {
-                    Some(v) => v,
-                    None => return false,
-                };
+                let cge = canonicalize(ge, granter_peer_id);
+                if cge == NEVER_MATCH {
+                    return false;
+                }
                 if !patterns_overlap(&ct, &cge) {
                     continue;
                 }
@@ -951,13 +1091,17 @@ pub fn check_resource_scope(
                 }
             }
         } else {
-            // Concrete target: must not be in grant exclude (granter frame)
+            // Concrete target: must not be in grant exclude (granter frame).
+            //
+            // ⛔ Unmatchable exclude excludes everything (§5.2, 0.8.2.21) — see
+            // `matches_scope` for the direction argument. Without this arm a
+            // grant exclude the granter misspelled carves out NOTHING and the
+            // grant is wider than written.
             for ge in grant_exclude {
-                // A malformed grant exclude can't be reasoned about → deny.
-                let cge = match canonicalize(ge, granter_peer_id) {
-                    Some(v) => v,
-                    None => return false,
-                };
+                let cge = canonicalize(ge, granter_peer_id);
+                if cge == NEVER_MATCH {
+                    return false;
+                }
                 if matches_pattern(&ct, &cge) {
                     return false;
                 }
@@ -965,6 +1109,192 @@ pub fn check_resource_scope(
         }
     }
     true
+}
+
+/// The targets a request **actually names**, after the caller's own exclusions
+/// (§5.2 `effective_targets`, 0.8.2.20/0.8.2.21).
+///
+/// **Returns the RAW survivors; decides the skip on the CANONICAL forms
+/// (0.8.2.21).** Both halves are load-bearing and they pull in opposite
+/// directions. The *skip* MUST be canonical, because two layers have to agree
+/// on which targets survive — that agreement is the whole point of the
+/// function. The *value handed back* is the target as the caller wrote it,
+/// because §6.13 derives a handler's install pattern from this function against
+/// the `system/handler/` prefix and its own worked example target is
+/// peer-relative, so a canonical return makes the derivation it states not
+/// fire. A consumer needing the absolute form calls [`canonicalize`] itself —
+/// `entity_handler::single_effective_target` does, which is why no handler in
+/// this tree changed shape when the return did.
+///
+/// The security property is unchanged under either return: the canonical form
+/// of a raw survivor is a member of the canonical effective set, so
+/// `subject ⊆ effective_targets` holds both ways.
+///
+/// **The authorizer and every handler MUST derive their subject from this one
+/// function.** It is a named function rather than a rule in prose because the
+/// defect it closes is two layers computing the same set independently and
+/// drifting: [`check_resource_scope`] skipped caller-excluded targets while
+/// every handler in the corpus indexed `resource.targets[0]`, and *which*
+/// targets differed was the caller's to choose. A third statement of the rule
+/// would drift the same way; a function has one definition.
+///
+/// Its parameters are deliberately only values a handler already holds
+/// (`ctx.resource_target`, the local peer id) — no grant, no capability, no
+/// dispatch state — so a handler specified in another document can call it.
+///
+/// ⛔ **The count is not the rule; the selection is.** `targets:[P,Q]
+/// exclude:[P]` has an effective list of exactly one, so an arity check
+/// *passes* — and `targets[0]` is still `P`. Index the list you counted. Use
+/// [`require_single_resource_path`](crate::require_single_resource_path)
+/// rather than open-coding the arity arms.
+///
+/// An absent resource yields the empty list, so callers need no separate null
+/// check: *absent* and *present but fully self-excluded* are the same answer to
+/// the same question, and §3.3 gives them the same code (`path_required`).
+pub fn effective_targets(
+    resource_target: Option<&ResourceTarget>,
+    local_peer_id: &str,
+) -> Vec<String> {
+    let Some(rt) = resource_target else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(rt.targets.len());
+    for target in &rt.targets {
+        let ct = canonicalize(target, local_peer_id);
+
+        // The caller targeted it and then excluded it — redundant but valid,
+        // and NOT a subject. The skip is correct and is retained: demanding
+        // grant coverage for a path nobody requested would refuse legitimate
+        // traffic. The defect was never the skip; it was that only one layer
+        // performed it.
+        //
+        // NEVER_MATCH is deliberately NOT skipped: it cannot be covered by any
+        // exclude (§5.4's matcher rule), so it stays in the list, counts toward
+        // the arity, and is refused by `validate_absolute_path` downstream.
+        if is_covered_by(&ct, &rt.exclude, local_peer_id) {
+            continue;
+        }
+        // The RAW survivor, not `ct` (0.8.2.21). The skip above used `ct`;
+        // only the returned value is raw.
+        out.push(target.clone());
+    }
+    out
+}
+
+/// Handler-level path authorization (§6.3 `check_path_permission`).
+///
+/// **This is not a secondary check `[MUST]` (§5.2, 0.8.2.20.)** The
+/// dispatch-level [`check_permission`] authorizes the request the caller
+/// *made*; this authorizes the path the handler is *about to touch*. The two
+/// differ whenever any part of the subject is derived after dispatch:
+///
+/// - `EXECUTE.resource` absent — then this is the **sole** resource enforcement,
+///   because §3.2 runs no dispatch-level resource check at all;
+/// - a path resolved at handler time (a `params.prefix` fallback, a merge
+///   resolving a snapshot into individual writes);
+/// - a listing expanded per entry (`CP-12a`'s wider class — the authorizer
+///   evaluated a prefix *string*, the handler enumerates a *set*);
+/// - `resource` present but the dispatch-level check made vacuous by a caller
+///   exclude covering the caller's own target (`F68`/`CP-12a`).
+///
+/// §6.7 is **act-neutral** (0.8.2.20): reads or writes. The measured harm was a
+/// `get` — disclosure rather than mutation.
+///
+/// `path` MUST come from [`effective_targets`], never `resource.targets[0]`.
+/// Unlike [`check_permission`] this consults three dimensions, not four:
+/// `handlers`, `operations`, `resources`. The `peers` dimension is the dispatch
+/// boundary's and is not re-asked here (§6.3's pseudocode).
+///
+/// **Two canonicalization frames, as at §5.2 (PR-8).** §6.3's pseudocode passes
+/// one `local_peer_id` and predates PR-8; taking it literally would let a
+/// foreign-granted bare `*` in `resources` canonicalize into *our* namespace —
+/// the V1' escalation — and that matters here precisely because this check is
+/// **sole** enforcement when `resource` is absent, so no dispatch-level check
+/// has applied the right frame first. The `path` is a request path and
+/// canonicalizes against `local_peer_id`; the grant's `resources` patterns
+/// canonicalize against `granter_peer_id`. `handlers` and `operations` carry no
+/// peer-id namespace semantics and stay on the local frame. For a self-issued
+/// capability the two coincide — pass `local_peer_id` twice.
+///
+/// ⛔ **The parameter is `authority`, not `capability` (§6.3 — renamed at
+/// 0.8.2.21 because the old name is what caused the defect).** It is NOT *"the
+/// capability on the request"*. It is the authority that authorized **this
+/// dispatch for THIS path**, selected by **who NAMED the path** (§6.8), never
+/// by who initiated the chain:
+///
+/// | the handler is about to touch | the authority is |
+/// |---|---|
+/// | a path the **caller named** — resource target, URI suffix, a `params` path the caller supplied | the caller's **verified** capability |
+/// | a path the **handler derived** that the caller did not name — an autonomous write, a continuation's onward leg | the **executing handler's own grant** |
+/// | a **peer-root** dispatch | **no check** — the capability is informational, and checking it would make this check stricter than the dispatch-level one for the same dispatch |
+///
+/// The two are the same value on the wire and different values everywhere else.
+/// **Measured here:** on a continuation's standing leg the value arriving at
+/// `system/tree:put` was the **inbox deliver token** (`handlers:[system/inbox]`,
+/// `operations:[receive]`), four hops after the delivery that minted it, because
+/// `caller_capability` propagates unchanged **for attribution** — its producer's
+/// own comment says so. Two independent seats filled a parameter named
+/// `capability` from that field.
+///
+/// ⚠ **Two rows of §6.8's table are NOT applied in this tree, and the reason is
+/// a contradiction inside `0.8.2.21` rather than a gap here — routed.** The
+/// table classes *"a merge expansion"* and *"a listing entry"* as
+/// handler-derived and therefore authorized by the handler's own grant. Both
+/// derive from a path the caller **did** name (`params.target_prefix`; the
+/// listing prefix), and §6.3's own *"Listing filter"* MUST — unchanged in the
+/// same revision — says each entry is checked *"against the **request's**
+/// capability"*. Applying the table there would filter the listing against a
+/// grant of `/*/*` and hand back exactly the entries `F71`/`CP-12a` closed.
+/// This tree keeps §6.3's reading for both.
+pub fn check_path_permission(
+    operation: &str,
+    path: &str,
+    authority: &CapabilityToken,
+    handler_pattern: &str,
+    local_peer_id: &str,
+    granter_peer_id: &str,
+) -> bool {
+    // A malformed path canonicalizes to NEVER_MATCH, which matches no grant
+    // (§5.4), so it falls through to DENY below rather than being compared
+    // against anything.
+    let canonical_path = canonicalize(path, local_peer_id);
+
+    authority.grants.iter().any(|grant| {
+        matches_scope(
+            handler_pattern,
+            &grant.handlers.include,
+            &grant.handlers.exclude,
+            local_peer_id,
+        ) && matches_id_scope(
+            operation,
+            &grant.operations.include,
+            &grant.operations.exclude,
+        ) && matches_scope(
+            // ⛔ **A FOURTH site of 0.8.2.21's fail-open, which the ruling does
+            // not enumerate because all three of its sites are in §5.2 — and
+            // this one is OURS, not the spec's.** §6.3's own pseudocode reads
+            // `matches_scope(canonical_path, grant.resources, …)`; this line
+            // open-coded it as `is_covered_by(include) && !is_covered_by(exclude)`,
+            // which is `matches_scope`'s body with the 0.8.2.21 arm missing. An
+            // unmatchable resource exclude therefore carved out nothing HERE
+            // even after the three §5.2 sites were fixed — and this is the check
+            // that is SOLE enforcement when `resource` is absent.
+            //
+            // The enforcement point is the call, not a fourth copy of the arm:
+            // one rule, one function. Grep `is_covered_by(` on any path that is
+            // implementing a scope rather than asking a containment question.
+            //
+            // **Frames (PR-8) survive the switch.** `matches_scope` canonicalizes
+            // its value with the peer id it is given, and `canonical_path` is
+            // already absolute — canonicalizing an absolute path is identity — so
+            // passing `granter_peer_id` puts the grant's patterns in the granter
+            // frame without moving the path into it.
+            &canonical_path,
+            &grant.resources.include,
+            &grant.resources.exclude,
+            granter_peer_id,
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1243,28 +1573,31 @@ fn scope_subset_path(
     child_canon_peer_id: &str,
     parent_canon_peer_id: &str,
 ) -> bool {
-    // Every child include must be covered by some parent include
+    // Every child include must be covered by some parent include.
+    // An unmatchable child include (NEVER_MATCH) is covered by nothing and
+    // denies — the same answer the `Option` form gave, for the same reason.
     for ci in &child.include {
-        let cc = match canonicalize(ci, child_canon_peer_id) {
-            Some(v) => v,
-            None => return false,
-        };
-        if !parent.include.iter().any(|pi| {
-            canonicalize(pi, parent_canon_peer_id).is_some_and(|cp| matches_pattern(&cc, &cp))
-        }) {
+        let cc = canonicalize(ci, child_canon_peer_id);
+        if !parent
+            .include
+            .iter()
+            .any(|pi| matches_pattern(&cc, &canonicalize(pi, parent_canon_peer_id)))
+        {
             return false;
         }
     }
 
-    // Child must inherit ALL parent excludes
+    // Child must inherit ALL parent excludes. An unmatchable parent exclude is
+    // inherited by nothing and denies — again unchanged, and deliberately left
+    // strict: §5.6 is not among §5.4's three ruled consumers of NEVER_MATCH,
+    // and refusing an attenuation we cannot reason about costs a delegation
+    // rather than a grant.
     for pe in &parent.exclude {
-        let cp = match canonicalize(pe, parent_canon_peer_id) {
-            Some(v) => v,
-            None => return false,
-        };
-        let child_has = child.exclude.iter().any(|ce| {
-            canonicalize(ce, child_canon_peer_id).is_some_and(|cc| matches_pattern(&cp, &cc))
-        });
+        let cp = canonicalize(pe, parent_canon_peer_id);
+        let child_has = child
+            .exclude
+            .iter()
+            .any(|ce| matches_pattern(&cp, &canonicalize(ce, child_canon_peer_id)));
         if !child_has {
             return false;
         }
@@ -1897,6 +2230,12 @@ mod tests {
     use super::*;
 
     const LOCAL_PEER: &str = "2DFfrCdapVgjiNBPRUdNpwKLfLsmUaKHod4jmhakzBDs3W";
+    /// A second peer id. MUST be a real 46-char Base58 string, not a readable
+    /// placeholder: since 0.8.2.20 `check_resource_scope` consumes
+    /// `validate_absolute_path`'s verdict on every concrete target (§5.4 R11/G6),
+    /// so `/some-other-peer/...` is now a malformed path and denies — which is
+    /// the check working, and three fixtures here were that shape.
+    const OTHER_PEER: &str = "2EGgsDebqWhkjXCQSVeQqxLgMtnVbLJpe5knibmkzCEt4X";
 
     /// §6.2 — the default per-handler self-grant carries `peers` **absent**, and
     /// `resources` **`/*/*`**. The two are pinned in one test because they are
@@ -2073,48 +2412,42 @@ mod tests {
 
     #[test]
     fn test_canonicalize_wildcard() {
-        assert_eq!(
-            canonicalize("*", LOCAL_PEER),
-            Some(format!("/{}/*", LOCAL_PEER))
-        );
+        assert_eq!(canonicalize("*", LOCAL_PEER), format!("/{}/*", LOCAL_PEER));
     }
 
     #[test]
     fn test_canonicalize_absolute_peer_wildcard() {
         assert_eq!(
-            canonicalize("/*/system/tree", LOCAL_PEER).as_deref(),
-            Some("/*/system/tree")
+            canonicalize("/*/system/tree", LOCAL_PEER).as_str(),
+            "/*/system/tree"
         );
     }
 
     #[test]
     fn test_canonicalize_rejects_bare_star_slash() {
         // Fail-closed (§1.11): ambiguous `*/rest` → None, never a panic.
-        assert!(canonicalize("*/system/tree", LOCAL_PEER).is_none());
+        assert_eq!(canonicalize("*/system/tree", LOCAL_PEER), NEVER_MATCH);
     }
 
     #[test]
     fn test_canonicalize_rejects_dot_slash() {
         // Fail-closed (§1.11): reserved `./` and `../` → None, never a panic.
-        assert!(canonicalize("./relative", LOCAL_PEER).is_none());
-        assert!(canonicalize("../escape", LOCAL_PEER).is_none());
+        assert_eq!(canonicalize("./relative", LOCAL_PEER), NEVER_MATCH);
+        assert_eq!(canonicalize("../escape", LOCAL_PEER), NEVER_MATCH);
     }
 
     #[test]
     fn test_canonicalize_bare_path() {
         assert_eq!(
             canonicalize("system/tree", LOCAL_PEER),
-            Some(format!("/{}/system/tree", LOCAL_PEER))
+            format!("/{}/system/tree", LOCAL_PEER)
         );
     }
 
     #[test]
     fn test_canonicalize_already_absolute() {
         let path = format!("/{}/system/tree", LOCAL_PEER);
-        assert_eq!(
-            canonicalize(&path, LOCAL_PEER).as_deref(),
-            Some(path.as_str())
-        );
+        assert_eq!(canonicalize(&path, LOCAL_PEER).as_str(), path.as_str());
     }
 
     // --- matches_scope ---
@@ -2545,7 +2878,7 @@ mod tests {
     #[test]
     fn foreign_granted_peer_relative_resources_reach_nothing_locally() {
         // The cap is minted by REMOTE and presented against LOCAL_PEER.
-        const REMOTE_GRANTER: &str = "2KRemoteGranterBase58xxxxxxxxxxxxxxxxxxxxxxxx";
+        const REMOTE_GRANTER: &str = "2KRemoteGranterBase58xxxxxxxxxxxxxxxxxxxxxxxxx";
         let target = ResourceTarget {
             targets: vec![format!("/{}/system/registry", LOCAL_PEER)],
             exclude: vec![],
@@ -2741,7 +3074,7 @@ mod tests {
             exclude: vec![],
         };
         let cross_target = ResourceTarget {
-            targets: vec!["/some-other-peer/system/signature/abc".into()],
+            targets: vec![format!("/{}/system/signature/abc", OTHER_PEER)],
             exclude: vec![],
         };
         assert!(
@@ -2790,7 +3123,7 @@ mod tests {
     fn test_debug_open_grants_authorizes_cross_namespace_signature_writes() {
         let token = make_token(debug_open_grants());
         let rt = ResourceTarget {
-            targets: vec![format!("/some-ephemeral-peer/system/signature/abcdef")],
+            targets: vec![format!("/{}/system/signature/abcdef", OTHER_PEER)],
             exclude: vec![],
         };
         assert!(
@@ -3014,6 +3347,449 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // §5.2 `effective_targets` + §5.4 R11/G6 (0.8.2.20)
+    // -----------------------------------------------------------------------
+
+    /// `effective_targets` is **pattern-aware and canonicalizing**, not set
+    /// subtraction.
+    ///
+    /// This row exists because `[t for t in targets if t not in exclude]` is the
+    /// obvious reading of *"targets minus the caller's own exclude"* and it
+    /// implements none of the rule: an exclude of `app/*` removes a target of
+    /// `/{p}/app/x`, and an exclude written peer-relative removes a target
+    /// written absolute. A naive string reduction removes nothing, the arity
+    /// stays 1, and the fix reports done while the bypass is open.
+    #[test]
+    fn effective_targets_is_pattern_aware_and_canonicalizing() {
+        // Pattern exclude removes a concrete target under it.
+        let rt = ResourceTarget {
+            targets: vec![format!("/{}/app/x", LOCAL_PEER)],
+            exclude: vec!["app/*".into()], // peer-relative, canonicalizes
+        };
+        assert!(
+            effective_targets(Some(&rt), LOCAL_PEER).is_empty(),
+            "a patterned, peer-relative exclude must remove an absolute target under it"
+        );
+
+        // Mixed: the survivor is the one NOT excluded, and it is the SUBJECT.
+        let rt = ResourceTarget {
+            targets: vec![
+                format!("/{}/app/secret", LOCAL_PEER),
+                format!("/{}/app/public", LOCAL_PEER),
+            ],
+            exclude: vec![format!("/{}/app/secret", LOCAL_PEER)],
+        };
+        let eff = effective_targets(Some(&rt), LOCAL_PEER);
+        assert_eq!(
+            eff.len(),
+            1,
+            "arity one — an arity check alone says `proceed`"
+        );
+        assert_eq!(
+            eff[0],
+            format!("/{}/app/public", LOCAL_PEER),
+            "⛔ the element, not targets[0]: `targets[0]` is the EXCLUDED path, and \
+             a handler that counts this list and then indexes targets[0] has \
+             implemented the arithmetic completely and shipped the bypass"
+        );
+
+        // An absent resource and a fully self-excluded one are the same answer.
+        assert!(effective_targets(None, LOCAL_PEER).is_empty());
+        let rt = ResourceTarget {
+            targets: vec![format!("/{}/app/x", LOCAL_PEER)],
+            exclude: vec![format!("/{}/app/x", LOCAL_PEER)],
+        };
+        assert!(effective_targets(Some(&rt), LOCAL_PEER).is_empty());
+    }
+
+    /// A malformed target **stays in the effective list** (§5.2's comment:
+    /// *"NEVER_MATCH is not skipped here — it cannot be covered by any
+    /// exclude"*), so it counts toward the arity and is refused downstream.
+    ///
+    /// Dropping it instead would be the quiet wrong answer: `targets:[*/x, good]`
+    /// would reduce to `[good]` and **proceed**, where the rule makes it two
+    /// entries and therefore `ambiguous_resource`.
+    #[test]
+    fn a_malformed_target_stays_in_the_effective_list_and_counts() {
+        let rt = ResourceTarget {
+            targets: vec!["*/x".into(), format!("/{}/app/good", LOCAL_PEER)],
+            exclude: vec![],
+        };
+        let eff = effective_targets(Some(&rt), LOCAL_PEER);
+        assert_eq!(eff.len(), 2, "the malformed target is counted, not dropped");
+        // The RAW survivor (0.8.2.21) — the target as the caller wrote it. The
+        // SKIP that let it survive was decided on the canonical form, which is
+        // the half that has to agree across layers; the returned value is not.
+        assert_eq!(
+            eff[0], "*/x",
+            "returns the raw survivor, not its canonical form"
+        );
+        assert_eq!(
+            canonicalize(&eff[0], LOCAL_PEER),
+            NEVER_MATCH,
+            "and canonicalizing it is still NEVER_MATCH — the consumer's job"
+        );
+
+        // And it cannot be excluded away, which is why the skip is safe to run
+        // before the refusal.
+        let rt = ResourceTarget {
+            targets: vec!["*/x".into()],
+            exclude: vec!["*".into(), "/*/*".into()],
+        };
+        assert_eq!(
+            effective_targets(Some(&rt), LOCAL_PEER),
+            vec!["*/x".to_string()],
+            "no exclude — not even a universal one — removes the NEVER_MATCH target"
+        );
+    }
+
+    /// The raw return is a property of the VALUE only; the SKIP still runs on
+    /// canonical forms, and that half is what two layers have to agree on.
+    ///
+    /// The discriminator is a peer-relative target excluded by its absolute
+    /// spelling: under a raw *skip* the two strings never compare equal and the
+    /// target survives — which is `F68` with the comparison done in the wrong
+    /// frame. Mutation-verified: replacing `is_covered_by(&ct, …)` with
+    /// `is_covered_by(target, …)` reddens this row and leaves the raw-return
+    /// assertions above green.
+    #[test]
+    fn the_skip_is_canonical_even_though_the_return_is_raw() {
+        let rt = ResourceTarget {
+            targets: vec!["app/secret".into()],
+            exclude: vec![format!("/{}/app/secret", LOCAL_PEER)],
+        };
+        assert!(
+            effective_targets(Some(&rt), LOCAL_PEER).is_empty(),
+            "a peer-relative target excluded by its ABSOLUTE spelling is still excluded"
+        );
+
+        // And the surviving value is the caller's spelling, not ours — this is
+        // what §6.13's install-pattern derivation reads.
+        let rt = ResourceTarget {
+            targets: vec!["system/handler/myapp".into()],
+            exclude: vec![],
+        };
+        assert_eq!(
+            effective_targets(Some(&rt), LOCAL_PEER),
+            vec!["system/handler/myapp".to_string()],
+            "§6.13 derives the install pattern against the `system/handler/` \
+             prefix and its worked example target is peer-relative — a canonical \
+             return makes that derivation not fire"
+        );
+    }
+
+    /// §5.4's matcher rule, asserted **directly on the function** because that is
+    /// the level the spec rules it at: *"NEVER_MATCH never matches, in either
+    /// operand. This arm is FIRST and is a matcher rule, not a property of the
+    /// string: the arm below returns true for a bare `*` operand, so safety MUST
+    /// NOT rest on a value merely looking unmatchable."*
+    ///
+    /// ⚠ **This row exists because the claim was written in a comment and the
+    /// mutation that was supposed to prove it PASSED.** Moving the NEVER_MATCH
+    /// arm after the `pattern == "*"` arm left every other test in this file
+    /// green — `canonicalize` never yields a bare `*` (it yields
+    /// `/{peer}/*`), and `/*/*` reaches the recursion through the `/*/` arm, so
+    /// no fixture anywhere put NEVER_MATCH next to a bare `*`. The ordering is
+    /// still the rule; it was simply unmeasured, which is indistinguishable from
+    /// absent.
+    #[test]
+    fn never_match_loses_to_every_pattern_including_a_bare_star() {
+        assert!(
+            !matches_pattern(NEVER_MATCH, "*"),
+            "the bare-`*` arm returns true for any path — the NEVER_MATCH arm \
+             MUST precede it, and this is the only assertion in the tree that \
+             fails if the two are swapped"
+        );
+        // CONTROL: the bare-`*` arm still matches an ordinary path, so the row
+        // above is not satisfied by a matcher that refuses everything.
+        assert!(matches_pattern(&format!("/{}/app/x", LOCAL_PEER), "*"));
+
+        // Either operand, and the other shapes for completeness.
+        assert!(!matches_pattern(NEVER_MATCH, "/*/*"));
+        assert!(!matches_pattern(NEVER_MATCH, NEVER_MATCH));
+        assert!(!matches_pattern(
+            &format!("/{}/app/x", LOCAL_PEER),
+            NEVER_MATCH
+        ));
+        assert!(!matches_pattern(NEVER_MATCH, &format!("/{}/*", LOCAL_PEER)));
+    }
+
+    /// ⛔ **`CORE-EXCLUDE-UNMATCHABLE-1` (§5.2, §5.4 — 0.8.2.21), at the three
+    /// sites the ruling enumerates, plus the control that makes a denial mean
+    /// something.**
+    ///
+    /// The vector's own shape: a grant `{include:["/*/*"], exclude:["*/secret"]}`
+    /// and a request for `/{peer}/secret`. `*/`-leading canonicalizes to
+    /// `NEVER_MATCH`, so under `0.8.2.20` the exclusion excluded **nothing** and
+    /// the request was allowed — a grant silently wider than its author wrote,
+    /// with no error anywhere, because the sentinel is designed not to raise.
+    ///
+    /// **Every deny row here is paired with the well-formed-exclude control the
+    /// vector requires**, because all three denials pass trivially against a
+    /// peer that denies everything, and that peer is what a "fix" that deletes
+    /// the exclude arm looks like from outside.
+    #[test]
+    fn an_unmatchable_exclude_excludes_everything_at_every_site() {
+        let secret = format!("/{}/secret", LOCAL_PEER);
+        let other = format!("/{}/public", LOCAL_PEER);
+
+        // --- Site 1: matches_scope's exclude loop (every dimension, every grant)
+        assert!(
+            !matches_scope(&secret, &["/*/*".into()], &["*/secret".into()], LOCAL_PEER),
+            "site 1 (matches_scope): an unmatchable exclude denies"
+        );
+        assert!(
+            !matches_scope(&secret, &["/*/*".into()], &["/*/secret".into()], LOCAL_PEER),
+            "CONTROL: a well-formed exclude denies the path it covers"
+        );
+        assert!(
+            matches_scope(&other, &["/*/*".into()], &["/*/secret".into()], LOCAL_PEER),
+            "CONTROL: and it allows the path it does not — a working exclusion \
+             is not a matcher that refuses everything"
+        );
+
+        // --- Site 2: check_resource_scope, CONCRETE target arm
+        let concrete = ResourceTarget {
+            targets: vec![secret.clone()],
+            exclude: vec![],
+        };
+        let unmatchable = PathScope::with_exclude(vec!["/*/*".into()], vec!["*/secret".into()]);
+        let well_formed = PathScope::with_exclude(vec!["/*/*".into()], vec!["/*/secret".into()]);
+        assert!(
+            !check_resource_scope(&concrete, &unmatchable, LOCAL_PEER, LOCAL_PEER),
+            "site 2 (concrete arm): the vector's own row"
+        );
+        assert!(
+            !check_resource_scope(&concrete, &well_formed, LOCAL_PEER, LOCAL_PEER),
+            "CONTROL: well-formed exclude still denies"
+        );
+        let elsewhere = ResourceTarget {
+            targets: vec![other.clone()],
+            exclude: vec![],
+        };
+        assert!(
+            check_resource_scope(&elsewhere, &well_formed, LOCAL_PEER, LOCAL_PEER),
+            "CONTROL: the discriminating allow — without it the two denies above \
+             are satisfied by a peer that denies everything"
+        );
+
+        // --- Site 3: check_resource_scope, PATTERN target arm.
+        //
+        // ⚠ **This is a DEPARTURE from 0.8.2.21's pseudocode and the reason is a
+        // measurement, not a reading.** The fold enumerates three sites and adds
+        // the arm to two, calling this one *"fail-closed BY ACCIDENT, the test
+        // is negated for an unrelated reason"* — the negated test being
+        // `if not is_covered_by(cge, caller_exclude): return false`, which does
+        // deny, because `is_covered_by` cannot cover NEVER_MATCH.
+        //
+        // That line is never REACHED. `patterns_overlap(ct, "/never-match")` is
+        // false for every real pattern target — `strip_wildcard` leaves the
+        // sentinel intact and neither string is a prefix of the other — so the
+        // loop `continue`s and the unmatchable exclude is skipped, exactly as it
+        // was in the concrete arm. Spec-literal, site 3 is fail-OPEN.
+        //
+        // The two assertions below are the measurement: the first states the
+        // overlap predicate's answer (the premise), the second states the
+        // consequence.
+        assert!(
+            !patterns_overlap(&format!("/{}/*", LOCAL_PEER), NEVER_MATCH),
+            "the premise: an unmatchable grant exclude does not OVERLAP a pattern \
+             target, so the negated is_covered_by test the ruling relies on is \
+             never reached"
+        );
+        let pattern_target = ResourceTarget {
+            targets: vec![format!("/{}/*", LOCAL_PEER)],
+            exclude: vec![],
+        };
+        assert!(
+            !check_resource_scope(&pattern_target, &unmatchable, LOCAL_PEER, LOCAL_PEER),
+            "site 3 (pattern arm): denies here too — spec-literal this ALLOWS"
+        );
+        assert!(
+            check_resource_scope(
+                &pattern_target,
+                &PathScope::new(vec!["/*/*".into()]),
+                LOCAL_PEER,
+                LOCAL_PEER
+            ),
+            "CONTROL: a pattern target under a grant with no exclude is allowed"
+        );
+    }
+
+    /// ⛔ **The FOURTH site, which `0.8.2.21` does not enumerate: §6.3's
+    /// `check_path_permission`.**
+    ///
+    /// The ruling measures three sites and all three are in §5.2, because §6.3's
+    /// pseudocode delegates its resource dimension to `matches_scope` and
+    /// therefore inherits the fix for free. **Ours did not**: it open-coded the
+    /// same predicate as `is_covered_by(include) && !is_covered_by(exclude)`,
+    /// which is `matches_scope`'s body minus the arm — so the fail-open survived
+    /// here after the three named sites were closed.
+    ///
+    /// This is the site where it costs most. §6.3 is **sole** resource
+    /// enforcement whenever `EXECUTE.resource` is absent (§3.2 runs no
+    /// dispatch-level resource check at all), so there is no §5.2 layer behind
+    /// it to catch the miss.
+    ///
+    /// Mutation-verified: restoring the `is_covered_by` pair reddens the first
+    /// row here and leaves both controls green.
+    #[test]
+    fn an_unmatchable_exclude_also_denies_at_the_handler_level_check() {
+        let secret = format!("/{}/secret", LOCAL_PEER);
+        let cap = |exclude: Vec<String>| {
+            make_token(vec![GrantEntry {
+                handlers: PathScope::new(vec!["system/tree".into()]),
+                resources: PathScope::with_exclude(vec!["/*/*".into()], exclude),
+                operations: IdScope::new(vec!["get".into()]),
+                peers: None,
+                constraints: None,
+                allowances: None,
+            }])
+        };
+        let check = |token: &CapabilityToken, path: &str| {
+            check_path_permission("get", path, token, "system/tree", LOCAL_PEER, LOCAL_PEER)
+        };
+
+        assert!(
+            !check(&cap(vec!["*/secret".into()]), &secret),
+            "an unmatchable exclude denies at §6.3 too — this is the check that \
+             is SOLE enforcement when `resource` is absent"
+        );
+        assert!(
+            !check(&cap(vec!["/*/secret".into()]), &secret),
+            "CONTROL: a well-formed exclude still denies"
+        );
+        assert!(
+            check(
+                &cap(vec!["/*/secret".into()]),
+                &format!("/{}/public", LOCAL_PEER)
+            ),
+            "CONTROL: and a working exclusion is not a check that denies everything"
+        );
+    }
+
+    /// The unmatchable verdict does not depend on the canonicalization frame,
+    /// which is why [`unmatchable_scope_pattern`] takes no peer id.
+    ///
+    /// `canonicalize` yields `NEVER_MATCH` for exactly three reserved prefixes,
+    /// all decided before any peer-id qualification — so the granter's frame and
+    /// the verifier's frame give the same answer, and a call site cannot get it
+    /// wrong by passing the one it happens to hold. This row fails if that stops
+    /// being true.
+    #[test]
+    fn frame_is_irrelevant_to_the_unmatchable_verdict() {
+        for pattern in ["*/secret", "./x", "../x"] {
+            for frame in [LOCAL_PEER, "some-other-frame", ""] {
+                assert_eq!(
+                    canonicalize(pattern, frame),
+                    NEVER_MATCH,
+                    "{pattern:?} is unmatchable in every frame"
+                );
+            }
+        }
+        // CONTROL: an ordinary peer-relative pattern IS frame-dependent, so the
+        // row above is not satisfied by a canonicalize that ignores its frame.
+        assert_ne!(
+            canonicalize("app/*", LOCAL_PEER),
+            canonicalize("app/*", "other"),
+        );
+
+        let grants = vec![GrantEntry {
+            handlers: PathScope::all(),
+            resources: PathScope::with_exclude(vec!["/*/*".into()], vec!["*/secret".into()]),
+            operations: IdScope::all(),
+            peers: None,
+            constraints: None,
+            allowances: None,
+        }];
+        assert_eq!(
+            unmatchable_scope_pattern(&grants).as_deref(),
+            Some("*/secret")
+        );
+
+        // Both path scopes are swept, and the exclude arrays too — the
+        // `include`-only reading is the one that would leave the fail-OPEN
+        // direction unguarded.
+        let handler_side = vec![GrantEntry {
+            handlers: PathScope::with_exclude(vec!["*".into()], vec!["../escape".into()]),
+            resources: PathScope::all(),
+            operations: IdScope::all(),
+            peers: None,
+            constraints: None,
+            allowances: None,
+        }];
+        assert_eq!(
+            unmatchable_scope_pattern(&handler_side).as_deref(),
+            Some("../escape")
+        );
+
+        // CONTROL: an ordinary grant is not flagged. `operations`/`peers` are
+        // id-scopes — literal matching, no canonicalization — so a `*/`-leading
+        // OPERATION is a legal (if odd) literal and is deliberately not swept.
+        let ok = vec![GrantEntry {
+            handlers: PathScope::new(vec!["system/tree".into()]),
+            resources: PathScope::with_exclude(vec!["/*/*".into()], vec!["/*/secret".into()]),
+            operations: IdScope::new(vec!["*/weird".into()]),
+            peers: None,
+            constraints: None,
+            allowances: None,
+        }];
+        assert!(unmatchable_scope_pattern(&ok).is_none());
+    }
+
+    /// **G6 / `CORE-CANONICALIZE-TOTAL-1`'s discriminating arm** — a malformed
+    /// concrete target reaching `check_resource_scope` MUST return `false`.
+    ///
+    /// `check_resource_scope` called `validate_absolute_path` nowhere at all, so
+    /// `/notapeerid/x` was matched against the grant as an ordinary string and a
+    /// broad grant covered it. The CONTROL is the same broad grant against a
+    /// WELL-FORMED cross-namespace target, which MUST still be allowed —
+    /// otherwise this row is satisfied by a grant that refuses everything, and
+    /// the R-5 invariant-pointer behaviour (`/*/*` reaches any namespace) is a
+    /// pin one screen up.
+    #[test]
+    fn a_malformed_concrete_target_is_refused_by_check_resource_scope() {
+        let open = PathScope::new(vec!["/*/*".into()]);
+
+        for bad in ["/notapeerid/x", "/abc/system/tree", "*/x", "./x", "../x"] {
+            let rt = ResourceTarget {
+                targets: vec![bad.into()],
+                exclude: vec![],
+            };
+            assert!(
+                !check_resource_scope(&rt, &open, LOCAL_PEER, LOCAL_PEER),
+                "a malformed target ({bad}) must deny even under a `/*/*` grant — \
+                 the verdict of validate_absolute_path is consumed, not discarded"
+            );
+        }
+
+        // CONTROL — a well-formed foreign-namespace target under the same grant
+        // is ALLOWED, so the rows above are attributable to the path being
+        // malformed and not to the grant refusing cross-namespace access.
+        let good = ResourceTarget {
+            targets: vec![format!("/{}/app/x", OTHER_PEER)],
+            exclude: vec![],
+        };
+        assert!(
+            check_resource_scope(&good, &open, LOCAL_PEER, LOCAL_PEER),
+            "CONTROL: `/*/*` must still reach a well-formed foreign namespace"
+        );
+
+        // CONTROL — a PATTERN target is not put through validate_absolute_path
+        // (§5.4: "NOT called on patterns — patterns may have wildcard segments
+        // which are valid pattern syntax but not valid peer_ids"), so the guard
+        // must be `!is_pattern`-conditioned rather than unconditional.
+        let pattern = ResourceTarget {
+            targets: vec!["/*/*".into()],
+            exclude: vec![],
+        };
+        assert!(
+            check_resource_scope(&pattern, &open, LOCAL_PEER, LOCAL_PEER),
+            "CONTROL: a pattern target must not be run through the peer_id validator"
+        );
+    }
+
     /// Fail-closed (V7 §1.11, F5): a malformed resource pattern in a grant
     /// MUST yield a clean DENY, never a panic / dropped connection. Covers
     /// every dimension — a malformed include, a malformed exclude, and a
@@ -3041,15 +3817,50 @@ mod tests {
             LOCAL_PEER
         ));
 
-        // Malformed resource exclude in the grant → fails closed (deny),
-        // never under-excludes into an accidental allow.
+        // ⛔ A malformed EXCLUDE **denies** — §5.4/§5.2 (0.8.2.21), and this row
+        // has now flipped twice. 0.8.2.20 ruled `matches_pattern` returns false
+        // on either operand and argued the safety from the `include` side only,
+        // so this line became an ALLOW; we shipped it with the control below and
+        // filed the objection. 0.8.2.21 upholds the objection: matches-nothing
+        // is fail-closed in an include and fail-OPEN here, and an unmatchable
+        // exclude now excludes EVERYTHING. The disposition is the one this file
+        // carried before 0.8.2.20.
+        //
+        // Kept as the SAME row through both flips on purpose: an assertion that
+        // gets deleted and rewritten loses the history that it is contested.
         let scope = PathScope::with_exclude(vec!["system/type/*".into()], vec!["*/sneaky".into()]);
-        assert!(!check_resource_scope(
-            &target, &scope, LOCAL_PEER, LOCAL_PEER
-        ));
+        assert!(
+            !check_resource_scope(&target, &scope, LOCAL_PEER, LOCAL_PEER),
+            "0.8.2.21: an unmatchable grant exclude carves out nothing and so must \
+             exclude everything — otherwise the grant is silently wider than written"
+        );
+        // CONTROL 1, and it is the whole reason that row is allowed to flip: a
+        // WELL-FORMED exclude still excludes. Without this the assertion above
+        // is indistinguishable from having deleted the exclude arm.
+        let well_formed =
+            PathScope::with_exclude(vec!["system/type/*".into()], vec!["system/type/foo".into()]);
+        assert!(
+            !check_resource_scope(&target, &well_formed, LOCAL_PEER, LOCAL_PEER),
+            "a well-formed grant exclude still denies the target it covers"
+        );
+        // CONTROL 2 — the one `CORE-EXCLUDE-UNMATCHABLE-1` names by name, and
+        // the one control 1 cannot supply. Both rows above are DENIALS, so a
+        // peer that denies everything passes both. This row must ALLOW: the same
+        // include, a well-formed exclude that does NOT cover the target.
+        let elsewhere = PathScope::with_exclude(
+            vec!["system/type/*".into()],
+            vec!["system/type/other".into()],
+        );
+        assert!(
+            check_resource_scope(&target, &elsewhere, LOCAL_PEER, LOCAL_PEER),
+            "a working exclusion is not a peer that denies everything — without \
+             this row the two denials above cannot tell those apart"
+        );
 
-        // Malformed handler exclude → fails closed at the operation/handler
-        // dimension too (no resource target needed).
+        // Malformed HANDLER exclude → same ruling, same direction, and this is
+        // the site the vector does not name: `matches_scope`'s exclude loop runs
+        // for **every dimension of every grant**, not only `resources`. Flipped
+        // with the resources row at 0.8.2.21.
         let mut grant = make_grant(&["system/tree"], &["*"], &["get"]);
         grant.handlers.exclude = vec!["*/sneaky".into()];
         let bad_handler_exclude = make_token(vec![grant]);
@@ -3059,6 +3870,28 @@ mod tests {
             LOCAL_PEER,
             None,
             &bad_handler_exclude,
+            LOCAL_PEER
+        ));
+        // CONTROL: the same grant with NO handler exclude still authorizes, so
+        // the denial above is not "check_permission refuses everything".
+        let grant = make_grant(&["system/tree"], &["*"], &["get"]);
+        assert!(check_permission(
+            "get",
+            "system/tree",
+            LOCAL_PEER,
+            None,
+            &make_token(vec![grant]),
+            LOCAL_PEER
+        ));
+        // CONTROL: a well-formed handler exclude still denies.
+        let mut grant = make_grant(&["system/tree"], &["*"], &["get"]);
+        grant.handlers.exclude = vec!["system/tree".into()];
+        assert!(!check_permission(
+            "get",
+            "system/tree",
+            LOCAL_PEER,
+            None,
+            &make_token(vec![grant]),
             LOCAL_PEER
         ));
 
@@ -3281,7 +4114,7 @@ mod canonicalize_entity_uri_tests {
     fn entity_uri_canonicalizes_to_the_address_it_names() {
         assert_eq!(
             canonicalize(&format!("entity://{}/system/inbox", REMOTE), LOCAL),
-            Some(format!("/{}/system/inbox", REMOTE)),
+            format!("/{}/system/inbox", REMOTE),
         );
         // The two spellings of one address MUST converge — this is the whole
         // point, and the property the 403 came from violating.
@@ -3292,7 +4125,7 @@ mod canonicalize_entity_uri_tests {
         // Bare peer, no path.
         assert_eq!(
             canonicalize(&format!("entity://{}", REMOTE), LOCAL),
-            Some(format!("/{}", REMOTE)),
+            format!("/{}", REMOTE),
         );
     }
 
@@ -3304,10 +4137,8 @@ mod canonicalize_entity_uri_tests {
     /// denied` — including the spec-model inbox delivery.
     #[test]
     fn entity_uri_scope_matches_normalized_delivery_target() {
-        let scope = canonicalize(&format!("entity://{}/system/inbox/*", REMOTE), LOCAL)
-            .expect("entity:// scope canonicalizes");
-        let target = canonicalize(&format!("/{}/system/inbox/msg-1", REMOTE), LOCAL)
-            .expect("delivery target canonicalizes");
+        let scope = canonicalize(&format!("entity://{}/system/inbox/*", REMOTE), LOCAL);
+        let target = canonicalize(&format!("/{}/system/inbox/msg-1", REMOTE), LOCAL);
         assert!(
             matches_pattern(&target, &scope),
             "an entity:// deliver_token scope {:?} must cover its own \
@@ -3322,7 +4153,7 @@ mod canonicalize_entity_uri_tests {
     /// literal `entity:` segment.
     #[test]
     fn entity_uri_is_not_mangled_into_a_local_path() {
-        let got = canonicalize(&format!("entity://{}/system/inbox", REMOTE), LOCAL).unwrap();
+        let got = canonicalize(&format!("entity://{}/system/inbox", REMOTE), LOCAL);
         assert!(
             !got.contains("entity:"),
             "the scheme survived canonicalization: {}",

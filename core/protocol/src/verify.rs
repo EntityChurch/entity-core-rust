@@ -885,6 +885,44 @@ pub fn verify_capability_chain(
         }
     }
 
+    // 2d. ⛔ Unmatchable scope patterns (§5.4 — 0.8.2.21). A capability ANY of
+    //     whose scope patterns canonicalizes to `NEVER_MATCH` is INVALID, at
+    //     mint, at delegation, and here. The reason it is a MUST rather than a
+    //     MAY is precisely this surface: an unmatchable pattern is fail-closed
+    //     in an `include` and fail-OPEN in an `exclude`, so a peer honouring
+    //     such a capability and a peer refusing it reach **different
+    //     authorization decisions on the same capability bytes** — which is a
+    //     cross-peer divergence, not a local policy choice.
+    //
+    //     Every link, not just the leaf: an intermediate whose exclude carves
+    //     out nothing is a grant wider than its author wrote, and `is_attenuated`
+    //     read it as a narrowing on the way down.
+    //
+    //     Runs with the other structural passes, before any signature work, so
+    //     a malformed cap is refused cheaply. Surfaces as `CapabilityInvalid` →
+    //     `403 capability_denied` per the §3.3 status-normalization rule.
+    //
+    //     A link that does not DECODE is deliberately skipped rather than
+    //     erroring here. This pass introduces the first full-token decode on
+    //     the chain walk, and turning a decode failure into a verdict would be
+    //     a strictness change wider than the ruling — an undecodable token is
+    //     already refused where it matters (the leaf at `verify_request`, an
+    //     intermediate at the attenuation pass below, both of which decode).
+    //     Skipping is not fail-open: a grant list we cannot read is a grant list
+    //     `check_permission` cannot iterate either.
+    for (entity, _fields) in chain.iter() {
+        let Ok(token) = CapabilityToken::from_entity(entity) else {
+            continue;
+        };
+        if let Some(bad) = entity_capability::unmatchable_scope_pattern(&token.grants) {
+            return Err(ProtocolError::CapabilityInvalid(format!(
+                "scope pattern matches nothing and would silently widen the grant: {:?} \
+                 (a peer-wildcard is `/*/…`, not `*/…`) — §5.4, 0.8.2.21",
+                bad
+            )));
+        }
+    }
+
     // 2b. M3 validity pass (PROPOSAL-MULTISIG-CORE-PRIMITIVE §3.3 MUST level).
     //    Multi-sig caps MUST have parent: None; signers/threshold must be
     //    well-formed. Run before any per-link signature work so malformed

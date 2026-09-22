@@ -4757,6 +4757,258 @@ mod tests {
         );
     }
 
+    /// ⛔ **A `*/`-leading resource target used to PANIC the connection task, from
+    /// any authenticated peer, before `check_permission` ran.**
+    ///
+    /// `EntityUri::qualify_path` asserted on the three reserved path shapes, and
+    /// `validate_path_input` — the pre-qualify guard both dispatch sites run —
+    /// rejects `./` and `../` and **does not reject `*/`**. So
+    /// `resource: {targets: ["*/anything"]}` reached the `assert!` and unwound the
+    /// task. Two path helpers, one §1.4 rule, two dispositions: exactly the
+    /// `is_connect_path` shape this repo already records, with a panic at the end
+    /// of it instead of a wrong route.
+    ///
+    /// Driven over the real wire (codec → `handle_connection` → `verify_request`
+    /// → the resource normalizer) because that is the reachability claim: a unit
+    /// call on `qualify_path` proves totality, not that a remote peer cannot kill
+    /// the connection. `core/entity`'s
+    /// `qualify_path_is_total_over_the_three_reserved_shapes` is the unit half.
+    ///
+    /// The assertion is `400` and **not** a specific refusal of `*/`: §5.4's R11
+    /// says a `*/`-leading pattern *"matches nothing and does not error"*, and
+    /// `CORE-TREE-PATH-FLEX-1` says a peer that admits such a request and matches
+    /// nothing is **also** conformant. What is not conformant is unwinding.
+    #[tokio::test]
+    async fn a_reserved_resource_target_is_answered_not_a_panic() {
+        use transport::{MemoryConnector, MemoryListener, MemoryTransportRegistry};
+        let registry = MemoryTransportRegistry::new();
+
+        let server = PeerBuilder::new()
+            .identity_keypair(entity_crypto::IdentityKeypair::Ed25519(
+                entity_crypto::Keypair::from_seed([73u8; 32]),
+            ))
+            .build()
+            .unwrap();
+        let server_pid = server.peer_id().to_string();
+        let listener = MemoryListener::bind(server_pid.clone(), registry.clone()).unwrap();
+        let shared = server.shared();
+        server.start_engines(&shared);
+        let shared_clone = shared.clone();
+        let server_handle = tokio::spawn(async move {
+            let _ = server::run(listener, shared_clone).await;
+        });
+        tokio::task::yield_now().await;
+
+        let client =
+            entity_crypto::IdentityKeypair::Ed25519(entity_crypto::Keypair::from_seed([74u8; 32]));
+        let conn = MemoryConnector::new(registry.clone())
+            .connect(&format!("memory://{}", server_pid))
+            .await
+            .unwrap();
+        let remote = remote::perform_connect(conn, &client, entity_hash::HASH_ALGORITHM_SHA256)
+            .await
+            .expect("handshake");
+
+        let params = entity_entity::Entity::new(
+            "system/params",
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![])),
+        )
+        .unwrap();
+
+        // Each of the three reserved shapes, and the bare-`*` form for good
+        // measure. Only `*/` was reachable (the other two are caught by
+        // `validate_path_input`), but the point of the fix is that the helper no
+        // longer panics on ANY of them, so all four are driven.
+        for reserved in ["*/system/tree", "./relative", "../parent", "*"] {
+            let probe = entity_capability::ResourceTarget {
+                targets: vec![reserved.to_string()],
+                exclude: vec![],
+            };
+            let resp = remote::send_execute(
+                &remote,
+                &client,
+                &format!("/{}/system/tree", server_pid),
+                "get",
+                &params,
+                Some(&probe),
+                None,
+                None,
+                &std::collections::HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "target {reserved:?}: the connection died instead of answering — \
+                     this is the panic, surfacing as a transport error: {e}"
+                )
+            });
+            assert!(
+                (400..500).contains(&resp.status),
+                "target {reserved:?} must be ANSWERED with a 4xx, got {}",
+                resp.status
+            );
+        }
+
+        // CONTROL — a well-formed target on the same live connection still gets a
+        // non-4xx, so the rows above are the reserved shapes being refused and not
+        // the connection having been poisoned by the first one.
+        let ok_target = entity_capability::ResourceTarget {
+            targets: vec![format!("/{}/system/type/", server_pid)],
+            exclude: vec![],
+        };
+        let resp = remote::send_execute(
+            &remote,
+            &client,
+            &format!("/{}/system/tree", server_pid),
+            "get",
+            &params,
+            Some(&ok_target),
+            None,
+            None,
+            &std::collections::HashMap::new(),
+            None,
+        )
+        .await
+        .expect("the connection is still alive after four refusals");
+        server_handle.abort();
+        assert!(
+            resp.status < 400,
+            "CONTROL: an in-grant well-formed target must still be served, got {}",
+            resp.status
+        );
+    }
+
+    /// ⛔ **The dispatch BOUNDARY narrows `resource.targets` to the effective set
+    /// — measured through a handler that deliberately reads `targets[0]`.**
+    ///
+    /// This row exists because of a mutation result that has to be written down.
+    /// core-go's `resource_effective` oracle scores 6/6 against this peer, and it
+    /// **cannot tell which of our two layers earned it**: with the boundary
+    /// narrowing ON, restoring `targets.first()` inside `TreeHandler::handle_get`
+    /// still scored 6P/0F (mutation M1), because by then `rt.targets` *is* the
+    /// effective list. Disabling the boundary as well reddened
+    /// `case_d_witness` 5P/1F (M3), and restoring only the handler selection
+    /// scored 6/6 again (M2). **Either layer alone satisfies the oracle, so the
+    /// oracle measures their union** — which is exactly the shape this repo's
+    /// charter calls an unmeasured claim in the shape of an optimization, and the
+    /// reason this test exists rather than a sentence saying the boundary works.
+    ///
+    /// The probe handler indexes `targets[0]` *on purpose*. It is the only way to
+    /// observe the boundary from outside, because every conformant consumer draws
+    /// its subject from `effective_targets` and is therefore blind to whether the
+    /// narrowing happened.
+    #[tokio::test]
+    async fn the_dispatch_boundary_hands_the_handler_only_the_effective_targets() {
+        use entity_handler::{Handler, HandlerContext, HandlerError, HandlerResult};
+
+        /// Echoes `ctx.resource_target.targets` back as the result entity's
+        /// `type`, joined by `|`. Reads `targets[0]` deliberately.
+        struct EchoTargets {
+            /// The QUALIFIED pattern. `handler_registry` keys on whatever
+            /// `pattern()` returns and resolution looks up
+            /// `/{peer}/app/echo`, so a bare pattern here registers under a key
+            /// nothing resolves to — the same `is_connect_path`-shaped trap this
+            /// repo already records, one layer over.
+            pattern: String,
+        }
+
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+        #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+        impl Handler for EchoTargets {
+            async fn handle(&self, ctx: &HandlerContext) -> Result<HandlerResult, HandlerError> {
+                let joined = ctx
+                    .resource_target
+                    .as_ref()
+                    .map(|rt| rt.targets.join("|"))
+                    .unwrap_or_else(|| "<absent>".to_string());
+                let ent = entity_entity::Entity::new(
+                    "app/echo-targets",
+                    entity_ecf::to_ecf(&entity_ecf::text(&joined)),
+                )
+                .map_err(|e| HandlerError::Internal(e.to_string()))?;
+                Ok(HandlerResult::ok(ent))
+            }
+            fn pattern(&self) -> &str {
+                &self.pattern
+            }
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn operations(&self) -> &[&str] {
+                &["probe"]
+            }
+        }
+
+        let kp = entity_crypto::Keypair::from_seed([71u8; 32]);
+        let pid = kp.peer_id().to_string();
+        let peer = PeerBuilder::new()
+            .identity_keypair(entity_crypto::IdentityKeypair::Ed25519(kp))
+            .handler(std::sync::Arc::new(EchoTargets {
+                pattern: format!("/{pid}/app/echo"),
+            }))
+            .build()
+            .unwrap();
+        let secret = format!("/{pid}/app/secret");
+        let public = format!("/{pid}/app/public");
+
+        let params = entity_entity::Entity::new(
+            "primitive/null",
+            entity_ecf::to_ecf(&entity_ecf::Value::Null),
+        )
+        .unwrap();
+
+        // targets:[P,Q] exclude:[P] — the case-D shape. `targets[0]` is P.
+        let got = peer
+            .execute_with_options(
+                "app/echo",
+                "probe",
+                params.clone(),
+                entity_handler::ExecuteOptions {
+                    resource: Some(entity_capability::ResourceTarget {
+                        targets: vec![secret.clone(), public.clone()],
+                        exclude: vec![secret.clone()],
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("dispatch returns a result");
+        let echoed: String = ciborium::from_reader(got.result.data.as_slice()).unwrap();
+        assert_eq!(
+            echoed, public,
+            "the handler MUST NOT be handed a target the authorizer skipped — \
+             it saw {echoed:?}, and `targets[0]` as the caller wrote it is the \
+             EXCLUDED path"
+        );
+
+        // CONTROL — with no exclusion both targets survive, so the row above is
+        // the narrowing working and not the boundary dropping everything but the
+        // last element (or rewriting the list to a constant).
+        let got = peer
+            .execute_with_options(
+                "app/echo",
+                "probe",
+                params,
+                entity_handler::ExecuteOptions {
+                    resource: Some(entity_capability::ResourceTarget {
+                        targets: vec![secret.clone(), public.clone()],
+                        exclude: vec![],
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("dispatch returns a result");
+        let echoed: String = ciborium::from_reader(got.result.data.as_slice()).unwrap();
+        assert_eq!(
+            echoed,
+            format!("{secret}|{public}"),
+            "CONTROL: with no caller exclusion the effective set is the whole list, \
+             in order"
+        );
+    }
+
     /// The other half of D1: its ceiling must not forbid the peer's own engine
     /// from writing the **foreign-namespace** subtrees its store legitimately
     /// holds (V7 §1.4 Category A — a cached foreign content site, a `follow`
@@ -6629,24 +6881,40 @@ mod tests {
             .unwrap_or_else(|e| panic!("handshake {server_kt:?}×{client_kt:?}: {e}"));
 
         // Send a real EXECUTE over the wire (codec + server handler +
-        // verify_request) and read back the status. tree/get on the
-        // server's own peer-id root.
+        // verify_request) and read back the status.
+        //
+        // The probe addresses `system/type/`, which the §4.4 connection grant
+        // covers (`resources: {include: ["system/type/*", "system/handler/*"]}`).
+        // It used to address `/{server}/system/tree` — the handler's own pattern
+        // path, which that grant does NOT cover as a *resource* — and that was
+        // fine only because nothing checked: since 0.8.2.20 `tree:get` runs
+        // §6.3's handler-level path check, which is the SOLE resource
+        // enforcement for a request carrying no `resource`, and it correctly
+        // answers `403 capability_denied`. This probe asserts `!= 403` to mean
+        // *"the signature and cap chain verified"*, so a legitimate 403 from a
+        // different layer defeats its discriminator; the fix is an in-grant
+        // path, not a weaker assertion.
+        let type_prefix = format!("/{}/system/type/", server_pid);
         let params = entity_entity::Entity::new(
             "system/params",
             entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
                 entity_ecf::text("path"),
-                entity_ecf::text(format!("/{}/system/tree", server_pid)),
+                entity_ecf::text(&type_prefix),
             )])),
         )
         .unwrap();
         let uri = format!("/{}/system/tree", server_pid);
+        let probe_resource = entity_capability::ResourceTarget {
+            targets: vec![type_prefix.clone()],
+            exclude: vec![],
+        };
         let resp = remote::send_execute(
             &remote,
             &client,
             &uri,
             "get",
             &params,
-            None,
+            Some(&probe_resource),
             None,
             None,
             &std::collections::HashMap::new(),
@@ -8627,20 +8895,41 @@ mod tests {
         // content store. Before the sender flip this path inlined the chain,
         // which is precisely what hid our double-walk revocation bug (`f227df8`)
         // until core-go flipped first and V3 direction B went 200 -> 403.
-        // `get` on C's own `system/tree` returns the handler descriptor (200),
-        // the same shape the rung-1 rig sees.
-        let empty_params = entity_entity::Entity::new(
+        // The probe reads a path INSIDE the §4.4 floor's `system/tree` resource
+        // scope (`system/type/*`) — the same discriminator core-go's
+        // `TestAcceptorOriginationReachesTheReciprocalGrant` uses, and for the
+        // same reason: *"if the grant authorizes anything at all, it authorizes
+        // this."*
+        //
+        // It used to send a bare `get` at `/{C}/system/tree` with no resource,
+        // relying on the handler falling back to its own pattern path. That
+        // answered 200 only because nothing checked it: since 0.8.2.20 `get`
+        // runs §6.3's handler-level path check, which for a request carrying no
+        // `resource` is the SOLE resource enforcement, and the §4.4 floor grants
+        // `system/type/*` + `system/handler/*` — not `system/tree` itself. A
+        // 403 there is conformant and it destroys this probe's discriminator,
+        // which asserts on the status to mean *"the reciprocal cap authorized
+        // the dispatch."*
+        let type_path = format!("/{}/system/type/system/peer", client_pid);
+        let probe_params = entity_entity::Entity::new(
             "system/params",
-            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![])),
+            entity_ecf::to_ecf(&entity_ecf::Value::Map(vec![(
+                entity_ecf::text("path"),
+                entity_ecf::text(&type_path),
+            )])),
         )
         .unwrap();
+        let probe_resource = entity_capability::ResourceTarget {
+            targets: vec![type_path.clone()],
+            exclude: vec![],
+        };
         let resp = remote::send_execute(
             endpoint.as_ref(),
             server.keypair(),
             &format!("/{}/system/tree", client_pid),
             "get",
-            &empty_params,
-            None,
+            &probe_params,
+            Some(&probe_resource),
             None,
             None,
             &std::collections::HashMap::new(),
