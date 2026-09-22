@@ -5562,7 +5562,16 @@ mod tests {
         );
     }
 
-    /// V7 §6.2: register on system/* MUST be rejected (forbidden_pattern).
+    /// Register on `system/*` is refused with `403 forbidden_pattern`.
+    ///
+    /// **This pins a deployment policy, not a protocol MUST.** 0.8.2.13
+    /// withdrew §6.2's *"MUST NOT allow user-installed handlers to register at
+    /// `system/*`"* and the matching §9.1 conformance row; §9.1 now says a peer
+    /// that refuses *"is applying deployment policy and remains conformant; so
+    /// does one that permits them."* So this row asserts **our posture** and
+    /// would be equally correct inverted — see `is_reserved_system_pattern`
+    /// (`extensions/handler-ops`) for why we keep the refusal and for the
+    /// cross-impl check that still requires it.
     #[cfg(feature = "handlers")]
     #[tokio::test]
     async fn test_register_rejects_system_pattern() {

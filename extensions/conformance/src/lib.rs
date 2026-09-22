@@ -165,34 +165,52 @@ impl DispatchOutboundHandler {
         let cap_raw = entity_wire::cbor_map_field_raw(&ctx.params.data, "reentry_capability");
         let granter_raw = entity_wire::cbor_map_field_raw(&ctx.params.data, "reentry_granter");
         let sig_raw = entity_wire::cbor_map_field_raw(&ctx.params.data, "reentry_cap_signature");
-        let (cap_raw, granter_raw, sig_raw) = match (cap_raw, granter_raw, sig_raw) {
-            (Some(c), Some(g), Some(s)) => (c, g, s),
+        //
+        // **The triple is OPTIONAL, and that is what makes PD-2 drivable here.**
+        // It used to be required, and a request omitting it got `400
+        // invalid_params` — which reads as strictness and is the reason
+        // `origination.dispatch_outbound_ambient_refused` could not score us.
+        // That check (0.8.2.17's §9.1 negative arm) drives this exact handler
+        // with the triple deliberately absent, so the sub-dispatch rides
+        // **ambient** handler authority; a 400 here means the probe never
+        // reaches the outbound branch and the arm it exists to measure is never
+        // entered. The refusal we owe that probe is the one §1.4 specifies —
+        // `403 capability_denied` from `outbound_sub_dispatch_authorized`, on
+        // the inner leg — and we cannot owe it from a handler that returns
+        // first. Present-but-partial stays a 400: two of three is a malformed
+        // §7a.2a request, not an ambient dispatch.
+        let (cap, included) = match (cap_raw, granter_raw, sig_raw) {
+            (Some(c), Some(g), Some(s)) => {
+                // Decode the authority entities byte-faithfully, then
+                // re-canonicalize so each carries the right content_hash before
+                // dispatch (decode keeps type+data; Entity::new recomputes the
+                // hash deterministically).
+                let cap = match recanonicalize(c) {
+                    Ok(e) => e,
+                    Err(e) => return invalid("reentry_capability", &e),
+                };
+                let granter = match recanonicalize(g) {
+                    Ok(e) => e,
+                    Err(e) => return invalid("reentry_granter", &e),
+                };
+                let sig = match recanonicalize(s) {
+                    Ok(e) => e,
+                    Err(e) => return invalid("reentry_cap_signature", &e),
+                };
+                (Some(cap), vec![granter, sig])
+            }
+            (None, None, None) => (None, Vec::new()),
             _ => {
                 return HandlerResult::error(
                     STATUS_BAD_REQUEST,
                     error_entity(
                         "invalid_params",
-                        "dispatch-outbound requires reentry_capability + reentry_granter + \
-                         reentry_cap_signature in-band per §7a.2a",
+                        "dispatch-outbound takes reentry_capability + reentry_granter + \
+                         reentry_cap_signature together (§7a.2a) or none of them (the \
+                         §1.4 ambient-authority arm); a partial triple is neither",
                     ),
                 )
             }
-        };
-
-        // Decode the authority entities byte-faithfully, then re-canonicalize
-        // so each carries the right content_hash before dispatch (decode keeps
-        // type+data; Entity::new recomputes the hash deterministically).
-        let cap = match recanonicalize(cap_raw) {
-            Ok(e) => e,
-            Err(e) => return invalid("reentry_capability", &e),
-        };
-        let granter = match recanonicalize(granter_raw) {
-            Ok(e) => e,
-            Err(e) => return invalid("reentry_granter", &e),
-        };
-        let sig = match recanonicalize(sig_raw) {
-            Ok(e) => e,
-            Err(e) => return invalid("reentry_cap_signature", &e),
         };
 
         // The caller passed `value` as a raw-CBOR opaque payload; wrap it as a
@@ -214,14 +232,16 @@ impl DispatchOutboundHandler {
             }
         };
 
-        // Originate one outbound EXECUTE through the §6.13(b) seam. The reentry
-        // capability authorizes this EXECUTE (opts.capability); its granter
-        // identity + signature ride in the envelope `included` via opts.included
-        // (the in-band chain isn't in the local store, so collect_chain_bundle
-        // can't reach it — this is the §7a.2a path).
+        // Originate one outbound EXECUTE through the §6.13(b) seam. When the
+        // §7a.2a triple was supplied, the reentry capability authorizes this
+        // EXECUTE (opts.capability) and its granter identity + signature ride in
+        // the envelope `included` via opts.included — the in-band chain isn't in
+        // the local store, so `collect_chain_bundle` can't reach it. With no
+        // triple, `capability: None` and the dispatch rides ambient authority,
+        // which is §1.4's other arm and the one PD-2's negative check drives.
         let opts = ExecuteOptions {
-            capability: Some(cap),
-            included: vec![granter, sig],
+            capability: cap,
+            included,
             ..Default::default()
         };
         let downstream = match execute_fn(target, operation, outbound_params, opts).await {
@@ -415,14 +435,59 @@ mod tests {
         assert_eq!(err_code(&r), "internal_error");
     }
 
+    /// **This row's expectation was rewritten, and it therefore witnesses
+    /// nothing on its own.** It asserted `400 invalid_params` for an absent
+    /// §7a.2a triple; 0.8.2.17 makes an absent triple the *ambient-authority*
+    /// input, which the handler must run rather than refuse — otherwise
+    /// `origination.dispatch_outbound_ambient_refused` cannot reach the arm it
+    /// scores, which is what it did against this peer. A test edited in the same
+    /// commit as the behaviour is not an independent witness of the behaviour,
+    /// so the evidence for this change is the cross-impl run and the control
+    /// below, not this line going green.
     #[tokio::test]
-    async fn dispatch_400_missing_reentry_fields() {
+    async fn dispatch_with_no_reentry_triple_runs_on_ambient_authority() {
         let h = DispatchOutboundHandler::new(PID);
         let r = h
             .handle(&ctx_with_fn("dispatch", dispatch_params_no_reentry()))
             .await
             .unwrap();
-        assert_eq!(r.status, STATUS_BAD_REQUEST);
+        assert_ne!(
+            r.status, STATUS_BAD_REQUEST,
+            "an absent triple selects §1.4's ambient arm; refusing here makes \
+             the arm unmeasurable from the wire"
+        );
+    }
+
+    /// **The control, and it is the row that says this was a discrimination and
+    /// not a deletion.** Two of the three authority fields is a malformed
+    /// §7a.2a request, not an ambient dispatch — the handler must still refuse
+    /// it. Without this, "the absent triple now runs" is indistinguishable from
+    /// "the 400 was removed", and the check above would pass against a handler
+    /// that accepts anything.
+    ///
+    /// Deliberately on the same handler and in the same file as the change, per
+    /// the rule that a control is scoped to the code path its input takes:
+    /// `dispatch_400_missing_target` refuses one branch earlier and would stay
+    /// green through a relabel of this one.
+    ///
+    /// **Mutation verified**: collapsing the partial arm into the
+    /// `(None, None, None)` arm — i.e. treating any incomplete triple as
+    /// ambient — reddens this row and leaves the one above green.
+    #[tokio::test]
+    async fn a_partial_reentry_triple_is_still_a_malformed_request() {
+        let h = DispatchOutboundHandler::new(PID);
+        let data = entity_ecf::to_ecf(&entity_ecf::cbor_map! {
+            "target" => entity_ecf::text("entity://x/system/validate/echo"),
+            "operation" => entity_ecf::text("echo"),
+            // A capability with no granter identity and no signature beside it.
+            "reentry_capability" => entity_ecf::Value::Bytes(vec![0xa0])
+        });
+        let params = Entity::new("primitive/any", data).unwrap();
+        let r = h.handle(&ctx_with_fn("dispatch", params)).await.unwrap();
+        assert_eq!(
+            r.status, STATUS_BAD_REQUEST,
+            "a partial triple is neither a §7a.2a dispatch nor an ambient one"
+        );
         assert_eq!(err_code(&r), "invalid_params");
     }
 

@@ -18,7 +18,10 @@
 //! `unregister` removes 1-3 (interface, grant, signature); type definitions
 //! are left in place since they may be shared by other handlers.
 //!
-//! V7 §6.2: `system/*` patterns are reserved — register/unregister return 403.
+//! `system/*` patterns are refused by register/unregister with `403
+//! forbidden_pattern` — as **deployment policy**, not as a protocol MUST. See
+//! [`is_reserved_system_pattern`] for the 0.8.2.13 withdrawal and why the
+//! behaviour is kept.
 
 use std::sync::Arc;
 
@@ -138,14 +141,24 @@ impl HandlersHandler {
             }
         }
 
-        // V7 §6.2: user-installed handlers MUST NOT register at system/* paths.
+        // Deployment policy, not a protocol constraint — see
+        // `is_reserved_system_pattern`. Ordering note: this sits AFTER the
+        // manifest checks and before the clobber check, where the withdrawn MUST
+        // used to sit. 0.8.2.13's complaint about the rule as a MUST was
+        // precisely that it "was enforced by a hardcoded prefix match ahead of
+        // authorization rather than by the capability system, so it overrode the
+        // grant a deployment had deliberately issued" — which is what a
+        // deployment policy is entitled to do, and is why the same code is
+        // conformant under a different name.
         if is_reserved_system_pattern(&pattern) {
             return Ok(HandlerResult::error(
                 STATUS_FORBIDDEN,
                 error_entity(
                     "forbidden_pattern",
                     &format!(
-                        "V7 §6.2: user-installed handlers MUST NOT register at system/* paths: {}",
+                        "this peer does not accept handler registration at system/* \
+                         paths (deployment policy; §6.2 places no protocol \
+                         constraint on the prefix): {}",
                         pattern
                     ),
                 ),
@@ -433,7 +446,11 @@ impl HandlersHandler {
                 STATUS_FORBIDDEN,
                 error_entity(
                     "forbidden_pattern",
-                    &format!("V7 §6.2: cannot unregister system/* handlers: {}", pattern),
+                    &format!(
+                        "this peer does not accept handler unregistration at \
+                         system/* paths (deployment policy): {}",
+                        pattern
+                    ),
                 ),
             ));
         }
@@ -597,6 +614,40 @@ fn error_entity(code: &str, message: &str) -> Entity {
     Entity::new(entity_types::TYPE_ERROR, entity_ecf::to_ecf(&data)).expect("error entity")
 }
 
+/// Does this peer decline to (un)register a handler at `pattern`?
+///
+/// **The protocol rule this implemented is WITHDRAWN (0.8.2.13), and the
+/// behaviour is kept deliberately.** §6.2 carried *"Implementations MUST NOT
+/// allow user-installed handlers to register at `system/*` paths"* and §9.1
+/// carried the matching conformance row; both are gone. Install authorization at
+/// any path — `system/*` included — is now the standard dispatch capability
+/// check on `resource` (§6.2, §6.13), which this handler already runs one layer
+/// up. The withdrawal names the defect precisely: the rule *"named a party —
+/// 'user' — that this specification does not define"*, and our refusal message
+/// quoted that undefined word back to the caller, which is why the wording
+/// changed with it.
+///
+/// **Keeping the refusal is conformant, and so is dropping it.** §6.2's
+/// informative paragraph is explicit: *"Many deployments will therefore choose
+/// not to issue grants covering `system/*` install paths, or to refuse such
+/// registrations outright once the peer is composed and running. Whether to do
+/// so is a deployment decision, not a protocol constraint"*, and §9.1 says a
+/// peer that refuses *"is applying deployment policy and remains conformant; so
+/// does one that permits them."* A handler bound over `system/tree` replaces the
+/// peer's own store operations for every subsequent dispatch, so refusing is the
+/// posture this peer takes.
+///
+/// **Two live cross-impl facts, recorded so the next reader does not re-derive
+/// them.** core-go's harness still *requires* the refusal —
+/// `core_register_reserved_refused` (`cmd/internal/validate/core_register_gate.go`)
+/// declares it a MUST citing *"V7 §6.6"*, and §6.6 no longer says anything about
+/// the prefix. That check is a tolerance keyed on the pre-ruling answer, exactly
+/// the shape `AGENTS.md` warns about, and it is why removing this refusal would
+/// turn a green cross-impl row red for a conformant reason. Second: `403
+/// forbidden_pattern` is not a §3.3 core code, and with the rule withdrawn there
+/// is no longer a core sentence behind it — it stands as this extension's domain
+/// code for a domain refusal, which is what 0.8.2.9 permits. Both are routed;
+/// neither is a reason to change behaviour ahead of a ruling.
 fn is_reserved_system_pattern(pattern: &str) -> bool {
     pattern == "system" || pattern.starts_with("system/")
 }

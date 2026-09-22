@@ -6338,3 +6338,103 @@ unauthenticated probe **is** the rule, so go's control asks exactly the right qu
 
 Routed in `docs/status/ROUTING-2026-09-02-g-ce1-landed-and-the-must-not-was-on-the-code-not-the-input.md`;
 ruled in arch `ROUTING-2026-09-03-a` §4 item 2. **Closed.**
+
+---
+
+## §1.4 presented authority — "granter resolves to the target peer's identity": LEAF or ROOT?
+
+**Spec:** `ENTITY-CORE-PROTOCOL` 0.8.2.17, §1.4 *"The enforcement point, and the authority it
+runs against"* (PD-2). Logged 2026-09-09.
+
+**The passage.** *"The presented-authority arm MUST verify all of the following, or it is
+forgeable. … The capability's `granter` resolves to the **target peer's** identity (§3.6); its
+`grantee` resolves to the **local peer's** identity; it is **valid** — not expired, not revoked,
+chain-verified (§5.5 …)."*
+
+**The ambiguity.** Read at the **leaf**, the `granter` clause forbids attenuation — which is the
+one narrowing move the chain model exists for. The common and *safer* shape is: the target grants
+this peer a broad connection capability at handshake; this peer re-attenuates it to a single
+operation on a single subtree before spending it. That leaf's granter is **this peer**, not the
+target. A literal leaf reading refuses exactly the credential that spends least, and accepts only
+the one that spends the whole grant unattenuated. Our own `follow(Continuation)` standing leg is
+that shape (`mint_cross_peer_chain_capability` — re-attenuate the handshake grant), and it is what
+surfaced the question: the leaf reading refused it.
+
+**Interim choice.** The property is about the chain's **root**, and the `grantee` clause stays on
+the leaf. Concretely: the leaf's `grantee` MUST be the local peer, and the chain MUST root at a
+capability the target granted — which §5.5's own root-trust rule already expresses, so we get it
+by passing `target_peer` as the frame argument to `verify_capability_chain` rather than by adding
+a check. A single-sig root whose granter is not the target fails `NotLocalPeer`; a multi-sig root
+the target did not sign fails M6. `core/peer/src/connection.rs::presented_authority_authorizes`
+states this at the code, with the leaf reading recorded as the rejected alternative so nobody
+"restores" it.
+
+**Why it is not merely editorial.** The two readings differ on a real security question in the
+permissive direction *for the leaf reading*: it accepts a broad unattenuated root and rejects its
+narrowed child. That is backwards from every other attenuation rule in the specification.
+
+**Ask.** One sentence in §1.4 saying whether the `granter` clause is evaluated at the leaf or at
+the chain root — and, if at the root, that the frame for the whole verification (root-trust,
+resource canonicalization, and the absent-`peers` default) is the **target's** peer id, not the
+dispatcher's. The second half matters as much as the first: passing our own peer id makes §5.5
+answer `NotLocalPeer` on every credential this arm exists to accept, and makes an absent `peers`
+scope default to `{include: [local]}` where the minting peer meant *"at me."*
+
+---
+
+## §3.3's `path_required` parenthetical names two operations it does not own
+
+**Spec:** `ENTITY-CORE-PROTOCOL` 0.8.2.17, §3.3 status table, 400 row. Logged 2026-09-09.
+
+**The passages, and they disagree.**
+
+- §3.3, the normative sentence: *"**Which* operations require one is stated by each operation's own
+  specification**"* — and then, illustratively: *"operations for which no resource is legitimate
+  (`configure`, `create_quorum`) simply do not carry the requirement."*
+- `EXTENSION-IDENTITY` §6's resource-target table gives `configure` → `system/identity/peer-config`
+  and `create_quorum` → `system/quorum/{q_hex}`, under *"**All ops follow path-as-resource** per
+  ENTITY-CORE-PROTOCOL.md §3.2 (architectural-side MUST)."*
+
+Both named operations are EXTENSION-IDENTITY's, and its own specification requires a resource for
+each. So the illustration contradicts the rule it illustrates.
+
+**Interim choice.** Follow the normative sentence: it points at the operation's own specification,
+and the operation's own specification requires a resource. `system/identity:create_quorum` and
+`:configure` continue to answer `400 path_required` when invoked without one. Recorded at
+`extensions/identity/src/ops/create_quorum.rs` so the next reader does not "fix" it toward the
+parenthetical.
+
+**Ask.** Either drop the two examples from §3.3, or rule for them — in which case
+`EXTENSION-IDENTITY` §6's table and its architectural-side MUST have to move in the same fold, and
+three seats have handler code to change.
+
+---
+
+## §1.4 requires the DISPATCHER to chain-verify a credential whose root signature it may not hold
+
+**Spec:** `ENTITY-CORE-PROTOCOL` 0.8.2.17 §1.4 (validity clause) against `EXTENSION-CONTINUATION`
+v1.22 §4.3. Logged 2026-09-09 — raised as a finding rather than a blocker; we closed it in our own
+tree and the fix may bind the other seats.
+
+**The tension.** §1.4's presented arm requires the dispatching peer to verify the capability is
+*"chain-verified (§5.5)"*. §5.5 verification needs a detached signature for **every** link. But
+§4.3's bundler contract makes signatures **best-effort** by design — *"the bound signature is
+resolved through a tree pointer that a wire-only cap may legitimately not have locally, and B
+fails closed if it needed it."* The design has always assumed the **recipient** verifies; PD-2 is
+the first rule that makes the **dispatcher** verify, and the dispatcher is not guaranteed to hold
+the material.
+
+**What we found, and it may not be ours alone.** In our tree this was not a spec problem but a
+defect: §6.5 envelope-signature ingestion ran on inbound EXECUTEs only and **never on the connect
+response**, so a peer held a connection grant whose granter's signature sat live on the connection
+(`auth_included`) and bound at no path — unreachable to the bundler, which resolves signatures only
+through the §3.5 invariant pointer. Every chain rooted at that grant was unverifiable *locally*,
+and it was invisible because the far side verifies against its own store where its own signature is
+bound. Fixed by running the same §6.5 ingestion over the connect response.
+
+**Interim choice.** Verify fully, and fix the material gap rather than relax the verification.
+
+**Ask.** Confirm that a peer is expected to bind the connect-response signatures at their §3.5
+invariant paths — i.e. that §6.5 ingestion applies to the connect response and not only to inbound
+EXECUTEs. If so it is worth one sentence in §6.5, because nothing currently says it and the
+consequence only becomes observable at 0.8.2.17.

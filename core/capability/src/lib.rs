@@ -304,12 +304,19 @@ pub fn wildcard_handler_grant() -> Vec<GrantEntry> {
 /// handlers under a bootstrap grant nobody minted for that purpose, undoing the
 /// dimension §5.2 Dimension 4 exists to close. We shipped `IdScope::all()` until
 /// arch ruled the question (go's spec-issue `2026-08-23-a`, ruled absent and
-/// folded into §6.2). Inert in this tree either way today — `make_execute_fn`
-/// returns at its `is_remote` branch before the ceiling check, so the path that
-/// reaches Dimension 4 always qualifies to the local peer — which is exactly why
-/// it is worth spelling correctly now: this is the same "harmless as
-/// documentation, wrong as an enforcement input" shape that produced the
-/// `resources` defect below.
+/// folded into §6.2). **This field is now live and it was not when it was
+/// written.** The prior sentence here read *"inert in this tree either way today
+/// — `make_execute_fn` returns at its `is_remote` branch before the ceiling
+/// check, so the path that reaches Dimension 4 always qualifies to the local
+/// peer."* True as written, and it stopped being true at 0.8.2.17, which put a
+/// four-dimension check on the outbound branch (§1.4 PD-2,
+/// `outbound_sub_dispatch_authorized`). So this is the *third* instance of the
+/// same shape in one function's doc comment: an unread field spelled correctly
+/// on the argument that a reader would one day consult it, and then consulted.
+/// The consequence of `peers: None` is now observable — a bootstrap-scope
+/// handler cannot sub-dispatch at a foreign peer on ambient authority, which is
+/// the escalation §6.2 names, and it reaches such a peer only by presenting a
+/// capability that peer minted.
 ///
 /// **Why the form matters here and did not before.** §6.9 describes this default
 /// as unrestricted, and until D1 (PROPOSAL-DISPATCH-AUTHORIZATION-FRAME, §5.2
@@ -2262,6 +2269,178 @@ mod tests {
             .is_none(),
             "the dispatch boundary must deny the absent-peers escalation too"
         );
+    }
+
+    /// **0.8.2.16 in the DELEGATION path — the two defects core-go found in
+    /// their own `grantCovers`, driven against ours.**
+    ///
+    /// §5.2 has said since `0.8.1` that a scope is matched **by its scope type**
+    /// — `path-scope` (handlers, resources) canonicalized, `id-scope`
+    /// (operations, peers) compared as literal identifiers — and that *"an id
+    /// dimension canonicalized is a conformance defect."* `0.8.2.16` found that
+    /// **both** normative code blocks did the thing the prose forbids, under a
+    /// comment reading `; Uniform scope check for all grant dimensions`, and
+    /// that *"an implementation reading the prose was conformant; one reading
+    /// the pseudocode was not, and the pseudocode is what gets transcribed."*
+    ///
+    /// We read the prose. `check_permission` and `scope_subset_id` have always
+    /// matched `operations` and `peers` literally, so this fold is a **no-op in
+    /// this tree** — and the rule here is that an unproven negative in a sweep is
+    /// how a no-op gets reported as a fix. These are the proofs, one per defect
+    /// core-go reported at their seat:
+    ///
+    /// 1. **Operations matched with the path matcher instead of literal
+    ///    id-scope**, which over-permits on a subset check. Under
+    ///    canonicalization both sides of the pair below become
+    ///    `/{local}/…`-qualified paths and `matches_pattern` reads the parent's
+    ///    `pwn/*` as covering the child — the child is judged an attenuation of
+    ///    a parent that does not grant it.
+    /// 2. **The `peers` dimension not checked in the subset at all**, so a child
+    ///    grant widens its network reach past its parent. Latent until PD-2
+    ///    (0.8.2.17) makes `peers` live on the outbound path, and reachable the
+    ///    moment it does — which it now is, at
+    ///    `connection.rs::outbound_sub_dispatch_authorized`.
+    ///
+    /// **Enforcement is the mutation, not the assertion.** For (1), swapping
+    /// `scope_subset_id` for `scope_subset_path` on the `operations` line of
+    /// `grant_axes_subset` reddens the first row. For (2), deleting the final
+    /// `scope_subset_id(child_peers, parent_peers)` — i.e. returning `true` —
+    /// reddens the second. Both verified; each mutation reddens only its own row,
+    /// which is what says the two dimensions are checked separately rather than
+    /// one masking the other.
+    #[test]
+    fn delegation_attenuates_operations_and_peers_as_literal_id_scope() {
+        let child_ops = make_token(vec![{
+            let mut g = make_grant(&["*"], &["*"], &["pwn/escalate"]);
+            g.peers = Some(IdScope::new(vec!["peer-a".into()]));
+            g
+        }]);
+        let parent_ops = make_token(vec![{
+            // `pwn/*` is a literal segment-prefix over IDENTIFIERS. It covers
+            // `pwn/escalate` under either reading, so it is not the discriminator
+            // — `system/tree` is: a canonicalizing matcher qualifies both sides
+            // to `/{local}/…` and the parent's include list, read as paths, no
+            // longer says what it says as identifiers.
+            let mut g = make_grant(&["*"], &["*"], &["/*/pwn/escalate"]);
+            g.peers = Some(IdScope::new(vec!["peer-a".into()]));
+            g
+        }]);
+        assert!(
+            !is_attenuated(&child_ops, &parent_ops, "local"),
+            "operations is id-scope: the parent's `/*/pwn/escalate` is a LITERAL \
+             identifier and does not cover the operation `pwn/escalate`. A \
+             canonicalizing matcher reads it as a peer-wildcard path pattern and \
+             covers it — that is 0.8.2.16 defect (1), and it widens authority \
+             down a chain nobody re-checks."
+        );
+
+        let child_peers = make_token(vec![{
+            let mut g = make_grant(&["*"], &["*"], &["*"]);
+            g.peers = Some(IdScope::new(vec!["peer-a".into(), "peer-b".into()]));
+            g
+        }]);
+        let parent_peers = make_token(vec![{
+            let mut g = make_grant(&["*"], &["*"], &["*"]);
+            g.peers = Some(IdScope::new(vec!["peer-a".into()]));
+            g
+        }]);
+        assert!(
+            !is_attenuated(&child_peers, &parent_peers, "local"),
+            "peers is one of the four attenuated dimensions (§5.6): a child that \
+             adds `peer-b` reaches a peer its parent never granted. Skipping the \
+             dimension in the subset check is 0.8.2.16 defect (2)."
+        );
+
+        // The control the two rows above need: an honest narrowing on BOTH
+        // dimensions still attenuates. Without it a `scope_subset` that returns
+        // `false` unconditionally satisfies every assertion here.
+        let honest = make_token(vec![{
+            let mut g = make_grant(&["*"], &["*"], &["get"]);
+            g.peers = Some(IdScope::new(vec!["peer-a".into()]));
+            g
+        }]);
+        let broad = make_token(vec![{
+            let mut g = make_grant(&["*"], &["*"], &["*"]);
+            g.peers = Some(IdScope::new(vec!["peer-a".into(), "peer-b".into()]));
+            g
+        }]);
+        assert!(
+            is_attenuated(&honest, &broad, "local"),
+            "narrowing operations and peers together is a valid attenuation"
+        );
+    }
+
+    /// The other half of `0.8.2.16`, and it is an **absence** rather than a
+    /// check: `scope_subset` gained `if child_scope.type != parent_scope.type:
+    /// return false`, and there is nothing here to add.
+    ///
+    /// The spec's scopes are entities carrying their own `type`
+    /// (`system/capability/path-scope` / `system/capability/id-scope`), so a
+    /// grant can carry a mismatched pair and a transcribing implementation must
+    /// refuse it. In this tree the scope type is fixed by the **dimension name**
+    /// at the decoder — `decode_grant_entry` sends `handlers`/`resources` to
+    /// `decode_path_scope` and `operations`/`peers` to `decode_id_scope`, with no
+    /// wire field consulted — so `PathScope` and `IdScope` are distinct Rust
+    /// types and a mismatched pair does not typecheck. `grant_axes_subset` calls
+    /// `scope_subset_path` and `scope_subset_id` on fixed dimensions; there is no
+    /// call site where the two could meet.
+    ///
+    /// **Stated rather than silently omitted, per the closed-grammar rule**: a
+    /// refusal that is unrepresentable and a refusal that was forgotten look
+    /// identical from outside, and the next reader porting the spec's line has to
+    /// know which this is. This test is the statement — it pins the
+    /// dimension→scope-type mapping the argument rests on, so if a decoder ever
+    /// starts reading a declared `type` off the wire, this row is where the
+    /// missing refusal surfaces.
+    #[test]
+    fn scope_type_is_fixed_by_dimension_so_a_mismatched_pair_is_unrepresentable() {
+        let g = decode_grant_entry(&ciborium::Value::Map(vec![
+            (
+                ciborium::Value::Text("handlers".into()),
+                ciborium::Value::Map(vec![(
+                    ciborium::Value::Text("include".into()),
+                    ciborium::Value::Array(vec![ciborium::Value::Text("system/tree".into())]),
+                )]),
+            ),
+            (
+                ciborium::Value::Text("resources".into()),
+                ciborium::Value::Map(vec![(
+                    ciborium::Value::Text("include".into()),
+                    ciborium::Value::Array(vec![ciborium::Value::Text("*".into())]),
+                )]),
+            ),
+            (
+                ciborium::Value::Text("operations".into()),
+                ciborium::Value::Map(vec![
+                    (
+                        ciborium::Value::Text("include".into()),
+                        ciborium::Value::Array(vec![ciborium::Value::Text("get".into())]),
+                    ),
+                    // A declared `type` claiming the OTHER scope type. The
+                    // decoder does not read it, which is the point: there is no
+                    // input that produces a mismatched child/parent pair.
+                    (
+                        ciborium::Value::Text("type".into()),
+                        ciborium::Value::Text("system/capability/path-scope".into()),
+                    ),
+                ]),
+            ),
+        ]))
+        .expect("grant decodes");
+
+        // `operations` came back an IdScope regardless of the declared type —
+        // it is the field name that decides, at exactly one site.
+        assert_eq!(g.operations.include, vec!["get".to_string()]);
+        assert!(
+            !matches_id_scope("/local/get", &g.operations.include, &g.operations.exclude),
+            "operations matches LITERALLY: a path-shaped value does not match the \
+             identifier `get`, whatever the scope map claimed its type was"
+        );
+        assert!(matches_id_scope(
+            "get",
+            &g.operations.include,
+            &g.operations.exclude
+        ));
     }
 
     fn make_token(grants: Vec<GrantEntry>) -> CapabilityToken {

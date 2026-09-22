@@ -22,7 +22,6 @@
 //! V7 invariant paths by the time they run.
 
 use std::collections::BTreeMap;
-use std::sync::Arc;
 
 use entity_crypto::TYPE_PEER;
 use entity_entity::{Entity, TYPE_SIGNATURE};
@@ -54,8 +53,8 @@ pub enum IngestError {
 /// re-run on the same envelope (no-op).
 pub fn ingest_envelope_signatures(
     included: &BTreeMap<Hash, Entity>,
-    content_store: &Arc<dyn ContentStore>,
-    location_index: &Arc<dyn LocationIndex>,
+    content_store: &dyn ContentStore,
+    location_index: &dyn LocationIndex,
 ) -> Result<usize, IngestError> {
     // Phase 1: persist any system/peer entities first, so signature
     // ingestion can resolve `signer` → peer_id. Has-before-put avoids
@@ -163,6 +162,7 @@ mod tests {
     use entity_crypto::Keypair;
     use entity_ecf::{text, to_ecf, Value};
     use entity_store::{MemoryContentStore, MemoryLocationIndex};
+    use std::sync::Arc;
 
     fn build_signed(target: Hash, kp: &Keypair, signer: Hash) -> Entity {
         let sig_bytes = kp.sign(&target.to_bytes());
@@ -187,7 +187,7 @@ mod tests {
         let sig_entity = build_signed(target, &kp, id_hash);
         let mut included: BTreeMap<Hash, Entity> = BTreeMap::new();
         included.insert(sig_entity.content_hash, sig_entity);
-        let n = ingest_envelope_signatures(&included, &cs, &li).unwrap();
+        let n = ingest_envelope_signatures(&included, cs.as_ref(), li.as_ref()).unwrap();
         assert_eq!(n, 1);
         let path = format!(
             "/{}/system/signature/{}",
@@ -227,7 +227,7 @@ mod tests {
         let mut included: BTreeMap<Hash, Entity> = BTreeMap::new();
         included.insert(sig.content_hash, sig);
 
-        let n = ingest_envelope_signatures(&included, &cs, &li).unwrap();
+        let n = ingest_envelope_signatures(&included, cs.as_ref(), li.as_ref()).unwrap();
         assert_eq!(
             n, 1,
             "Ed448 signature MUST bind (was silently dropped pre-fix)"
@@ -257,8 +257,8 @@ mod tests {
         let sig_entity = build_signed(Hash::zero(), &kp, id_hash);
         let mut included: BTreeMap<Hash, Entity> = BTreeMap::new();
         included.insert(sig_entity.content_hash, sig_entity);
-        ingest_envelope_signatures(&included, &cs, &li).unwrap();
-        let n2 = ingest_envelope_signatures(&included, &cs, &li).unwrap();
+        ingest_envelope_signatures(&included, cs.as_ref(), li.as_ref()).unwrap();
+        let n2 = ingest_envelope_signatures(&included, cs.as_ref(), li.as_ref()).unwrap();
         assert_eq!(n2, 0, "idempotent re-run binds nothing new");
     }
 
@@ -274,7 +274,7 @@ mod tests {
         let mut included: BTreeMap<Hash, Entity> = BTreeMap::new();
         included.insert(id_hash, id_entity);
         included.insert(sig_entity.content_hash, sig_entity);
-        let n = ingest_envelope_signatures(&included, &cs, &li).unwrap();
+        let n = ingest_envelope_signatures(&included, cs.as_ref(), li.as_ref()).unwrap();
         assert_eq!(n, 1);
         // Identity entity is now in the content store.
         assert!(cs.get(&id_hash).is_some());
@@ -307,7 +307,7 @@ mod tests {
         let sig_entity = build_signed(target, &kp, id_hash);
         let mut included: BTreeMap<Hash, Entity> = BTreeMap::new();
         included.insert(sig_entity.content_hash, sig_entity);
-        let err = ingest_envelope_signatures(&included, &cs, &li).unwrap_err();
+        let err = ingest_envelope_signatures(&included, cs.as_ref(), li.as_ref()).unwrap_err();
         assert!(matches!(err, IngestError::SignaturePathConflict { .. }));
     }
 }

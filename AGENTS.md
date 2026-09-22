@@ -262,6 +262,21 @@ gates by making the TCP path compile on wasm32.
   it.** The fix is never to pick one reading: §4.4.2 removed the collision (`log` takes
   `start_at`, `fetch` keeps `since`) and we split both the decoder and the builder, because
   a shared code path is what lets the two meanings drift back together (`59e6f55`).
+  **Third shape, and it is an ARGUMENT rather than a type or a name: one parameter carrying more
+  than one rule, so passing the wrong value silently deletes a check instead of mis-formatting a
+  value.** *(2026-09-09; it is the same family, so it strengthens this entry rather than opening
+  one.)* `verify_capability_chain(hash, bundle, local_peer_id)` reads as a canonicalization frame,
+  and mostly is. It is also the input to **§5.5 root-trust** — *"the single-sig root's granter must
+  be the local peer"* — and to the absent-`peers` default. Verifying a capability the **target**
+  minted requires passing `target_peer` there; passing our own peer id does not mis-canonicalize a
+  path, it answers `NotLocalPeer` on every credential the check exists to accept, and in the other
+  direction it would default `peers` to `{include: [local]}` where the minter meant *"at me."* The
+  tell is the same as the `Option<T>` one: you catch yourself explaining what an argument means
+  **twice with different answers** depending on who granted the thing. Remedy here was not a new
+  type — the call sites are two — but naming every rule the argument decides at the call site, so
+  the next reader cannot "simplify" it back to our own pid
+  (`connection.rs::presented_authority_authorizes`). Grep `local_peer_id` on any path that
+  verifies a **foreign-granted** artifact and ask, per rule, whose frame it is.
 - **A closed grammar needs a writer that refuses, not just a matcher that omits — and
   where nothing *can* be refused, say so at the `fn`.** *(Ratified: bit us twice, and the
   second time the correct answer was the opposite one.)* §2.4 pinned the exclude matcher to four forms; the
@@ -610,6 +625,54 @@ gates by making the TCP path compile on wasm32.
   is untested and the comment should say that instead. Same rule as *"a declared exclusion whose
   ground is 'nothing installs it' is a gap wearing an exemption"*, applied to a deferral rather
   than an exclusion.
+- **A precondition guard on a TEST FIXTURE can make the behaviour under test unreachable — and
+  it reads as strictness, not as a hole.** *(Candidate: bit us once, 2026-09-09, found by a
+  sibling's check scoring us FAIL for a reason unrelated to what it measures.)* 0.8.2.17's §9.1
+  negative arm is driven by core-go's `origination.dispatch_outbound_ambient_refused`, which sends
+  `system/validate/dispatch-outbound` **with the §7a.2a authority triple deliberately absent** so
+  the sub-dispatch rides ambient authority. Our conformance handler *required* the triple and
+  answered `400 invalid_params`, so the probe never reached the outbound branch: we scored FAIL on
+  an arm that was correctly implemented and never entered. The 400 looked careful. It was
+  unmeasurability — **a handler that refuses early makes its peer look strict and makes the thing
+  under test unobservable**, and `400` and `403` are one word to a reader and two different facts
+  to a check.
+  Same family as the deferral-comment entry above, one layer out: there a *comment* stopped anyone
+  driving a branch, here a *guard* did, and a guard leaves no prose for a reviewer to disbelieve.
+  **Enforcement:** when a ruling adds an arm selected by the ABSENCE of a field, grep the fixture
+  handlers on that path for a required-field check over the same field
+  (`extensions/conformance/`, and any `--validate`-only scaffolding) — an absent-field 400 there is
+  the arm's off-switch. And the fix owes a discriminator, because relaxing a guard and deleting it
+  are one edit apart: **all-or-none**, with *partial* still refused
+  (`a_partial_reentry_triple_is_still_a_malformed_request`, mutation-verified — collapsing the
+  partial arm into the absent arm reddens the control and leaves the relaxed row green). Note the
+  ladder position: this commit rewrote a test's own expectation, so per the rule above the in-tree
+  green is a smoke check and the evidence is that control plus the cross-impl row.
+
+- **When a ruling moves a check to a NEW PARTY, audit what that party is guaranteed to hold — the
+  material may have been assembled best-effort for someone else.** *(Candidate: bit us once,
+  2026-09-09; the defect had been shipping invisibly since the code existed.)* 0.8.2.17's
+  presented-authority arm requires the **dispatcher** to chain-verify a capability the target
+  minted. Every input already existed, so it reads as a composition. It is not: §5.5 verification
+  needs a detached signature per link, and `EXTENSION-CONTINUATION` §4.3 makes bundled signatures
+  explicitly **best-effort** — *"B fails closed if it needed it"* — because the design had always
+  assumed the **recipient** verifies. Move the check to the dispatcher and it inherits a bundle
+  nobody promised would be complete.
+  Underneath that was a real defect: §6.5 envelope-signature ingestion ran on **inbound EXECUTEs
+  only, never on the connect response**, so this peer held a connection grant whose granter's
+  signature sat live on the connection (`auth_included`) and bound at **no path** — unreachable to
+  `collect_chain_bundle`, which resolves signatures only through the §3.5 invariant pointer. Every
+  chain rooted at that grant was unverifiable *locally*, and nothing could see it because the far
+  side verifies against its own store where its own signature **is** bound. It surfaced as
+  `MissingSignature` on `follow(Continuation)`'s standing leg — a legitimate credential refused
+  for want of a proof we were holding.
+  **Enforcement:** for any rule that relocates a verification, name the artifact it consumes and
+  find the site that PRODUCES that artifact locally; if the producer's own contract says
+  *best-effort*, *silently omitted*, or *the verifier fails closed*, the relocation has a material
+  gap and the fix is to close the gap, not to soften the check. In this tree the pair is
+  `ingest_envelope_signatures` (producer) and `collect_chain_bundle` (consumer), and the question
+  that closes it is *"which envelopes does ingestion run on?"* — the answer was one, and the code
+  said so nowhere.
+
 - **An operation added to a `Handler` has two registration sites, and the second one is in
   another crate.** `impl Handler::operations()` makes it answerable; `bootstrap_handler(...)` in
   `core/peer/src/lib.rs` writes the **advertised** `system/handler/{pattern}` interface entity
@@ -832,6 +895,21 @@ gates by making the TCP path compile on wasm32.
   `v1_retention_clamp_beyond_ceiling_live` and `v2_retention_clamp_null_takes_ceiling_live`.
   The entry stays because the check that caught it — read the ROWS, not the exit code — is
   the transferable part.)**
+  **And one level BELOW the row: read the row's DETAIL LINE, because a harness failure wears the
+  vector's name.** *(Candidate: bit us once, 2026-09-09, cost one wrong bisect plan.)* A
+  `validate-complete.sh rust` run came back with six `peer_issued` FAILs reading
+  `REG-PEERISSUED-RESOLVE-1 — by-name → binding → verify against the pinned registry key`,
+  `…-VERIFY-FAIL-1 — §2.1 step 3 MUST`, and four more — a coherent, spec-shaped story about the
+  registry chain, in the same run that landed a change to outbound dispatch authorization, which
+  is exactly what a live-fetch vector would exercise. Every one of them was
+  `bind: address already in use` on the `PI_PORT` we had picked: the fixture bundle could not
+  listen, so nothing was measured. **A FAIL names the check that did not pass, not the reason**,
+  and the reason is on the indented line under it. Enforcement: before attributing any cross-impl
+  FAIL, `grep -A 1 '  FAIL '` the report and read the detail; a message naming a socket, a path,
+  a build or a timeout is harness state, not a verdict. Corollary on the port rule already
+  recorded above — *"pick free ports"* means pick them **freshly measured**
+  (`socket.bind(('127.0.0.1', 0))`), not plausibly-high; a guessed port that collides does not
+  announce itself as a collision.
   **And the third level: a harness TOLERANCE encodes the pre-ruling answer, so the first seat
   to land a ruling is the seat that turns it red.** *(Candidate: bit us once, 2026-09-03,
   predicted-by-nothing and found only by running the gate.)* Our 501 slot sweep made

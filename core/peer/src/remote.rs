@@ -1240,6 +1240,46 @@ async fn adopt_transport_connection(
     .await
     .map_err(|e| PeerError::ConnectionError(format!("handshake with {}: {}", peer_id, e)))?;
 
+    // §6.5 envelope-signature ingestion, dialer side.
+    //
+    // The inbound EXECUTE path has always run this (`connection.rs`, before
+    // handler resolution); the **connect response** never did, and it is the one
+    // envelope that carries the signature over the capability the responder just
+    // minted for us. So this peer held a connection grant whose granter's
+    // signature was in `auth_included` — live, in memory, on the connection —
+    // and bound at no path, which means `collect_chain_bundle` could not find it
+    // (it resolves signatures only through the §3.5 invariant pointer) and any
+    // chain rooted at that grant was unverifiable **locally**.
+    //
+    // That was invisible until 0.8.2.17: the far side verifies against its own
+    // store, where its own signature is bound, so every cross-peer dispatch
+    // worked. PD-2's presented-authority arm is the first code that has to
+    // verify a target-minted credential *here*, and it failed `MissingSignature`
+    // at the chain root on `follow(Continuation)`'s standing leg — a legitimate
+    // credential, refused for want of a signature we were holding.
+    //
+    // Best-effort by the same rule as the inbound path: a malformed or
+    // unresolvable signature is skipped, and only a genuine path conflict is an
+    // error — which is not fatal to a connection that is otherwise established,
+    // so it is logged rather than propagated.
+    {
+        let included: std::collections::BTreeMap<Hash, Entity> = conn
+            .auth_included
+            .iter()
+            .map(|(h, e)| (*h, e.clone()))
+            .collect();
+        if let Err(e) =
+            crate::ingest::ingest_envelope_signatures(&included, content_store, location_index)
+        {
+            tracing::warn!(
+                peer = %peer_id,
+                error = %e,
+                "connect-response signature ingestion failed; chains rooted at \
+                 this connection grant may not verify locally"
+            );
+        }
+    }
+
     // R6 (PROPOSAL §9 rulings) — write the dialer-side
     // `held_capability` on `/{local_peer_id}/system/peer/session/
     // {remote_peer_id}`. Preserves any pre-existing

@@ -1830,8 +1830,8 @@ pub(crate) async fn dispatch_request(
     // signatures being bound at canonical V7 paths by the time they run.
     if let Err(e) = crate::ingest::ingest_envelope_signatures(
         &envelope.included,
-        &shared.content_store,
-        &shared.location_index,
+        shared.content_store.as_ref(),
+        shared.location_index.as_ref(),
     ) {
         let (status, code) = match e {
             crate::ingest::IngestError::SignaturePathConflict { .. } => {
@@ -3449,6 +3449,279 @@ pub enum DispatchCeiling {
     Handler(Option<Box<entity_capability::CapabilityToken>>),
 }
 
+/// §1.4 *"The enforcement point, and the authority it runs against"*
+/// (0.8.2.17 — PD-2): may this locally-originated sub-dispatch **leave the
+/// peer**?
+///
+/// `check_permission` runs before the sub-dispatch leaves, all four dimensions
+/// applied, `target_peer = extract_peer(uri, local_peer_id)`. *Which* authority
+/// it runs against depends on what the sub-dispatch spends, and the two cases
+/// are different questions:
+///
+/// - **Presented authority** — a capability that is *not* the propagated
+///   `caller_capability` (§6.2) but a distinct credential minted **by the target
+///   peer** naming **this peer** as `grantee`. That capability's own four
+///   dimensions authorize, and the dispatching handler's `peers` scope is not
+///   consulted: the party that decides what may be done at a peer is that peer,
+///   and it already has.
+/// - **Ambient authority** — no such capability. The sub-dispatch rides the
+///   executing handler's grant and **Dimension 4 binds it**: a handler whose
+///   grant carries no matching `peers` scope cannot reach a foreign peer. This
+///   is the confused-deputy ceiling the dimension exists for, and it is the arm
+///   this tree did not have — `default_handler_self_grant`'s `peers: None` was
+///   documented as "inert in this tree today" precisely because the remote
+///   branch returned before any ceiling check ran.
+///
+/// **Disjoint from §6.2's confused-deputy prohibition, not an exception to it.**
+/// That rule forbids re-spending the *propagated caller capability* at a target
+/// the caller chose; presented authority is the opposite shape — minted for this
+/// purpose, by the party being accessed. `parent_caller_capability` is
+/// deliberately **not** a candidate here.
+///
+/// **Both candidate sources are target-minted.** `opts.capability` is the
+/// explicit one (a continuation's scoped `dispatch_capability`). The session's
+/// `held_capability` is the standing one — *"the cap remote granted me at
+/// handshake"* (`session_entity`, R6-a), granter = target, grantee = local by
+/// construction. Both are verified here on their own terms rather than trusted
+/// for their provenance; a capability failing any check **is not presented
+/// authority** and falls through to the ambient arm.
+///
+/// Framing note, and it is the half that is easy to get backwards: a presented
+/// capability is evaluated **end to end in the target's frame**, not ours. It
+/// was minted by the target, so its `resources` canonicalize against the
+/// target's peer id (§5.5a / PR-8's per-link granter frame) and an absent
+/// `peers` defaults to `{include: [target]}` — which is what makes an ordinary
+/// handshake cap, naming no peers at all, authorize a dispatch *at the peer that
+/// issued it*. The same argument is passed to the chain walk, where it decides
+/// §5.5's root-trust rule rather than a canonicalization; using our own peer id
+/// there rejects every target-issued credential outright. Both were measured,
+/// not reasoned: our own pid yields `NotLocalPeer` at the chain and a
+/// no-matching-grant at coverage.
+#[allow(clippy::too_many_arguments)]
+fn outbound_sub_dispatch_authorized(
+    shared: &PeerShared,
+    ceiling: &DispatchCeiling,
+    presented: Option<&entity_entity::Entity>,
+    included: &HashMap<entity_hash::Hash, entity_entity::Entity>,
+    handler_pattern: &str,
+    operation: &str,
+    target_peer: &str,
+    resource: Option<&entity_capability::ResourceTarget>,
+    local_pid: &str,
+) -> bool {
+    // --- Arm 1: presented authority ---------------------------------------
+    //
+    // The target's identity hash is derived, never read off the connection:
+    // §1.4 rejects keying this on "the connection the request arrived on"
+    // because that makes an authority question turn on a transport predicate.
+    // `resolve_peer_id_hex` derives it from the PeerID itself for identity-form
+    // PIDs and falls back to state we already hold for SHA-256-form ones.
+    let target_identity_hex = crate::remote::resolve_peer_id_hex(
+        target_peer,
+        shared.content_store.as_ref(),
+        shared.location_index.as_ref(),
+        local_pid,
+    );
+
+    let mut candidates: Vec<entity_entity::Entity> = Vec::new();
+    if let Some(cap) = presented {
+        candidates.push(cap.clone());
+    }
+    // The standing handshake credential, if this peer holds one for the target.
+    if let Some(ref hex) = target_identity_hex {
+        let session_path = format!("/{}/system/peer/session/{}", local_pid, hex);
+        if let Some(held) = shared
+            .location_index
+            .get(&session_path)
+            .and_then(|h| shared.content_store.get(&h))
+            .and_then(|e| crate::session_entity::PeerSession::from_entity(&e).ok())
+            .and_then(|s| s.held_capability)
+            .and_then(|c| shared.content_store.get(&c.hash))
+        {
+            candidates.push(held);
+        }
+    }
+
+    for cand in &candidates {
+        if presented_authority_authorizes(
+            shared,
+            cand,
+            included,
+            handler_pattern,
+            operation,
+            target_peer,
+            resource,
+        ) {
+            return true;
+        }
+    }
+
+    // --- Arm 2: ambient authority ------------------------------------------
+    match ceiling {
+        // The peer itself is dispatching — `Peer::execute_with_options`, the
+        // engine, the network link. There is no deputy and no grant: Dimension 4
+        // bounds a *grant*, and the operator acting through its own peer has
+        // none to attenuate against. Same reading as the local branch's
+        // `PeerRoot` arm, and the same reason.
+        DispatchCeiling::PeerRoot => true,
+        DispatchCeiling::Handler(Some(grant)) => entity_capability::check_permission(
+            operation,
+            handler_pattern,
+            target_peer,
+            resource,
+            grant,
+            local_pid,
+        ),
+        // A handler that can prove no authority at all cannot reach a foreign
+        // peer on ambient authority. Fail-closed, as on the local branch.
+        DispatchCeiling::Handler(None) => false,
+    }
+}
+
+/// The presented-authority arm's four verifications (§1.4, 0.8.2.17). Every one
+/// already existed in this tree; this is a composition, not new machinery.
+///
+/// Returns `false` — *"not presented authority"*, never an error — for any
+/// failure, because §1.4's disposition for a capability failing any of these is
+/// to **fall back to the ambient arm**, not to refuse outright.
+#[allow(clippy::too_many_arguments)]
+fn presented_authority_authorizes(
+    shared: &PeerShared,
+    cap_entity: &entity_entity::Entity,
+    included: &HashMap<entity_hash::Hash, entity_entity::Entity>,
+    handler_pattern: &str,
+    operation: &str,
+    target_peer: &str,
+    resource: Option<&entity_capability::ResourceTarget>,
+) -> bool {
+    let token = match entity_capability::CapabilityToken::from_entity(cap_entity) {
+        Ok(t) => t,
+        Err(_) => return false,
+    };
+
+    // (a) The authority `granter`-roots at the TARGET peer (§3.6).
+    //
+    // §1.4 says *"granter resolves to the target peer's identity"*, and read at
+    // the LEAF that sentence forbids attenuation — which is the one narrowing
+    // move the chain model exists for. A peer handed a broad connection grant by
+    // the target and re-attenuating it to a single operation before spending it
+    // presents a leaf whose granter is ITSELF; that is strictly safer than
+    // spending the root, and the leaf-equality reading refuses exactly it. Our
+    // own `follow(Continuation)` standing leg is that shape
+    // (`mint_cross_peer_chain_capability` — re-attenuate the handshake grant),
+    // and it is what measured the difference: leaf-equality reddened it while
+    // the reentry row stayed green, because that row's cap happens to be a root.
+    //
+    // The property that actually holds is about the chain's ROOT, and the
+    // enforcing construct is named rather than described: §5.5 root-trust in
+    // `verify_capability_chain` below, whose `local_peer_id` argument is passed
+    // as `target_peer` — a single-sig root whose granter is not the target
+    // fails `NotLocalPeer`, and a multi-sig root the target did not sign fails
+    // M6. So (a) is not a separate check here; it is the frame argument at (c),
+    // and moving that argument back to our own peer id is what would silently
+    // remove it.
+    //
+    // The target's derived identity hex is still load-bearing one frame up: it
+    // is how the standing handshake credential is located, so an underivable
+    // target identity yields no session candidate at all.
+
+    // (b) `grantee` resolves to the LOCAL peer's identity.
+    if token.grantee != shared.identity_hash {
+        return false;
+    }
+
+    // (c) Valid: chain-verified, unexpired, unrevoked (§5.5; §6.2's *Capability
+    //     validity* rule already binds this at sub-dispatch).
+    //
+    // The chain is walked against the same sources the outbound bundler uses —
+    // the presented entity itself, the parent envelope's `included`, then the
+    // local store — so a chain that will travel with the EXECUTE is a chain that
+    // verifies here.
+    let resolve = |h: &entity_hash::Hash| -> Option<entity_entity::Entity> {
+        if h == &cap_entity.content_hash {
+            return Some(cap_entity.clone());
+        }
+        included
+            .get(h)
+            .cloned()
+            .or_else(|| shared.content_store.get(h))
+    };
+    let mut bundle =
+        match entity_protocol::collect_chain_bundle(&cap_entity.content_hash, resolve, |p| {
+            shared.location_index.get(p)
+        }) {
+            Ok(b) => b.into_iter().collect::<std::collections::BTreeMap<_, _>>(),
+            Err(_) => return false,
+        };
+    // Verify against the SAME set the far side will: `collect_chain_bundle`
+    // finds a detached §5.5 signature only through the location index, and a
+    // §7a.2a signature rides in-band — it is in `included` and bound at no
+    // local path. The outbound branch merges `included` into `chain_bundle`
+    // for exactly this reason (V7 §3.3 v7.51), so verifying without the merge
+    // measures a bundle that never travels: `MissingSignature` here on a
+    // capability the recipient verifies fine. Bundle entries win on collision —
+    // the chain walk's own resolution is authoritative for the links.
+    for (h, ent) in included.iter() {
+        bundle.entry(*h).or_insert_with(|| ent.clone());
+    }
+    // The GRANTER'S frame, not ours — see the framing note on the caller, and
+    // note this argument decides more than canonicalization here. §5.5's
+    // root-trust rule is *"the single-sig root's granter must be the local
+    // peer"*, which is correct for a capability rooted in OUR authority and
+    // exactly wrong for one the target minted: passing our own peer id rejects
+    // every target-issued credential with `NotLocalPeer`, which is the shape
+    // this arm exists to accept. Revocation qualifies its §5.1 marker paths the
+    // same way, so a marker we hold for the target's namespace (V7 §1.4
+    // Category A — a mirrored foreign subtree) is the one consulted; the
+    // authoritative check still runs at the target on receipt.
+    if entity_protocol::verify_capability_chain(&cap_entity.content_hash, &bundle, target_peer)
+        .is_err()
+    {
+        return false;
+    }
+    if entity_protocol::is_revoked(
+        &cap_entity.content_hash,
+        target_peer,
+        // Same three sources as the bundler's resolver, and for the same reason:
+        // a §7a.2a capability arrives in-band and is in NEITHER the store nor
+        // `included` under its own hash until it is folded in. Resolving without
+        // the presented entity itself makes `collect_authority_chain` fail, and
+        // `is_revoked` fails closed on an unwalkable chain — so the leaf would
+        // read as REVOKED and every in-band presented capability would fall to
+        // the ambient arm. (Measured: that is what reddened
+        // `dispatch_outbound_reentry_with_in_band_authority` before this arm
+        // named the entity.)
+        |h| {
+            if h == &cap_entity.content_hash {
+                return Some(cap_entity.clone());
+            }
+            shared
+                .content_store
+                .get(h)
+                .or_else(|| included.get(h).cloned())
+        },
+        |p| shared.location_index.get(p),
+        // A capability the target minted for us is a wire-only cap from this
+        // peer's side — it has no canonical local storage path, so the
+        // path-binding half of §5.1 does not apply and the marker check does.
+        |_| None,
+    ) {
+        return false;
+    }
+
+    // (d) Coverage: the capability's OWN four dimensions authorize the request,
+    //     evaluated in the granter's frame — see the framing note on
+    //     `outbound_sub_dispatch_authorized`.
+    entity_capability::check_permission(
+        operation,
+        handler_pattern,
+        target_peer,
+        resource,
+        &token,
+        target_peer,
+    )
+}
+
 /// `ceiling` bounds §5.2's resource dimension for sub-dispatches made through
 /// the returned `execute_fn` — see [`DispatchCeiling`] and the check on the
 /// local branch below.
@@ -3510,6 +3783,145 @@ pub fn make_execute_fn(
                             ))
                         })?;
 
+                    // EXTENSION-CONTINUATION §3.6 step 5 / §4.2 case 3 / §4.3:
+                    // a continuation dispatch carries its scoped
+                    // `dispatch_capability` (opts.capability) as the EXECUTE
+                    // capability — never a silent fallback to the broad
+                    // connection grant (V7 §6.8 — the cross-peer silent-
+                    // escalation Amendment-2's recipe step 2 forbids). Its full
+                    // authority chain (persisted locally at install, §3.2 step 5)
+                    // is bundled into the dispatched envelope's `included` so the
+                    // verifying peer can validate it to a root it recognizes
+                    // (§4.3 chain transport — the general V7 §3.1/§3.2 rule
+                    // places only the leaf). Ordinary internal dispatch (no
+                    // opts.capability) is unchanged: None + empty bundle.
+                    let empty_bundle = std::collections::HashMap::new();
+                    // Chain resolution reads the **in-band** authority first,
+                    // then the local store. §3.2 step 5 persists an installed
+                    // chain locally, and a store-only resolver serves every
+                    // such dispatch correctly — but GUIDE-CONFORMANCE §7a.2a
+                    // hands the chain to the dispatcher *in params* (cap +
+                    // granter identity + signature), and those entities are
+                    // deliberately not in this peer's store. Resolving only
+                    // against the store made §4.3's MUST unsatisfiable on that
+                    // path: the bundler could not reach a chain it was
+                    // physically holding, and every reentrant dispatch-outbound
+                    // died at `chain_unreachable` → 502 (core-go's
+                    // `origination.dispatch_outbound_reentry`, established
+                    // 2026-08-14-e; ours, introduced with the §4.3 fail-closed
+                    // at deb5127).
+                    //
+                    // Reading them here is transport assembly, not an authority
+                    // decision: `included` is exactly what would have travelled
+                    // to B anyway (it is merged into `chain_bundle` below), and
+                    // B verifies every signature and link itself (V7 §5.5).
+                    //
+                    // ORDERING, and it is load-bearing: this block runs BEFORE
+                    // the PD-2 outbound check below, not after. §4.3's
+                    // `chain_unreachable` is a statement about a chain the
+                    // dispatcher physically cannot assemble, and it must keep
+                    // its precedence — a cap whose granter identity resolves
+                    // nowhere also fails PD-2's presented arm (it cannot be
+                    // shown to be target-minted), so running PD-2 first turns
+                    // every §4.3 refusal into a 403 and silently retires the
+                    // control that proves the fail-closed still bites
+                    // (`unresolvable_granter_identity_still_fails_the_bundle`).
+                    // Both refusals happen before the dial either way.
+                    let resolve_chain = |h: &entity_hash::Hash| -> Option<entity_entity::Entity> {
+                        if let Some(cap) = opts.capability.as_ref() {
+                            if &cap.content_hash == h {
+                                return Some(cap.clone());
+                            }
+                        }
+                        included
+                            .get(h)
+                            .cloned()
+                            .or_else(|| shared.content_store.get(h))
+                    };
+                    let (dispatch_cap, mut chain_bundle) = match opts.capability.as_ref() {
+                        Some(cap) => match entity_protocol::collect_chain_bundle(
+                            &cap.content_hash,
+                            resolve_chain,
+                            |p| shared.location_index.get(p),
+                        ) {
+                            Ok(bundle) => (Some(cap), bundle),
+                            Err(e) => {
+                                // EXTENSION-CONTINUATION v1.22 §4.3: a bundler
+                                // that cannot resolve a chain link — or the
+                                // `system/peer` identity of any granter or
+                                // grantee in it — MUST fail HERE with
+                                // `chain_unreachable` rather than dispatch an
+                                // incomplete bundle. The prior behaviour sent
+                                // the leaf alone and let B fail closed; that is
+                                // not an escalation, but it is non-conformant
+                                // and it moved a defect the dispatcher can see
+                                // (and name) into a 401 on the far side that
+                                // reads as the target's problem.
+                                tracing::warn!(
+                                    cap = %cap.content_hash,
+                                    error = %e,
+                                    "continuation dispatch: authority chain or a \
+                                     granter/grantee identity is unresolvable; \
+                                     refusing to dispatch an incomplete bundle"
+                                );
+                                return Err(HandlerError::Internal(
+                                    "chain_unreachable".to_string(),
+                                ));
+                            }
+                        },
+                        None => (None, empty_bundle),
+                    };
+
+                    // §1.4 "The enforcement point, and the authority it runs
+                    // against" (0.8.2.17 — PD-2). BEFORE the dial, not merely
+                    // before the send: a sub-dispatch the peer may not make is
+                    // not a reason to open a connection to the peer it may not
+                    // reach. `handler_pattern` is the requested handler with the
+                    // peer prefix stripped — the same bare form a grant's
+                    // `handlers` scope is written in, so both sides canonicalize
+                    // into one frame.
+                    //
+                    // This replaces the reasoning the old code carried at the
+                    // local branch: *"the remote branch sends an EXECUTE that the
+                    // receiving peer authorizes through its own dispatch_request
+                    // check, so the dimension binds there already."* It does not.
+                    // The far peer authorizes against what it granted US; it
+                    // cannot see whether our handler was steered into asking, and
+                    // Dimension 4 is the ceiling on exactly that.
+                    let bare_handler = entity_entity::EntityUri::strip_peer_prefix(
+                        entity_entity::EntityUri::extract_handler_path(&handler_path),
+                    );
+                    if !outbound_sub_dispatch_authorized(
+                        shared.as_ref(),
+                        &ceiling,
+                        opts.capability.as_ref(),
+                        &included,
+                        bare_handler,
+                        &operation,
+                        &remote_peer_id,
+                        opts.resource.as_ref(),
+                        local_pid.as_str(),
+                    ) {
+                        tracing::warn!(
+                            handler_path = %handler_path,
+                            operation = %operation,
+                            target_peer = %remote_peer_id,
+                            "outbound sub-dispatch denied: §5.2 Dimension 4 (peers) \
+                             on ambient authority, and no target-minted capability \
+                             authorizes it (§1.4, 0.8.2.17 PD-2)"
+                        );
+                        return Ok(entity_handler::HandlerResult::error(
+                            STATUS_FORBIDDEN,
+                            make_error_response_entity(
+                                "capability_denied",
+                                &format!(
+                                    "no authority to sub-dispatch {} at peer {}",
+                                    operation, remote_peer_id
+                                ),
+                            ),
+                        ));
+                    }
+
                     let conn: std::sync::Arc<dyn crate::remote::RemoteEndpoint> =
                         crate::remote::get_or_connect(
                             &shared.remote,
@@ -3563,83 +3975,6 @@ pub fn make_execute_fn(
                         }
                     } else {
                         None
-                    };
-
-                    // EXTENSION-CONTINUATION §3.6 step 5 / §4.2 case 3 / §4.3:
-                    // a continuation dispatch carries its scoped
-                    // `dispatch_capability` (opts.capability) as the EXECUTE
-                    // capability — never a silent fallback to the broad
-                    // connection grant (V7 §6.8 — the cross-peer silent-
-                    // escalation Amendment-2's recipe step 2 forbids). Its full
-                    // authority chain (persisted locally at install, §3.2 step 5)
-                    // is bundled into the dispatched envelope's `included` so the
-                    // verifying peer can validate it to a root it recognizes
-                    // (§4.3 chain transport — the general V7 §3.1/§3.2 rule
-                    // places only the leaf). Ordinary internal dispatch (no
-                    // opts.capability) is unchanged: None + empty bundle.
-                    let empty_bundle = std::collections::HashMap::new();
-                    // Chain resolution reads the **in-band** authority first,
-                    // then the local store. §3.2 step 5 persists an installed
-                    // chain locally, and a store-only resolver serves every
-                    // such dispatch correctly — but GUIDE-CONFORMANCE §7a.2a
-                    // hands the chain to the dispatcher *in params* (cap +
-                    // granter identity + signature), and those entities are
-                    // deliberately not in this peer's store. Resolving only
-                    // against the store made §4.3's MUST unsatisfiable on that
-                    // path: the bundler could not reach a chain it was
-                    // physically holding, and every reentrant dispatch-outbound
-                    // died at `chain_unreachable` → 502 (core-go's
-                    // `origination.dispatch_outbound_reentry`, established
-                    // 2026-08-14-e; ours, introduced with the §4.3 fail-closed
-                    // at deb5127).
-                    //
-                    // Reading them here is transport assembly, not an authority
-                    // decision: `included` is exactly what would have travelled
-                    // to B anyway (it is merged into `chain_bundle` below), and
-                    // B verifies every signature and link itself (V7 §5.5).
-                    let resolve_chain = |h: &entity_hash::Hash| -> Option<entity_entity::Entity> {
-                        if let Some(cap) = opts.capability.as_ref() {
-                            if &cap.content_hash == h {
-                                return Some(cap.clone());
-                            }
-                        }
-                        included
-                            .get(h)
-                            .cloned()
-                            .or_else(|| shared.content_store.get(h))
-                    };
-                    let (dispatch_cap, mut chain_bundle) = match opts.capability.as_ref() {
-                        Some(cap) => match entity_protocol::collect_chain_bundle(
-                            &cap.content_hash,
-                            resolve_chain,
-                            |p| shared.location_index.get(p),
-                        ) {
-                            Ok(bundle) => (Some(cap), bundle),
-                            Err(e) => {
-                                // EXTENSION-CONTINUATION v1.22 §4.3: a bundler
-                                // that cannot resolve a chain link — or the
-                                // `system/peer` identity of any granter or
-                                // grantee in it — MUST fail HERE with
-                                // `chain_unreachable` rather than dispatch an
-                                // incomplete bundle. The prior behaviour sent
-                                // the leaf alone and let B fail closed; that is
-                                // not an escalation, but it is non-conformant
-                                // and it moved a defect the dispatcher can see
-                                // (and name) into a 401 on the far side that
-                                // reads as the target's problem.
-                                tracing::warn!(
-                                    cap = %cap.content_hash,
-                                    error = %e,
-                                    "continuation dispatch: authority chain or a \
-                                     granter/grantee identity is unresolvable; \
-                                     refusing to dispatch an incomplete bundle"
-                                );
-                                return Err(HandlerError::Internal(
-                                    "chain_unreachable".to_string(),
-                                ));
-                            }
-                        },
-                        None => (None, empty_bundle),
                     };
 
                     // V7 §3.3 v7.51: request-side envelope-`included` preservation.
@@ -3841,9 +4176,15 @@ pub fn make_execute_fn(
                 // ALWAYS carries a resource (§3.2 path-as-resource) — so a path
                 // that skips it leaves handler installation authorized by nothing.
                 //
-                // Scoped to the local branch on purpose: the remote branch sends
-                // an EXECUTE that the receiving peer authorizes through its own
-                // `dispatch_request` check, so the dimension binds there already.
+                // Scoped to the local branch: the remote branch runs its own
+                // four-dimension check at `outbound_sub_dispatch_authorized`
+                // (§1.4, 0.8.2.17 — PD-2), which binds Dimension 4 as well and
+                // has a second authority arm this one does not need. This
+                // paragraph used to read *"the receiving peer authorizes through
+                // its own dispatch_request check, so the dimension binds there
+                // already"* — that is the reasoning PD-2 withdraws. The far peer
+                // authorizes against what it granted us; it cannot see that our
+                // handler was steered into asking.
                 //
                 // Fail-closed when the deputy holds no grant at all: a dispatch
                 // that names a resource while its dispatcher can prove no

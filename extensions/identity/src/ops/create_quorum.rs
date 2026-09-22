@@ -17,6 +17,26 @@ impl IdentityHandler {
         // enforcement; no canonical-path fallback. Caller supplies the
         // canonical quorum path, e.g. `system/quorum/{quorum_id_hex}` after
         // computing the quorum_id locally.
+        //
+        // **`0.8.2.17` names this operation as an example of the opposite, and
+        // we are deliberately not following it.** Retracting `path_required`
+        // from dispatch, §3.3's 400 row says *"which operations require one is
+        // stated by each operation's own specification"* and then offers
+        // *"operations for which no resource is legitimate (`configure`,
+        // `create_quorum`) simply do not carry the requirement."* Both named ops
+        // are EXTENSION-IDENTITY's, and EXTENSION-IDENTITY §6's resource-target
+        // table gives `create_quorum` → `system/quorum/{q_hex}` and `configure`
+        // → `system/identity/peer-config`, under *"All ops follow path-as-
+        // resource per ENTITY-CORE-PROTOCOL.md §3.2 (architectural-side MUST)."*
+        //
+        // The normative sentence and the parenthetical disagree, so we follow
+        // the normative sentence: it points at the operation's own
+        // specification, and the operation's own specification requires a
+        // resource. The parenthetical is an illustration that names two
+        // operations it does not own. Routed rather than silently resolved —
+        // if arch rules for the parenthetical, this arm and `configure`'s in
+        // `handler.rs` come out together, and `EXTENSION-IDENTITY` §6's table
+        // and §1380's MUST have to move with them.
         let resource_path = match self.resource_path(ctx) {
             Some(p) => p,
             None => {
